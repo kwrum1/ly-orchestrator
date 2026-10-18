@@ -34,7 +34,8 @@ case "$*" in
   'show dpdk interface hqos placement') printf '%s\n' "${VPPCTL_HQOS_PLACEMENT:-}" ;;
   create\ interface\ af_xdp*)
     case "$*" in
-      *' zero-copy') [ "${VPPCTL_AFXDP_SUCCESS:-0}" = 1 ] ;;
+      *' zero-copy'*) [ "${VPPCTL_AFXDP_SUCCESS:-0}" = 1 ] ;;
+      *' no-zero-copy'*) [ "${VPPCTL_AFXDP_SUCCESS:-0}" = 1 ] ;;
       *) exit 1 ;;
     esac
     ;;

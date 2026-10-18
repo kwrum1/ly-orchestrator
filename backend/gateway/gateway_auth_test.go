@@ -15,8 +15,8 @@ func TestGatewayAuthDefaultsRequireFactoryPasswordChange(t *testing.T) {
 	if config.AdminUsername != "admin" {
 		t.Fatalf("default admin username = %q, want admin", config.AdminUsername)
 	}
-	if config.AdminPassword != "password" {
-		t.Fatalf("default admin password = %q, want password", config.AdminPassword)
+	if config.AdminPassword != "" {
+		t.Fatalf("factory admin password = %q, want first-boot generated secret", config.AdminPassword)
 	}
 	if !config.ForcePasswordChange {
 		t.Fatal("factory admin account must require a password change")

@@ -1309,6 +1309,7 @@ func (server *Server) handleChangePassword(w http.ResponseWriter, r *http.Reques
 		writeError(w, r, http.StatusInternalServerError, "password_save_failed", "password could not be saved")
 		return
 	}
+	server.clearInitialAdminCredentials()
 	server.sessions.delete(session.ID)
 	newSession := server.sessions.create(server.auth.AdminUsername, "admin", false)
 	http.SetCookie(w, sessionCookie(newSession.ID, server.auth.CookieSecure))

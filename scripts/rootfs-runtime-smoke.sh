@@ -40,7 +40,7 @@ if [ -f "$artifact.sha256" ]; then
   (cd "$artifact_dir" && sha256sum -c "$artifact_name.sha256")
 fi
 
-if tar --use-compress-program="$compressor" -tf "$artifact" | grep -Eiq 'no-zero-copy|native-driver-auto|generic[-_]?xdp|generic[-_]?skb'; then
+if tar --use-compress-program="$compressor" -tf "$artifact" | grep -Eiq 'native-driver-auto|generic[-_]?xdp|generic[-_]?skb'; then
   echo "rootfs artifact contains a forbidden dataplane path" >&2
   exit 1
 fi
@@ -75,7 +75,7 @@ fi
 if [ -f "$tmp/etc/ly-route/vpp-command-map.json" ]; then
   grep -q '"operations"' "$tmp/etc/ly-route/vpp-command-map.json"
 fi
-if grep -Eiq 'no-zero-copy|native-driver-auto|generic[-_]?xdp|generic[-_]?skb' \
+if grep -Eiq 'native-driver-auto|generic[-_]?xdp|generic[-_]?skb' \
   "$tmp/etc/ly-route/runtime.env" \
   "$tmp/etc/ly-route/default-config.json" \
   "$tmp/etc/ly-route/vpp-command-map.json"; then

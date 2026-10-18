@@ -237,7 +237,7 @@ probe_interface() {
     native='{"hook":"tap_bridge","mode":"linux_bridge","tier":"vpp_native","verified":"installer_acceptance","native":true,"high_performance":false,"acceptance_only":true,"kernel_driver":"vmxnet3"}'
   elif [ -e "/sys/class/net/$name/queues/rx-0" ] && [ "$driver" != none ] &&
        grep -q '^CONFIG_XDP_SOCKETS=y$' "/boot/config-$(uname -r)" 2>/dev/null; then
-    native='{"hook":"af_xdp","mode":"zero_copy","tier":"vpp_native","verified":"hardware_preflight"}'
+    native='{"hook":"af_xdp","mode":"copy","tier":"vpp_native","verified":"hardware_preflight","high_performance":true}'
   fi
   if [ -n "$iommu" ] && { [ -d /sys/module/vfio_pci ] || modprobe vfio-pci >/dev/null 2>&1; }; then
     dpdk_mode=vfio_pci

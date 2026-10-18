@@ -15,23 +15,23 @@ import (
 type NativeHook string
 
 const (
-	NativeHookAFXDP    NativeHook = "af_xdp"
-	NativeHookAFPacket NativeHook = "af_packet"
+	NativeHookAFXDP     NativeHook = "af_xdp"
+	NativeHookAFPacket  NativeHook = "af_packet"
 	NativeHookTapBridge NativeHook = "tap_bridge"
-	NativeHookRDMA     NativeHook = "rdma"
-	NativeHookDPDK     NativeHook = "dpdk"
+	NativeHookRDMA      NativeHook = "rdma"
+	NativeHookDPDK      NativeHook = "dpdk"
 )
 
 type NativeMode string
 
 const (
-	NativeModeZeroCopy NativeMode = "zero_copy"
-	NativeModeRDMADV   NativeMode = "rdma_dv"
-	NativeModeCopy     NativeMode = "copy"
-	NativeModeAFPacket NativeMode = "linux_packet_socket"
+	NativeModeZeroCopy  NativeMode = "zero_copy"
+	NativeModeRDMADV    NativeMode = "rdma_dv"
+	NativeModeCopy      NativeMode = "copy"
+	NativeModeAFPacket  NativeMode = "linux_packet_socket"
 	NativeModeTapBridge NativeMode = "linux_bridge"
-	NativeModeDPDKVFIO NativeMode = "vfio_pci"
-	NativeModeDPDKUIO  NativeMode = "uio_pci_generic"
+	NativeModeDPDKVFIO  NativeMode = "vfio_pci"
+	NativeModeDPDKUIO   NativeMode = "uio_pci_generic"
 )
 
 type DataplaneTier string
@@ -42,7 +42,7 @@ const (
 )
 
 func approvedNativeMode(hook NativeHook, mode NativeMode) bool {
-	return hook == NativeHookAFXDP && mode == NativeModeZeroCopy ||
+	return hook == NativeHookAFXDP && (mode == NativeModeZeroCopy || mode == NativeModeCopy) ||
 		hook == NativeHookRDMA && mode == NativeModeRDMADV
 }
 

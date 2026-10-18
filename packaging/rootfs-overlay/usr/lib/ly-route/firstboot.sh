@@ -74,6 +74,32 @@ management_ip=${LY_ROUTE_MANAGEMENT_FALLBACK_CIDR%/*}
 state_dir=/var/lib/ly-route
 mkdir -p "$state_dir"
 
+# First boot is a one-time provisioning step. Re-running it must not reset
+# credentials, SSH policy, or the management network after the operator has
+# changed them.
+if [ -e "$state_dir/firstboot-complete" ]; then
+  exit 0
+fi
+
+# The web admin password is generated per device. It is written to a
+# root-only environment file consumed by ly-route-control-api.service.
+initial_admin_password_file=/root/ly-route-initial-admin-password
+if [ ! -s "$initial_admin_password_file" ]; then
+  umask 077
+  openssl rand -base64 18 | tr -d '\n' > "$initial_admin_password_file"
+fi
+chmod 600 "$initial_admin_password_file"
+initial_admin_password=$(cat "$initial_admin_password_file")
+control_env=/etc/ly-route/control-api.env
+mkdir -p /etc/ly-route
+touch "$control_env"
+chmod 600 "$control_env"
+if grep -q '^LY_ROUTE_ADMIN_PASSWORD=' "$control_env"; then
+  sed -i "s|^LY_ROUTE_ADMIN_PASSWORD=.*|LY_ROUTE_ADMIN_PASSWORD=$initial_admin_password|" "$control_env"
+else
+  printf 'LY_ROUTE_ADMIN_PASSWORD=%s\n' "$initial_admin_password" >> "$control_env"
+fi
+
 dns_sync_token=/etc/ly-route/dns-sync.token
 if [ ! -s "$dns_sync_token" ]; then
   umask 077
@@ -101,8 +127,12 @@ if [ -n "${LY_ROUTE_SYSTEM_ADMIN_PASSWORD:-}" ] && command -v useradd >/dev/null
 fi
 
 if [ -f /etc/ssh/sshd_config ]; then
-  sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-  sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
+  # The appliance is managed through HTTPS. SSH remains available for keys
+  # only; interactive password login (especially root) is not a factory
+  # credential path.
+  sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+  sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
   systemctl enable ssh.service >/dev/null 2>&1 || true
   systemctl try-restart ssh.service >/dev/null 2>&1 || true
 fi
@@ -292,6 +322,7 @@ PY
     python3 - "$installed_network" "$operations_file" <<'PY'
 import json
 import os
+import subprocess
 import sys
 
 source_path, target_path = sys.argv[1:]
@@ -323,9 +354,17 @@ for item in document.get("data_interfaces", []):
             "show hardware-interfaces " + vpp_name,
             "show interface " + vpp_name,
         ]
-    elif hook == "af_xdp" and mode == "zero_copy":
+    elif hook == "af_xdp" and mode in ("zero_copy", "copy"):
+        mode_flag = "zero-copy" if mode == "zero_copy" else "no-zero-copy"
+        subprocess.run(["ip", "link", "set", "dev", name, "promisc", "on"], check=False)
+        subprocess.run(["ip", "link", "set", "dev", name, "up"], check=False)
         commands = [
-            "?create interface af_xdp host-if " + name + " name " + vpp_name + " zero-copy",
+            "?create interface af_xdp host-if " + name + " name " + vpp_name + " " + mode_flag + " num-rx-queues all",
+        ]
+        mac = str(item.get("mac", "")).strip()
+        if mac:
+            commands.append("set interface mac address " + vpp_name + " " + mac)
+        commands += [
             "set interface state " + vpp_name + " up",
             "show hardware-interfaces " + vpp_name,
             "show interface " + vpp_name,
@@ -366,9 +405,12 @@ fi
 cat > /etc/issue <<EOF
 Ly Route appliance
 Default LAN: selected management interface, $LY_ROUTE_MANAGEMENT_FALLBACK_CIDR with DHCP enabled
-Admin UI: http://$management_ip/
-Admin UI HTTPS: https://$management_ip/
-Configure admin credentials in /etc/ly-route/control-api.env
+Admin UI: https://$management_ip/
+Initial admin password: $initial_admin_password
+Change it after the first login. This line is removed after the password change.
 EOF
 
+printf '\nLy Route initial admin password: %s\n' "$initial_admin_password" > /dev/tty1 2>/dev/null || true
+
 date -u +%Y-%m-%dT%H:%M:%SZ > "$state_dir/firstboot-ran-at"
+touch "$state_dir/firstboot-complete"

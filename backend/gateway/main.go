@@ -96,7 +96,7 @@ func run() error {
 func gatewayAuthConfig() httpapi.AuthConfig {
 	return httpapi.AuthConfig{
 		AdminUsername:       env("LY_ROUTE_ADMIN_USERNAME", "admin"),
-		AdminPassword:       env("LY_ROUTE_ADMIN_PASSWORD", "password"),
+		AdminPassword:       env("LY_ROUTE_ADMIN_PASSWORD", ""),
 		ReadonlyUsername:    env("LY_ROUTE_READONLY_USERNAME", "readonly"),
 		ReadonlyPassword:    env("LY_ROUTE_READONLY_PASSWORD", ""),
 		CookieSecure:        envBool("LY_ROUTE_SESSION_COOKIE_SECURE", false),

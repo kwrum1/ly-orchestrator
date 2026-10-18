@@ -66,7 +66,12 @@ probe_native_candidate() {
       probe_create="create interface rdma host-if $probe_interface name $probe_vpp_interface mode dv"
       ;;
     af_xdp:zero_copy)
-      probe_create="create interface af_xdp host-if $probe_interface name $probe_vpp_interface zero-copy"
+      ip link set dev "$probe_interface" promisc on up >/dev/null 2>&1 || true
+      probe_create="create interface af_xdp host-if $probe_interface name $probe_vpp_interface zero-copy num-rx-queues all"
+      ;;
+    af_xdp:copy)
+      ip link set dev "$probe_interface" promisc on up >/dev/null 2>&1 || true
+      probe_create="create interface af_xdp host-if $probe_interface name $probe_vpp_interface no-zero-copy num-rx-queues all"
       ;;
     af_packet:linux_packet_socket)
       # An active AF_PACKET attachment is renamed to lyroute-$iface by the
@@ -107,6 +112,7 @@ probe_native_candidate() {
     case "$probe_hook:$probe_mode" in
       rdma:rdma_dv) probe_score=120 ;;
       af_xdp:zero_copy) probe_score=100 ;;
+      af_xdp:copy) probe_score=85 ;;
       af_packet:linux_packet_socket) probe_score=10 ;;
       *) probe_score=90 ;;
     esac
@@ -445,26 +451,23 @@ for interface_name in $(split_csv "$LY_ROUTE_VPP_DATA_INTERFACES"); do
       vmxnet3_af_packet_candidate="{\"tier\":\"vpp_native\",\"hook\":\"af_packet\",\"mode\":\"linux_packet_socket\",\"source\":\"runtime_probe\",\"runtime_verified\":true,\"native\":true,\"high_performance\":false,\"acceptance_only\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$native_score,\"kernel_driver\":\"vmxnet3\",\"mac_address\":\"$(json_escape "$interface_mac")\",\"smart_qos_plugin_available\":$smart_qos_plugin_available}"
       native_candidate=$vmxnet3_af_packet_candidate
     fi
-    native_specs='rdma rdma_dv rdma_plugin.so af_xdp zero_copy af_xdp_plugin.so'
     # VMXNET3 is validated through AF_PACKET only. Its unsupported native
     # candidates must not be probed or selected; physical NICs retain the
     # normal native-path detection below.
-    if [ "$LY_ROUTE_VMXNET3_AF_PACKET_ACCEPTANCE" = true ] && [ "$interface_driver" = vmxnet3 ]; then
-      native_specs=
-    fi
-    for native_spec in 'rdma rdma_dv rdma_plugin.so' 'af_xdp zero_copy af_xdp_plugin.so'; do
-      [ -n "$native_specs" ] || continue
-      set -- $native_spec
-      native_hook=$1
-      native_mode=$2
-      native_plugin=$3
-      if printf '%s\n' "$plugin_output" | grep -q "$native_plugin"; then
-        if native_score=$(probe_native_candidate "$interface_name" "$native_hook" "$native_mode"); then
-          candidate="{\"tier\":\"vpp_native\",\"hook\":\"$native_hook\",\"mode\":\"$native_mode\",\"source\":\"runtime_probe\",\"runtime_verified\":true,\"native\":true,\"high_performance\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$native_score,\"smart_qos_plugin_available\":$smart_qos_plugin_available}"
-          if [ -n "$native_candidate" ]; then native_candidate="$native_candidate,$candidate"; else native_candidate=$candidate; fi
+    if [ "$LY_ROUTE_VMXNET3_AF_PACKET_ACCEPTANCE" != true ] || [ "$interface_driver" != vmxnet3 ]; then
+      for native_spec in 'rdma rdma_dv rdma_plugin.so' 'af_xdp zero_copy af_xdp_plugin.so' 'af_xdp copy af_xdp_plugin.so'; do
+        set -- $native_spec
+        native_hook=$1
+        native_mode=$2
+        native_plugin=$3
+        if printf '%s\n' "$plugin_output" | grep -q "$native_plugin"; then
+          if native_score=$(probe_native_candidate "$interface_name" "$native_hook" "$native_mode"); then
+            candidate="{\"tier\":\"vpp_native\",\"hook\":\"$native_hook\",\"mode\":\"$native_mode\",\"source\":\"runtime_probe\",\"runtime_verified\":true,\"native\":true,\"high_performance\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$native_score,\"mac_address\":\"$(json_escape "$interface_mac")\",\"smart_qos_plugin_available\":$smart_qos_plugin_available}"
+            if [ -n "$native_candidate" ]; then native_candidate="$native_candidate,$candidate"; else native_candidate=$candidate; fi
+          fi
         fi
-      fi
-    done
+      done
+    fi
   fi
   if [ -z "$native_candidate" ]; then all_native=false; fi
   dpdk_source=runtime_probe

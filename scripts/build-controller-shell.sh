@@ -65,6 +65,9 @@ fi
 rm -rf "$out_dir"
 mkdir -p "$out_dir"
 cp "$source_dir/index.html" "$source_dir/styles.css" "$source_dir/shell.js" "$manifest" "$out_dir/"
+if [ -f "$source_dir/commercial.css" ]; then
+  cp "$source_dir/commercial.css" "$out_dir/"
+fi
 mv "$out_dir/$(basename "$manifest")" "$out_dir/capabilities.json"
 node - "$out_dir/index.html" <<'NODE'
 const { readFileSync, writeFileSync } = require("node:fs");
@@ -78,7 +81,8 @@ case "$product" in
       "$source_dir/bootstrap.js" \
       "$source_dir/modules/routing.js" \
       "$source_dir/modules/modal.js" \
-      "$source_dir/modules/overview.js" \
+      "$source_dir/gateway-overview.js" \
+      "$source_dir/gateway-dependencies.js" \
       "$source_dir/app.js" > "$out_dir/app.js"
     ;;
   orchestrator)
@@ -102,4 +106,13 @@ writeFileSync(path, source.replace("</head>", "  <link rel=\"stylesheet\" href=\
 NODE
     ;;
 esac
+# Reject bundles whose HTML points at local assets that were not copied or bundled.
+missing=0
+for ref in $(grep -oE '(href|src)="\./[^"]+"' "$out_dir/index.html" | sed -E 's/.*="\.\/([^"]+)"/\1/; s/[?#].*$//' | sort -u); do
+  if [ ! -f "$out_dir/$ref" ]; then
+    echo "bundle is missing referenced asset: $ref" >&2
+    missing=1
+  fi
+done
+[ "$missing" = 0 ] || exit 1
 printf 'Built %s controller-shell bundle at %s\n' "$product" "$out_dir"

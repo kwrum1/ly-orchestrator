@@ -59,7 +59,7 @@ func TestNativePath_proven_assignment_builds_attach_with_semantic_readback(t *te
 	if len(operations) == 0 || operations[0].Name != "vpp.dataplane.attach" {
 		t.Fatalf("operations = %#v, want native attach first", operations)
 	}
-	if got := operations[0].VPPCtlCommands; len(got) != 4 || got[0] != "?create interface af_xdp host-if eth1 name lyroute-eth1 zero-copy" || got[1] != "set interface state lyroute-eth1 up" || got[2] != "show hardware-interfaces lyroute-eth1" || got[3] != "show interface lyroute-eth1" {
+	if got := operations[0].VPPCtlCommands; len(got) != 4 || got[0] != "?create interface af_xdp host-if eth1 name lyroute-eth1 zero-copy num-rx-queues all" || got[1] != "set interface state lyroute-eth1 up" || got[2] != "show hardware-interfaces lyroute-eth1" || got[3] != "show interface lyroute-eth1" {
 		t.Fatalf("attach commands = %#v", got)
 	}
 }
@@ -117,7 +117,42 @@ func TestNativePath_proven_zero_copy_assignment_is_selected(t *testing.T) {
 	}
 }
 
-func TestNativePath_unsupported_or_copy_only_hook_is_locked(t *testing.T) {
+func TestNativePath_proven_copy_assignment_is_selected(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	request := NativePathRequest{
+		ManagementInterface: "eth0",
+		Now:                 now,
+		Assignments: []NativeAssignment{{
+			LinuxInterface: "eth1",
+			Explicit:       true,
+			Proof: CapabilityProof{
+				Hook:            NativeHookAFXDP,
+				Mode:            NativeModeCopy,
+				Source:          ProofSourceRuntimeProbe,
+				RuntimeVerified: true,
+				Native:          true,
+				HighPerformance: true,
+				ObservedAt:      now.Add(-time.Minute),
+				ValidUntil:      now.Add(time.Minute),
+			},
+		}},
+	}
+
+	path, err := SelectNativePath(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(path.Attachments) != 1 || path.Attachments[0].Hook != NativeHookAFXDP || path.Attachments[0].Mode != NativeModeCopy {
+		t.Fatalf("path = %#v, want proven AF_XDP copy attachment", path)
+	}
+	for _, result := range path.Prerequisites {
+		if !result.Passed {
+			t.Fatalf("prerequisite failed in selected path: %#v", result)
+		}
+	}
+}
+
+func TestNativePath_unsupported_hook_is_locked(t *testing.T) {
 	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name  string
@@ -126,7 +161,6 @@ func TestNativePath_unsupported_or_copy_only_hook_is_locked(t *testing.T) {
 		proof CapabilityProof
 	}{
 		{name: "unsupported hook", hook: NativeHook("idpf"), mode: NativeMode("pci")},
-		{name: "AF_XDP copy mode", hook: NativeHookAFXDP, mode: NativeModeCopy},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

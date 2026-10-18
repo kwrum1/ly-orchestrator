@@ -167,8 +167,13 @@ if ! grep -q 'openssh-server' "$repo_root/scripts/build-rootfs.sh" || ! grep -q 
   exit 1
 fi
 
-if ! grep -q 'LY_ROUTE_SYSTEM_ROOT_PASSWORD=admin12345' "$repo_root/packaging/rootfs-overlay/etc/ly-route/appliance.env"; then
-  echo "factory root SSH password is not provisioned" >&2
+if grep -qE '^(LY_ROUTE_ADMIN_PASSWORD|LY_ROUTE_SYSTEM_ROOT_PASSWORD|LY_ROUTE_SYSTEM_ADMIN_PASSWORD)=' "$repo_root/packaging/rootfs-overlay/etc/ly-route/appliance.env"; then
+  echo "factory credentials must not be embedded in appliance.env" >&2
+  exit 1
+fi
+
+if ! grep -q '^LY_ROUTE_SESSION_COOKIE_SECURE=true' "$repo_root/packaging/rootfs-overlay/etc/ly-route/appliance.env"; then
+  echo "admin session cookies must be Secure by default" >&2
   exit 1
 fi
 
@@ -318,7 +323,7 @@ if ! grep -q '"operations"' "$repo_root/packaging/rootfs-overlay/etc/ly-route/vp
   exit 1
 fi
 
-for forbidden in no-zero-copy native-driver-auto; do
+for forbidden in native-driver-auto; do
   if grep -R -i --line-number --fixed-strings -- "$forbidden" \
     "$repo_root/scripts/build-runtime-debs.sh" \
     "$repo_root/packaging/rootfs-overlay/etc/vpp/startup.conf" \
