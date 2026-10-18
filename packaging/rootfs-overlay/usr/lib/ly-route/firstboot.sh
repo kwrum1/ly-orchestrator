@@ -74,6 +74,16 @@ management_ip=${LY_ROUTE_MANAGEMENT_FALLBACK_CIDR%/*}
 state_dir=/var/lib/ly-route
 mkdir -p "$state_dir"
 
+# Enforce key-only SSH on every boot. The appliance is managed through HTTPS;
+# interactive password login (especially root) is not a factory credential path.
+if [ -f /etc/ssh/sshd_config ]; then
+  sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+  sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+  systemctl enable ssh.service >/dev/null 2>&1 || true
+  systemctl try-restart ssh.service >/dev/null 2>&1 || true
+fi
+
 # First boot is a one-time provisioning step. Re-running it must not reset
 # credentials, SSH policy, or the management network after the operator has
 # changed them.
@@ -124,17 +134,6 @@ if [ -n "${LY_ROUTE_SYSTEM_ADMIN_PASSWORD:-}" ] && command -v useradd >/dev/null
     usermod -a -G vpp admin
   fi
   printf 'admin:%s\n' "$LY_ROUTE_SYSTEM_ADMIN_PASSWORD" | chpasswd
-fi
-
-if [ -f /etc/ssh/sshd_config ]; then
-  # The appliance is managed through HTTPS. SSH remains available for keys
-  # only; interactive password login (especially root) is not a factory
-  # credential path.
-  sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
-  sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-  sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-  systemctl enable ssh.service >/dev/null 2>&1 || true
-  systemctl try-restart ssh.service >/dev/null 2>&1 || true
 fi
 
 tls_dir=/etc/ly-route/tls

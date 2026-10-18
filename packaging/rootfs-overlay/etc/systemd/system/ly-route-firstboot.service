@@ -4,7 +4,6 @@ After=network-pre.target systemd-networkd.service
 Before=network-online.target nginx.service
 Before=vpp.service ly-route-runtime-check.service ly-route-vpp-apply.service
 Wants=network-online.target
-ConditionPathExists=!/var/lib/ly-route/firstboot-complete
 
 [Service]
 Type=oneshot

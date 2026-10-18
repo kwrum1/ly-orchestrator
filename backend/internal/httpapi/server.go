@@ -169,7 +169,6 @@ type Server struct {
 	trafficTrend                  TrafficTrendCollector
 	gatewayTelemetry              GatewayTelemetryCollector
 	gatewayState                  *gatewayTelemetryState
-	gatewayCollectMu              sync.Mutex
 	smartQoSObserver              SmartQoSRuntimeObserver
 	securityGuardObserver         SecurityGuardRuntimeObserver
 	requireSmartQoS               bool
