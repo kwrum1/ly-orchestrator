@@ -22,6 +22,7 @@ image=
 out_dir=dist/iso
 suite=bookworm
 mirror=${LY_ROUTE_MIRROR:-https://deb.debian.org/debian}
+bootappend_extra=${LY_ROUTE_ISO_BOOTAPPEND_EXTRA:-}
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --product) product=${2:-}; shift 2 ;;
@@ -546,7 +547,7 @@ else
       --security false --mirror-bootstrap "$mirror" --mirror-chroot "$mirror" \
       --mirror-binary "$mirror" --debootstrap-options '--include=gpgv' \
       --linux-packages linux-image \
-      --bootappend-live 'boot=live components console=tty0 systemd.show_status=true lyroute.autoinstall=1' \
+      --bootappend-live "boot=live components console=tty0 console=ttyS0,115200n8 systemd.show_status=true lyroute.autoinstall=1 $bootappend_extra" \
       --iso-volume 'LY_ROUTE_INSTALL' --memtest none
     # Debian live-build defaults both BIOS and UEFI menus to an infinite wait.
     # Keep a short recovery window, then enter the hardware-aware installer.

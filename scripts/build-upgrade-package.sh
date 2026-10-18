@@ -157,6 +157,12 @@ if [ "$product" = gateway ]; then
 fi
 service="$package_root/etc/systemd/system/ly-route-control-api.service"
 cp "$repo_root/packaging/rootfs-overlay/etc/systemd/system/ly-route-control-api.service" "$service"
+for runtime_script in runtime-check.sh firstboot.sh; do
+  cp "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/$runtime_script" "$package_root/usr/lib/ly-route/$runtime_script"
+  chmod 0755 "$package_root/usr/lib/ly-route/$runtime_script"
+done
+firstboot_service="$package_root/etc/systemd/system/ly-route-firstboot.service"
+cp "$repo_root/packaging/rootfs-overlay/etc/systemd/system/ly-route-firstboot.service" "$firstboot_service"
 awk -v profile='Environment=LY_ROUTE_PRODUCT_PROFILE=/etc/ly-route/product-manifest.json' \
     -v database="Environment=LY_ROUTE_DB_PATH=$PRODUCT_DATABASE_PATH" \
     -v config="Environment=LY_ROUTE_CONFIG_PATH=$PRODUCT_CONFIG_PATH" '
@@ -177,6 +183,10 @@ shell_hash=$(sha256sum "$package_root/opt/ly-route/admin/shell.js" | cut -d' ' -
 styles_hash=$(sha256sum "$package_root/opt/ly-route/admin/styles.css" | cut -d' ' -f1)
 nginx_hash=$(sha256sum "$package_root/etc/nginx/conf.d/ly-route-admin.conf" | cut -d' ' -f1)
 service_hash=$(sha256sum "$service" | cut -d' ' -f1)
+runtime_check_hash=$(sha256sum "$package_root/usr/lib/ly-route/runtime-check.sh" | cut -d' ' -f1)
+firstboot_hash=$(sha256sum "$package_root/usr/lib/ly-route/firstboot.sh" | cut -d' ' -f1)
+firstboot_service_hash=$(sha256sum "$firstboot_service" | cut -d' ' -f1)
+commercial_css_hash=$(sha256sum "$package_root/opt/ly-route/admin/commercial.css" | cut -d' ' -f1)
 profile_hash=$(sha256sum "$package_root/etc/ly-route/product-manifest.json" | cut -d' ' -f1)
 artifact_manifest_hash=$(sha256sum "$package_root/usr/share/ly-route/artifact-manifest.json" | cut -d' ' -f1)
 cat >"$package_root/checksums.sha256" <<EOF
@@ -189,6 +199,10 @@ $shell_hash  opt/ly-route/admin/shell.js
 $styles_hash  opt/ly-route/admin/styles.css
 $nginx_hash  etc/nginx/conf.d/ly-route-admin.conf
 $service_hash  etc/systemd/system/ly-route-control-api.service
+$runtime_check_hash  usr/lib/ly-route/runtime-check.sh
+$firstboot_hash  usr/lib/ly-route/firstboot.sh
+$firstboot_service_hash  etc/systemd/system/ly-route-firstboot.service
+$commercial_css_hash  opt/ly-route/admin/commercial.css
 $profile_hash  etc/ly-route/product-manifest.json
 $artifact_manifest_hash  usr/share/ly-route/artifact-manifest.json
 EOF
@@ -204,11 +218,13 @@ fi
 node - "$package_root/manifest.json" "$PRODUCT_BUILD_PROFILE" "$product" "$suite" "$arch" \
   "$source_commit" "$created_at" "$control_hash" "$vpp_apply_hash" "$app_hash" \
   "$capabilities_hash" "$index_hash" "$shell_hash" "$styles_hash" "$nginx_hash" \
-  "$service_hash" "$profile_hash" "$artifact_manifest_hash" <<'NODE'
+  "$service_hash" "$runtime_check_hash" "$firstboot_hash" "$firstboot_service_hash" \
+  "$commercial_css_hash" "$profile_hash" "$artifact_manifest_hash" <<'NODE'
 const { readFileSync, writeFileSync } = require("node:fs");
 const [output, profilePath, product, suite, arch, commit, createdAt,
   controlHash, vppHash, appHash, capabilitiesHash, indexHash, shellHash, stylesHash,
-  nginxHash, serviceHash, profileHash, artifactManifestHash] = process.argv.slice(2);
+  nginxHash, serviceHash, runtimeCheckHash, firstbootHash, firstbootServiceHash,
+  commercialCSSHash, profileHash, artifactManifestHash] = process.argv.slice(2);
 const profile = JSON.parse(readFileSync(profilePath, "utf8"));
 const manifest = {
   package_type: "ly-route-upgrade",
@@ -229,6 +245,10 @@ const manifest = {
     "opt/ly-route/admin/styles.css": stylesHash,
     "etc/nginx/conf.d/ly-route-admin.conf": nginxHash,
     "etc/systemd/system/ly-route-control-api.service": serviceHash,
+    "usr/lib/ly-route/runtime-check.sh": runtimeCheckHash,
+    "usr/lib/ly-route/firstboot.sh": firstbootHash,
+    "etc/systemd/system/ly-route-firstboot.service": firstbootServiceHash,
+    "opt/ly-route/admin/commercial.css": commercialCSSHash,
     "etc/ly-route/product-manifest.json": profileHash,
     "usr/share/ly-route/artifact-manifest.json": artifactManifestHash,
   },

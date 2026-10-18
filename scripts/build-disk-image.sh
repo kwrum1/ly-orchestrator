@@ -334,7 +334,7 @@ GRUB_DEFAULT=0
 GRUB_TIMEOUT=3
 GRUB_DISTRIBUTOR="Ly Route $product"
 GRUB_CMDLINE_LINUX_DEFAULT="quiet"
-GRUB_CMDLINE_LINUX="root=UUID=$root_uuid intel_iommu=on amd_iommu=on iommu=pt"
+GRUB_CMDLINE_LINUX="root=UUID=$root_uuid intel_iommu=on amd_iommu=on iommu=pt console=tty0 console=ttyS0,115200n8"
 EOF
   mount --bind /dev "$mnt/dev"
   mount --bind /dev/pts "$mnt/dev/pts"

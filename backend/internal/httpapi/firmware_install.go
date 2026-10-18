@@ -28,6 +28,14 @@ test -x "$tmp/usr/lib/ly-route/vpp-apply"
 install -d -m 0755 "$target_dir"
 install -m 0755 "$tmp/usr/lib/ly-route/ly-route-control" "$target_dir/ly-route-control"
 install -m 0755 "$tmp/usr/lib/ly-route/vpp-apply" "$target_dir/vpp-apply"
+for runtime_script in runtime-check.sh firstboot.sh; do
+  if [ -f "$tmp/usr/lib/ly-route/$runtime_script" ]; then
+    install -m 0755 "$tmp/usr/lib/ly-route/$runtime_script" "$target_dir/$runtime_script"
+  fi
+done
+if [ "$target_dir" = "/usr/lib/ly-route" ] && [ -f "$tmp/etc/systemd/system/ly-route-firstboot.service" ]; then
+  install -D -m 0644 "$tmp/etc/systemd/system/ly-route-firstboot.service" /etc/systemd/system/ly-route-firstboot.service
+fi
 if [ -d "$tmp/opt/ly-route/admin" ]; then
   rm -rf /opt/ly-route/admin.new
   mkdir -p /opt/ly-route/admin.new

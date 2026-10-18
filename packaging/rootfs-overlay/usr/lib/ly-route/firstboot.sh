@@ -122,7 +122,7 @@ if [ -n "${LY_ROUTE_SYSTEM_ROOT_PASSWORD:-}" ] && command -v chpasswd >/dev/null
   passwd -u root >/dev/null 2>&1 || true
 fi
 
-if [ -n "${LY_ROUTE_SYSTEM_ADMIN_PASSWORD:-}" ] && command -v useradd >/dev/null 2>&1 && command -v chpasswd >/dev/null 2>&1; then
+if command -v useradd >/dev/null 2>&1 && command -v chpasswd >/dev/null 2>&1; then
   if ! id admin >/dev/null 2>&1; then
     if getent group sudo >/dev/null 2>&1; then
       useradd -m -s /bin/bash -G sudo admin
@@ -133,8 +133,12 @@ if [ -n "${LY_ROUTE_SYSTEM_ADMIN_PASSWORD:-}" ] && command -v useradd >/dev/null
   if getent group vpp >/dev/null 2>&1; then
     usermod -a -G vpp admin
   fi
-  printf 'admin:%s\n' "$LY_ROUTE_SYSTEM_ADMIN_PASSWORD" | chpasswd
+  console_admin_password=${LY_ROUTE_SYSTEM_ADMIN_PASSWORD:-$initial_admin_password}
+  printf 'admin:%s\n' "$console_admin_password" | chpasswd
 fi
+
+systemctl enable serial-getty@ttyS0.service >/dev/null 2>&1 || true
+systemctl start serial-getty@ttyS0.service >/dev/null 2>&1 || true
 
 tls_dir=/etc/ly-route/tls
 mkdir -p "$tls_dir"
