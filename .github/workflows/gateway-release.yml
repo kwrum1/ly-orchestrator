@@ -34,7 +34,7 @@ env:
   LY_ROUTE_SECURITY_MIRROR: https://mirrors.ustc.edu.cn/debian-security
   LY_ROUTE_SMARTDNS_REF: Release48.3
   LY_ROUTE_XRAY_REF: v26.3.27
-  LY_ROUTE_VPP_COMMIT: 744d3c7159ae130fb57f669a826ff1e45ed51836
+  LY_ROUTE_VPP_COMMIT: c3200b88dc46bd380f00a49ca3392a102cc1980b
 
 jobs:
   verify:
@@ -96,7 +96,7 @@ jobs:
         run: |
           git init vpp-master
           git -C vpp-master remote add origin https://github.com/FDio/vpp.git
-          git -C vpp-master fetch --depth 512 origin "$LY_ROUTE_VPP_COMMIT" '+refs/tags/v25.10:refs/tags/v25.10'
+          git -C vpp-master fetch --depth 512 origin "$LY_ROUTE_VPP_COMMIT" '+refs/tags/v26.06:refs/tags/v26.06'
           git -C vpp-master checkout --detach "$LY_ROUTE_VPP_COMMIT"
           test "$(git -C vpp-master rev-parse HEAD)" = "$LY_ROUTE_VPP_COMMIT"
       - name: Build pinned x86 VPP packages
@@ -199,7 +199,7 @@ jobs:
         run: |
           git init vpp-master
           git -C vpp-master remote add origin https://github.com/FDio/vpp.git
-          git -C vpp-master fetch --depth 512 origin "$LY_ROUTE_VPP_COMMIT" '+refs/tags/v25.10:refs/tags/v25.10'
+          git -C vpp-master fetch --depth 512 origin "$LY_ROUTE_VPP_COMMIT" '+refs/tags/v26.06:refs/tags/v26.06'
           git -C vpp-master checkout --detach "$LY_ROUTE_VPP_COMMIT"
           test "$(git -C vpp-master rev-parse HEAD)" = "$LY_ROUTE_VPP_COMMIT"
       - name: Build pinned ARM VPP packages

@@ -1,0 +1,8 @@
+diff --git a/build/external/packages/dpdk.mk b/build/external/packages/dpdk.mk
+--- a/build/external/packages/dpdk.mk
++++ b/build/external/packages/dpdk.mk
+@@ -191,4 +191,3 @@ DPDK_MESON_ARGS = \
+ 	$(DPDK_MAX_LCORES_FLAG) \
+         --buildtype=$(DPDK_BUILD_TYPE) \
+-	-Denable_kmods=false \
+ 	${DPDK_MLX_CONFIG_FLAG}

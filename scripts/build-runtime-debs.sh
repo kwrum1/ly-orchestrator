@@ -22,7 +22,7 @@ Environment:
   LY_ROUTE_VPP_SRC                Explicit VPP source directory (required for vpp).
   LY_ROUTE_VPP_INSTALL_DEPS=1     Run VPP make install-dep before make pkg-deb.
   LY_ROUTE_VPP_MAKE_ARGS          Extra arguments passed to VPP make.
-  LY_ROUTE_FDIO_VPP_VERSION       FD.io VPP release package version. Defaults to 25.10-release.
+  LY_ROUTE_FDIO_VPP_VERSION       FD.io VPP release package version. Defaults to 26.06-release.
   LY_ROUTE_FDIO_VPP_DISTRO        FD.io Debian distro path. Defaults to bookworm.
   LY_ROUTE_FDIO_VPP_DISTRO_ID     packagecloud distro version id. Defaults to 215.
   LY_ROUTE_FDIO_CACHE_DIR         Directory containing predownloaded FD.io .deb packages.
@@ -67,11 +67,14 @@ xray_repo=${LY_ROUTE_XRAY_REPO:-https://github.com/XTLS/Xray-core.git}
 xray_ref=${LY_ROUTE_XRAY_REF:-main}
 xray_src=${LY_ROUTE_XRAY_SRC:-$src_dir/xray-core}
 vpp_src=${LY_ROUTE_VPP_SRC:-}
-fdio_vpp_version=${LY_ROUTE_FDIO_VPP_VERSION:-25.10-release}
+fdio_vpp_version=${LY_ROUTE_FDIO_VPP_VERSION:-26.06-release}
 fdio_vpp_distro=${LY_ROUTE_FDIO_VPP_DISTRO:-bookworm}
 fdio_vpp_distro_id=${LY_ROUTE_FDIO_VPP_DISTRO_ID:-215}
 fdio_cache_dir=${LY_ROUTE_FDIO_CACHE_DIR:-}
 source_offline=${LY_ROUTE_SOURCE_OFFLINE:-${LY_ROUTE_RUNTIME_SRC_OFFLINE:-0}}
+local_deb_repo=${LY_ROUTE_LOCAL_DEB_REPO:-}
+vpp_package_version=${LY_ROUTE_VPP_PACKAGE_VERSION:-$fdio_vpp_version}
+lyroute_plugin_version=${LY_ROUTE_PLUGIN_VERSION:-${vpp_package_version%-release}+lyroute1}
 
 detect_deb_arch() {
   if command -v dpkg >/dev/null 2>&1; then
@@ -189,9 +192,9 @@ EOF
   cat > "$package_root/lib/systemd/system/ly-route-dns-vpp-proxy.service" <<'EOF'
 [Unit]
 Description=LY-Route VPP native DNS service adapter
-Requires=vpp.service ly-route-vpp-session-enable.service smartdns.service ly-route-dns-vpp-v6-namespace.service ly-route-policy-routing.service
-PartOf=vpp.service ly-route-dns-vpp-v6-namespace.service ly-route-policy-routing.service
-After=vpp.service ly-route-vpp-session-enable.service smartdns.service ly-route-dns-vpp-v6-namespace.service ly-route-policy-routing.service
+Requires=vpp.service ly-route-vpp-session-enable.service smartdns.service ly-route-dns-vpp-v6-namespace.service
+PartOf=vpp.service ly-route-dns-vpp-v6-namespace.service
+After=vpp.service ly-route-vpp-session-enable.service smartdns.service ly-route-dns-vpp-v6-namespace.service
 Before=ly-route-dns-vpp-session.service
 
 [Service]
@@ -214,9 +217,9 @@ EOF
   cat > "$package_root/lib/systemd/system/ly-route-dns-vpp-proxy-v6.service" <<'EOF'
 [Unit]
 Description=LY-Route VPP native IPv6 DNS service adapter
-Requires=vpp.service ly-route-vpp-session-enable.service smartdns.service ly-route-dns-vpp-v6-namespace.service ly-route-policy-routing.service
-PartOf=vpp.service ly-route-dns-vpp-v6-namespace.service ly-route-policy-routing.service
-After=vpp.service ly-route-vpp-session-enable.service smartdns.service ly-route-dns-vpp-v6-namespace.service ly-route-policy-routing.service
+Requires=vpp.service ly-route-vpp-session-enable.service smartdns.service ly-route-dns-vpp-v6-namespace.service
+PartOf=vpp.service ly-route-dns-vpp-v6-namespace.service
+After=vpp.service ly-route-vpp-session-enable.service smartdns.service ly-route-dns-vpp-v6-namespace.service
 Before=ly-route-dns-vpp-session.service
 
 [Service]
@@ -353,7 +356,13 @@ build_smartdns() {
   build_tar=$build_root/smartdns-src.tar
   tar -C "$smartdns_src" --exclude .git -cf "$build_tar" .
   chroot_dir=$build_root/chroot
-  mmdebstrap --architectures="$deb_arch" --variant=minbase --components=main --include=ca-certificates,build-essential,make,gcc,pkg-config,libssl-dev,zlib1g-dev,git bookworm "$chroot_dir" "${LY_ROUTE_MIRROR:-http://deb.debian.org/debian}"
+  smartdns_mirror="${LY_ROUTE_MIRROR:-http://deb.debian.org/debian}"
+  smartdns_mmdebstrap_args=(--architectures="$deb_arch" --variant=minbase --components=main --include=ca-certificates,build-essential,make,gcc,pkg-config,libssl-dev,zlib1g-dev,git)
+  if [ -n "$local_deb_repo" ]; then
+    smartdns_mirror="deb [trusted=yes] file://$local_deb_repo bookworm main"
+    smartdns_mmdebstrap_args+=(--mode=root --hook-dir=/usr/share/mmdebstrap/hooks/file-mirror-automount --aptopt=Acquire::AllowInsecureRepositories=true --aptopt=APT::Get::AllowUnauthenticated=true)
+  fi
+  mmdebstrap "${smartdns_mmdebstrap_args[@]}" bookworm "$chroot_dir" "$smartdns_mirror"
   mkdir -p "$chroot_dir/src/smartdns"
   tar -C "$chroot_dir/src/smartdns" -xf "$build_tar"
   chroot "$chroot_dir" /bin/sh -lc 'cd /src/smartdns && make'
@@ -1214,12 +1223,12 @@ build_vpp() {
 
 fdio_vpp_sha256() {
   case "$1:$fdio_vpp_version" in
-    libvppinfra:25.10-release) printf '1f6e9b7a4018b02ab062104891453392a4cfb1f81708c68e9d953d61db9ff0a8\n' ;;
-    vpp:25.10-release) printf 'c355ee5c9c80e012ce5f02e81014eaa136a984f2b11287d757682d98de26277a\n' ;;
-    vpp-plugin-core:25.10-release) printf 'de71aaf0cc2cc952c76524a4ec294179d161911f6c6dcb127431cbb2527458ce\n' ;;
-    vpp-plugin-dpdk:25.10-release) printf 'f22c6ae649c36ae59d4053cc40f6f6b81c4ea66a86c66cef3ac4c2407a77533c\n' ;;
-    vpp-dev:25.10-release) printf '3e4c4106955ebd569d126e29f97dca621d1c8adaa370cd006ae48e8554cab94d\n' ;;
-    libvppinfra-dev:25.10-release) printf '2e03781cb364411e677227a538cfb15770d0a79fa21a3057f266d0707f5dba0e\n' ;;
+    libvppinfra:26.06-release) printf '1a123ad8acac09860e8a416af8dc8baa39d23f724676b09eecc7ce79b27cf359\n' ;;
+    vpp:26.06-release) printf '13eb74cbb38d8f056d5156c69b7f2a11ddb581d15d8a85c029dd97b9ae4dfd11\n' ;;
+    vpp-plugin-core:26.06-release) printf 'd70ecbdb008dd948fbffc6f010d79501d318d63bb684e7f29faf111ca2bc8335\n' ;;
+    vpp-plugin-dpdk:26.06-release) printf '8d4d00f37b15fcf58ec5b863c5e87706f53304a2fcc69d9398ad1a90982e6b5f\n' ;;
+    vpp-dev:26.06-release) printf '708afa77cc2fb22e57c05ed2514f27d1f810c83d2a462dc003fa3b2d2ba03f14\n' ;;
+    libvppinfra-dev:26.06-release) printf 'fcb9c0f16cf638c2205b8e009cc339295dcda2beb996cefe9f5e4a2b58366344\n' ;;
     *) printf '' ;;
   esac
 }
@@ -1294,7 +1303,7 @@ build_vpp_smart_qos() {
   chmod 0644 "$plugin_dir/ly_route_smart_qos_plugin.so"
   cat > "$package_root/DEBIAN/control" <<EOF
 Package: ly-route-vpp-smart-qos
-Version: 25.10.0+lyroute1
+Version: $lyroute_plugin_version
 Section: net
 Priority: optional
 Architecture: $deb_arch
@@ -1304,7 +1313,7 @@ Description: Ly Route VPP FQ-CoDel smart QoS plugin
 EOF
   mkdir -p "$out_dir"
   rm -f "$out_dir/ly-route-vpp-smart-qos_"*"_${deb_arch}.deb"
-  dpkg-deb --build --root-owner-group "$package_root" "$out_dir/ly-route-vpp-smart-qos_25.10.0+lyroute1_${deb_arch}.deb" >/dev/null
+  dpkg-deb --build --root-owner-group "$package_root" "$out_dir/ly-route-vpp-smart-qos_${lyroute_plugin_version}_${deb_arch}.deb" >/dev/null
 }
 
 build_vpp_pppoe_client() {
@@ -1333,7 +1342,7 @@ build_vpp_pppoe_client() {
   install -m 0644 "$plugin" "$plugin_dir/ly_route_pppoe_client_plugin.so"
   cat > "$package_root/DEBIAN/control" <<EOF
 Package: ly-route-vpp-pppoe-client
-Version: 25.10.0+lyroute1
+Version: $lyroute_plugin_version
 Section: net
 Priority: optional
 Architecture: $deb_arch
@@ -1343,7 +1352,7 @@ Description: Ly Route native VPP PPPoE client binding
 EOF
   mkdir -p "$out_dir"
   rm -f "$out_dir/ly-route-vpp-pppoe-client_"*"_${deb_arch}.deb"
-  dpkg-deb --build --root-owner-group "$package_root" "$out_dir/ly-route-vpp-pppoe-client_25.10.0+lyroute1_${deb_arch}.deb" >/dev/null
+  dpkg-deb --build --root-owner-group "$package_root" "$out_dir/ly-route-vpp-pppoe-client_${lyroute_plugin_version}_${deb_arch}.deb" >/dev/null
 }
 
 build_vpp_security_guard() {
@@ -1366,7 +1375,7 @@ build_vpp_security_guard() {
   chmod 0644 "$plugin_dir/ly_route_security_guard_plugin.so"
   cat > "$package_root/DEBIAN/control" <<EOF
 Package: ly-route-vpp-security-guard
-Version: 25.10.0+lyroute1
+Version: $lyroute_plugin_version
 Section: net
 Priority: optional
 Architecture: $deb_arch
@@ -1376,7 +1385,7 @@ Description: Ly Route VPP protocol-aware security rate guard plugin
 EOF
   mkdir -p "$out_dir"
   rm -f "$out_dir/ly-route-vpp-security-guard_"*"_${deb_arch}.deb"
-  dpkg-deb --build --root-owner-group "$package_root" "$out_dir/ly-route-vpp-security-guard_25.10.0+lyroute1_${deb_arch}.deb" >/dev/null
+  dpkg-deb --build --root-owner-group "$package_root" "$out_dir/ly-route-vpp-security-guard_${lyroute_plugin_version}_${deb_arch}.deb" >/dev/null
 }
 
 build_vpp_dns_intercept() {
@@ -1399,7 +1408,7 @@ build_vpp_dns_intercept() {
   chmod 0644 "$plugin_dir/ly_route_dns_intercept_plugin.so"
   cat > "$package_root/DEBIAN/control" <<EOF
 Package: ly-route-vpp-dns-intercept
-Version: 25.10.0+lyroute1
+Version: $lyroute_plugin_version
 Section: net
 Priority: optional
 Architecture: $deb_arch
@@ -1409,7 +1418,7 @@ Description: Ly Route VPP pre-NAT transparent DNS interception plugin
 EOF
   mkdir -p "$out_dir"
   rm -f "$out_dir/ly-route-vpp-dns-intercept_"*"_${deb_arch}.deb"
-  dpkg-deb --build --root-owner-group "$package_root" "$out_dir/ly-route-vpp-dns-intercept_25.10.0+lyroute1_${deb_arch}.deb" >/dev/null
+  dpkg-deb --build --root-owner-group "$package_root" "$out_dir/ly-route-vpp-dns-intercept_${lyroute_plugin_version}_${deb_arch}.deb" >/dev/null
 }
 
 build_vpp_pre_nat_route() {
@@ -1432,7 +1441,7 @@ build_vpp_pre_nat_route() {
   chmod 0644 "$plugin_dir/ly_route_pre_nat_route_plugin.so"
   cat > "$package_root/DEBIAN/control" <<EOF
 Package: ly-route-vpp-pre-nat-route
-Version: 25.10.0+lyroute1
+Version: $lyroute_plugin_version
 Section: net
 Priority: optional
 Architecture: $deb_arch
@@ -1442,7 +1451,7 @@ Description: Ly Route VPP pre-NAT policy routing plugin
 EOF
   mkdir -p "$out_dir"
   rm -f "$out_dir/ly-route-vpp-pre-nat-route_"*"_${deb_arch}.deb"
-  dpkg-deb --build --root-owner-group "$package_root" "$out_dir/ly-route-vpp-pre-nat-route_25.10.0+lyroute1_${deb_arch}.deb" >/dev/null
+  dpkg-deb --build --root-owner-group "$package_root" "$out_dir/ly-route-vpp-pre-nat-route_${lyroute_plugin_version}_${deb_arch}.deb" >/dev/null
 }
 
 build_vpp_orchestrator() {
@@ -1451,9 +1460,15 @@ build_vpp_orchestrator() {
   build_debs=$(mktemp -d "${TMPDIR:-/tmp}/ly-route-vpp-orchestrator-deps.XXXXXX")
   package_root=$(mktemp -d "${TMPDIR:-/tmp}/ly-route-vpp-orchestrator-package.XXXXXX")
   trap 'rm -rf "$build_debs" "$package_root"' RETURN
-  fetch_fdio_package vpp-dev "$build_debs"
-  fetch_fdio_package libvppinfra-dev "$build_debs"
-  plugin=$(LY_ROUTE_RUNTIME_DEB_ARCH="$deb_arch" LY_ROUTE_VPP_DEV_DEBS_DIR="$build_debs" "$repo_root/scripts/build-vpp-orchestrator-plugin.sh" | tail -1)
+  vpp_dev_dir=${LY_ROUTE_VPP_DEV_DEBS_DIR:-}
+  if [ -z "$vpp_dev_dir" ] ||
+     ! find "$vpp_dev_dir" -maxdepth 1 -type f -name "vpp-dev_${vpp_package_version}_${deb_arch}.deb" -print -quit | grep -q . ||
+     ! find "$vpp_dev_dir" -maxdepth 1 -type f -name "libvppinfra-dev_${vpp_package_version}_${deb_arch}.deb" -print -quit | grep -q .; then
+    fetch_fdio_package vpp-dev "$build_debs"
+    fetch_fdio_package libvppinfra-dev "$build_debs"
+    vpp_dev_dir="$build_debs"
+  fi
+  plugin=$(LY_ROUTE_RUNTIME_DEB_ARCH="$deb_arch" LY_ROUTE_VPP_PACKAGE_VERSION="$vpp_package_version" LY_ROUTE_VPP_DEV_DEBS_DIR="$vpp_dev_dir" "$repo_root/scripts/build-vpp-orchestrator-plugin.sh" | tail -1)
   [ -f "$plugin" ] || { echo "orchestrator plugin build did not produce a library" >&2; exit 1; }
   plugin_dir="$package_root/usr/lib/$(vpp_plugin_multiarch)/vpp_plugins"
   mkdir -p "$package_root/DEBIAN" "$plugin_dir"
@@ -1461,17 +1476,17 @@ build_vpp_orchestrator() {
   chmod 0644 "$plugin_dir/ly_route_orchestrator_plugin.so"
   cat > "$package_root/DEBIAN/control" <<EOF
 Package: ly-route-vpp-orchestrator
-Version: 25.10.0+lyroute1
+Version: $lyroute_plugin_version
 Section: net
 Priority: optional
 Architecture: $deb_arch
 Maintainer: Ly Route <root@ly-route.local>
-Depends: vpp (= $fdio_vpp_version)
+Depends: vpp (= $vpp_package_version)
 Description: Ly Route VPP native transparent traffic orchestrator plugin
 EOF
   mkdir -p "$out_dir"
   rm -f "$out_dir/ly-route-vpp-orchestrator_"*"_${deb_arch}.deb"
-  dpkg-deb --build --root-owner-group "$package_root" "$out_dir/ly-route-vpp-orchestrator_25.10.0+lyroute1_${deb_arch}.deb" >/dev/null
+  dpkg-deb --build --root-owner-group "$package_root" "$out_dir/ly-route-vpp-orchestrator_${lyroute_plugin_version}_${deb_arch}.deb" >/dev/null
 }
 
 case "$target" in
@@ -1492,7 +1507,11 @@ case "$target" in
     build_dns_vpp_proxy
     build_xray
     build_vpp_apply
-    build_vpp_fdio
+    if [ -n "$vpp_src" ]; then
+      build_vpp
+    else
+      build_vpp_fdio
+    fi
     build_vpp_pppoe_client
     build_vpp_smart_qos
     build_vpp_security_guard

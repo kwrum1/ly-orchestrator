@@ -1,0 +1,10 @@
+diff --git a/src/vpp-api/python/CMakeLists.txt b/src/vpp-api/python/CMakeLists.txt
+--- a/src/vpp-api/python/CMakeLists.txt
++++ b/src/vpp-api/python/CMakeLists.txt
+@@ -23,5 +23,6 @@ install(
+ 	--root=\$ENV{DESTDIR}/
+ 	--prefix=${CMAKE_INSTALL_PREFIX}
+ 	--no-deps
++	--no-build-isolation
+     RESULT_VARIABLE _pip_result
+   )

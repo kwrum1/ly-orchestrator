@@ -376,7 +376,7 @@ cleanup_rootfs "$rootfs"
 if [ "${LY_ROUTE_ROOTFS_ALLOW_TAR_ONLY:-0}" = 1 ]; then
   mkdir -p "$rootfs"
 elif command -v mmdebstrap >/dev/null 2>&1; then
-  include='apt,systemd-sysv,dbus,nginx-light,openssh-server,sudo,openssl,ca-certificates,curl,gpgv,iproute2,iputils-ping,netbase,python3,python3-minimal,libunwind8,libnl-3-200,libnl-route-3-200,libpcap0.8,libnuma1,libelf1,zlib1g'
+  include='apt,systemd-sysv,dbus,nginx-light,openssh-server,sudo,openssl,ca-certificates,curl,gpgv,iproute2,iputils-ping,netbase,python3,python3-minimal,libunwind8,libnl-3-200,libnl-route-3-200,libpcap0.8,libnuma1,libelf1,libxdp1,zlib1g'
   if [ "$product" = gateway ]; then
     include="$include,kea-dhcp4-server,isc-dhcp-client,ipset"
   fi

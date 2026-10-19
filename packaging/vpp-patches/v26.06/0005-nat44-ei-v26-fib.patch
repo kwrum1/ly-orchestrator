@@ -1,0 +1,55 @@
+diff --git a/src/plugins/nat/nat44-ei/nat44_ei_in2out.c b/src/plugins/nat/nat44-ei/nat44_ei_in2out.c
+index ec524d3..4b23910 100644
+--- a/src/plugins/nat/nat44-ei/nat44_ei_in2out.c
++++ b/src/plugins/nat/nat44-ei/nat44_ei_in2out.c
+@@ -29,6 +29,20 @@
+ 
+ extern vnet_feature_arc_registration_t vnet_feat_arc_ip4_local;
+ 
++#define LY_ROUTE_PRE_NAT_ROUTE_TAG 0x4c595250u
++
++static_always_inline u32
++nat44_ei_ly_route_selected_fib (vlib_buffer_t *b, u32 fallback)
++{
++  if (vnet_buffer2 (b)->unused[0] != LY_ROUTE_PRE_NAT_ROUTE_TAG)
++    return fallback;
++
++  u32 fib_index = vnet_buffer2 (b)->unused[1];
++  vnet_buffer2 (b)->unused[0] = 0;
++  vnet_buffer2 (b)->unused[1] = 0;
++  return fib_index;
++}
++
+ #define foreach_nat44_ei_in2out_error                                         \
+   _ (UNSUPPORTED_PROTOCOL, "unsupported protocol")                            \
+   _ (OUT_OF_PORTS, "out of ports")                                            \
+@@ -1457,7 +1471,8 @@ nat44_ei_in2out_node_fn_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
+       ip0->src_address = s0->out2in.addr;
+       new_addr0 = ip0->src_address.as_u32;
+       if (!is_output_feature)
+-	vnet_buffer (b0)->sw_if_index[VLIB_TX] = s0->out2in.fib_index;
++      vnet_buffer (b0)->sw_if_index[VLIB_TX] =
++	 nat44_ei_ly_route_selected_fib (b0, s0->out2in.fib_index);
+ 
+       sum0 = ip0->checksum;
+       sum0 = ip_csum_update (sum0, old_addr0, new_addr0,
+@@ -1676,7 +1691,8 @@ nat44_ei_in2out_node_fn_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
+       ip1->src_address = s1->out2in.addr;
+       new_addr1 = ip1->src_address.as_u32;
+       if (!is_output_feature)
+-	vnet_buffer (b1)->sw_if_index[VLIB_TX] = s1->out2in.fib_index;
++      vnet_buffer (b1)->sw_if_index[VLIB_TX] =
++	 nat44_ei_ly_route_selected_fib (b1, s1->out2in.fib_index);
+ 
+       sum1 = ip1->checksum;
+       sum1 = ip_csum_update (sum1, old_addr1, new_addr1,
+@@ -1924,7 +1940,8 @@ nat44_ei_in2out_node_fn_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
+       ip0->src_address = s0->out2in.addr;
+       new_addr0 = ip0->src_address.as_u32;
+       if (!is_output_feature)
+-	vnet_buffer (b0)->sw_if_index[VLIB_TX] = s0->out2in.fib_index;
++      vnet_buffer (b0)->sw_if_index[VLIB_TX] =
++	 nat44_ei_ly_route_selected_fib (b0, s0->out2in.fib_index);
+ 
+       sum0 = ip0->checksum;
+       sum0 = ip_csum_update (sum0, old_addr0, new_addr0,

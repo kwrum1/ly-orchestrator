@@ -3,8 +3,8 @@
 ## 中文
 
 1. 修复实际使用中发现的缺陷，并只回归受影响功能和发行门禁。
-2. 在隔离分支完成 VPP 26.x 迁移，逐项验证插件编译、二进制 API、CLI 和运行态，
-   通过后再替换当前基线。
+2. 在 VPP 26.06 基线上完成插件、CLI、运行态和 AF_XDP copy 的定向回归，
+   并以 J1900/i211 真机结果作为最终准入。
 3. 实现管理口虚拟化，使管理地址可与 LAN 数据口共享，并提供配置回滚、失联保护和
    恢复入口。
 4. 优化 Smart QoS，覆盖多带宽档位、公平性、长期稳定性、代理 WAN 交互和遥测。
@@ -17,8 +17,8 @@
 ## English
 
 1. Fix field defects with focused regression and release gates.
-2. Migrate to VPP 26.x in isolation, validating plugin builds, binary APIs, CLI
-   behavior and runtime state before changing the baseline.
+2. Harden the VPP 26.06 baseline with focused plugin, CLI, runtime and AF_XDP
+   copy regression, then gate it on real J1900/i211 hardware.
 3. Virtualize management so it can share a LAN data port with rollback and
    management-loss protection.
 4. Improve Smart QoS across bandwidth tiers, fairness, long-run stability,

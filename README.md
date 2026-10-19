@@ -2,7 +2,7 @@
 
 ## 中文
 
-Ly Route 是面向 x86-64 路由设备和 Armbian Bookworm ARM64 设备的 VPP
+Ly Route 是面向 x86-64 路由设备和 Armbian Bookworm ARM64 设备的 VPP 26.06
 出口网关。
 
 主要能力包括 LAN/WAN、链路聚合、PPPoE、多 WAN、策略路由、Endpoint-dependent
@@ -24,8 +24,8 @@ x86-64 升级包、ARM64 Armbian 一键安装包、ARM64 升级包和统一 `SHA
 
 ## English
 
-Ly Route is a VPP-based egress gateway for x86-64 appliances and ARM64 devices
-running Armbian Bookworm. This repository contains the Gateway only. The traffic
+Ly Route is a VPP 26.06-based egress gateway for x86-64 appliances and ARM64
+devices running Armbian Bookworm. This repository contains the Gateway only. The traffic
 orchestrator is maintained in a separate repository with independent scope,
 validation and releases.
 

@@ -46,6 +46,11 @@ func approvedNativeMode(hook NativeHook, mode NativeMode) bool {
 		hook == NativeHookRDMA && mode == NativeModeRDMADV
 }
 
+func acceptedNativePerformance(proof CapabilityProof) bool {
+	return proof.HighPerformance ||
+		proof.Hook == NativeHookAFXDP && proof.Mode == NativeModeCopy && proof.Native
+}
+
 func proveNativeAttachment(attachment NativeAttachment) NativeAttachment {
 	attachment.capabilityFingerprint = nativeAttachmentFingerprint(attachment)
 	return attachment
@@ -217,7 +222,7 @@ func SelectNativePath(request NativePathRequest) (NativePath, error) {
 			prerequisite("valid_runtime_proof_lifetime", name, validProofLifetime, "runtime capability proof validity must end after observation"),
 			prerequisite("approved_native_mode", name, approvedMode || acceptanceAFPacketProof(request.AcceptanceAFPacket, proof), "hook and mode are not an approved VPP-native high-performance path"),
 			prerequisite("native_hook", name, proof.Native, "proof does not identify a native hook"),
-			prerequisite("high_performance", name, proof.HighPerformance || acceptanceAFPacketProof(request.AcceptanceAFPacket, proof), "proof does not establish high-performance mode"),
+			prerequisite("high_performance", name, acceptedNativePerformance(proof) || acceptanceAFPacketProof(request.AcceptanceAFPacket, proof), "proof does not establish an accepted VPP user-space data path"),
 		)
 		if acceptanceAFPacketProof(request.AcceptanceAFPacket, proof) {
 			results = append(results, prerequisite("af_packet_mac_address", name, hardwareAddressSafe(proof.MACAddress), "AF_PACKET attachment requires the current Linux interface MAC address"))

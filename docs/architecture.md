@@ -3,7 +3,7 @@
 ## 中文
 
 Ly Route 是单一出口网关产品。控制面由 Go API、SQLite、系统服务和 Web UI 组成；
-数据面由 VPP 和项目自有插件组成。SmartDNS、Kea 和 Xray 只承担各自服务，不拥有
+数据面由 VPP 26.06 和项目自有插件组成。SmartDNS、Kea 和 Xray 只承担各自服务，不拥有
 网关的全局路由决策。
 
 数据口自动探测并选择设备级统一合格路径：VPP 原生高性能路径优先，DPDK/VFIO
@@ -65,9 +65,9 @@ flowchart LR
 ## English
 
 Ly Route is one egress Gateway product. The control plane consists of the Go
-API, SQLite, system services and web UI. VPP and project-owned plugins form the
-data plane. SmartDNS, Kea and Xray provide bounded services and do not own global
-routing decisions.
+API, SQLite, system services and web UI. VPP 26.06 and project-owned plugins form
+the data plane. SmartDNS, Kea and Xray provide bounded services and do not own
+global routing decisions.
 
 Data ports select one device-wide qualified tier: VPP-native high-performance
 integration first, then DPDK/VFIO. Forwarding remains locked when neither is

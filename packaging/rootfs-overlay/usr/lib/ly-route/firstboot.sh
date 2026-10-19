@@ -362,12 +362,7 @@ for item in document.get("data_interfaces", []):
         subprocess.run(["ip", "link", "set", "dev", name, "promisc", "on"], check=False)
         subprocess.run(["ip", "link", "set", "dev", name, "up"], check=False)
         commands = [
-            "?create interface af_xdp host-if " + name + " name " + vpp_name + " " + mode_flag + " num-rx-queues all",
-        ]
-        mac = str(item.get("mac", "")).strip()
-        if mac:
-            commands.append("set interface mac address " + vpp_name + " " + mac)
-        commands += [
+            "?create interface af_xdp host-if " + name + " name " + vpp_name + " rx-queue-size 512 tx-queue-size 512 num-rx-queues all " + mode_flag + " mac-reuse",
             "set interface state " + vpp_name + " up",
             "show hardware-interfaces " + vpp_name,
             "show interface " + vpp_name,

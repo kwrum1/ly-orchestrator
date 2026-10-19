@@ -1,0 +1,13 @@
+diff --git a/src/crypto_engines/ipsecmb/ipsecmb.c b/src/crypto_engines/ipsecmb/ipsecmb.c
+--- a/src/crypto_engines/ipsecmb/ipsecmb.c
++++ b/src/crypto_engines/ipsecmb/ipsecmb.c
+@@ -5,5 +5,9 @@
+ #include <fcntl.h>
+
+ #include <intel-ipsec-mb.h>
+
++#ifndef IMB_CHACHA20_POLY1305_KEY_SIZE
++#define IMB_CHACHA20_POLY1305_KEY_SIZE 32
++#endif
++
+ #include <vnet/vnet.h>

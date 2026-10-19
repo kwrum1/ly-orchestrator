@@ -175,7 +175,7 @@ func candidateRejectionReasons(proof CapabilityProof, now time.Time, tier Datapl
 	if !runtimeProof || lifetime <= 0 {
 		reasons = append(reasons, "runtime capability proof validity must end after observation")
 	}
-	if !proof.HighPerformance && !acceptancePath {
+	if !acceptedNativePerformance(proof) && !acceptancePath {
 		reasons = append(reasons, "proof does not establish high-performance mode")
 	}
 	switch tier {

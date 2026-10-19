@@ -6,18 +6,19 @@ debs=${LY_ROUTE_VPP_DEV_DEBS_DIR:-$repo_root/runtime-downloads}
 out=${LY_ROUTE_VPP_ORCHESTRATOR_BUILD_DIR:-$repo_root/build/vpp-orchestrator}
 sysroot=${LY_ROUTE_VPP_ORCHESTRATOR_SYSROOT:-$out/sysroot}
 arch=${LY_ROUTE_RUNTIME_DEB_ARCH:-amd64}
+vpp_package_version=${LY_ROUTE_VPP_PACKAGE_VERSION:-26.06-release}
 
 [ "$arch" = amd64 ] || { echo "VPP orchestrator plugin build currently requires amd64 FD.io development packages" >&2; exit 1; }
 for package in vpp-dev libvppinfra-dev; do
-  file="$debs/${package}_25.10-release_${arch}.deb"
+  file="$debs/${package}_${vpp_package_version}_${arch}.deb"
   [ -f "$file" ] || { echo "missing VPP development package: $file" >&2; exit 1; }
 done
 command -v cmake >/dev/null
 command -v dpkg-deb >/dev/null
 
 mkdir -p "$out" "$sysroot"
-dpkg-deb -x "$debs/vpp-dev_25.10-release_${arch}.deb" "$sysroot"
-dpkg-deb -x "$debs/libvppinfra-dev_25.10-release_${arch}.deb" "$sysroot"
+dpkg-deb -x "$debs/vpp-dev_${vpp_package_version}_${arch}.deb" "$sysroot"
+dpkg-deb -x "$debs/libvppinfra-dev_${vpp_package_version}_${arch}.deb" "$sysroot"
 
 cmake -S "$repo_root/runtime/vpp-orchestrator" -B "$out/cmake" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \

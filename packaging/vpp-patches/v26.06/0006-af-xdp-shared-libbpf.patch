@@ -1,0 +1,21 @@
+diff --git a/src/plugins/af_xdp/CMakeLists.txt b/src/plugins/af_xdp/CMakeLists.txt
+index fd7ee4e..f028c9e 100644
+--- a/src/plugins/af_xdp/CMakeLists.txt
++++ b/src/plugins/af_xdp/CMakeLists.txt
+@@ -18,8 +18,14 @@ if (NOT XDP_INCLUDE_DIR)
+ endif()
+ 
+ set_property(GLOBAL PROPERTY FIND_LIBRARY_USE_LIB64_PATHS TRUE)
+-vpp_plugin_find_library(af_xdp XDP_LIB libxdp.a)
+-vpp_plugin_find_library(af_xdp BPF_LIB libbpf.a)
++vpp_plugin_find_library(af_xdp XDP_LIB libxdp.so)
++vpp_plugin_find_library(af_xdp BPF_LIB libbpf.so)
++if (NOT XDP_LIB)
++  vpp_plugin_find_library(af_xdp XDP_LIB libxdp.a)
++endif()
++if (NOT BPF_LIB)
++  vpp_plugin_find_library(af_xdp BPF_LIB libbpf.a)
++endif()
+ vpp_plugin_find_library(af_xdp ELF_LIB elf)
+ vpp_plugin_find_library(af_xdp Z_LIB z)
+ if (NOT XDP_LIB OR NOT BPF_LIB OR NOT ELF_LIB OR NOT Z_LIB)

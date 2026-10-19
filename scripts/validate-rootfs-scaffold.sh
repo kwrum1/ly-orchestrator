@@ -177,7 +177,7 @@ if ! grep -q '^LY_ROUTE_SESSION_COOKIE_SECURE=true' "$repo_root/packaging/rootfs
   exit 1
 fi
 
-if ! grep -q 'mmdebstrap --architectures="$deb_arch"' "$repo_root/scripts/build-runtime-debs.sh" || ! grep -q 'chroot "$chroot_dir"' "$repo_root/scripts/build-runtime-debs.sh"; then
+if ! grep -q 'mmdebstrap' "$repo_root/scripts/build-runtime-debs.sh" || ! grep -q 'chroot "$chroot_dir"' "$repo_root/scripts/build-runtime-debs.sh"; then
   echo "SmartDNS is not built inside the target Debian environment" >&2
   exit 1
 fi

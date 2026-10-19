@@ -120,7 +120,7 @@ EOF
 run_check native eth0 eth1 af_xdp_plugin.so 1
 grep -q '"dataplane_state": "native_ready"' "$tmp/native/readiness.json"
 grep -q '"hook":"af_xdp"' "$tmp/native/proof.json"
-grep -Eq 'create interface af_xdp host-if eth1 name lyroute-proof-[0-9]+-[0-9]+-af_xdp zero-copy' "$tmp/native/vppctl.log"
+grep -Eq 'create interface af_xdp host-if eth1 name lyroute-proof-[0-9]+-[0-9]+-af_xdp .*zero-copy' "$tmp/native/vppctl.log"
 if grep -q 'host-if eth0' "$tmp/native/vppctl.log"; then
   echo "management interface reached VPP probe" >&2
   exit 1
@@ -191,7 +191,7 @@ fi
 run_check shared-management eth0 eth0 af_xdp_plugin.so 1 true
 grep -q '"dataplane_state": "native_ready"' "$tmp/shared-management/readiness.json"
 grep -q '"linux_interface":"eth0"' "$tmp/shared-management/proof.json"
-grep -Eq 'create interface af_xdp host-if eth0 name lyroute-proof-[0-9]+-[0-9]+-af_xdp zero-copy' "$tmp/shared-management/vppctl.log"
+grep -Eq 'create interface af_xdp host-if eth0 name lyroute-proof-[0-9]+-[0-9]+-af_xdp .*zero-copy' "$tmp/shared-management/vppctl.log"
 
 run_check invalid-shared-mode eth0 eth0 af_xdp_plugin.so 1 shared
 grep -q '"dataplane_state": "dataplane_locked"' "$tmp/invalid-shared-mode/readiness.json"

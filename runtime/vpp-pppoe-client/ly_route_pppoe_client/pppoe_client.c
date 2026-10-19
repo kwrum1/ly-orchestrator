@@ -5,19 +5,6 @@
 #include <vnet/plugin/plugin.h>
 #include <vpp/app/version.h>
 
-#define LY_ROUTE_VLIB_CLI_COMMAND(x, ...)                                    \
-  __VA_ARGS__ vlib_cli_command_t x;                                          \
-  static void __ly_route_cli_registration_##x (void)                         \
-    __attribute__ ((__constructor__));                                       \
-  static void __ly_route_cli_registration_##x (void)                         \
-  {                                                                          \
-    vlib_global_main_t *vgm = vlib_get_global_main ();                       \
-    vlib_cli_main_t *cm = &vgm->cli_main;                                    \
-    x.next_cli_command = cm->cli_command_registrations;                      \
-    cm->cli_command_registrations = &x;                                      \
-  }                                                                          \
-  __VA_ARGS__ vlib_cli_command_t x
-
 typedef struct
 {
   u32 control_sw_if_index;
@@ -424,7 +411,7 @@ ly_pppoe_client_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
   return 0;
 }
 
-LY_ROUTE_VLIB_CLI_COMMAND (ly_pppoe_client_set_command, static) = {
+VLIB_CLI_COMMAND (ly_pppoe_client_set_command, static) = {
   .path = "set ly-route pppoe-client",
   .short_help = "set ly-route pppoe-client control-interface <interface> "
                 "wan-interface <interface> [disable] | disable",
@@ -462,7 +449,7 @@ ly_pppoe_client_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
   return 0;
 }
 
-LY_ROUTE_VLIB_CLI_COMMAND (ly_pppoe_client_show_command, static) = {
+VLIB_CLI_COMMAND (ly_pppoe_client_show_command, static) = {
   .path = "show ly-route pppoe-client",
   .short_help = "show ly-route pppoe-client",
   .function = ly_pppoe_client_show_command_fn,

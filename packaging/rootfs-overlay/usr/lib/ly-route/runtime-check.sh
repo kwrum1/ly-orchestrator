@@ -67,11 +67,11 @@ probe_native_candidate() {
       ;;
     af_xdp:zero_copy)
       ip link set dev "$probe_interface" promisc on up >/dev/null 2>&1 || true
-      probe_create="create interface af_xdp host-if $probe_interface name $probe_vpp_interface zero-copy num-rx-queues all"
+      probe_create="create interface af_xdp host-if $probe_interface name $probe_vpp_interface rx-queue-size 512 tx-queue-size 512 num-rx-queues all zero-copy mac-reuse"
       ;;
     af_xdp:copy)
       ip link set dev "$probe_interface" promisc on up >/dev/null 2>&1 || true
-      probe_create="create interface af_xdp host-if $probe_interface name $probe_vpp_interface no-zero-copy num-rx-queues all"
+      probe_create="create interface af_xdp host-if $probe_interface name $probe_vpp_interface rx-queue-size 512 tx-queue-size 512 num-rx-queues all no-zero-copy mac-reuse"
       ;;
     af_packet:linux_packet_socket)
       # An active AF_PACKET attachment is renamed to lyroute-$iface by the
