@@ -35,6 +35,7 @@ vpp_cmake_dir=$(find "$sysroot/usr/lib" -type d -path '*/cmake/vpp' -print -quit
 cmake -S "$repo_root/runtime/vpp-pppoe-client" -B "$out/cmake" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DVPP_DIR="$vpp_cmake_dir" \
+  -DVPP_BUILD_NATIVE_ARCH="${LY_ROUTE_VPP_NATIVE_ARCH:-native}" \
   -DVPP_INCLUDE_DIR="$sysroot/usr/include" \
   -DVPP_APIGEN="$sysroot/usr/bin/vppapigen" \
   -DVPP_VAPI_C_GEN="$sysroot/usr/bin/vapi_c_gen.py" \

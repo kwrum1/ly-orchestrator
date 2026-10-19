@@ -12,7 +12,7 @@ DNS 透明劫持、策略路由、WAN 群组、QoS、安全和配置事务。历
 最新 x86 ISO 在 ESXi 完成纯净安装：光盘安装、硬盘启动、管理口
 `192.168.88.254/24`、HTTPS/API、VPP、SmartDNS、Kea、Nginx 和控制服务正常；
 systemd 失败单元为 0。三张 VMXNET3 数据口以验收专用 TAP bridge 进入 VPP，状态
-为 `up` 并观察到报文。PPPoE、DNS 拦截、Smart QoS 和安全插件均已加载。当前数据面基线已切换为 VPP 26.06，并纳入 26.06 专用补丁与运行时校验。x86-64 使用 portable default 架构构建，避免 J1900（Silvermont）执行 native AVX 指令时触发非法指令。
+为 `up` 并观察到报文。PPPoE、DNS 拦截、Smart QoS 和安全插件均已加载。当前数据面基线已切换为 VPP 26.06，并纳入 26.06 专用补丁与运行时校验。x86-64 使用 Silvermont-safe 的 VPP 架构（`-march=silvermont`）构建，避免 J1900 执行 native AVX 指令时触发非法指令。
 
 GitHub Actions 已能并行生成 x86 ISO/x86 升级包和 ARM64 Armbian 一键安装包/
 ARM64 升级包。ARM rootfs 仅是组装一键安装包的临时输入，不上传、不按设备型号生成。
@@ -24,9 +24,9 @@ PD 与 RA；长时间 Smart QoS 稳定性和多速率公平性；管理口虚拟
 ## English
 
 The Gateway UI, API, persistence, service orchestration, VPP operation rendering
-and release builders are integrated. The x86-64 VPP packages use the portable
-default architecture so J1900 (Silvermont) does not hit illegal-instruction
-faults from native AVX code. Container evidence covers PPPoE, LAN/DHCP,
+and release builders are integrated. The x86-64 VPP packages use the Silvermont-safe
+`-march=silvermont` build so J1900 does not hit illegal-instruction faults from
+native AVX code. Container evidence covers PPPoE, LAN/DHCP,
 IPv4 routing/NAT, port mapping, VLESS/Reality, SmartDNS, transparent DNS,
 policy routing, WAN groups, QoS, security and transactional configuration.
 
