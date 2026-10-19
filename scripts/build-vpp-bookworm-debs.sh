@@ -18,6 +18,11 @@ esac
 [ -f "$source_dir/Makefile" ] || { echo "VPP source tree not found: $source_dir" >&2; exit 1; }
 vpp_cmake_layout=false
 [ -d "$source_dir/src/plugins" ] && vpp_cmake_layout=true
+vpp_arch_default=native
+vpp_native_arch_default=silvermont
+[ "$arch" = arm64 ] && vpp_native_arch_default=native
+: "${LY_ROUTE_VPP_ARCH:=$vpp_arch_default}"
+: "${LY_ROUTE_VPP_NATIVE_ARCH:=$vpp_native_arch_default}"
 command -v mmdebstrap >/dev/null 2>&1 || { echo "mmdebstrap is required" >&2; exit 1; }
 command -v chroot >/dev/null 2>&1 || { echo "chroot is required" >&2; exit 1; }
 
@@ -108,12 +113,12 @@ rm -f "$rootfs/src/vpp/build-root"/*.deb \
   "$rootfs/src/vpp/build-root"/*.changes
 make_args=${LY_ROUTE_VPP_MAKE_ARGS:-DPDK_MLX_IBV_LINK=dlopen}
 if [ "$vpp_cmake_layout" = true ]; then
-  build_command='export DEBIAN_FRONTEND=noninteractive PIP_NO_BUILD_ISOLATION=1 PYTHONPATH=/usr/lib/python3/dist-packages:${PYTHONPATH:-}; cd /src/vpp && make UNATTENDED=y install-dep; external_install=/src/vpp/build/external/_install; external_stage=/src/vpp/build-root/install-vpp-native/external; if [ -d "$external_install/include" ]; then rm -rf "$external_stage/include" "$external_stage/lib" "$external_stage/lib64"; mkdir -p "$external_stage/include" "$external_stage/lib"; cp -a "$external_install/include/." "$external_stage/include/"; cp -a "$external_install/lib/." "$external_stage/lib/" 2>/dev/null || true; if [ -d "$external_install/lib64" ]; then mkdir -p "$external_stage/lib64"; cp -a "$external_install/lib64/." "$external_stage/lib64/"; fi; rm -f "$external_stage/include/unistd.h" "$external_stage/include/getopt.h" "$external_stage/include/sched.h" "$external_stage/include/pthread.h" "$external_stage/include/signal.h" "$external_stage/include/stdio.h" "$external_stage/include/stdlib.h" "$external_stage/include/string.h" "$external_stage/include/strings.h" "$external_stage/include/time.h" "$external_stage/include/errno.h" "$external_stage/include/fcntl.h" "$external_stage/include/stdint.h" "$external_stage/include/inttypes.h" "$external_stage/include/rte_windows.h"; fi; export VPP_EXTRA_CMAKE_ARGS="-DDPDK_INCLUDE_DIR:PATH=$external_stage/include -DDPDK_LIB:FILEPATH=$external_stage/lib/libdpdk.a"; make UNATTENDED=y SOURCE_PATH=/src/vpp PLATFORM=vpp vpp_arch=native ${LY_ROUTE_VPP_MAKE_ARGS:-DPDK_MLX_IBV_LINK=dlopen} pkg-deb'
+  build_command='export DEBIAN_FRONTEND=noninteractive PIP_NO_BUILD_ISOLATION=1 PYTHONPATH=/usr/lib/python3/dist-packages:${PYTHONPATH:-}; cd /src/vpp && make UNATTENDED=y install-dep; external_install=/src/vpp/build/external/_install; external_stage=/src/vpp/build-root/install-vpp-native/external; if [ -d "$external_install/include" ]; then rm -rf "$external_stage/include" "$external_stage/lib" "$external_stage/lib64"; mkdir -p "$external_stage/include" "$external_stage/lib"; cp -a "$external_install/include/." "$external_stage/include/"; cp -a "$external_install/lib/." "$external_stage/lib/" 2>/dev/null || true; if [ -d "$external_install/lib64" ]; then mkdir -p "$external_stage/lib64"; cp -a "$external_install/lib64/." "$external_stage/lib64/"; fi; rm -f "$external_stage/include/unistd.h" "$external_stage/include/getopt.h" "$external_stage/include/sched.h" "$external_stage/include/pthread.h" "$external_stage/include/signal.h" "$external_stage/include/stdio.h" "$external_stage/include/stdlib.h" "$external_stage/include/string.h" "$external_stage/include/strings.h" "$external_stage/include/time.h" "$external_stage/include/errno.h" "$external_stage/include/fcntl.h" "$external_stage/include/stdint.h" "$external_stage/include/inttypes.h" "$external_stage/include/rte_windows.h"; fi; export VPP_EXTRA_CMAKE_ARGS="-DDPDK_INCLUDE_DIR:PATH=$external_stage/include -DDPDK_LIB:FILEPATH=$external_stage/lib/libdpdk.a -DVPP_BUILD_NATIVE_ARCH=${LY_ROUTE_VPP_NATIVE_ARCH:-native}"; make UNATTENDED=y SOURCE_PATH=/src/vpp PLATFORM=vpp vpp_arch=${LY_ROUTE_VPP_ARCH:-native} ${LY_ROUTE_VPP_MAKE_ARGS:-DPDK_MLX_IBV_LINK=dlopen} pkg-deb'
 else
-  build_command='export DEBIAN_FRONTEND=noninteractive; git config --global --add safe.directory /src/vpp && cd /src/vpp && make UNATTENDED=y install-dep && make UNATTENDED=y SOURCE_PATH=/src/vpp PLATFORM=vpp vpp_arch=native ${LY_ROUTE_VPP_MAKE_ARGS:-DPDK_MLX_IBV_LINK=dlopen} pkg-deb'
+  build_command='export DEBIAN_FRONTEND=noninteractive; git config --global --add safe.directory /src/vpp && cd /src/vpp && make UNATTENDED=y install-dep && make UNATTENDED=y SOURCE_PATH=/src/vpp PLATFORM=vpp vpp_arch=${LY_ROUTE_VPP_ARCH:-native} ${LY_ROUTE_VPP_MAKE_ARGS:-DPDK_MLX_IBV_LINK=dlopen} pkg-deb'
 fi
 LY_ROUTE_VPP_MAKE_ARGS="$make_args" PIP_INDEX_URL="$pip_index" PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=10 \
-  PIP_DISABLE_PIP_VERSION_CHECK=1 BUILD_COMMAND="$build_command" chroot "$rootfs" /bin/bash -lc 'eval "$BUILD_COMMAND"'
+  PIP_DISABLE_PIP_VERSION_CHECK=1 LY_ROUTE_VPP_ARCH="$LY_ROUTE_VPP_ARCH" LY_ROUTE_VPP_NATIVE_ARCH="$LY_ROUTE_VPP_NATIVE_ARCH" BUILD_COMMAND="$build_command" chroot "$rootfs" /bin/bash -lc 'eval "$BUILD_COMMAND"'
 
 found=0
 package_list="$work_dir/packages.list"

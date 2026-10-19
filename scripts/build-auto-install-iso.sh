@@ -442,6 +442,9 @@ LY_ROUTE_MANAGEMENT_INTERFACE=$management_name
 LY_ROUTE_VMXNET3_TAP_BRIDGE_ACCEPTANCE=$vmxnet3_tap_bridge_acceptance
 EOF
 chmod 0600 /mnt/etc/ly-route/installer-network.env
+[ -s /mnt/etc/ly-route/installed-network.json ] || fail 'installed network mapping was not written'
+[ -s /mnt/etc/ly-route/installer-network.env ] || fail 'installer network environment was not written'
+sync
 runtime_env=/mnt/etc/ly-route/runtime.env
 runtime_env_tmp="$runtime_env.tmp.$$"
 if [ -f "$runtime_env" ]; then

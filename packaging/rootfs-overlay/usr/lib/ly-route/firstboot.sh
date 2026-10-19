@@ -95,8 +95,7 @@ fi
 # root-only environment file consumed by ly-route-control-api.service.
 initial_admin_password_file=/root/ly-route-initial-admin-password
 if [ ! -s "$initial_admin_password_file" ]; then
-  umask 077
-  openssl rand -base64 18 | tr -d '\n' > "$initial_admin_password_file"
+  (umask 077; openssl rand -base64 18 | tr -d '\n' > "$initial_admin_password_file")
 fi
 chmod 600 "$initial_admin_password_file"
 initial_admin_password=$(cat "$initial_admin_password_file")
@@ -112,8 +111,7 @@ fi
 
 dns_sync_token=/etc/ly-route/dns-sync.token
 if [ ! -s "$dns_sync_token" ]; then
-  umask 077
-  openssl rand -hex 32 > "$dns_sync_token"
+  (umask 077; openssl rand -hex 32 > "$dns_sync_token")
 fi
 chmod 600 "$dns_sync_token"
 
@@ -183,6 +181,7 @@ IPv6AcceptRA=yes
 Gateway=$LY_ROUTE_MANAGEMENT_FALLBACK_GATEWAY
 EOF
   fi
+  chmod 0644 "$management_network"
   rm -f /run/systemd/network/05-ly-route-lan.network
   ip link set "$lan_if" up 2>/dev/null || true
   if ! ip -o -4 addr show dev "$lan_if" | grep -Fq " $LY_ROUTE_MANAGEMENT_FALLBACK_CIDR "; then
@@ -259,6 +258,7 @@ with open(target, "w", encoding="utf-8") as output:
     json.dump(document, output, indent=2)
     output.write("\n")
 PY
+    chmod 0644 /etc/kea/kea-dhcp4.conf
   fi
   control_env=/etc/ly-route/control-api.env
   mkdir -p /etc/ly-route
@@ -407,6 +407,7 @@ Admin UI: https://$management_ip/
 Initial admin password: $initial_admin_password
 Change it after the first login. This line is removed after the password change.
 EOF
+chmod 0644 /etc/issue
 
 printf '\nLy Route initial admin password: %s\n' "$initial_admin_password" > /dev/tty1 2>/dev/null || true
 

@@ -164,9 +164,9 @@ trap cleanup EXIT INT TERM
 
 mkdir -p "$artifact_dir" "$root_tree" "$mnt"
 case "$rootfs_name" in
-  *.tar.zst) tar --no-same-owner --no-same-permissions --use-compress-program=unzstd -xf "$rootfs" -C "$root_tree" ;;
-  *.tar.gz) tar --no-same-owner --no-same-permissions -xzf "$rootfs" -C "$root_tree" ;;
-  *.tar) tar --no-same-owner --no-same-permissions -xf "$rootfs" -C "$root_tree" ;;
+  *.tar.zst) tar --no-same-owner --use-compress-program=unzstd -xf "$rootfs" -C "$root_tree" ;;
+  *.tar.gz) tar --no-same-owner -xzf "$rootfs" -C "$root_tree" ;;
+  *.tar) tar --no-same-owner -xf "$rootfs" -C "$root_tree" ;;
   *) product_build_fail "Unsupported rootfs archive format: $rootfs_name" ;;
 esac
 
