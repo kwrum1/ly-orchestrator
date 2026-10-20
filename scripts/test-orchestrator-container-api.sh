@@ -250,6 +250,38 @@ assert resources['orchestrator_policy'][0]['policy_groups'][0]['id']=='route'
 for forbidden in ('wan_link','wan_group','nat_static','port_map','dns_policy','dns_upstream','dhcp_server','proxy_node','proxy_subscription'):
     assert forbidden not in resources
 PY
+python3 - "$tmp/evidence/config-export.json" "$tmp/import-preflight-request.json" <<'PY'
+import json,sys
+pkg=json.load(open(sys.argv[1]))
+json.dump({'dry_run':True,'confirm':False,'package_manifest':pkg['package_manifest'],'payload':pkg['payload']},open(sys.argv[2],'w'))
+PY
+curl --fail --silent --show-error -b "$tmp/cookies" -H 'Content-Type: application/json' \
+  --data-binary @"$tmp/import-preflight-request.json" \
+  "http://127.0.0.1:$port/api/v1/config/import" > "$tmp/evidence/import-preflight.json"
+python3 - "$tmp/evidence/config-export.json" "$tmp/evidence/import-preflight.json" "$tmp/import-confirm-request.json" <<'PY'
+import json,sys
+pkg=json.load(open(sys.argv[1])); pre=json.load(open(sys.argv[2]))
+assert pre['status']=='dry_run'
+json.dump({
+  'confirm':True,
+  'package_manifest':pkg['package_manifest'],
+  'payload':pkg['payload'],
+  'confirmation_token':pre['confirmation_token'],
+  'confirmation_actor':pre['confirmation_actor'],
+  'package_hash':pre['package_hash'],
+  'diff_hash':pre['diff_hash'],
+  'confirmation_expires_at':pre['confirmation_expires_at'],
+},open(sys.argv[3],'w'))
+PY
+curl --fail-with-body --silent --show-error -b "$tmp/cookies" -H 'Content-Type: application/json' \
+  --data-binary @"$tmp/import-confirm-request.json" \
+  "http://127.0.0.1:$port/api/v1/config/import" > "$tmp/evidence/import-confirm.json"
+python3 - "$tmp/evidence/import-confirm.json" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1]))
+assert x['status']=='persisted'
+assert x['rollback_snapshot_id']
+PY
 curl --fail --silent --show-error -b "$tmp/cookies" -H 'Content-Type: application/json' -X POST \
   --data '{"name":"runtime-before-restart"}' \
   "http://127.0.0.1:$port/api/v1/config/snapshots" > "$tmp/evidence/snapshot-create.json"

@@ -104,6 +104,14 @@ func TestOrchestratorConfigExportIncludesTopologyAndPolicy(t *testing.T) {
 	}
 }
 
+func TestOrchestratorConfigExportWithoutState(t *testing.T) {
+	server, _, cookie := orchestratorPackageServer(t)
+	payload := exportedConfigPackage(t, server, cookie)
+	if len(payload.Resources[orchestratorTopologyConfigResource]) != 0 || len(payload.Resources[orchestratorPolicyConfigResource]) != 0 {
+		t.Fatalf("empty orchestrator export = %#v", payload.Resources)
+	}
+}
+
 func TestOrchestratorSnapshotRestoreRestoresTopologyAndPolicy(t *testing.T) {
 	server, repository, cookie := orchestratorPackageServer(t)
 	seedOrchestratorPackageState(t, repository)

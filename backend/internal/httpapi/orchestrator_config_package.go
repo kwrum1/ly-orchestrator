@@ -116,7 +116,7 @@ func (server *Server) orchestratorConfigResources(ctx context.Context) (map[stri
 		return resources, nil
 	}
 	policy, _, err := policyRepository.PolicySnapshot(ctx)
-	if err != nil && !errors.Is(err, orchestrator.ErrPolicyNotFound) {
+	if err != nil && !errors.Is(err, orchestrator.ErrPolicyNotFound) && !errors.Is(err, orchestrator.ErrTopologyNotFound) {
 		return nil, fmt.Errorf("export orchestrator policy: %w", err)
 	}
 	if err == nil {
