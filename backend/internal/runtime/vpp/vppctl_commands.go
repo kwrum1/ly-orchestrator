@@ -50,10 +50,25 @@ func resolveRuntimePPPoEInterface(value string) (string, error) {
 	if err := json.Unmarshal(data, &status); err != nil {
 		return "", fmt.Errorf("decode PPPoE runtime peer %q: %w", peerID, err)
 	}
-	if !strings.HasPrefix(status.Interface, "pppoe_session") {
+	if !validRuntimePPPoEInterface(status.Interface) {
 		return "", fmt.Errorf("PPPoE runtime peer %q has invalid interface %q", peerID, status.Interface)
 	}
 	return status.Interface, nil
+}
+
+// validRuntimePPPoEInterface accepts the names produced by both the legacy
+// native client (pppoe_sessionN) and the Hi-Jiajun plugin (pppoxN, or a
+// lyppp-* custom name).  The status file is the authority; the prefix check
+// only rejects unsafe/foreign tokens.
+func validRuntimePPPoEInterface(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 64 || strings.ContainsAny(name, "/\\ \t\r\n\"'") {
+		return false
+	}
+	lower := strings.ToLower(name)
+	return strings.HasPrefix(lower, "pppoe_session") ||
+		strings.HasPrefix(lower, "pppox") ||
+		strings.HasPrefix(lower, "lyppp-")
 }
 
 func (channel vppctlChannel) doCommands(ctx context.Context, operation Operation) (Reply, error) {
@@ -91,6 +106,13 @@ func (channel vppctlChannel) doCommands(ctx context.Context, operation Operation
 		if command == "" {
 			continue
 		}
+		cacheable := cacheableVPPCTLCommand(command)
+		if cacheable {
+			if stdout, stderr, ok := channel.cache.get(command); ok {
+				results = append(results, VPPCTLCommandResult{Command: logicalCommand, Stdout: stdout, Stderr: stderr, Retval: 0})
+				continue
+			}
+		}
 		args := strings.Fields(command)
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -108,6 +130,13 @@ func (channel vppctlChannel) doCommands(ctx context.Context, operation Operation
 			}
 		}
 		results = append(results, VPPCTLCommandResult{Command: logicalCommand, Stdout: stdout.String(), Stderr: stderr.String(), Retval: retval})
+		if err == nil && cacheable {
+			channel.cache.put(command, stdout.String(), stderr.String())
+		} else if !cacheable {
+			// A mutation invalidates every prior snapshot: the next readback
+			// must not observe a pre-change show result.
+			channel.cache.invalidate()
+		}
 		if err != nil {
 			if ignoreFailure {
 				continue
@@ -200,6 +229,7 @@ func (channel vppctlChannel) doVPPRouteBatchChunk(ctx context.Context, commands 
 	cmd.Stderr = &stderr
 	runErr := cmd.Run()
 	result := VPPCTLCommandResult{Command: label, Stdout: stdout.String(), Stderr: stderr.String()}
+	channel.cache.invalidate()
 	if runErr != nil {
 		return result, fmt.Errorf("vppctl exec %s failed: %w: %s", label, runErr, strings.TrimSpace(stderr.String()))
 	}

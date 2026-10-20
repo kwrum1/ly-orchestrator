@@ -49,6 +49,7 @@ func (runtime Runtime) ApplyCapabilitiesForTransaction(ctx context.Context, tran
 }
 
 func (runtime Runtime) applyCapabilities(ctx context.Context, artifacts []RenderedArtifact) ApplyReport {
+	defer runtime.invalidateHealth()
 	byService := groupByService(artifacts)
 	report := ApplyReport{AppliedArtifacts: make([]RenderedArtifact, 0, len(artifacts))}
 	for _, service := range serviceOrder() {

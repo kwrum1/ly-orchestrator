@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ly-route/backend/internal/runtime/dns"
@@ -58,7 +59,12 @@ type RenderedArtifact struct {
 type Health struct {
 	Service   ServiceName `json:"service"`
 	Available bool        `json:"available"`
-	Reason    string      `json:"reason,omitempty"`
+	// TimedOut marks a probe that could not establish the real unit state
+	// before its deadline.  It is deliberately distinct from "inactive":
+	// callers may report degraded/unknown, but must not claim the service is
+	// stopped when PID1 itself is slow.
+	TimedOut bool   `json:"timed_out,omitempty"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 type ProcessController interface {
@@ -84,18 +90,25 @@ type CommandRunner interface {
 type SystemctlRunner struct{}
 
 func (SystemctlRunner) Run(ctx context.Context, name string, args ...string) error {
-	command := exec.CommandContext(ctx, name, args...)
-	output, err := command.CombinedOutput()
+	timeout := 2 * time.Minute
+	if name == "systemctl" {
+		// Start/stop/restart normally completes in well under a second, but
+		// PID1 can be busy on a loaded router.  Bound it so an apply cannot
+		// hang forever; the outer transaction still owns the overall budget.
+		timeout = 45 * time.Second
+	}
+	output, err := runCommandBounded(ctx, timeout, name, args...)
 	if err != nil {
-		message := strings.TrimSpace(string(output))
+		message := strings.TrimSpace(output)
+		if errors.Is(err, ErrCommandTimeout) {
+			return fmt.Errorf("%s %s timed out after %s", name, strings.Join(args, " "), timeout)
+		}
 		if message == "" {
 			message = err.Error()
 		}
-		if name == "systemctl" && len(args) >= 2 {
-			statusCommand := exec.CommandContext(ctx, "systemctl", "status", "--no-pager", "-l", args[len(args)-1])
-			if statusOutput, statusErr := statusCommand.CombinedOutput(); statusErr == nil || len(statusOutput) > 0 {
-				statusMessage := strings.TrimSpace(string(statusOutput))
-				if statusMessage != "" {
+		if name == "systemctl" && len(args) >= 2 && !errors.Is(ctx.Err(), context.Canceled) {
+			if statusOutput, statusErr := runCommandBounded(context.WithoutCancel(ctx), 2*time.Second, "systemctl", "status", "--no-pager", "-l", args[len(args)-1]); statusErr == nil || statusOutput != "" {
+				if statusMessage := strings.TrimSpace(statusOutput); statusMessage != "" {
 					message += "\n" + statusMessage
 				}
 			}
@@ -106,33 +119,58 @@ func (SystemctlRunner) Run(ctx context.Context, name string, args ...string) err
 }
 
 func (SystemctlRunner) Status(ctx context.Context, service ServiceName) (Health, error) {
-	// PID1 can have a stuck job while a runtime apply is in progress. Never
-	// let a health/readback request hang a browser or the apply transaction.
-	statusCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	ctx = statusCtx
+	// PID1 can have a stuck job while a runtime apply is in progress.  The
+	// hard bound is enforced by runCommandBounded (process-group kill), not
+	// just by the child context.  A timeout is reported as unknown/degraded,
+	// never as "the unit is not active".
 	unit := serviceUnit(service)
-	if err := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run(); err != nil {
-		reason := unit + " is not active"
-		statusCommand := exec.CommandContext(ctx, "systemctl", "status", "--no-pager", "-l", unit)
-		if output, statusErr := statusCommand.CombinedOutput(); statusErr == nil || len(output) > 0 {
-			if status := strings.TrimSpace(string(output)); status != "" {
-				reason += ": " + status
-			}
-		}
-		journalCommand := exec.CommandContext(ctx, "journalctl", "-u", unit, "--no-pager", "-n", "20")
-		if output, journalErr := journalCommand.CombinedOutput(); journalErr == nil || len(output) > 0 {
-			if journal := strings.TrimSpace(string(output)); journal != "" {
-				reason += "\n" + journal
-			}
-		}
-		return Health{Service: service, Available: false, Reason: reason}, nil
+	_, err := runCommandBounded(ctx, 5*time.Second, "systemctl", "is-active", "--quiet", unit)
+	if err == nil {
+		return Health{Service: service, Available: true}, nil
 	}
-	return Health{Service: service, Available: true}, nil
+	if errors.Is(err, ErrCommandTimeout) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return Health{Service: service, Available: false, TimedOut: true, Reason: unit + " status check timed out"}, nil
+	}
+	reason := unit + " is not active"
+	// Diagnostics are best-effort and receive their own short budget.  They
+	// must not reuse an expired context (the old code ran them after the
+	// status deadline and always returned an empty diagnostic).
+	if statusOutput, statusErr := runCommandBounded(context.WithoutCancel(ctx), 2*time.Second, "systemctl", "status", "--no-pager", "-l", unit); statusErr == nil || statusOutput != "" {
+		if status := strings.TrimSpace(statusOutput); status != "" {
+			reason += ": " + status
+		}
+	}
+	if journalOutput, journalErr := runCommandBounded(context.WithoutCancel(ctx), 2*time.Second, "journalctl", "-u", unit, "--no-pager", "-n", "20"); journalErr == nil || journalOutput != "" {
+		if journal := strings.TrimSpace(journalOutput); journal != "" {
+			reason += "\n" + journal
+		}
+	}
+	return Health{Service: service, Available: false, Reason: reason}, nil
 }
 
 type Runtime struct {
 	Controller ProcessController
+	// health caches short-lived health results and collapses concurrent
+	// probes.  It is pointer-backed so copying a Runtime value does not copy
+	// a mutex.
+	health *runtimeHealthCache
+}
+
+var runtimeHealthInitMu sync.Mutex
+
+func (runtime *Runtime) healthCache() *runtimeHealthCache {
+	runtimeHealthInitMu.Lock()
+	defer runtimeHealthInitMu.Unlock()
+	if runtime.health == nil {
+		runtime.health = newRuntimeHealthCache()
+	}
+	return runtime.health
+}
+
+func (runtime *Runtime) invalidateHealth() {
+	if runtime != nil && runtime.health != nil {
+		runtime.health.invalidate()
+	}
 }
 
 func NewArtifact(service ServiceName, path, content, reloadMode string) RenderedArtifact {
@@ -1582,7 +1620,10 @@ func serviceUnderlayInterface(value string) string {
 
 func serviceVPPRoutePath(value string) string {
 	fields := strings.Fields(strings.TrimSpace(value))
-	if len(fields) == 1 && (strings.HasPrefix(strings.ToLower(fields[0]), "pppoe_session") || isRuntimePPPoEUnderlay(fields[0])) {
+	if len(fields) == 1 && (strings.HasPrefix(strings.ToLower(fields[0]), "pppoe_session") ||
+		strings.HasPrefix(strings.ToLower(fields[0]), "pppox") ||
+		strings.HasPrefix(strings.ToLower(fields[0]), "lyppp-") ||
+		isRuntimePPPoEUnderlay(fields[0])) {
 		// PPPoE is a point-to-point VPP interface. VPP resolves the peer
 		// through the session; an artificial 0.0.0.0 next hop is invalid.
 		return fields[0]
@@ -1613,7 +1654,7 @@ func renderRuntimeUnderlayResolver(underlays []string) (string, error) {
 				"      status_file=/run/ly-route/pppoe/$peer_id.json\n" +
 				"      [ -r \"$status_file\" ] || { echo \"PPPoE status $status_file is unavailable\" >&2; return 1; }\n" +
 				"      interface=$(sed -n 's/.*\"interface\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$status_file\" | head -n 1)\n" +
-				"      case \"$interface\" in pppoe_session[0-9]*) printf '%s\\n' \"$interface\" ;; *) echo \"invalid PPPoE runtime interface\" >&2; return 1 ;; esac\n" +
+				"      case \"$interface\" in pppoe_session[0-9]*|pppox[0-9]*|lyppp-*) printf '%s\\n' \"$interface\" ;; *) echo \"invalid PPPoE runtime interface\" >&2; return 1 ;; esac\n" +
 				"      ;;\n" +
 				"    *) printf '%s\\n' \"$1\" ;;\n" +
 				"  esac\n" +
@@ -1984,6 +2025,7 @@ func (runtime Runtime) Apply(ctx context.Context, artifacts []RenderedArtifact) 
 }
 
 func (runtime Runtime) Stop(ctx context.Context, service ServiceName, artifacts []RenderedArtifact) error {
+	defer runtime.invalidateHealth()
 	if runtime.Controller == nil {
 		return fmt.Errorf("%s stop requires a service controller", service)
 	}
@@ -1994,19 +2036,34 @@ func (runtime Runtime) Stop(ctx context.Context, service ServiceName, artifacts 
 	return controller.Stop(ctx, service, artifacts)
 }
 
-func (runtime Runtime) HealthCheck(ctx context.Context, services ...ServiceName) ([]Health, error) {
-	results := make([]Health, 0, len(services))
-	for _, service := range services {
-		health, err := runtime.Controller.Status(ctx, service)
+func (runtime *Runtime) HealthCheck(ctx context.Context, services ...ServiceName) ([]Health, error) {
+	if runtime == nil || runtime.Controller == nil {
+		return nil, fmt.Errorf("service controller is not configured")
+	}
+	cache := runtime.healthCache()
+	results := make([]Health, len(services))
+	errs := make([]error, len(services))
+	var wait sync.WaitGroup
+	for index, service := range services {
+		wait.Add(1)
+		go func(index int, service ServiceName) {
+			defer wait.Done()
+			results[index], errs[index] = cache.check(ctx, service, func(checkCtx context.Context) (Health, error) {
+				return runtime.Controller.Status(checkCtx, service)
+			})
+		}(index, service)
+	}
+	wait.Wait()
+	for _, err := range errs {
 		if err != nil {
 			return nil, err
 		}
-		results = append(results, health)
 	}
 	return results, nil
 }
 
 func (runtime Runtime) Rollback(ctx context.Context, artifacts []RenderedArtifact) error {
+	defer runtime.invalidateHealth()
 	byService := groupByService(artifacts)
 	order := serviceOrder()
 	rollbackErrors := make([]error, 0)

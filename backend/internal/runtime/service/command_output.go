@@ -3,14 +3,21 @@ package service
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
+	"time"
 )
 
 func (SystemctlRunner) Output(ctx context.Context, name string, args ...string) (string, error) {
-	output, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
-	message := strings.TrimSpace(string(output))
+	timeout := 15 * time.Second
+	if name == "systemctl" || name == "journalctl" {
+		timeout = 10 * time.Second
+	}
+	output, err := runCommandBounded(ctx, timeout, name, args...)
+	message := strings.TrimSpace(output)
 	if err != nil {
+		if err == ErrCommandTimeout {
+			return "", fmt.Errorf("%s %s timed out after %s", name, strings.Join(args, " "), timeout)
+		}
 		if message == "" {
 			message = err.Error()
 		}

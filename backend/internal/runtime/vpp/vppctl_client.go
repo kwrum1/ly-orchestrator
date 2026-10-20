@@ -15,13 +15,14 @@ import (
 type VPPCTLClient struct {
 	Binary     string
 	dynamicACL bool
+	cache      *vppctlCache
 }
 
 func NewVPPCTLClient(binary string) VPPCTLClient {
 	if strings.TrimSpace(binary) == "" {
 		binary = "vppctl"
 	}
-	return VPPCTLClient{Binary: binary}
+	return VPPCTLClient{Binary: binary, cache: newVPPCTLCache(defaultVPPCTLCacheTTL)}
 }
 
 func NewProductionVPPCTLClient(binary string) VPPCTLClient {
@@ -34,12 +35,13 @@ func (client VPPCTLClient) OpenChannel(context.Context) (Channel, error) {
 	if _, err := exec.LookPath(client.Binary); err != nil {
 		return nil, fmt.Errorf("vppctl binary %q is unavailable: %w", client.Binary, err)
 	}
-	return &vppctlChannel{binary: client.Binary, dynamicACL: client.dynamicACL}, nil
+	return &vppctlChannel{binary: client.Binary, dynamicACL: client.dynamicACL, cache: client.cache}, nil
 }
 
 type vppctlChannel struct {
 	binary                string
 	dynamicACL            bool
+	cache                 *vppctlCache
 	natReturnGuardIngress string
 	lanVPPInterface       string
 }
