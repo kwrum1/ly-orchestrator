@@ -35,7 +35,10 @@ The install and rollback scripts:
 - write a JSON result file so the task reconciles after a control restart.
 
 The upgrade package manifest now records `version` (`LY_ROUTE_VERSION`, falling
-back to the source commit) in addition to `commit`.
+back to the source commit) in addition to `commit`. Rootfs and upgrade payloads
+carry `/etc/ly-route/version.env`; `ly-route-control-api.service` loads it, and
+install/rollback preserve it so the version inventory updates after an upgrade
+and returns to the previous value on rollback.
 
 ## Conversion API
 
