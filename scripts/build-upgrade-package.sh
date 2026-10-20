@@ -186,7 +186,11 @@ service_hash=$(sha256sum "$service" | cut -d' ' -f1)
 runtime_check_hash=$(sha256sum "$package_root/usr/lib/ly-route/runtime-check.sh" | cut -d' ' -f1)
 firstboot_hash=$(sha256sum "$package_root/usr/lib/ly-route/firstboot.sh" | cut -d' ' -f1)
 firstboot_service_hash=$(sha256sum "$firstboot_service" | cut -d' ' -f1)
-commercial_css_hash=$(sha256sum "$package_root/opt/ly-route/admin/commercial.css" | cut -d' ' -f1)
+if [ -f "$package_root/opt/ly-route/admin/commercial.css" ]; then
+  commercial_css_hash=$(sha256sum "$package_root/opt/ly-route/admin/commercial.css" | cut -d' ' -f1)
+else
+  commercial_css_hash=
+fi
 profile_hash=$(sha256sum "$package_root/etc/ly-route/product-manifest.json" | cut -d' ' -f1)
 artifact_manifest_hash=$(sha256sum "$package_root/usr/share/ly-route/artifact-manifest.json" | cut -d' ' -f1)
 cat >"$package_root/checksums.sha256" <<EOF
@@ -202,10 +206,12 @@ $service_hash  etc/systemd/system/ly-route-control-api.service
 $runtime_check_hash  usr/lib/ly-route/runtime-check.sh
 $firstboot_hash  usr/lib/ly-route/firstboot.sh
 $firstboot_service_hash  etc/systemd/system/ly-route-firstboot.service
-$commercial_css_hash  opt/ly-route/admin/commercial.css
 $profile_hash  etc/ly-route/product-manifest.json
 $artifact_manifest_hash  usr/share/ly-route/artifact-manifest.json
 EOF
+if [ -n "$commercial_css_hash" ]; then
+  printf '%s  opt/ly-route/admin/commercial.css\n' "$commercial_css_hash" >>"$package_root/checksums.sha256"
+fi
 if [ -d "$package_root/usr/share/ly-route/geodata" ]; then
   for geodata_file in geoip.dat geosite.dat china-list.txt manifest.json; do
     if [ -f "$package_root/usr/share/ly-route/geodata/$geodata_file" ]; then
@@ -226,6 +232,23 @@ const [output, profilePath, product, suite, arch, commit, createdAt,
   nginxHash, serviceHash, runtimeCheckHash, firstbootHash, firstbootServiceHash,
   commercialCSSHash, profileHash, artifactManifestHash] = process.argv.slice(2);
 const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+const checksums = {
+  "usr/lib/ly-route/ly-route-control": controlHash,
+  "usr/lib/ly-route/vpp-apply": vppHash,
+  "opt/ly-route/admin/app.js": appHash,
+  "opt/ly-route/admin/capabilities.json": capabilitiesHash,
+  "opt/ly-route/admin/index.html": indexHash,
+  "opt/ly-route/admin/shell.js": shellHash,
+  "opt/ly-route/admin/styles.css": stylesHash,
+  "etc/nginx/conf.d/ly-route-admin.conf": nginxHash,
+  "etc/systemd/system/ly-route-control-api.service": serviceHash,
+  "usr/lib/ly-route/runtime-check.sh": runtimeCheckHash,
+  "usr/lib/ly-route/firstboot.sh": firstbootHash,
+  "etc/systemd/system/ly-route-firstboot.service": firstbootServiceHash,
+  "etc/ly-route/product-manifest.json": profileHash,
+  "usr/share/ly-route/artifact-manifest.json": artifactManifestHash,
+};
+if (commercialCSSHash) checksums["opt/ly-route/admin/commercial.css"] = commercialCSSHash;
 const manifest = {
   package_type: "ly-route-upgrade",
   product,
@@ -235,23 +258,7 @@ const manifest = {
   created_at: createdAt,
   install_root: "/usr/lib/ly-route",
   services: profile.services,
-  checksums: {
-    "usr/lib/ly-route/ly-route-control": controlHash,
-    "usr/lib/ly-route/vpp-apply": vppHash,
-    "opt/ly-route/admin/app.js": appHash,
-    "opt/ly-route/admin/capabilities.json": capabilitiesHash,
-    "opt/ly-route/admin/index.html": indexHash,
-    "opt/ly-route/admin/shell.js": shellHash,
-    "opt/ly-route/admin/styles.css": stylesHash,
-    "etc/nginx/conf.d/ly-route-admin.conf": nginxHash,
-    "etc/systemd/system/ly-route-control-api.service": serviceHash,
-    "usr/lib/ly-route/runtime-check.sh": runtimeCheckHash,
-    "usr/lib/ly-route/firstboot.sh": firstbootHash,
-    "etc/systemd/system/ly-route-firstboot.service": firstbootServiceHash,
-    "opt/ly-route/admin/commercial.css": commercialCSSHash,
-    "etc/ly-route/product-manifest.json": profileHash,
-    "usr/share/ly-route/artifact-manifest.json": artifactManifestHash,
-  },
+  checksums,
 };
 writeFileSync(output, `${JSON.stringify(manifest, null, 2)}\n`);
 NODE
