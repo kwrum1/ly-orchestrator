@@ -34,38 +34,51 @@ func (err *UpgradeProductMismatchError) Is(target error) bool {
 }
 
 type upgradePackageManifest struct {
-	PackageType string            `json:"package_type"`
-	Product     product.ID        `json:"product"`
-	Suite       string            `json:"suite,omitempty"`
-	Arch        string            `json:"arch,omitempty"`
-	Commit      string            `json:"commit,omitempty"`
-	CreatedAt   string            `json:"created_at,omitempty"`
-	InstallRoot string            `json:"install_root,omitempty"`
-	Services    []string          `json:"services,omitempty"`
-	Checksums   map[string]string `json:"checksums"`
+	PackageType       string            `json:"package_type"`
+	Product           product.ID        `json:"product"`
+	Version           string            `json:"version,omitempty"`
+	FromVersion       string            `json:"from_version,omitempty"`
+	ToVersion         string            `json:"to_version,omitempty"`
+	Suite             string            `json:"suite,omitempty"`
+	Arch              string            `json:"arch,omitempty"`
+	Commit            string            `json:"commit,omitempty"`
+	CreatedAt         string            `json:"created_at,omitempty"`
+	InstallRoot       string            `json:"install_root,omitempty"`
+	Services          []string          `json:"services,omitempty"`
+	IncludesDataplane bool              `json:"includes_dataplane,omitempty"`
+	Conversion        json.RawMessage   `json:"conversion,omitempty"`
+	Checksums         map[string]string `json:"checksums"`
 }
 
 func validateUpgradePackage(packagePath string, expectedProduct product.ID) error {
+	_, err := inspectUpgradePackage(packagePath, expectedProduct)
+	return err
+}
+
+func inspectUpgradePackage(packagePath string, expectedProduct product.ID) (upgradePackageManifest, error) {
 	tmp, err := os.MkdirTemp(filepath.Dir(packagePath), "validate-*")
 	if err != nil {
-		return fmt.Errorf("create validation directory: %w", err)
+		return upgradePackageManifest{}, fmt.Errorf("create validation directory: %w", err)
 	}
 	defer os.RemoveAll(tmp)
 	if err := extractUpgradePackage(packagePath, tmp); err != nil {
-		return err
+		return upgradePackageManifest{}, err
 	}
 	body, err := os.ReadFile(filepath.Join(tmp, "manifest.json"))
 	if err != nil {
-		return fmt.Errorf("manifest.json is required: %w", err)
+		return upgradePackageManifest{}, fmt.Errorf("manifest.json is required: %w", err)
 	}
 	manifest, err := parseUpgradeManifest(body)
 	if err != nil {
-		return err
+		return upgradePackageManifest{}, err
 	}
 	if manifest.Product != expectedProduct {
-		return &UpgradeProductMismatchError{Package: manifest.Product, Server: expectedProduct}
+		return upgradePackageManifest{}, &UpgradeProductMismatchError{Package: manifest.Product, Server: expectedProduct}
 	}
-	return verifyUpgradeChecksums(tmp, manifest)
+	if err := verifyUpgradeChecksums(tmp, manifest); err != nil {
+		return upgradePackageManifest{}, err
+	}
+	return manifest, nil
 }
 
 func extractUpgradePackage(packagePath, root string) (err error) {

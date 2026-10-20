@@ -30,9 +30,22 @@ test -x "$tmp/usr/lib/ly-route/vpp-apply"
 # A control-plane-only payload would silently roll the device back to the old
 # dataplane.  Require the native VPP PPPoE plugin (or an explicit manifest
 # claim that the payload includes the dataplane) before touching the system.
-if [ ! -f "$tmp/usr/lib/x86_64-linux-gnu/vpp_plugins/pppoeclient_plugin.so" ] &&
-   ! grep -q '"includes_dataplane"[[:space:]]*:[[:space:]]*true' "$tmp/manifest.json"; then
-  echo "refusing upgrade: payload does not include the VPP/PPPoE dataplane" >&2
+# A product-conversion package is recognized explicitly: it may instead
+# declare that the existing dataplane is preserved and verified.  This is not
+# a silent "includes_dataplane=true" shortcut.
+dataplane_ok=false
+if [ -f "$tmp/usr/lib/x86_64-linux-gnu/vpp_plugins/pppoeclient_plugin.so" ] ||
+   grep -q '"includes_dataplane"[[:space:]]*:[[:space:]]*true' "$tmp/manifest.json"; then
+  dataplane_ok=true
+fi
+if [ "$dataplane_ok" != true ] &&
+   grep -q '"package_type"[[:space:]]*:[[:space:]]*"ly-route-conversion"' "$tmp/manifest.json" &&
+   grep -q '"preserve"[[:space:]]*:[[:space:]]*true' "$tmp/manifest.json" &&
+   grep -q '"verify_packages"[[:space:]]*:[[:space:]]*\[' "$tmp/manifest.json"; then
+  dataplane_ok=true
+fi
+if [ "$dataplane_ok" != true ]; then
+  echo "refusing upgrade: payload does not include or preserve the VPP dataplane" >&2
   exit 1
 fi
 

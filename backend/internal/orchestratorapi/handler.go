@@ -31,6 +31,7 @@ type Handler struct {
 	repository       orchestrator.Orchestrator
 	access           AccessController
 	runtime          ServiceChainRuntime
+	updates          UpdateService
 	managementShared func(context.Context, string) bool
 	reconcile        reconcileState
 }
@@ -65,6 +66,10 @@ type TransparentTransactionRuntime interface {
 
 func (handler *Handler) SetManagementSharingResolver(resolver func(context.Context, string) bool) {
 	handler.managementShared = resolver
+}
+
+func (handler *Handler) SetUpdateService(service UpdateService) {
+	handler.updates = service
 }
 
 type ServiceChainTransitionRuntime interface {
@@ -117,6 +122,12 @@ func (handler *Handler) RegisterRoutes(mux *http.ServeMux) {
 		mux.HandleFunc(ServiceChainCompilePath, handler.handleServiceChainCompile)
 		mux.HandleFunc(ServiceChainApplyPath, handler.handleServiceChainApply)
 		mux.HandleFunc(ServiceChainStatusPath, handler.handleServiceChainStatus)
+	}
+	if handler.updates != nil {
+		mux.HandleFunc(UpgradesPath, handler.handleUpgrades)
+		mux.HandleFunc(UpgradesPath+"/", handler.handleUpgradeItem)
+		mux.HandleFunc(ConversionsPath, handler.handleConversions)
+		mux.HandleFunc(ConversionsPath+"/", handler.handleConversionItem)
 	}
 }
 

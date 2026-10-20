@@ -5,6 +5,8 @@ Orchestrator 是**单机 VPP 流量编排器**（本地拓扑、策略、服务�
 多站点集中控制器；文档没有设计站点注册、跨网关心跳或集中下发，因此本表不会把
 这些能力标记为“待实现”。
 
+升级与转换接口见 [orchestrator-upgrade-conversion-api.md](orchestrator-upgrade-conversion-api.md)。
+
 ## 能力盘点
 
 | 模块 | 已有 | 缺口 | 优先级 | 验证 |
@@ -21,9 +23,15 @@ Orchestrator 是**单机 VPP 流量编排器**（本地拓扑、策略、服务�
 | 运行时应用 | **本次新增**：`/api/v1/runtime/apply` 会先重放已持久化的拓扑/策略代际，再执行运行态计划 | 无 | P1 | 新增运行时应用单测 |
 | 遥测 | 接口/策略命中/连接/邻居/流量趋势/dashboard | 依赖 VPP CLI 输出；不可用时显式 degraded | P1 | `internal/orchestrator/telemetry` + HTTP 测试 |
 | VPP 插件 | `runtime/vpp-orchestrator` 真实 C 插件、CLI、生成器、服务链/透明模式 | 无（需在目标 VPP 版本上构建） | P1 | `scripts/build-vpp-orchestrator-plugin.sh`；`test-vpp-orchestrator-transparent.sh` |
-| 升级/版本 | 打包脚本可生成 Orchestrator upgrade 载荷；产品 profile 不暴露 Gateway 固件 API | Orchestrator 没有独立升级任务 API/页面（产品设计未包含） | P3 | 产物结构检查 |
+| 升级/版本 | **本次新增**：Orchestrator 独立版本清单、升级任务、安装/回滚、失败态与审计；复用 `ly-route-upgrade` 载荷 | 真实镜像转换未启用（conversion `apply` 返回 501） | P1 | `test-orchestrator-upgrade-conversion-contract.sh` |
+| 产品转换 | **本次新增**：conversion manifest 校验、任务持久化、预转换快照、服务 enable 状态捕获/恢复、回滚骨架；Gateway installer 显式识别 conversion 类型 | 不做真实镜像迁移/上传 | P1 | `internal/productupdate` + httpapi 测试 |
 | 打包 | rootfs/upgrade/disk 支持 `--product orchestrator`；systemd unit 复用并注入产品 profile | ISO 只支持 Gateway（明确不支持 Orchestrator ISO） | P1 | `scripts/build-rootfs.sh`/`build-upgrade-package.sh`/`build-disk-image.sh` |
 | 测试 | Go 单测、Shell 契约、容器 API/重启、VPP 数据面脚本 | 无统一 CI 入口 | P2 | 见下 |
+
+> 依赖说明：本分支 cherry-pick 了 `9867b65`（`fix: make firmware upgrade
+> verifiable and reversible`，来自 `fix/p0-ui-af-xdp`），提供 Gateway
+> 升级的备份/回滚/健康检查与 `includes_dataplane` 校验；本分支在其之上增加了
+> conversion 类型识别。后续合并主分支时不要重复应用该提交。
 
 ## 本次修改的根因
 
@@ -72,10 +80,11 @@ ACL 等外围配置。配置导入完成后 UI 又提示“需执行运行时应
 
 ```sh
 cd backend
-go test ./internal/orchestrator/... ./internal/orchestratorapi/... \
-  ./internal/product ./internal/persistence -count=1
-go test ./internal/httpapi -run 'TestProductConfig|TestProductSnapshot|TestOrchestrator' -count=1
+go test ./internal/productupdate ./internal/persistence ./internal/orchestrator/... \
+  ./internal/orchestratorapi -count=1
+go test ./internal/httpapi -run 'TestOrchestratorUpgrade|TestGatewayConversion|TestFirmwareUpgradeInstaller' -count=1
 cd ..
+sh scripts/test-orchestrator-upgrade-conversion-contract.sh
 sh scripts/test-orchestrator-negative-contract.sh
 sh scripts/test-orchestrator-policy-contract.sh
 sh scripts/test-orchestrator-container-api.sh

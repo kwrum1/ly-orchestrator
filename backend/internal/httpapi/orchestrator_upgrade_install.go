@@ -1,0 +1,185 @@
+package httpapi
+
+import "strconv"
+
+type orchestratorUpgradeInvocation struct {
+	Name string
+	Args []string
+}
+
+const orchestratorUpgradeScript = `
+set -eu
+exec >>/var/log/ly-route-orchestrator-upgrade.log 2>&1
+action=$1
+package_path=$2
+package_hash=$3
+target_dir=$4
+backup_dir=$5
+result_path=$6
+reboot_requested=${7:-false}
+result_dir=$(dirname "$result_path")
+mkdir -p "$result_dir"
+
+write_result() {
+  state=$1
+  reason=${2:-}
+  printf '{"state":"%s","reason":"%s"}\n' "$state" "$reason" >"$result_path"
+}
+
+fail() {
+  reason=$1
+  write_result failed "$reason"
+  echo "$reason" >&2
+  exit 1
+}
+
+capture_services() {
+  mkdir -p "$backup_dir"
+  : >"$backup_dir/services.state"
+  for unit in ly-route-control-api.service ly-route-vpp-apply.service ly-route-runtime-check.service ly-route-recovery.service ly-route-firstboot.service vpp.service nginx.service; do
+    state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    [ -n "$state" ] || state=missing
+    printf '%s|%s\n' "$unit" "$state" >>"$backup_dir/services.state"
+  done
+}
+
+restore_services() {
+  [ -f "$backup_dir/services.state" ] || return 0
+  while IFS='|' read -r unit state; do
+    [ -n "$unit" ] || continue
+    case "$state" in
+      enabled) systemctl enable "$unit" >/dev/null 2>&1 || true ;;
+      disabled) systemctl disable "$unit" >/dev/null 2>&1 || true ;;
+      masked) systemctl mask "$unit" >/dev/null 2>&1 || true ;;
+      *) : ;;
+    esac
+  done <"$backup_dir/services.state"
+}
+
+restore_files() {
+  echo "restoring orchestrator payload from $backup_dir" >&2
+  if [ -d "$backup_dir/target" ]; then
+    rm -rf "$target_dir"
+    cp -a "$backup_dir/target" "$target_dir"
+  fi
+  if [ -d "$backup_dir/admin" ]; then
+    rm -rf /opt/ly-route/admin
+    cp -a "$backup_dir/admin" /opt/ly-route/admin
+  fi
+  if [ -f "$backup_dir/ly-route-admin.conf" ]; then
+    cp -a "$backup_dir/ly-route-admin.conf" /etc/nginx/conf.d/ly-route-admin.conf
+  fi
+  if [ -f "$backup_dir/ly-route-control-api.service" ]; then
+    cp -a "$backup_dir/ly-route-control-api.service" /etc/systemd/system/ly-route-control-api.service
+  fi
+  if [ -f "$backup_dir/ly-route-firstboot.service" ]; then
+    cp -a "$backup_dir/ly-route-firstboot.service" /etc/systemd/system/ly-route-firstboot.service
+  fi
+  restore_services
+  systemctl daemon-reload || true
+  systemctl restart ly-route-control-api.service || true
+  systemctl reload nginx.service || systemctl restart nginx.service || true
+}
+
+health_check() {
+  healthy=0
+  i=0
+  while [ "$i" -lt 30 ]; do
+    if systemctl is-active --quiet ly-route-control-api.service &&
+       curl -fsS --max-time 2 http://127.0.0.1:8080/api/v1/health >/dev/null 2>&1; then
+      healthy=1
+      break
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  [ "$healthy" = 1 ]
+}
+
+if [ "$action" = rollback ]; then
+  [ -d "$backup_dir" ] || fail "rollback backup is missing"
+  restore_files
+  if health_check; then
+    write_result rolled_back "service enable state and control payload restored"
+    exit 0
+  fi
+  write_result rollback_failed "health check failed after rollback"
+  exit 1
+fi
+
+[ "$action" = install ] || fail "unsupported action $action"
+actual=$(sha256sum -- "$package_path" | cut -d' ' -f1)
+[ "$actual" = "$package_hash" ] || fail "package hash mismatch"
+tmp=$(mktemp -d /var/lib/ly-route/orchestrator/upgrade-install.XXXXXX)
+trap 'rm -rf "$tmp"' EXIT
+zstd -dc -- "$package_path" | tar -x -C "$tmp"
+test -f "$tmp/manifest.json" || fail "manifest.json is required"
+test -f "$tmp/checksums.sha256" || fail "checksums.sha256 is required"
+grep -q '"package_type": "ly-route-upgrade"' "$tmp/manifest.json" || fail "not an upgrade package"
+grep -q '"product": "orchestrator"' "$tmp/manifest.json" || fail "not an Orchestrator upgrade package"
+(cd "$tmp" && sha256sum -c checksums.sha256) || fail "package checksum verification failed"
+test -x "$tmp/usr/lib/ly-route/ly-route-control" || fail "control binary is missing"
+test -x "$tmp/usr/lib/ly-route/vpp-apply" || fail "vpp-apply is missing"
+
+# An Orchestrator upgrade must never silently downgrade the dataplane.  The
+# base appliance owns the VPP orchestrator plugin; accept it either from the
+# system or from a conversion payload explicitly carrying the plugin.
+plugin_path=/usr/lib/x86_64-linux-gnu/vpp_plugins/ly_route_orchestrator_plugin.so
+if [ ! -f "$plugin_path" ] && [ ! -f "$tmp/usr/lib/x86_64-linux-gnu/vpp_plugins/ly_route_orchestrator_plugin.so" ]; then
+  fail "VPP orchestrator plugin is not installed and the payload does not include it"
+fi
+
+mkdir -p "$backup_dir"
+capture_services
+if [ -e "$target_dir" ]; then cp -a "$target_dir" "$backup_dir/target"; fi
+if [ -e /opt/ly-route/admin ]; then cp -a /opt/ly-route/admin "$backup_dir/admin"; fi
+if [ -e /etc/nginx/conf.d/ly-route-admin.conf ]; then cp -a /etc/nginx/conf.d/ly-route-admin.conf "$backup_dir/ly-route-admin.conf"; fi
+if [ -e /etc/systemd/system/ly-route-control-api.service ]; then cp -a /etc/systemd/system/ly-route-control-api.service "$backup_dir/ly-route-control-api.service"; fi
+if [ -e /etc/systemd/system/ly-route-firstboot.service ]; then cp -a /etc/systemd/system/ly-route-firstboot.service "$backup_dir/ly-route-firstboot.service"; fi
+
+install -d -m 0755 "$target_dir"
+install -m 0755 "$tmp/usr/lib/ly-route/ly-route-control" "$target_dir/ly-route-control"
+install -m 0755 "$tmp/usr/lib/ly-route/vpp-apply" "$target_dir/vpp-apply"
+for runtime_script in runtime-check.sh firstboot.sh; do
+  if [ -f "$tmp/usr/lib/ly-route/$runtime_script" ]; then
+    install -m 0755 "$tmp/usr/lib/ly-route/$runtime_script" "$target_dir/$runtime_script"
+  fi
+done
+if [ "$target_dir" = "/usr/lib/ly-route" ] && [ -f "$tmp/etc/systemd/system/ly-route-firstboot.service" ]; then
+  install -D -m 0644 "$tmp/etc/systemd/system/ly-route-firstboot.service" /etc/systemd/system/ly-route-firstboot.service
+fi
+if [ "$target_dir" = "/usr/lib/ly-route" ] && [ -f "$tmp/etc/systemd/system/ly-route-control-api.service" ]; then
+  install -D -m 0644 "$tmp/etc/systemd/system/ly-route-control-api.service" /etc/systemd/system/ly-route-control-api.service
+fi
+if [ -d "$tmp/opt/ly-route/admin" ]; then
+  rm -rf /opt/ly-route/admin.new
+  mkdir -p /opt/ly-route/admin.new
+  cp -a "$tmp/opt/ly-route/admin/." /opt/ly-route/admin.new/
+  rm -rf /opt/ly-route/admin
+  mv /opt/ly-route/admin.new /opt/ly-route/admin
+fi
+if [ -f "$tmp/etc/nginx/conf.d/ly-route-admin.conf" ]; then
+  install -D -m 0644 "$tmp/etc/nginx/conf.d/ly-route-admin.conf" /etc/nginx/conf.d/ly-route-admin.conf
+fi
+systemctl daemon-reload || true
+if ! systemctl restart ly-route-control-api.service; then
+  restore_files
+  fail "control API restart failed"
+fi
+systemctl reload nginx.service || systemctl restart nginx.service || true
+if ! health_check; then
+  restore_files
+  fail "health check failed after install"
+fi
+write_result installed "orchestrator payload installed and health check passed"
+if [ "$reboot_requested" = true ]; then
+  systemctl reboot
+fi
+`
+
+func orchestratorUpgradeScriptInvocation(action, packagePath, packageHash, targetDir, backupDir, resultPath string, reboot bool) orchestratorUpgradeInvocation {
+	return orchestratorUpgradeInvocation{
+		Name: "bash",
+		Args: []string{"-c", orchestratorUpgradeScript, "ly-route-orchestrator-upgrade", action, packagePath, packageHash, targetDir, backupDir, resultPath, strconv.FormatBool(reboot)},
+	}
+}

@@ -157,6 +157,31 @@ PY
 
 start_dut
 login
+curl --fail --silent --show-error -b "$tmp/cookies" \
+  "http://127.0.0.1:$port/api/v1/orchestrator/upgrades" > "$tmp/evidence/upgrades.json"
+python3 - "$tmp/evidence/upgrades.json" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1]))
+assert x['version']['product']=='orchestrator'
+assert x['version']['upgrade_supported'] is True
+assert x['items']==[]
+PY
+python3 - "$repo_root/packaging/fixtures/product-conversion/gateway-to-orchestrator.json" "$tmp/conversion-validate.json" <<'PY'
+import json,sys
+manifest=json.load(open(sys.argv[1]))
+manifest['from_product']='orchestrator'
+manifest['to_product']='gateway'
+json.dump({'manifest':manifest,'prepare':False},open(sys.argv[2],'w'))
+PY
+curl --fail --silent --show-error -b "$tmp/cookies" -H 'Content-Type: application/json' \
+  --data-binary @"$tmp/conversion-validate.json" \
+  "http://127.0.0.1:$port/api/v1/orchestrator/conversions/validate" > "$tmp/evidence/conversion-validate.json"
+python3 - "$tmp/evidence/conversion-validate.json" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1]))
+assert x['validation']['valid'] is True
+assert x['validation']['plan']['dataplane_mode']=='preserve'
+PY
 curl --fail-with-body --silent --show-error -b "$tmp/cookies" -H 'Content-Type: application/json' -X PUT \
   --data-binary @"$repo_root/backend/internal/orchestratorapi/testdata/topology-v1.json" \
   "http://127.0.0.1:$port/api/v1/orchestrator/topology" > "$tmp/evidence/topology-put.json" || {

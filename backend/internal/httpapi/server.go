@@ -31,6 +31,7 @@ import (
 	"ly-route/backend/internal/orchestratorapi"
 	"ly-route/backend/internal/persistence"
 	"ly-route/backend/internal/product"
+	"ly-route/backend/internal/productupdate"
 	"ly-route/backend/internal/runtime/apply"
 	"ly-route/backend/internal/runtime/dns"
 	"ly-route/backend/internal/runtime/flow"
@@ -179,6 +180,9 @@ type Server struct {
 	firmwareStageDir              string
 	firmwareStatus                FirmwareUpdateStatus
 	firmwareInstallStart          func(firmwareInstallInvocation) error
+	orchestratorUpgradeDir        string
+	orchestratorInstallStart      func(orchestratorUpgradeInvocation) error
+	conversionServiceState        productupdate.ServiceStateController
 	dnsSyncToken                  string
 }
 
@@ -422,6 +426,30 @@ func WithFirmwareStageDir(path string) Option {
 	}
 }
 
+func WithOrchestratorUpgradeDir(path string) Option {
+	return func(server *Server) {
+		if strings.TrimSpace(path) != "" {
+			server.orchestratorUpgradeDir = path
+		}
+	}
+}
+
+func WithOrchestratorInstallStart(start func(orchestratorUpgradeInvocation) error) Option {
+	return func(server *Server) {
+		if start != nil {
+			server.orchestratorInstallStart = start
+		}
+	}
+}
+
+func WithConversionServiceState(controller productupdate.ServiceStateController) Option {
+	return func(server *Server) {
+		if controller != nil {
+			server.conversionServiceState = controller
+		}
+	}
+}
+
 func New(options ...Option) *Server {
 	return newServer(product.Gateway(), options...)
 }
@@ -450,9 +478,14 @@ func newServer(profile product.Profile, options ...Option) *Server {
 		firmwareInstallStart: func(invocation firmwareInstallInvocation) error {
 			return exec.Command(invocation.Name, invocation.Args...).Start()
 		},
-		subscriptionFetch: proxy.FetchSubscription,
-		dnsSyncToken:      loadDNSSyncToken(),
-		proxyEgress:       proxy.NewProxyEgress("proxy-egress-default", "xray-tproxy-outbound"),
+		orchestratorUpgradeDir: envOrDefault("LY_ROUTE_ORCHESTRATOR_UPGRADE_DIR", "/var/lib/ly-route/orchestrator/upgrades"),
+		orchestratorInstallStart: func(invocation orchestratorUpgradeInvocation) error {
+			return exec.Command(invocation.Name, invocation.Args...).Start()
+		},
+		conversionServiceState: productupdate.SystemctlController{},
+		subscriptionFetch:      proxy.FetchSubscription,
+		dnsSyncToken:           loadDNSSyncToken(),
+		proxyEgress:            proxy.NewProxyEgress("proxy-egress-default", "xray-tproxy-outbound"),
 		flowIntent: flow.NewIntent("default", []flow.Rule{
 			flow.NewRule("classify-default", flow.RuleGranularity, flow.Classify("best-effort")),
 		}),
@@ -479,10 +512,14 @@ func (server *Server) Handler() http.Handler {
 			item := server.managementNetworkState(ctx, false)
 			return normalizeManagementMode(stringField(item, "mode")) == "shared_lan" && stringField(item, "interface_id") == interfaceID
 		})
+		handler.SetUpdateService(newOrchestratorUpdateService(server))
 		handler.RegisterRoutes(mux)
 		if _, transparent := server.orchestratorRuntime.(orchestratorapi.TransparentRuntime); !transparent {
 			handler.StartServiceChainReconciler(context.Background(), server.orchestratorReconcileInterval)
 		}
+	}
+	if server.profile.ID() == product.Gateway().ID() {
+		server.registerGatewayConversionRoutes(mux)
 	}
 	for _, route := range productRoutes() {
 		if server.profile.Allows(route.capability) {
@@ -508,6 +545,17 @@ func (access orchestratorSessionAccess) Authorize(request *http.Request, permiss
 		return orchestratorapi.ErrAdminRequired
 	}
 	return nil
+}
+
+func (access orchestratorSessionAccess) Actor(request *http.Request) (string, string, bool) {
+	if access.server == nil {
+		return "", "", false
+	}
+	session, ok := access.server.sessionFromRequest(request)
+	if !ok {
+		return "", "", false
+	}
+	return session.Username, session.Role, true
 }
 
 func (server *Server) handleDNSPolicies(w http.ResponseWriter, r *http.Request) {
@@ -9334,6 +9382,10 @@ func (server *Server) sessionFromRequest(r *http.Request) (Session, bool) {
 }
 
 func (server *Server) recordAudit(actor, role, resource, action, status, eventError string, r *http.Request) {
+	server.recordAuditWithTransaction(actor, role, resource, action, status, eventError, requestID(r))
+}
+
+func (server *Server) recordAuditWithTransaction(actor, role, resource, action, status, eventError, transactionID string) {
 	eventError = auditSafeText(eventError)
 	server.auditMu.Lock()
 	defer server.auditMu.Unlock()
@@ -9346,11 +9398,11 @@ func (server *Server) recordAudit(actor, role, resource, action, status, eventEr
 		Action:    action,
 		Status:    status,
 		Error:     eventError,
-		RequestID: requestID(r),
+		RequestID: transactionID,
 	}
 	server.audit = append(server.audit, event)
 	if server.store != nil {
-		_ = server.store.SaveAuditEvents(r.Context(), []persistence.AuditEvent{{
+		_ = server.store.SaveAuditEvents(context.WithoutCancel(context.Background()), []persistence.AuditEvent{{
 			ID:            event.ID,
 			Timestamp:     event.Timestamp,
 			Actor:         event.Actor,
@@ -9359,7 +9411,7 @@ func (server *Server) recordAudit(actor, role, resource, action, status, eventEr
 			Action:        event.Action,
 			Status:        event.Status,
 			Error:         event.Error,
-			TransactionID: event.RequestID,
+			TransactionID: transactionID,
 		}})
 	}
 }

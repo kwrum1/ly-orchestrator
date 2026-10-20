@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "package_type": "ly-route-conversion",
+  "from_product": "gateway",
+  "to_product": "orchestrator",
+  "from_version": "26.06+lyroute1",
+  "to_version": "26.06+lyroute1",
+  "base_version": "26.06",
+  "suite": "bookworm",
+  "arch": "amd64",
+  "includes_dataplane": false,
+  "dataplane": {
+    "preserve": true,
+    "verify_packages": [
+      "vpp",
+      "vpp-plugin-core",
+      "vpp-plugin-dpdk",
+      "ly-route-vpp-apply",
+      "ly-route-vpp-orchestrator"
+    ],
+    "required_plugin": "ly_route_orchestrator_plugin.so"
+  },
+  "config": {
+    "migration": "preserve",
+    "preserve_database": false,
+    "snapshot_required": true
+  },
+  "rollback": {
+    "supported": true,
+    "backup_required": true
+  },
+  "services": {
+    "preserve_enable_state": true,
+    "units": [
+      "ly-route-control-api.service",
+      "ly-route-vpp-apply.service",
+      "ly-route-runtime-check.service",
+      "ly-route-recovery.service",
+      "ly-route-firstboot.service",
+      "vpp.service",
+      "nginx.service"
+    ]
+  },
+  "checksums": {
+    "usr/lib/ly-route/ly-route-control": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

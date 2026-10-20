@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"ly-route/backend/internal/orchestrator"
+	"ly-route/backend/internal/productupdate"
 )
 
 type topologyResponse struct {
@@ -82,6 +83,18 @@ func codeForError(err error) string {
 		return "forbidden"
 	case errors.Is(err, orchestrator.ErrInvalidName), errors.Is(err, orchestrator.ErrInvalidInterface), errors.Is(err, orchestrator.ErrInvalidBond):
 		return "invalid_topology"
+	case errors.Is(err, ErrTaskNotFound):
+		return "task_not_found"
+	case errors.Is(err, ErrTaskConflict):
+		return "task_conflict"
+	case errors.Is(err, ErrUpgradeUnsupported):
+		return "upgrade_unsupported"
+	case errors.Is(err, ErrConversionExecutionBlocked):
+		return "conversion_execution_blocked"
+	case errors.Is(err, productupdate.ErrInvalidConversionManifest):
+		return "invalid_conversion_manifest"
+	case errors.Is(err, productupdate.ErrConversionNotApplicable):
+		return "conversion_not_applicable"
 	default:
 		return "internal_error"
 	}

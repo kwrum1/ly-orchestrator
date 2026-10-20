@@ -101,6 +101,7 @@ if [ "${LY_ROUTE_BUILD_TAR_ONLY:-0}" != 1 ]; then
 fi
 
 source_commit=$(product_source_commit)
+ly_route_version=${LY_ROUTE_VERSION:-$source_commit}
 source_epoch=$(product_source_date_epoch)
 created_at=$(date -u -d "@$source_epoch" +%Y-%m-%dT%H:%M:%SZ)
 artifact_base="ly-route-upgrade-${product}-${suite}-${arch}"
@@ -222,12 +223,12 @@ if [ -d "$package_root/usr/share/ly-route/geodata" ]; then
 fi
 
 node - "$package_root/manifest.json" "$PRODUCT_BUILD_PROFILE" "$product" "$suite" "$arch" \
-  "$source_commit" "$created_at" "$control_hash" "$vpp_apply_hash" "$app_hash" \
+  "$source_commit" "$ly_route_version" "$created_at" "$control_hash" "$vpp_apply_hash" "$app_hash" \
   "$capabilities_hash" "$index_hash" "$shell_hash" "$styles_hash" "$nginx_hash" \
   "$service_hash" "$runtime_check_hash" "$firstboot_hash" "$firstboot_service_hash" \
   "$commercial_css_hash" "$profile_hash" "$artifact_manifest_hash" <<'NODE'
 const { readFileSync, writeFileSync } = require("node:fs");
-const [output, profilePath, product, suite, arch, commit, createdAt,
+const [output, profilePath, product, suite, arch, commit, version, createdAt,
   controlHash, vppHash, appHash, capabilitiesHash, indexHash, shellHash, stylesHash,
   nginxHash, serviceHash, runtimeCheckHash, firstbootHash, firstbootServiceHash,
   commercialCSSHash, profileHash, artifactManifestHash] = process.argv.slice(2);
@@ -255,6 +256,7 @@ const manifest = {
   suite,
   arch,
   commit,
+  version,
   created_at: createdAt,
   install_root: "/usr/lib/ly-route",
   services: profile.services,
