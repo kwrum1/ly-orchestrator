@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -127,6 +128,19 @@ func TestOrchestratorUpgradeInstallConflictWhileInstalling(t *testing.T) {
 	second := authenticatedJSONRequest(t, server, http.MethodPost, orchestratorapi.UpgradesPath+"/"+body.Item.ID+"/install", `{"confirm_install":true}`, cookie)
 	if second.Code != http.StatusConflict {
 		t.Fatalf("second install status = %d, want conflict: %s", second.Code, second.Body.String())
+	}
+}
+
+func TestUpgradeInstallerScriptsParse(t *testing.T) {
+	for name, script := range map[string]string{
+		"gateway":      firmwareUpgradeInstallScript,
+		"orchestrator": orchestratorUpgradeScript,
+	} {
+		command := exec.Command("bash", "-n")
+		command.Stdin = strings.NewReader(script)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("%s installer script syntax: %v: %s", name, err, strings.TrimSpace(string(output)))
+		}
 	}
 }
 
