@@ -17,8 +17,9 @@ import time
 
 STOP = False
 CONNECT_TIMEOUT = 30
-PING_FAILURE_LIMIT = 3
+PING_FAILURE_LIMIT = 24
 RECONNECT_DELAY = 5
+MAX_RECONNECT_DELAY = 30
 
 
 def log(message):
@@ -290,23 +291,27 @@ def main():
             break
         time.sleep(1)
 
+    reconnect_delay = RECONNECT_DELAY
     while not STOP:
         write_status(status_file, "connecting", name, reason="dialing")
         if not create_client(wan, name, host_uniq):
             write_status(status_file, "failed", name, reason="create pppoe client failed")
-            time.sleep(RECONNECT_DELAY)
+            time.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_DELAY)
             continue
         if not set_client(name, username, password, mru, plan):
             write_status(status_file, "failed", name, reason="set pppoe client failed")
             cleanup_stale(wan)
-            time.sleep(RECONNECT_DELAY)
+            time.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_DELAY)
             continue
 
         session = wait_for_session(time.time() + CONNECT_TIMEOUT)
         if not session:
             write_status(status_file, "connecting", name, reason="no PPPoE session")
             cleanup_stale(wan)
-            time.sleep(RECONNECT_DELAY)
+            time.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_DELAY)
             continue
 
         ensure_address(name, session["local"])
@@ -319,6 +324,7 @@ def main():
         else:
             write_status(status_file, "connected", name, session["session_id"],
                          session["local"], session["peer"], session["ac_mac"])
+            reconnect_delay = RECONNECT_DELAY
             log(f"{peer_id} connected session {session['session_id']} {session['local']} peer {session['peer']} on {name}")
 
         failures = 0 if healthy else 1
@@ -332,28 +338,39 @@ def main():
             else:
                 session = parse_detail(detail)
                 if not session:
-                    write_status(status_file, "connecting", name, reason="session lost")
-                    break
-                if session["local"] != current["local"] or session["session_id"] != current["session_id"]:
-                    ensure_address(name, session["local"])
-                    configure_nat(name, plan)
-                current = session
-                if session_healthy(name, session["peer"], plan.get("default_route", True)):
-                    failures = 0
-                    write_status(status_file, "connected", name, session["session_id"],
-                                 session["local"], session["peer"], session["ac_mac"])
+                    if "PPPOE_CLIENT_SESSION" in detail:
+                        # The plugin still owns a session but detail is not
+                        # parseable yet (label/address transition).  Do not
+                        # discard it and burn another pool address.
+                        failures += 1
+                        write_status(status_file, "degraded", name,
+                                     reason="session detail not ready")
+                    else:
+                        write_status(status_file, "connecting", name, reason="session lost")
+                        break
                 else:
-                    failures += 1
-                    write_status(status_file, "degraded", name, session["session_id"],
-                                 session["local"], session["peer"], session["ac_mac"],
-                                 reason="dataplane probe failed")
+                    if session["local"] != current["local"] or session["session_id"] != current["session_id"]:
+                        ensure_address(name, session["local"])
+                        configure_nat(name, plan)
+                    current = session
+                    if session_healthy(name, session["peer"], plan.get("default_route", True)):
+                        failures = 0
+                        reconnect_delay = RECONNECT_DELAY
+                        write_status(status_file, "connected", name, session["session_id"],
+                                     session["local"], session["peer"], session["ac_mac"])
+                    else:
+                        failures += 1
+                        write_status(status_file, "degraded", name, session["session_id"],
+                                     session["local"], session["peer"], session["ac_mac"],
+                                     reason="dataplane probe failed")
             if failures >= PING_FAILURE_LIMIT:
                 log(f"{peer_id} dataplane probe failed {failures} times; reconnecting")
                 break
 
         cleanup_stale(wan)
-        write_status(status_file, "disconnected", name)
-        time.sleep(RECONNECT_DELAY)
+        write_status(status_file, "connecting", name, reason="reconnecting")
+        time.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_DELAY)
 
     cleanup_stale(wan)
     write_status(status_file, "disconnected", name)

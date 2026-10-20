@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"ly-route/backend/internal/runtime/vpp"
 )
 
 func TestFilesystemControllerStopPPPoEStopsEveryInstanceAndVerifiesInterfacesGone(t *testing.T) {
@@ -85,6 +87,22 @@ func TestFilesystemControllerStopPPPoEContinuesAcrossInstanceFailures(t *testing
 	}
 	if !strings.Contains(strings.Join(runner.commands, "\n"), "systemctl stop ly-route-pppoe@ly-route-wan-green.service") {
 		t.Fatalf("second PPPoE instance was not stopped after first failure: %#v", runner.commands)
+	}
+}
+
+func TestRenderVPPOperationsIgnoresRequestID(t *testing.T) {
+	operationsA := []vpp.Operation{{Name: "vpp.interface.address", RequestID: "request-a", Resource: "lan"}}
+	operationsB := []vpp.Operation{{Name: "vpp.interface.address", RequestID: "request-b", Resource: "lan"}}
+	first, err := RenderVPPOperations(operationsA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := RenderVPPOperations(operationsB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first[0].ContentHash != second[0].ContentHash {
+		t.Fatalf("VPP operation render depends on request id: %s != %s", first[0].ContentHash, second[0].ContentHash)
 	}
 }
 

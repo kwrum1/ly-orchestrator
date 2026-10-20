@@ -301,7 +301,15 @@ func RenderVPPOperations(operations []vpp.Operation) ([]RenderedArtifact, error)
 	if len(operations) == 0 {
 		return nil, fmt.Errorf("vpp operation render requires at least one operation")
 	}
-	content, err := marshalIndented(map[string]any{"operations": operations})
+	// RequestID is per-transaction and must not leak into the persisted
+	// generation.  Otherwise every status/next-apply re-render has a different
+	// hash and the previous apply receipt looks corrupt forever.
+	stable := make([]vpp.Operation, len(operations))
+	for index, operation := range operations {
+		operation.RequestID = ""
+		stable[index] = operation
+	}
+	content, err := marshalIndented(map[string]any{"operations": stable})
 	if err != nil {
 		return nil, err
 	}
