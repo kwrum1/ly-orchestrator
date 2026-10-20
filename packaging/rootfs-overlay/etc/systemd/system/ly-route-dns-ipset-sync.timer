@@ -2,8 +2,13 @@
 Description=Periodically synchronize Ly Route DNS IP sets
 
 [Timer]
-OnBootSec=5s
-OnUnitActiveSec=2s
+OnBootSec=15s
+# Measure the interval from completion, not activation.  A oneshot run can
+# exceed the interval on a loaded router; OnUnitActiveSec then queues another
+# start while the previous run is still finishing and turns the timer into a
+# PID1 job storm.
+OnUnitInactiveSec=30s
+RandomizedDelaySec=5s
 AccuracySec=1s
 Unit=ly-route-dns-ipset-sync.service
 

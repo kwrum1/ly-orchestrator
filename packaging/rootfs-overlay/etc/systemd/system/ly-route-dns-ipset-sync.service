@@ -5,4 +5,9 @@ Wants=smartdns.service ly-route-control-api.service
 
 [Service]
 Type=oneshot
+# Bound the whole synchronization so a wedged control API cannot leave a
+# start job (and the timer) occupied indefinitely.
+TimeoutStartSec=60s
+TimeoutStopSec=15s
+Environment=LY_ROUTE_DNS_SYNC_API_TIMEOUT_SECONDS=10
 ExecStart=/usr/lib/ly-route/dns-ipset-sync.py
