@@ -7,7 +7,7 @@ Wants=network-online.target vpp.service
 Type=oneshot
 EnvironmentFile=-/etc/ly-route/runtime.env
 ExecStart=/usr/lib/ly-route/recover-runtime.sh
-TimeoutStartSec=420s
+TimeoutStartSec=180s
 
 [Install]
 WantedBy=multi-user.target

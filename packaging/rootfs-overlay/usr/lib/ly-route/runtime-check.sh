@@ -311,10 +311,14 @@ if [ "$LY_ROUTE_PRODUCT" = gateway ]; then
   pppoe_client_plugin_available=false
   if command -v vppctl >/dev/null 2>&1 &&
      plugin_output=$(vppctl show plugin 2>/dev/null) &&
-     cli_output=$(vppctl show cli 2>/dev/null) &&
-     printf '%s\n' "$plugin_output" | grep -q 'ly_route_pppoe_client_plugin.so' &&
-     printf '%s\n' "$cli_output" | grep -q 'set ly-route pppoe-client'; then
-    pppoe_client_plugin_available=true
+     cli_output=$(vppctl show cli 2>/dev/null); then
+    if printf '%s\n' "$plugin_output" | grep -q 'pppoeclient_plugin.so' &&
+       printf '%s\n' "$cli_output" | grep -q 'create pppoe client'; then
+      pppoe_client_plugin_available=true
+    elif printf '%s\n' "$plugin_output" | grep -q 'ly_route_pppoe_client_plugin.so' &&
+         printf '%s\n' "$cli_output" | grep -q 'set ly-route pppoe-client'; then
+      pppoe_client_plugin_available=true
+    fi
   fi
   if [ "$pppoe_client_plugin_available" != true ]; then
     missing_commands=$(append_missing "$missing_commands" vpp-pppoe-client-plugin)

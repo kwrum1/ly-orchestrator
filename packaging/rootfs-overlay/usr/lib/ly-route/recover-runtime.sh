@@ -6,13 +6,13 @@ set -eu
 : "${LY_ROUTE_RUNTIME_CHECK:=/usr/lib/ly-route/runtime-check.sh}"
 : "${LY_ROUTE_DNS_SYNC_TOKEN_FILE:=/etc/ly-route/dns-sync.token}"
 : "${LY_ROUTE_PPPOE_CONFIG_DIR:=/etc/ly-route/pppoe}"
-: "${LY_ROUTE_PPPOE_WAIT_SECONDS:=45}"
-: "${LY_ROUTE_RECOVERY_ATTEMPTS:=12}"
+: "${LY_ROUTE_PPPOE_WAIT_SECONDS:=20}"
+: "${LY_ROUTE_RECOVERY_ATTEMPTS:=3}"
 : "${LY_ROUTE_RECOVERY_RETRY_SECONDS:=5}"
 # A complete runtime transaction can restart VPP-side DNS adapters, Xray,
-# SmartDNS, and Kea.  It routinely exceeds 30 seconds on a cold PPPoE link;
-# timing out earlier queues overlapping transactions with stale PPPoE paths.
-: "${LY_ROUTE_RECOVERY_APPLY_TIMEOUT:=90}"
+# SmartDNS, and Kea.  Bound each attempt so the unit cannot run for 19 minutes
+# and block boot; the timer/next boot can retry after this pass.
+: "${LY_ROUTE_RECOVERY_APPLY_TIMEOUT:=60}"
 
 mkdir -p "$(dirname "$LY_ROUTE_RECOVERY_REPORT")"
 timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
