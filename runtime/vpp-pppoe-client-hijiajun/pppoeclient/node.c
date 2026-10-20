@@ -598,13 +598,18 @@ pppoeclient_session_input_one (vlib_main_t *vm, pppoeclient_main_t *pem, vlib_bu
    * current_length is safe; total_length_not_including_first_buffer stays 0. */
   b->current_length = clib_net_to_host_u16 (pppoe->length);
   vnet_buffer (b)->sw_if_index[VLIB_RX] = c->pppox_sw_if_index;
+  /* The PPPoX interface has no input node of its own: session-input is the
+   * first node that sees the decapsulated packet.  Account it here so
+   * "show interface lyppp-*" reflects received traffic instead of staying at
+   * zero while IP traffic is forwarded. */
+  vlib_increment_combined_counter (
+    pem->vnet_main->interface_main.combined_sw_if_counters +
+      VNET_INTERFACE_COUNTER_RX,
+    vlib_get_thread_index (), c->pppox_sw_if_index, 1,
+    vlib_buffer_length_in_chain (vm, b));
 
   if (ppp_proto == PPP_PROTOCOL_ip4)
     {
-      static int ip4_debug_count;
-      if (ip4_debug_count++ < 8)
-	clib_warning ("pppoeclient: RX ip4 length %u current_length %u",
-		      clib_net_to_host_u16 (pppoe->length), b->current_length);
       pppoeclient_try_update_tcp_mss (vnm, b, c->pppox_sw_if_index);
       vlib_buffer_advance (b, sizeof (u16));
       next = PPPOECLIENT_SESSION_INPUT_NEXT_IP4_INPUT;
@@ -639,10 +644,6 @@ pppoeclient_session_input_one (vlib_main_t *vm, pppoeclient_main_t *pem, vlib_bu
     }
   else
     {
-      static int proto_debug_count;
-      if (proto_debug_count++ < 12)
-	clib_warning ("pppoeclient: unsupported RX ppp proto 0x%04x length %u",
-		      ppp_proto, clib_net_to_host_u16 (pppoe->length));
       error = PPPOECLIENT_ERROR_UNSUPPORTED_PPP_PROTOCOL;
     }
 

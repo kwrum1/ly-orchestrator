@@ -122,7 +122,7 @@ def ensure_address(interface, local):
         run("set", "interface", "ip", "address", interface, wanted)
 
 
-def configure_nat(name, plan):
+def configure_nat(name, plan, local):
     if not plan.get("nat", True):
         return
     behavior = str(plan.get("nat_behavior", "")).lower()
@@ -141,6 +141,15 @@ def configure_nat(name, plan):
         run("nat44", "ei", "add", "interface", "address", name)
     else:
         run("nat44", "add", "interface", "address", name)
+        # NAT44 ED out2in runs before ip4-local.  Without an identity mapping
+        # for the router's own WAN address, inbound echo replies to locally
+        # originated traffic are dropped as "no translation".
+        run("nat44", "add", "identity", "mapping", local)
+
+
+def remove_identity(local):
+    if local:
+        run("nat44", "add", "identity", "mapping", local, "del")
 
 
 def peer_route_ready(interface, peer):
@@ -316,7 +325,7 @@ def main():
             continue
 
         ensure_address(name, session["local"])
-        configure_nat(name, plan)
+        configure_nat(name, plan, session["local"])
         healthy = session_healthy(name, session["peer"], plan.get("default_route", True))
         if not healthy:
             write_status(status_file, "degraded", name, session["session_id"],
@@ -352,8 +361,9 @@ def main():
                         break
                 else:
                     if session["local"] != current["local"] or session["session_id"] != current["session_id"]:
+                        remove_identity(current["local"])
                         ensure_address(name, session["local"])
-                        configure_nat(name, plan)
+                        configure_nat(name, plan, session["local"])
                         grace_until = time.time() + DATAPLANE_GRACE
                     current = session
                     if session_healthy(name, session["peer"], plan.get("default_route", True)):
@@ -381,6 +391,7 @@ def main():
                              reason="waiting for AC dataplane")
                 grace_until = time.time() + DATAPLANE_GRACE
 
+        remove_identity(current["local"])
         cleanup_stale(wan)
         write_status(status_file, "connecting", name, reason="reconnecting")
         time.sleep(reconnect_delay)
