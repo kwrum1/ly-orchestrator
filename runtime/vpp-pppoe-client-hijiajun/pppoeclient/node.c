@@ -967,6 +967,12 @@ pppoeclient_session_output_one (vlib_main_t *vm, pppoeclient_main_t *pem, vlib_b
     }
 
   next = c->hw_output_next_index;
+  if (next == ~0 || c->hw_output_node_index == 0)
+    {
+      error = PPPOECLIENT_ERROR_LINK_DOWN;
+      next = PPPOECLIENT_SESSION_OUTPUT_NEXT_DROP;
+      goto out;
+    }
   vnet_buffer (b)->sw_if_index[VLIB_TX] = c->sw_if_index;
   forwarded = 1;
 

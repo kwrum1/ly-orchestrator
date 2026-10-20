@@ -288,6 +288,7 @@ typedef struct
   u32 pppox_sw_if_index;
   u32 hw_if_index;
   u32 hw_output_next_index;
+  u32 hw_output_node_index;
   /* Parent hardware interface that owns the device-input feature.  For a
    * client on a VLAN sub-interface this differs from sw_if_index: VPP runs
    * the device-input arc on the physical port and demultiplexes tagged

@@ -1431,6 +1431,34 @@ pppoeclient_client_free_resources (pppoeclient_t *c)
   vec_free (c->control_history);
 }
 
+static void
+pppoeclient_refresh_hw_output (pppoeclient_main_t *pem, pppoeclient_t *c)
+{
+  vnet_hw_interface_t *hw;
+  u32 edge;
+
+  if (c == 0)
+    return;
+  hw = vnet_get_hw_interface (pem->vnet_main, c->hw_if_index);
+  if (hw == 0 || hw->output_node_index == 0)
+    return;
+  if (c->hw_output_next_index != ~0 &&
+      c->hw_output_node_index == hw->output_node_index)
+    return;
+  edge = vlib_node_get_next (pem->vlib_main,
+			     pppoeclient_session_output_node.index,
+			     hw->output_node_index);
+  if (edge == ~0)
+    edge = vlib_node_add_next (pem->vlib_main,
+			       pppoeclient_session_output_node.index,
+			       hw->output_node_index);
+  if (edge != ~0)
+    {
+      c->hw_output_next_index = edge;
+      c->hw_output_node_index = hw->output_node_index;
+    }
+}
+
 static uword
 pppoeclient_process (vlib_main_t *vm, vlib_node_runtime_t *rt, vlib_frame_t *f)
 {
@@ -1459,13 +1487,22 @@ pppoeclient_process (vlib_main_t *vm, vlib_node_runtime_t *rt, vlib_frame_t *f)
 	{
 	case EVENT_PPPOE_CLIENT_WAKEUP:
 	  for (i = 0; i < vec_len (event_data); i++)
-	    timeout = pppoeclient_sm (now, timeout, event_data[i]);
+	    {
+	      uword client_index = event_data[i];
+	      if (!pool_is_free_index (pem->clients, client_index))
+		pppoeclient_refresh_hw_output (
+		  pem, pool_elt_at_index (pem->clients, client_index));
+	      timeout = pppoeclient_sm (now, timeout, client_index);
+	    }
 	  break;
 
 	case ~0:
 	  pool_foreach (c, pem->clients)
 	    {
+	      pppoeclient_refresh_hw_output (pem, c);
 	      timeout = pppoeclient_sm (now, timeout, (uword) (c - pem->clients));
+	      if (c->state == PPPOE_CLIENT_SESSION && timeout > 1.0)
+		timeout = 1.0;
 	    };
 	  if (pool_elts (pem->clients) == 0)
 	    timeout = PPPOECLIENT_PROCESS_IDLE_TIMEOUT;
@@ -4093,19 +4130,32 @@ pppoeclient_add_del_internal (vnet_pppoeclient_add_del_args_t *a, u32 *pppox_sw_
       pppoeclient_sup_client_list_add (pem, c->sup_sw_if_index, result.fields.client_index);
 
       /* Add the interface output node to pppoeclient_session_output_node if not already
-       * present.  Physical interfaces are few, so once added the entry is never removed. */
+       * present.  Physical interfaces are few, so once added the entry is never removed.
+       * If the host-interface output node is not published yet, leave the edge
+       * unresolved; the process node re-resolves it after link-up instead of
+       * caching slot 0 (the null node) and blackholing every packet. */
       {
 	vnet_hw_interface_t *phy_hi = vnet_get_hw_interface (vnm, c->hw_if_index);
-	u32 edge =
-	  vlib_node_get_next (vm, pppoeclient_session_output_node.index, phy_hi->output_node_index);
-	if (~0 == edge)
+	c->hw_output_node_index = phy_hi->output_node_index;
+	if (phy_hi->output_node_index == 0)
 	  {
-	    c->hw_output_next_index = vlib_node_add_next (vm, pppoeclient_session_output_node.index,
-							  phy_hi->output_node_index);
+	    c->hw_output_next_index = ~0;
 	  }
 	else
 	  {
-	    c->hw_output_next_index = edge;
+	    u32 edge =
+	      vlib_node_get_next (vm, pppoeclient_session_output_node.index,
+				  phy_hi->output_node_index);
+	    if (~0 == edge)
+	      {
+		c->hw_output_next_index = vlib_node_add_next (vm, pppoeclient_session_output_node.index,
+							      phy_hi->output_node_index);
+	      }
+	    else
+	      {
+		c->hw_output_next_index = edge;
+	      }
+	    c->hw_output_node_index = phy_hi->output_node_index;
 	  }
       }
       /* dispatch is refcounted per access interface. */

@@ -511,6 +511,16 @@ pppox_handle_allocated_address (pppox_virtual_interface_t *t, u8 is_add)
   if (t->our_addr == 0)
     return;
 
+  if (is_add)
+    {
+      /* A reused pppox hw_if_index may still carry the initial 0.0.0.0/32
+       * placeholder from an earlier IPCP negotiation.  Remove it before the
+       * negotiated address is installed. */
+      ip4_address_t zero;
+      clib_memset (&zero, 0, sizeof (zero));
+      ip4_add_del_interface_address (pom->vlib_main, t->sw_if_index, &zero, 32, 1);
+    }
+
   /* Configure ip4 address. */
   our_adr_ipv4.as_u32 = t->our_addr;
   ip4_add_del_interface_address (pom->vlib_main, t->sw_if_index, (void *) &our_adr_ipv4, 32,

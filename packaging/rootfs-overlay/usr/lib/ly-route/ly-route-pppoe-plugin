@@ -79,11 +79,15 @@ def parse_detail(detail):
     )
     if not session_match or not address_match:
         return None
+    local = address_match.group(1)
+    peer = address_match.group(2)
+    if local in ("0.0.0.0", "::") or peer in ("0.0.0.0", "::"):
+        return None
     ac_match = re.search(r"ac-mac\s+(\S+)", detail)
     return {
         "session_id": int(session_match.group(1)),
-        "local": address_match.group(1),
-        "peer": address_match.group(2),
+        "local": local,
+        "peer": peer,
         "ac_mac": ac_match.group(1) if ac_match else "",
     }
 
@@ -108,6 +112,8 @@ def remove_all_addresses(interface, keep=""):
 
 
 def ensure_address(interface, local):
+    if not local or local in ("0.0.0.0", "::"):
+        return
     wanted = f"{local}/32"
     remove_all_addresses(interface, keep=wanted)
     if wanted not in interface_addresses(interface):
