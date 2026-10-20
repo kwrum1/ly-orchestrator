@@ -302,7 +302,12 @@ func LoadNativePathRequestWithSharedManagement(path, management string, interfac
 				if len(item.Candidates) > 0 {
 					candidates[name] = append([]CapabilityProof(nil), item.Candidates...)
 				} else {
+					// Older runtime reports emit one proof instead of a candidate
+					// array. A single data interface must not be rejected merely
+					// because the report has one candidate; smart-QoS availability
+					// is still checked by candidateRejectionReasons.
 					proofs[name] = item.Proof
+					candidates[name] = []CapabilityProof{item.Proof}
 				}
 			}
 		}
