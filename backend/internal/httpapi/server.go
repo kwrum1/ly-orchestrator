@@ -1246,6 +1246,11 @@ func (server *Server) adminPasswordMatches(ctx context.Context, password string)
 	if server.store != nil {
 		stored, err := server.store.AuthUser(ctx, server.auth.AdminUsername)
 		if err == nil && stored.PasswordHash != "" {
+			// A stale provisioning row that still requires a password change may
+			// coexist with the per-device factory password printed by firstboot.
+			if stored.PasswordChangeRequired && constantEqual(password, server.auth.AdminPassword) {
+				return true
+			}
 			return constantEqual(stored.PasswordHash, hashPassword(server.auth.AdminUsername, password))
 		}
 	}
@@ -1259,6 +1264,9 @@ func (server *Server) adminPasswordChangeRequired(ctx context.Context, password 
 	if server.store != nil {
 		stored, err := server.store.AuthUser(ctx, server.auth.AdminUsername)
 		if err == nil && stored.Stored {
+			if stored.PasswordChangeRequired && constantEqual(password, server.auth.AdminPassword) {
+				return true
+			}
 			return stored.PasswordChangeRequired
 		}
 	}
