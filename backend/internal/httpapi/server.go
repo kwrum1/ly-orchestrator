@@ -448,6 +448,17 @@ func newServer(profile product.Profile, options ...Option) *Server {
 		vppReceiptPath:   envOrDefault("LY_ROUTE_VPP_RECEIPT", "/var/lib/ly-route/vpp-apply-receipt.json"),
 		firmwareStageDir: envOrDefault("LY_ROUTE_FIRMWARE_STAGE_DIR", "/var/lib/ly-route/firmware-update"),
 		firmwareInstallStart: func(invocation firmwareInstallInvocation) error {
+			// The installer restarts ly-route-control-api.  A plain child
+			// process lives in this service's cgroup and is killed by that
+			// restart halfway through the upgrade, skipping both the health
+			// check and restore_backup.  Launch it as an independent transient
+			// systemd unit so it survives the control service restart.
+			if _, err := exec.LookPath("systemd-run"); err == nil {
+				unit := "ly-route-firmware-install-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+				args := []string{"--no-block", "--collect", "--unit=" + unit, invocation.Name}
+				args = append(args, invocation.Args...)
+				return exec.Command("systemd-run", args...).Run()
+			}
 			return exec.Command(invocation.Name, invocation.Args...).Start()
 		},
 		subscriptionFetch: proxy.FetchSubscription,
@@ -2462,6 +2473,13 @@ func (server *Server) compileDNSPolicyResource(ctx context.Context, req DNSPolic
 	expandedPolicy, err := server.expandDNSPolicySourceGroups(ctx, policy)
 	if err != nil {
 		return DNSPolicyResource{}, nil, "", err
+	}
+	for _, rule := range expandedPolicy.Rules {
+		if rule.Outcome.Kind == dns.OutcomeDirect &&
+			strings.TrimSpace(rule.Outcome.UpstreamID) != "" &&
+			strings.TrimSpace(rule.Outcome.WANEgressID) != "" {
+			return DNSPolicyResource{}, nil, "", fmt.Errorf("dns rule %q direct outcome must not select both an upstream and WAN egress", rule.ID)
+		}
 	}
 	compiled, err := dns.CompilePolicy(expandedPolicy, []proxy.Egress{server.proxyEgress})
 	if err != nil {

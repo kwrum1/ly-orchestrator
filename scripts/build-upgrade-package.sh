@@ -60,6 +60,12 @@ esac
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 geodata_dir=${LY_ROUTE_GEODATA_DIR:-$repo_root/packaging/geodata}
+vpp_pppoe_plugin=${LY_ROUTE_PPPOECLIENT_PLUGIN:-$repo_root/build/vpp-pppoeclient-hijiajun/cmake/lib/vpp_plugins/pppoeclient_plugin.so}
+case "$arch" in
+  amd64) vpp_multiarch=x86_64-linux-gnu ;;
+  arm64) vpp_multiarch=aarch64-linux-gnu ;;
+esac
+vpp_plugin_rel="usr/lib/$vpp_multiarch/vpp_plugins/pppoeclient_plugin.so"
 . "$repo_root/scripts/lib/product-build-profile.sh"
 load_product_build_profile "$repo_root" "$product" "$manifest"
 export LY_ROUTE_SOURCE_FINGERPRINT=$(product_source_fingerprint "$repo_root")
@@ -122,6 +128,12 @@ trap 'rm -rf "$work_parent"' EXIT INT TERM
 mkdir -p "$artifact_dir" "$package_root/usr/lib/ly-route" "$package_root/usr/share/ly-route" \
   "$package_root/opt/ly-route/admin" "$package_root/etc/ly-route" \
   "$package_root/etc/nginx/conf.d" "$package_root/etc/systemd/system"
+if [ "$product" = gateway ]; then
+  product_build_require_file "$vpp_pppoe_plugin"
+  mkdir -p "$package_root/$(dirname "$vpp_plugin_rel")"
+  cp "$vpp_pppoe_plugin" "$package_root/$vpp_plugin_rel"
+  chmod 0755 "$package_root/$vpp_plugin_rel"
+fi
 
 if [ -n "$control_binary" ]; then
   cp "$control_binary" "$package_root/usr/lib/ly-route/ly-route-control"
@@ -157,10 +169,15 @@ if [ "$product" = gateway ]; then
 fi
 service="$package_root/etc/systemd/system/ly-route-control-api.service"
 cp "$repo_root/packaging/rootfs-overlay/etc/systemd/system/ly-route-control-api.service" "$service"
-for runtime_script in runtime-check.sh firstboot.sh; do
+for runtime_script in runtime-check.sh firstboot.sh recover-runtime.sh; do
   cp "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/$runtime_script" "$package_root/usr/lib/ly-route/$runtime_script"
   chmod 0755 "$package_root/usr/lib/ly-route/$runtime_script"
 done
+if [ "$product" = gateway ]; then
+  cp "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/ly-route-pppoe-plugin" \
+    "$package_root/usr/lib/ly-route/ly-route-pppoe-plugin"
+  chmod 0755 "$package_root/usr/lib/ly-route/ly-route-pppoe-plugin"
+fi
 firstboot_service="$package_root/etc/systemd/system/ly-route-firstboot.service"
 cp "$repo_root/packaging/rootfs-overlay/etc/systemd/system/ly-route-firstboot.service" "$firstboot_service"
 awk -v profile='Environment=LY_ROUTE_PRODUCT_PROFILE=/etc/ly-route/product-manifest.json' \
@@ -185,6 +202,13 @@ nginx_hash=$(sha256sum "$package_root/etc/nginx/conf.d/ly-route-admin.conf" | cu
 service_hash=$(sha256sum "$service" | cut -d' ' -f1)
 runtime_check_hash=$(sha256sum "$package_root/usr/lib/ly-route/runtime-check.sh" | cut -d' ' -f1)
 firstboot_hash=$(sha256sum "$package_root/usr/lib/ly-route/firstboot.sh" | cut -d' ' -f1)
+recover_runtime_hash=$(sha256sum "$package_root/usr/lib/ly-route/recover-runtime.sh" | cut -d' ' -f1)
+plugin_hash=
+helper_hash=
+if [ "$product" = gateway ]; then
+  plugin_hash=$(sha256sum "$package_root/$vpp_plugin_rel" | cut -d' ' -f1)
+  helper_hash=$(sha256sum "$package_root/usr/lib/ly-route/ly-route-pppoe-plugin" | cut -d' ' -f1)
+fi
 firstboot_service_hash=$(sha256sum "$firstboot_service" | cut -d' ' -f1)
 commercial_css_hash=$(sha256sum "$package_root/opt/ly-route/admin/commercial.css" | cut -d' ' -f1)
 profile_hash=$(sha256sum "$package_root/etc/ly-route/product-manifest.json" | cut -d' ' -f1)
@@ -200,12 +224,19 @@ $styles_hash  opt/ly-route/admin/styles.css
 $nginx_hash  etc/nginx/conf.d/ly-route-admin.conf
 $service_hash  etc/systemd/system/ly-route-control-api.service
 $runtime_check_hash  usr/lib/ly-route/runtime-check.sh
+$recover_runtime_hash  usr/lib/ly-route/recover-runtime.sh
 $firstboot_hash  usr/lib/ly-route/firstboot.sh
 $firstboot_service_hash  etc/systemd/system/ly-route-firstboot.service
 $commercial_css_hash  opt/ly-route/admin/commercial.css
 $profile_hash  etc/ly-route/product-manifest.json
 $artifact_manifest_hash  usr/share/ly-route/artifact-manifest.json
 EOF
+if [ "$product" = gateway ]; then
+  cat >>"$package_root/checksums.sha256" <<EOF
+$plugin_hash  $vpp_plugin_rel
+$helper_hash  usr/lib/ly-route/ly-route-pppoe-plugin
+EOF
+fi
 if [ -d "$package_root/usr/share/ly-route/geodata" ]; then
   for geodata_file in geoip.dat geosite.dat china-list.txt manifest.json; do
     if [ -f "$package_root/usr/share/ly-route/geodata/$geodata_file" ]; then
@@ -219,39 +250,54 @@ node - "$package_root/manifest.json" "$PRODUCT_BUILD_PROFILE" "$product" "$suite
   "$source_commit" "$created_at" "$control_hash" "$vpp_apply_hash" "$app_hash" \
   "$capabilities_hash" "$index_hash" "$shell_hash" "$styles_hash" "$nginx_hash" \
   "$service_hash" "$runtime_check_hash" "$firstboot_hash" "$firstboot_service_hash" \
-  "$commercial_css_hash" "$profile_hash" "$artifact_manifest_hash" <<'NODE'
+  "$commercial_css_hash" "$profile_hash" "$artifact_manifest_hash" \
+  "$recover_runtime_hash" "$plugin_hash" "$helper_hash" "$vpp_plugin_rel" <<'NODE'
 const { readFileSync, writeFileSync } = require("node:fs");
 const [output, profilePath, product, suite, arch, commit, createdAt,
   controlHash, vppHash, appHash, capabilitiesHash, indexHash, shellHash, stylesHash,
   nginxHash, serviceHash, runtimeCheckHash, firstbootHash, firstbootServiceHash,
-  commercialCSSHash, profileHash, artifactManifestHash] = process.argv.slice(2);
+  commercialCSSHash, profileHash, artifactManifestHash,
+  recoverRuntimeHash, pluginHash, helperHash, pluginRelativePath] = process.argv.slice(2);
 const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+const checksums = {
+  "usr/lib/ly-route/ly-route-control": controlHash,
+  "usr/lib/ly-route/vpp-apply": vppHash,
+  "opt/ly-route/admin/app.js": appHash,
+  "opt/ly-route/admin/capabilities.json": capabilitiesHash,
+  "opt/ly-route/admin/index.html": indexHash,
+  "opt/ly-route/admin/shell.js": shellHash,
+  "opt/ly-route/admin/styles.css": stylesHash,
+  "etc/nginx/conf.d/ly-route-admin.conf": nginxHash,
+  "etc/systemd/system/ly-route-control-api.service": serviceHash,
+  "usr/lib/ly-route/runtime-check.sh": runtimeCheckHash,
+  "usr/lib/ly-route/recover-runtime.sh": recoverRuntimeHash,
+  "usr/lib/ly-route/firstboot.sh": firstbootHash,
+  "etc/systemd/system/ly-route-firstboot.service": firstbootServiceHash,
+  "opt/ly-route/admin/commercial.css": commercialCSSHash,
+  "etc/ly-route/product-manifest.json": profileHash,
+  "usr/share/ly-route/artifact-manifest.json": artifactManifestHash,
+};
+if (product === "gateway") {
+  checksums[pluginRelativePath] = pluginHash;
+  checksums["usr/lib/ly-route/ly-route-pppoe-plugin"] = helperHash;
+}
 const manifest = {
   package_type: "ly-route-upgrade",
+  version: commit,
   product,
   suite,
   arch,
   commit,
   created_at: createdAt,
   install_root: "/usr/lib/ly-route",
+  includes_dataplane: product === "gateway",
+  dataplane: product === "gateway" ? {
+    vpp_plugin: pluginRelativePath,
+    pppoe_helper: "usr/lib/ly-route/ly-route-pppoe-plugin",
+    recover_runtime: "usr/lib/ly-route/recover-runtime.sh",
+  } : undefined,
   services: profile.services,
-  checksums: {
-    "usr/lib/ly-route/ly-route-control": controlHash,
-    "usr/lib/ly-route/vpp-apply": vppHash,
-    "opt/ly-route/admin/app.js": appHash,
-    "opt/ly-route/admin/capabilities.json": capabilitiesHash,
-    "opt/ly-route/admin/index.html": indexHash,
-    "opt/ly-route/admin/shell.js": shellHash,
-    "opt/ly-route/admin/styles.css": stylesHash,
-    "etc/nginx/conf.d/ly-route-admin.conf": nginxHash,
-    "etc/systemd/system/ly-route-control-api.service": serviceHash,
-    "usr/lib/ly-route/runtime-check.sh": runtimeCheckHash,
-    "usr/lib/ly-route/firstboot.sh": firstbootHash,
-    "etc/systemd/system/ly-route-firstboot.service": firstbootServiceHash,
-    "opt/ly-route/admin/commercial.css": commercialCSSHash,
-    "etc/ly-route/product-manifest.json": profileHash,
-    "usr/share/ly-route/artifact-manifest.json": artifactManifestHash,
-  },
+  checksums,
 };
 writeFileSync(output, `${JSON.stringify(manifest, null, 2)}\n`);
 NODE

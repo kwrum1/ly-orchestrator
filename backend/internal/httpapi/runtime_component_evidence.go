@@ -11,6 +11,12 @@ import (
 
 func (server *Server) attachServiceEvidence(ctx context.Context, components []RuntimeComponentState, artifacts []serviceRuntime.RenderedArtifact) []RuntimeComponentState {
 	evidence := server.runtimeEvidence()
+	// The status plan can consume most of the request deadline before this
+	// evidence pass starts.  Live readback commands are independently bounded
+	// by the runner, so detach them from the already-expired request context;
+	// otherwise every component is reported degraded solely because the
+	// handler reached it late.
+	evidenceCtx := context.WithoutCancel(ctx)
 	services := map[string]serviceRuntime.ServiceName{
 		"smartdns":        serviceRuntime.SmartDNS,
 		"kea":             serviceRuntime.Kea,
@@ -50,8 +56,8 @@ func (server *Server) attachServiceEvidence(ctx context.Context, components []Ru
 			continue
 		}
 		request := RuntimeEvidenceRequest{TransactionID: evidence.TransactionID, Capability: components[index].Name, Artifacts: serviceArtifacts}
-		receipt, receiptErr := server.runtimeReceipt(ctx, request)
-		readback, readbackErr := server.runtimeReadback(ctx, request)
+		receipt, receiptErr := server.runtimeReceipt(evidenceCtx, request)
+		readback, readbackErr := server.runtimeReadback(evidenceCtx, request)
 		if receiptErr != nil || readbackErr != nil {
 			components[index].State = "degraded"
 			components[index].Available = false

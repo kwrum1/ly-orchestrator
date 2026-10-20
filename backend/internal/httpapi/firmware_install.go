@@ -28,13 +28,19 @@ test -x "$tmp/usr/lib/ly-route/ly-route-control"
 test -x "$tmp/usr/lib/ly-route/vpp-apply"
 
 # A control-plane-only payload would silently roll the device back to the old
-# dataplane.  Require the native VPP PPPoE plugin (or an explicit manifest
-# claim that the payload includes the dataplane) before touching the system.
-if [ ! -f "$tmp/usr/lib/x86_64-linux-gnu/vpp_plugins/pppoeclient_plugin.so" ] &&
+# dataplane.  Require both the native VPP PPPoE plugin and the explicit
+# manifest claim; a manifest claim without the file is not installable.
+case "$(uname -m)" in
+  aarch64|arm64) dataplane_plugin_rel="usr/lib/aarch64-linux-gnu/vpp_plugins/pppoeclient_plugin.so" ;;
+  *) dataplane_plugin_rel="usr/lib/x86_64-linux-gnu/vpp_plugins/pppoeclient_plugin.so" ;;
+esac
+dataplane_plugin="$tmp/$dataplane_plugin_rel"
+if [ ! -f "$dataplane_plugin" ] ||
    ! grep -q '"includes_dataplane"[[:space:]]*:[[:space:]]*true' "$tmp/manifest.json"; then
   echo "refusing upgrade: payload does not include the VPP/PPPoE dataplane" >&2
   exit 1
 fi
+test -f "$tmp/usr/lib/ly-route/ly-route-pppoe-plugin"
 
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 backup=/var/lib/ly-route/firmware-update/backup-$stamp
@@ -43,6 +49,15 @@ if [ -e "$target_dir" ]; then cp -a "$target_dir" "$backup/target"; fi
 if [ -e /opt/ly-route/admin ]; then cp -a /opt/ly-route/admin "$backup/admin"; fi
 if [ -e /etc/nginx/conf.d/ly-route-admin.conf ]; then cp -a /etc/nginx/conf.d/ly-route-admin.conf "$backup/ly-route-admin.conf"; fi
 if [ -e /etc/systemd/system/ly-route-firstboot.service ]; then cp -a /etc/systemd/system/ly-route-firstboot.service "$backup/ly-route-firstboot.service"; fi
+if [ -e "/$dataplane_plugin_rel" ]; then
+  cp -a "/$dataplane_plugin_rel" "$backup/plugin"
+fi
+if [ -e /usr/lib/ly-route/ly-route-pppoe-plugin ]; then
+  cp -a /usr/lib/ly-route/ly-route-pppoe-plugin "$backup/helper"
+fi
+if [ -e /usr/lib/ly-route/recover-runtime.sh ]; then
+  cp -a /usr/lib/ly-route/recover-runtime.sh "$backup/recover"
+fi
 
 restore_backup() {
   echo "upgrade failed; restoring $backup" >&2
@@ -60,6 +75,15 @@ restore_backup() {
   if [ -e "$backup/ly-route-firstboot.service" ]; then
     cp -a "$backup/ly-route-firstboot.service" /etc/systemd/system/ly-route-firstboot.service
   fi
+  if [ -e "$backup/plugin" ]; then
+    install -D -m 0755 "$backup/plugin" "/$dataplane_plugin_rel"
+  fi
+  if [ -e "$backup/helper" ]; then
+    install -m 0755 "$backup/helper" /usr/lib/ly-route/ly-route-pppoe-plugin
+  fi
+  if [ -e "$backup/recover" ]; then
+    install -m 0755 "$backup/recover" /usr/lib/ly-route/recover-runtime.sh
+  fi
   systemctl daemon-reload || true
   systemctl restart ly-route-control-api.service || true
   systemctl reload nginx.service || systemctl restart nginx.service || true
@@ -68,6 +92,11 @@ restore_backup() {
 install -d -m 0755 "$target_dir"
 install -m 0755 "$tmp/usr/lib/ly-route/ly-route-control" "$target_dir/ly-route-control"
 install -m 0755 "$tmp/usr/lib/ly-route/vpp-apply" "$target_dir/vpp-apply"
+install -D -m 0755 "$dataplane_plugin" "/$dataplane_plugin_rel"
+install -m 0755 "$tmp/usr/lib/ly-route/ly-route-pppoe-plugin" "$target_dir/ly-route-pppoe-plugin"
+if [ -f "$tmp/usr/lib/ly-route/recover-runtime.sh" ]; then
+  install -m 0755 "$tmp/usr/lib/ly-route/recover-runtime.sh" "$target_dir/recover-runtime.sh"
+fi
 for runtime_script in runtime-check.sh firstboot.sh; do
   if [ -f "$tmp/usr/lib/ly-route/$runtime_script" ]; then
     install -m 0755 "$tmp/usr/lib/ly-route/$runtime_script" "$target_dir/$runtime_script"

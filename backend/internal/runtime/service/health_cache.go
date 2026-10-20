@@ -66,7 +66,12 @@ func (cache *runtimeHealthCache) check(ctx context.Context, service ServiceName,
 	cache.flights[service] = flight
 	cache.mu.Unlock()
 
-	probeCtx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
+	// The probe is shared by every waiter and is deliberately detached from
+	// the caller's request context.  Otherwise a status request that returns
+	// (or whose handler context is cancelled) aborts the warm probe, caches a
+	// false "unknown/degraded" result for the next request, and makes the
+	// component state depend on request timing rather than systemd.
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), healthCheckTimeout)
 	health, err := probe(probeCtx)
 	cancel()
 	if err == nil && !health.Available && health.Reason == "" {

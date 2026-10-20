@@ -34,15 +34,18 @@ func (err *UpgradeProductMismatchError) Is(target error) bool {
 }
 
 type upgradePackageManifest struct {
-	PackageType string            `json:"package_type"`
-	Product     product.ID        `json:"product"`
-	Suite       string            `json:"suite,omitempty"`
-	Arch        string            `json:"arch,omitempty"`
-	Commit      string            `json:"commit,omitempty"`
-	CreatedAt   string            `json:"created_at,omitempty"`
-	InstallRoot string            `json:"install_root,omitempty"`
-	Services    []string          `json:"services,omitempty"`
-	Checksums   map[string]string `json:"checksums"`
+	PackageType       string            `json:"package_type"`
+	Version           string            `json:"version,omitempty"`
+	Product           product.ID        `json:"product"`
+	Suite             string            `json:"suite,omitempty"`
+	Arch              string            `json:"arch,omitempty"`
+	Commit            string            `json:"commit,omitempty"`
+	CreatedAt         string            `json:"created_at,omitempty"`
+	InstallRoot       string            `json:"install_root,omitempty"`
+	IncludesDataplane bool              `json:"includes_dataplane,omitempty"`
+	Dataplane         map[string]string `json:"dataplane,omitempty"`
+	Services          []string          `json:"services,omitempty"`
+	Checksums         map[string]string `json:"checksums"`
 }
 
 func validateUpgradePackage(packagePath string, expectedProduct product.ID) error {

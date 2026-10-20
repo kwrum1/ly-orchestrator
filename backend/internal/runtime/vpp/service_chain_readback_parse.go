@@ -145,6 +145,19 @@ func parseObservedServiceChainABFPolicy(output string) (observedServiceChainABFP
 		}
 		nextHop, addressErr := netip.ParseAddr(fields[3])
 		if addressErr != nil {
+			// Route-policy ABF paths use a lookup table, rendered by VPP as
+			// "via table <id>", not as an address + service interface.
+			if fields[3] == "table" && len(fields) >= 5 {
+				tableID, tableErr := strconv.Atoi(strings.TrimRight(fields[4], ",:"))
+				if tableErr != nil {
+					return observedServiceChainABFPolicy{}, serviceChainDecodeError("ABF path table %q", fields[4])
+				}
+				paths++
+				observed.AddressFamily = family
+				observed.NextHop = fmt.Sprintf("ip4-lookup-in-table %d", tableID)
+				observed.ServiceInterface = ""
+				continue
+			}
 			return observedServiceChainABFPolicy{}, serviceChainDecodeError("ABF path next hop %q", fields[3])
 		}
 		paths++
