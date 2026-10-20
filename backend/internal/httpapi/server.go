@@ -46,7 +46,7 @@ const (
 	DefaultVersion      = "dev"
 	HeaderRequestID     = "X-Request-ID"
 	HeaderDNSSyncToken  = "X-LY-Route-DNS-Sync-Token"
-	runtimeApplyTimeout = 4 * time.Minute
+	runtimeApplyTimeout = 8 * time.Minute
 )
 
 type HealthResponse struct {

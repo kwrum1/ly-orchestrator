@@ -35,7 +35,7 @@ func validatePPPoEReadback(ctx context.Context, runner CommandRunner, artifacts 
 }
 
 func validateNativePPPoEReadback(ctx context.Context, runner CommandRunner, peerID, statusFile string) error {
-	deadline := time.NewTimer(8 * time.Second)
+	deadline := time.NewTimer(30 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -50,7 +50,7 @@ func validateNativePPPoEReadback(ctx context.Context, runner CommandRunner, peer
 		case <-ctx.Done():
 			return fmt.Errorf("PPPoE peer %s did not converge: %w", peerID, errors.Join(lastErr, ctx.Err()))
 		case <-deadline.C:
-			return fmt.Errorf("PPPoE peer %s did not converge within 8s: %w", peerID, lastErr)
+			return fmt.Errorf("PPPoE peer %s did not converge within 30s: %w", peerID, lastErr)
 		case <-ticker.C:
 		}
 	}

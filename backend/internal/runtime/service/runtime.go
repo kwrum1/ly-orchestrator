@@ -92,10 +92,11 @@ type SystemctlRunner struct{}
 func (SystemctlRunner) Run(ctx context.Context, name string, args ...string) error {
 	timeout := 2 * time.Minute
 	if name == "systemctl" {
-		// Start/stop/restart normally completes in well under a second, but
-		// PID1 can be busy on a loaded router.  Bound it so an apply cannot
-		// hang forever; the outer transaction still owns the overall budget.
-		timeout = 45 * time.Second
+		// Enable/restart talks to PID1, which can be slow while VPP is
+		// polling a core.  A 45s cap caused otherwise-valid applies to roll
+		// back; keep the outer transaction budget but give each unit command
+		// a realistic window.
+		timeout = 2 * time.Minute
 	}
 	output, err := runCommandBounded(ctx, timeout, name, args...)
 	if err != nil {
@@ -124,7 +125,7 @@ func (SystemctlRunner) Status(ctx context.Context, service ServiceName) (Health,
 	// just by the child context.  A timeout is reported as unknown/degraded,
 	// never as "the unit is not active".
 	unit := serviceUnit(service)
-	_, err := runCommandBounded(ctx, 5*time.Second, "systemctl", "is-active", "--quiet", unit)
+	_, err := runCommandBounded(ctx, 6*time.Second, "systemctl", "is-active", "--quiet", unit)
 	if err == nil {
 		return Health{Service: service, Available: true}, nil
 	}

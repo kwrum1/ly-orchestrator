@@ -8,6 +8,7 @@ PartOf=vpp.service ly-route-pppoe.target
 
 [Service]
 Type=simple
+TimeoutStopSec=20s
 ExecStart=/usr/lib/ly-route/ly-route-pppoe-plugin -config /etc/ly-route/pppoe/%i.json
 Restart=on-failure
 RestartSec=3s
