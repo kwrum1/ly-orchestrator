@@ -35,3 +35,17 @@
 - The current local Xray two-TAP service network is an implementation precedent, not a ready-made external-appliance integration.
 - Nginx-like proxies only cover their supported protocols (typically TCP/HTTP/HTTPS); UDP/QUIC and arbitrary transparent traffic require a different proxy.
 - Integration must define: health checks, bypass/fail-closed behavior, asymmetric-return validation, MTU/MSS handling, conntrack/state, loop prevention and rollback.
+
+## Testing model for Gateway and Orchestrator
+
+- Gateway and Orchestrator use the same delivery loop:
+  1. dedicated functional tester produces a feature matrix and bug report;
+  2. development expert performs targeted fixes;
+  3. tester reruns regression;
+  4. only a clean regression can open the next gate.
+- The tester is read-only and does not fix code; the development expert fixes code and builds artifacts.
+- Orchestrator testing starts only after its backend reaches a testable development milestone and the user or coordinator explicitly starts it.
+- Orchestrator test scope must cover: backend/API, DB/persistence, auth/audit/health, topology/groups, policy compile/apply, configuration export/snapshot/import/restore, telemetry, upgrade/version/rollback, rootfs/upgrade/disk, the real VPP orchestrator plugin, and Gateway/Orchestrator conversion once implemented.
+- Orchestrator tests use an isolated temporary instance, database and ports; they must not modify the Gateway router or delete user VMs.
+- Explicit exclusions: no multi-site/cross-gateway management, no Orchestrator ISO, no frontend UI testing, no security/penetration review.
+- Every report must distinguish "environment not ready" from "product bug", include reproduction and evidence, and classify P0/P1/P2.
