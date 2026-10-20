@@ -3979,7 +3979,7 @@ func TestFirmwareUpdateInstallStartsAsyncPackageInstaller(t *testing.T) {
 			t.Fatalf("install command contains forbidden disk writer %q: %s", forbidden, script)
 		}
 	}
-	for _, required := range []string{"sha256sum", "zstd -dc", "tar -x", "manifest.json", "ly-route-upgrade", "install -m 0755", "/usr/lib/ly-route/ly-route-control", "/usr/lib/ly-route/vpp-apply", "systemctl restart ly-route-control-api.service", "reboot -f"} {
+	for _, required := range []string{"sha256sum", "zstd -dc", "tar -x", "manifest.json", "ly-route-upgrade", "install -m 0755", "/usr/lib/ly-route/ly-route-control", "/usr/lib/ly-route/vpp-apply", "systemctl restart ly-route-control-api.service", "restore_backup", "systemctl reboot"} {
 		if !strings.Contains(script, required) {
 			t.Fatalf("install command missing %q: %s", required, script)
 		}
