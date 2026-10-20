@@ -468,6 +468,12 @@ pppox_allocate_interface (u32 pppoeclient_index)
    * directly; it encapsulates the frame and forwards it to the physical port.
    * Set on both the fresh-registration and hw_if_index-reuse paths. */
   hi->output_node_index = pppox_get_tx_node_index ();
+  /* FIB/adjacency traffic on a point-to-point interface enters tx_node_index,
+   * while interface-output traffic enters output_node_index.  A device class
+   * without tx_function leaves tx_node_index pointing at the null node, which
+   * shows up as "<ifname>-tx blackholed packets".  Point both edges at the
+   * shared session-output node. */
+  hi->tx_node_index = pppox_get_tx_node_index ();
 
   t->hw_if_index = hw_if_index;
   t->sw_if_index = sw_if_index = hi->sw_if_index;
@@ -501,6 +507,9 @@ pppox_handle_allocated_address (pppox_virtual_interface_t *t, u8 is_add)
   ip4_address_t our_adr_ipv4;
   fib_prefix_t pfx;
   u32 fib_index;
+
+  if (t->our_addr == 0)
+    return;
 
   /* Configure ip4 address. */
   our_adr_ipv4.as_u32 = t->our_addr;
@@ -681,6 +690,20 @@ pppox_set_interface_name (u32 sw_if_index, const u8 *name)
 	{
 	  clib_warning ("pppox: rename to %v failed: %U", t->custom_name, format_clib_error, err);
 	  clib_error_free (err);
+	}
+      else
+	{
+	  /* vnet_rename_interface can reset the per-interface output node to
+	   * the device-class default (the null node).  Re-apply the shared
+	   * pppoeclient-session-output edge after every rename, otherwise all
+	   * TX packets on a custom-named lyppp-* interface are blackholed. */
+	  vnet_hw_interface_t *hi =
+	    vnet_get_hw_interface (pom->vnet_main, t->hw_if_index);
+	  if (hi)
+	    {
+	      hi->output_node_index = pppox_get_tx_node_index ();
+	      hi->tx_node_index = pppox_get_tx_node_index ();
+	    }
 	}
     }
 }
@@ -1078,6 +1101,19 @@ ifaddr_callback (void *arg)
 
   if (a->is_add)
     {
+      if (a->our_adr == 0)
+	{
+	  /* IPCP initialization calls sifaddr with 0.0.0.0 before the peer
+	   * assigns an address.  Installing that placeholder leaves a
+	   * permanent 0.0.0.0/32 on the session interface. */
+	  return 0;
+	}
+      if (t->our_addr != 0 && t->our_addr != a->our_adr)
+	{
+	  /* A reconnect can negotiate a different local address.  Remove the
+	   * previous address/peer route before installing the new one. */
+	  pppox_handle_allocated_address (t, 0);
+	}
       t->our_addr = a->our_adr;
       t->his_addr = a->his_adr;
       pppox_handle_allocated_address (t, 1);
@@ -1354,6 +1390,9 @@ int
 sifaddr (int unit, u32 our_adr, u32 his_adr, u32 net_mask)
 {
   ifaddr_arg_t a;
+
+  if (our_adr == 0)
+    return 1;
 
   clib_memset (&a, 0, sizeof (a));
   a.unit = unit;

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Ly Route native PPPoE peer driven by the Hi-Jiajun VPP PPPoE plugin.
 
-This replaces the old userspace Go PPPoE client and never invokes pppd.  The
-plugin owns discovery, LCP/PAP/CHAP, IPCP and IPv6CP; this process only maps
-the appliance peer plan to `vppctl` and publishes the status contract.
+The plugin owns discovery, LCP/PAP/CHAP, IPCP and IPv6CP.  This process maps
+the appliance peer plan to `vppctl`, publishes the status contract, and keeps
+the session honest: a VPP session is only reported connected when the
+negotiated address, the peer route and an actual dataplane probe all agree.
 """
 import hashlib
 import json
@@ -15,6 +16,9 @@ import sys
 import time
 
 STOP = False
+CONNECT_TIMEOUT = 30
+PING_FAILURE_LIMIT = 3
+RECONNECT_DELAY = 5
 
 
 def log(message):
@@ -38,13 +42,21 @@ def run(*args, timeout=10):
     return code, out
 
 
-def write_status(path, state, interface="", local="", peer=""):
+def write_status(path, state, interface="", session_id=0, local="", peer="", ac_mac="", reason=""):
     if not path:
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {"state": state, "interface": interface}
-    if local:
-        payload["session"] = {"local_address": local, "peer_address": peer}
+    if session_id or local or peer or ac_mac:
+        payload["session"] = {
+            "session_id": int(session_id or 0),
+            "local_address": local,
+            "peer_address": peer,
+        }
+        if ac_mac:
+            payload["session"]["ac_mac"] = ac_mac
+    if reason:
+        payload["reason"] = reason
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, separators=(",", ":"))
@@ -58,15 +70,22 @@ def plugin_name(peer_id):
     return "lyppp-" + digest
 
 
-def parse_session(detail):
-    match = re.search(
+def parse_detail(detail):
+    if "PPPOE_CLIENT_SESSION" not in detail:
+        return None
+    session_match = re.search(r"session-id\s+(\d+)", detail)
+    address_match = re.search(
         r"runtime\s+ipv4\s+local\s+(\S+)\s+peer\s+(\S+)", detail
     )
-    if not match:
-        return None, None
-    if "PPPOE_CLIENT_SESSION" not in detail:
-        return None, None
-    return match.group(1), match.group(2)
+    if not session_match or not address_match:
+        return None
+    ac_match = re.search(r"ac-mac\s+(\S+)", detail)
+    return {
+        "session_id": int(session_match.group(1)),
+        "local": address_match.group(1),
+        "peer": address_match.group(2),
+        "ac_mac": ac_match.group(1) if ac_match else "",
+    }
 
 
 def interface_addresses(interface):
@@ -81,13 +100,16 @@ def interface_addresses(interface):
     return addresses
 
 
-def remove_all_addresses(interface):
+def remove_all_addresses(interface, keep=""):
     for address in interface_addresses(interface):
+        if keep and address == keep:
+            continue
         run("set", "interface", "ip", "address", "del", interface, address)
 
 
 def ensure_address(interface, local):
     wanted = f"{local}/32"
+    remove_all_addresses(interface, keep=wanted)
     if wanted not in interface_addresses(interface):
         run("set", "interface", "ip", "address", interface, wanted)
 
@@ -111,6 +133,109 @@ def configure_nat(name, plan):
         run("nat44", "ei", "add", "interface", "address", name)
     else:
         run("nat44", "add", "interface", "address", name)
+
+
+def peer_route_ready(interface, peer):
+    code, out, _ = vppctl("show", "ip", "fib", peer)
+    if code != 0 or interface not in out:
+        return False
+    return True
+
+
+def default_route_ready(interface):
+    for prefix in ("0.0.0.0/0", "0.0.0.0"):
+        code, out, _ = vppctl("show", "ip", "fib", prefix)
+        if code == 0 and interface in out:
+            return True
+    return False
+
+
+def ping_peer(interface, peer):
+    code, out, _ = vppctl(
+        "ping", peer, "source", interface, "repeat", "3", "interval", "0.2",
+        timeout=12,
+    )
+    if code != 0:
+        return False
+    match = re.search(r"(\d+)\s+received", out)
+    if not match or int(match.group(1)) == 0:
+        return False
+    return "100% packet loss" not in out
+
+
+def session_healthy(interface, peer, require_default=False):
+    if not (ping_peer(interface, peer) and peer_route_ready(interface, peer)):
+        return False
+    if require_default:
+        return default_route_ready(interface)
+    return True
+
+
+def interface_index(name):
+    code, out, _ = vppctl("show", "interface")
+    if code != 0:
+        return None
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == name and fields[1].isdigit():
+            return fields[1]
+    return None
+
+
+def stale_clients(wan):
+    code, out, _ = vppctl("show", "pppoe", "client")
+    if code != 0:
+        return []
+    clients = []
+    for line in out.splitlines():
+        match = re.search(r"access-interface\s+(\S+)\s+host-uniq\s+(\d+)", line)
+        if match and match.group(1) == wan:
+            clients.append(match.group(2))
+    return clients
+
+
+def cleanup_stale(wan):
+    index = interface_index(wan)
+    for uniq in stale_clients(wan):
+        if index:
+            run("create", "pppoe", "client", "sw-if-index", index,
+                "host-uniq", uniq, "del")
+        else:
+            run("create", "pppoe", "client", wan, "host-uniq", uniq, "del")
+    time.sleep(1)
+
+
+def create_client(wan, name, host_uniq):
+    cleanup_stale(wan)
+    code, _ = run(
+        "create", "pppoe", "client", wan, "host-uniq", str(host_uniq),
+        "name", name,
+    )
+    return code == 0
+
+
+def set_client(name, username, password, mru, plan):
+    args = [
+        "set", "pppoe", "client", name,
+        "username", username, "password", password,
+        "mru", str(mru), "mtu", str(mru),
+    ]
+    if plan.get("default_route", True):
+        args.append("add-default-route")
+    if plan.get("nat", True):
+        args.append("use-peer-dns")
+    return run(*args)[0] == 0
+
+
+def wait_for_session(deadline):
+    while not STOP and time.time() < deadline:
+        code, detail, _ = vppctl("show", "pppoe", "client", "detail")
+        if code == 0:
+            session = parse_detail(detail)
+            if session and session["local"] and session["peer"]:
+                return session
+        time.sleep(0.5)
+    return None
 
 
 def stop(*_):
@@ -151,8 +276,6 @@ def main():
 
     write_status(status_file, "connecting", name)
 
-    # The underlay may still be creating the host-interface; do not fail the
-    # peer unit just because the VPP apply job is still in flight.
     for _ in range(60):
         if STOP:
             break
@@ -161,61 +284,72 @@ def main():
             break
         time.sleep(1)
 
-    # Remove a previous instance and stale addresses before reconnecting.
-    run("create", "pppoe", "client", wan, "host-uniq", str(host_uniq), "del")
-    time.sleep(1)
-    remove_all_addresses(name)
-    code, _ = run(
-        "create", "pppoe", "client", wan, "host-uniq", str(host_uniq),
-        "name", name,
-    )
-    if code != 0:
-        write_status(status_file, "failed", name)
-        return 1
-    set_args = [
-        "set", "pppoe", "client", name,
-        "username", username, "password", password,
-        "mru", str(mru), "mtu", str(mru),
-    ]
-    if plan.get("default_route", True):
-        set_args.append("add-default-route")
-    if plan.get("nat", True):
-        set_args.append("use-peer-dns")
-    run(*set_args)
-
-    local = peer = None
-    for _ in range(40):
-        if STOP:
-            break
-        code, detail, _ = vppctl("show", "pppoe", "client", "detail")
-        if code == 0:
-            local, peer = parse_session(detail)
-            if local:
-                break
-        time.sleep(0.5)
-
-    if local:
-        ensure_address(name, local)
-        configure_nat(name, plan)
-        write_status(status_file, "connected", name, local, peer or "")
-        log(f"{peer_id} connected {local} peer {peer or '?'} on {name}")
-    else:
-        write_status(status_file, "connecting", name)
-
     while not STOP:
-        time.sleep(5)
-        code, detail, _ = vppctl("show", "pppoe", "client", "detail")
-        if code != 0:
-            write_status(status_file, "unavailable", name)
+        write_status(status_file, "connecting", name, reason="dialing")
+        if not create_client(wan, name, host_uniq):
+            write_status(status_file, "failed", name, reason="create pppoe client failed")
+            time.sleep(RECONNECT_DELAY)
             continue
-        local, peer = parse_session(detail)
-        if local:
-            ensure_address(name, local)
-            write_status(status_file, "connected", name, local, peer or "")
-        else:
-            write_status(status_file, "connecting", name)
+        if not set_client(name, username, password, mru, plan):
+            write_status(status_file, "failed", name, reason="set pppoe client failed")
+            cleanup_stale(wan)
+            time.sleep(RECONNECT_DELAY)
+            continue
 
-    run("create", "pppoe", "client", wan, "host-uniq", str(host_uniq), "del")
+        session = wait_for_session(time.time() + CONNECT_TIMEOUT)
+        if not session:
+            write_status(status_file, "connecting", name, reason="no PPPoE session")
+            cleanup_stale(wan)
+            time.sleep(RECONNECT_DELAY)
+            continue
+
+        ensure_address(name, session["local"])
+        configure_nat(name, plan)
+        healthy = session_healthy(name, session["peer"], plan.get("default_route", True))
+        if not healthy:
+            write_status(status_file, "degraded", name, session["session_id"],
+                         session["local"], session["peer"], session["ac_mac"],
+                         reason="dataplane probe failed")
+        else:
+            write_status(status_file, "connected", name, session["session_id"],
+                         session["local"], session["peer"], session["ac_mac"])
+            log(f"{peer_id} connected session {session['session_id']} {session['local']} peer {session['peer']} on {name}")
+
+        failures = 0 if healthy else 1
+        current = session
+        while not STOP:
+            time.sleep(5)
+            code, detail, _ = vppctl("show", "pppoe", "client", "detail")
+            if code != 0:
+                write_status(status_file, "unavailable", name, reason="vppctl unavailable")
+                failures += 1
+            else:
+                session = parse_detail(detail)
+                if not session:
+                    write_status(status_file, "connecting", name, reason="session lost")
+                    break
+                if session["local"] != current["local"] or session["session_id"] != current["session_id"]:
+                    ensure_address(name, session["local"])
+                    configure_nat(name, plan)
+                current = session
+                if session_healthy(name, session["peer"], plan.get("default_route", True)):
+                    failures = 0
+                    write_status(status_file, "connected", name, session["session_id"],
+                                 session["local"], session["peer"], session["ac_mac"])
+                else:
+                    failures += 1
+                    write_status(status_file, "degraded", name, session["session_id"],
+                                 session["local"], session["peer"], session["ac_mac"],
+                                 reason="dataplane probe failed")
+            if failures >= PING_FAILURE_LIMIT:
+                log(f"{peer_id} dataplane probe failed {failures} times; reconnecting")
+                break
+
+        cleanup_stale(wan)
+        write_status(status_file, "disconnected", name)
+        time.sleep(RECONNECT_DELAY)
+
+    cleanup_stale(wan)
     write_status(status_file, "disconnected", name)
     return 0
 
