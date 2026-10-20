@@ -1,0 +1,15 @@
+version: 2
+ethernets:
+  mgmt:
+    match:
+      macaddress: "52:54:00:aa:bb:21"
+    dhcp4: true
+    dhcp4-overrides:
+      route-metric: 100
+  lan:
+    match:
+      macaddress: "52:54:00:aa:bb:22"
+    dhcp4: true
+    dhcp4-overrides:
+      route-metric: 200
+    optional: true

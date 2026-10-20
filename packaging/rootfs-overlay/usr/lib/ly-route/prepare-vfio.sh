@@ -40,11 +40,14 @@ else
   printf '%s\n' 'VPP ownership preflight skipped: no installer NIC mapping'
   exit 0
 fi
-[ -n "$management_pci" ] || fail 'management PCI identity is missing'
 if [ -z "$pci_rows" ]; then
-  printf '%s\n' 'VPP ownership preflight: native path selected; Linux retains NIC drivers'
+  # VMnet/AF_PACKET and native paths do not hand PCI devices to VFIO. A
+  # MAC-only installer mapping has no management PCI, and that must not block
+  # VPP startup when there is no DPDK data interface to take over.
+  printf '%s\n' 'VPP ownership preflight: no DPDK data interface; Linux retains NIC drivers'
   exit 0
 fi
+[ -n "$management_pci" ] || fail 'management PCI identity is missing'
 
 is_selected() {
   candidate=$1

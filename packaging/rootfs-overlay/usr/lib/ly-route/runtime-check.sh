@@ -15,6 +15,7 @@ umask 077
 : "${LY_ROUTE_SYSFS_ROOT:=/sys}"
 : "${LY_ROUTE_VPP_NATIVE_BENCHMARK:=}"
 : "${LY_ROUTE_VMXNET3_AF_PACKET_ACCEPTANCE:=false}"
+: "${LY_ROUTE_VMNET_AF_PACKET_ACCEPTANCE:=false}"
 : "${LY_ROUTE_DATAPLANE_ACTIVE_STATE:=/var/lib/ly-route/dataplane/active.json}"
 : "${LY_ROUTE_ACTIVE_DPDK_READER:=/usr/lib/ly-route/active-dpdk-state.py}"
 
@@ -444,11 +445,20 @@ for interface_name in $(split_csv "$LY_ROUTE_VPP_DATA_INTERFACES"); do
     if [ -e "$interface_device/driver" ]; then
       interface_driver=$(basename "$(readlink -f "$interface_device/driver" 2>/dev/null)")
     fi
-    if [ "$LY_ROUTE_VMXNET3_AF_PACKET_ACCEPTANCE" = true ] && [ "$interface_driver" = vmxnet3 ] &&
+    vmnet_af_packet_acceptable=false
+    if [ "$LY_ROUTE_VMXNET3_AF_PACKET_ACCEPTANCE" = true ] && [ "$interface_driver" = vmxnet3 ]; then
+      vmnet_af_packet_acceptable=true
+    fi
+    if [ "$LY_ROUTE_VMNET_AF_PACKET_ACCEPTANCE" = true ]; then
+      case "$interface_driver" in
+        e1000|vmxnet3) vmnet_af_packet_acceptable=true ;;
+      esac
+    fi
+    if [ "$vmnet_af_packet_acceptable" = true ] &&
        printf '%s\n' "$plugin_output" | grep -q 'af_packet_plugin.so' &&
        ip link set dev "$interface_name" promisc on >/dev/null 2>&1 &&
        native_score=$(probe_native_candidate "$interface_name" af_packet linux_packet_socket); then
-      vmxnet3_af_packet_candidate="{\"tier\":\"vpp_native\",\"hook\":\"af_packet\",\"mode\":\"linux_packet_socket\",\"source\":\"runtime_probe\",\"runtime_verified\":true,\"native\":true,\"high_performance\":false,\"acceptance_only\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$native_score,\"kernel_driver\":\"vmxnet3\",\"mac_address\":\"$(json_escape "$interface_mac")\",\"smart_qos_plugin_available\":$smart_qos_plugin_available}"
+      vmxnet3_af_packet_candidate="{\"tier\":\"vpp_native\",\"hook\":\"af_packet\",\"mode\":\"linux_packet_socket\",\"source\":\"runtime_probe\",\"runtime_verified\":true,\"native\":true,\"high_performance\":false,\"acceptance_only\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$native_score,\"kernel_driver\":\"$interface_driver\",\"mac_address\":\"$(json_escape "$interface_mac")\",\"smart_qos_plugin_available\":$smart_qos_plugin_available}"
       native_candidate=$vmxnet3_af_packet_candidate
     fi
     # VMXNET3 is validated through AF_PACKET only. Its unsupported native

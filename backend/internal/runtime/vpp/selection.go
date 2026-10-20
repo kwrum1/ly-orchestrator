@@ -327,7 +327,7 @@ func LoadNativePathRequestWithSharedManagement(path, management string, interfac
 		Assignments:         assignments,
 		ReportPrerequisites: reportPrerequisites,
 		Now:                 now,
-		AcceptanceAFPacket:  os.Getenv("LY_ROUTE_VMXNET3_AF_PACKET_ACCEPTANCE") == "true",
+		AcceptanceAFPacket:  os.Getenv("LY_ROUTE_VMXNET3_AF_PACKET_ACCEPTANCE") == "true" || os.Getenv("LY_ROUTE_VMNET_AF_PACKET_ACCEPTANCE") == "true",
 	}
 }
 

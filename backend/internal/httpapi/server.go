@@ -1196,12 +1196,23 @@ type authUserWriteRequest struct {
 	Enabled  *bool  `json:"enabled"`
 }
 
+func (server *Server) authAvailable(ctx context.Context) bool {
+	if server.auth.configured() {
+		return true
+	}
+	if server.store != nil && strings.TrimSpace(server.auth.AdminUsername) != "" {
+		stored, err := server.store.AuthUser(ctx, server.auth.AdminUsername)
+		return err == nil && stored.PasswordHash != ""
+	}
+	return false
+}
+
 func (server *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
 		return
 	}
-	if !server.auth.configured() {
+	if !server.authAvailable(r.Context()) {
 		writeError(w, r, http.StatusServiceUnavailable, "auth_not_configured", "admin credentials are not configured")
 		return
 	}
@@ -1433,7 +1444,7 @@ func (server *Server) handleUserItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (server *Server) users(ctx context.Context) []User {
-	users := []User{{Username: server.auth.AdminUsername, Role: "admin", Enabled: server.auth.configured()}}
+	users := []User{{Username: server.auth.AdminUsername, Role: "admin", Enabled: server.authAvailable(ctx)}}
 	if strings.TrimSpace(server.auth.ReadonlyUsername) != "" {
 		users = append(users, User{Username: server.auth.ReadonlyUsername, Role: "readonly", Enabled: server.auth.readonlyConfigured()})
 	}
@@ -3377,14 +3388,21 @@ func (server *Server) handleDesiredMutation(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		if !exists {
-			writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
-			return
+			// A physical NIC with a telemetry row has no desired-state row
+			// until its first role configuration. The UI edits that row in
+			// place, so interface PATCH must be able to create the initial
+			// desired document. Other resources keep strict update semantics.
+			if resourceType != "interface" {
+				writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+				return
+			}
+		} else {
+			merged := cloneObject(current)
+			for key, value := range payload {
+				merged[key] = value
+			}
+			payload = merged
 		}
-		merged := cloneObject(current)
-		for key, value := range payload {
-			merged[key] = value
-		}
-		payload = merged
 	}
 	id := nonEmpty(explicitID, stringField(payload, "id"))
 	if id == "" {

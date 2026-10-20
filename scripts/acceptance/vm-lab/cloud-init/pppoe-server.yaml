@@ -1,0 +1,81 @@
+#cloud-config
+hostname: ly-lab-pppoe
+manage_etc_hosts: true
+ssh_pwauth: false
+users:
+  - name: lab
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - __SSH_PUBKEY__
+package_update: true
+packages:
+  - pppoe
+  - ppp
+  - dnsmasq
+  - curl
+  - openssh-server
+write_files:
+  - path: /etc/ppp/pppoe-server-options
+    permissions: '0644'
+    content: |
+      noauth
+      mtu 1492
+      mru 1492
+      lcp-echo-interval 5
+      lcp-echo-failure 3
+      ms-dns 100.64.0.1
+  - path: /etc/ppp/pap-secrets
+    permissions: '0600'
+    content: |
+      labuser * labpass *
+  - path: /etc/ppp/chap-secrets
+    permissions: '0600'
+    content: |
+      labuser * labpass *
+  - path: /etc/systemd/system/lab-pppoe.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Ly Route VM lab PPPoE access concentrator
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      Type=simple
+      ExecStartPre=/bin/sh -c 'ip link set eth1 up'
+      ExecStart=/usr/sbin/pppoe-server -F -I eth1 -L 100.64.0.1 -R 100.64.0.100 -N 8 -C LY-LAB -O /etc/ppp/pppoe-server-options
+      Restart=always
+      RestartSec=2
+      [Install]
+      WantedBy=multi-user.target
+  - path: /srv/lab/health
+    permissions: '0644'
+    content: |
+      ok
+  - path: /etc/systemd/system/lab-http.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Ly Route VM lab upstream HTTP
+      After=network.target
+      [Service]
+      Type=simple
+      ExecStart=/usr/bin/python3 -m http.server 8080 --directory /srv/lab
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/dnsmasq.d/lab.conf
+    permissions: '0644'
+    content: |
+      bind-interfaces
+      listen-address=0.0.0.0
+      address=/pppoe.test/100.64.0.1
+      no-resolv
+      server=1.1.1.1
+runcmd:
+  - systemctl disable --now systemd-resolved || true
+  - systemctl daemon-reload
+  - systemctl enable --now lab-http.service
+  - systemctl enable --now lab-pppoe.service
+  - systemctl enable --now dnsmasq
+  - ip link set eth1 up
