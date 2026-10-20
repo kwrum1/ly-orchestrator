@@ -642,7 +642,10 @@ pppox_free_interface (u32 hw_if_index)
   pppox_clear_allocated_runtime_state (t);
   t->pppoe_session_allocated = 0;
 
-  vec_add1 (pom->free_pppox_hw_if_indices, hw_if_index);
+  /* Do not recycle the hw/sw_if_index.  A reused PPPoX interface keeps its
+   * old adjacency/output-interface RX state, which is exactly how an AC
+   * restart leaves VPP receiving replies that never reach ip4-input.  A fresh
+   * interface per session is cheaper than that stale state. */
   pom->virtual_interface_index_by_sw_if_index[hi->sw_if_index] = ~0;
   pppox_cleanup_virtual_interface (unit);
   pool_put (pom->virtual_interfaces, t);

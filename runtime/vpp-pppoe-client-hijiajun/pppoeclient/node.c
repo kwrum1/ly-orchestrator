@@ -601,6 +601,10 @@ pppoeclient_session_input_one (vlib_main_t *vm, pppoeclient_main_t *pem, vlib_bu
 
   if (ppp_proto == PPP_PROTOCOL_ip4)
     {
+      static int ip4_debug_count;
+      if (ip4_debug_count++ < 8)
+	clib_warning ("pppoeclient: RX ip4 length %u current_length %u",
+		      clib_net_to_host_u16 (pppoe->length), b->current_length);
       pppoeclient_try_update_tcp_mss (vnm, b, c->pppox_sw_if_index);
       vlib_buffer_advance (b, sizeof (u16));
       next = PPPOECLIENT_SESSION_INPUT_NEXT_IP4_INPUT;
@@ -635,6 +639,10 @@ pppoeclient_session_input_one (vlib_main_t *vm, pppoeclient_main_t *pem, vlib_bu
     }
   else
     {
+      static int proto_debug_count;
+      if (proto_debug_count++ < 12)
+	clib_warning ("pppoeclient: unsupported RX ppp proto 0x%04x length %u",
+		      ppp_proto, clib_net_to_host_u16 (pppoe->length));
       error = PPPOECLIENT_ERROR_UNSUPPORTED_PPP_PROTOCOL;
     }
 
