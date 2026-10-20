@@ -267,10 +267,9 @@ func (server *Server) ensureOrchestratorConfigResources(ctx context.Context, pay
 	if server.profile.ID() != product.Orchestrator().ID() {
 		return nil
 	}
-	if _, ok := payload.Resources[orchestratorTopologyConfigResource]; ok {
-		return nil
-	}
-	if _, ok := payload.Resources[orchestratorPolicyConfigResource]; ok {
+	_, hasTopology := payload.Resources[orchestratorTopologyConfigResource]
+	_, hasPolicy := payload.Resources[orchestratorPolicyConfigResource]
+	if hasTopology && hasPolicy {
 		return nil
 	}
 	resources, err := server.orchestratorConfigResources(ctx)
@@ -280,8 +279,11 @@ func (server *Server) ensureOrchestratorConfigResources(ctx context.Context, pay
 	if payload.Resources == nil {
 		payload.Resources = map[string][]json.RawMessage{}
 	}
-	for resourceType, items := range resources {
-		payload.Resources[resourceType] = items
+	if !hasTopology {
+		payload.Resources[orchestratorTopologyConfigResource] = resources[orchestratorTopologyConfigResource]
+	}
+	if !hasPolicy {
+		payload.Resources[orchestratorPolicyConfigResource] = resources[orchestratorPolicyConfigResource]
 	}
 	return nil
 }
