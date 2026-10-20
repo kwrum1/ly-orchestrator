@@ -141,6 +141,16 @@ def main():
 
     write_status(status_file, "connecting", name)
 
+    # The underlay may still be creating the host-interface; do not fail the
+    # peer unit just because the VPP apply job is still in flight.
+    for _ in range(60):
+        if STOP:
+            break
+        code, out, _ = vppctl("show", "interface", wan)
+        if code == 0 and "up" in out:
+            break
+        time.sleep(1)
+
     # Remove a previous instance and stale addresses before reconnecting.
     run("create", "pppoe", "client", wan, "host-uniq", str(host_uniq), "del")
     time.sleep(1)
