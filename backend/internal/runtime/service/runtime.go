@@ -1765,6 +1765,14 @@ func RenderPPPoEConfig(peers []PPPoEPeer) ([]RenderedArtifact, error) {
 		if !strings.HasPrefix(wanInterface, "lyroute-") {
 			wanInterface = "lyroute-" + wanInterface
 		}
+		natInside := peer.NATInsideInterfaces
+		if natInside == nil {
+			natInside = []string{}
+		}
+		ipv6LAN := peer.IPv6LANInterfaces
+		if ipv6LAN == nil {
+			ipv6LAN = []string{}
+		}
 		content, err := marshalIndented(map[string]any{
 			"id":                    peer.ID,
 			"control_interface":     controlInterface,
@@ -1777,10 +1785,10 @@ func RenderPPPoEConfig(peers []PPPoEPeer) ([]RenderedArtifact, error) {
 			"status_file":           "/run/ly-route/pppoe/" + peer.ID + ".json",
 			"default_route":         true,
 			"nat":                   true,
-			"nat_inside_interfaces": peer.NATInsideInterfaces,
+			"nat_inside_interfaces": natInside,
 			"nat_behavior":          peer.NATBehavior,
 			"ipv6_prefix_group":     peer.IPv6PrefixGroup,
-			"ipv6_lan_interfaces":   peer.IPv6LANInterfaces,
+			"ipv6_lan_interfaces":   ipv6LAN,
 		})
 		if err != nil {
 			return nil, err

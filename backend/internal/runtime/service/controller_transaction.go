@@ -79,8 +79,10 @@ func (controller FilesystemController) applyWithRecovery(ctx context.Context, se
 	// An unchanged native PPPoE plan must not tear down a live session. A
 	// needless stop/start races the AC and makes policy routing observe a
 	// missing pppoe_session. Restart only after a plan change or loss of the
-	// native session.
-	skipPPPoEApply := service == PPPoE && artifactsMatchSnapshot(controller, snapshot, artifacts) && nativePPPoEArtifactsReady(ctx, controller.Runner, artifacts)
+	// native session.  A helper that is still dialing (status connecting /
+	// degraded) is already converging and must not be restarted either.
+	skipPPPoEApply := service == PPPoE && artifactsMatchSnapshot(controller, snapshot, artifacts) &&
+		nativePPPoEArtifactsActive(ctx, controller.Runner, artifacts)
 	if persistOnly {
 		if err := controller.verifyPersistedArtifacts(artifacts); err != nil {
 			return restoreFailedApply(err, false)
@@ -104,16 +106,28 @@ func (controller FilesystemController) applyWithRecovery(ctx context.Context, se
 				return restoreFailedApply(err, false)
 			}
 		}
-		if err := liveReadback(ctx, controller.Runner, service, artifacts); err != nil {
+		var readbackErr error
+		if service == PPPoE {
+			// PPPoE is an asynchronous resource: LCP/IPCP and the dataplane
+			// probe routinely take 105-265s on a loaded AC.  Apply must not
+			// hold the transaction (or roll it back) while the helper is still
+			// legitimately converging.  Accept a published connecting/connected
+			// status and let runtime/status track the final state.
+			readbackErr = pppoeApplyStarted(ctx, controller.Runner, artifacts)
+		} else {
+			readbackErr = liveReadback(ctx, controller.Runner, service, artifacts)
+		}
+		if readbackErr != nil {
 			if service == PPPoE {
-				// A failed PPPoE readback must not leave a retrying or stale session.
-				// Stop all rendered peers and verify VPP has no residual session.
+				// If the peer unit did not even publish a status, stop it but
+				// never disable it; the next apply or boot must be able to
+				// bring WAN back.
 				stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 				stopErr := controller.Stop(stopCtx, service, artifacts)
 				cancel()
-				return restoreFailedApply(errors.Join(fmt.Errorf("%s live readback: %w", service, err), stopErr), false)
+				return restoreFailedApply(errors.Join(fmt.Errorf("%s apply start: %w", service, readbackErr), stopErr), false)
 			}
-			return restoreFailedApply(fmt.Errorf("%s live readback: %w", service, err), true)
+			return restoreFailedApply(fmt.Errorf("%s live readback: %w", service, readbackErr), true)
 		}
 	}
 	if err := controller.saveApplyRecord(service, artifacts, transactionIDFromContext(ctx)); err != nil {
@@ -260,17 +274,11 @@ func artifactContentsEqual(left, right []byte) bool {
 	return leftErr == nil && rightErr == nil && bytes.Equal(leftCanonical, rightCanonical)
 }
 
-func nativePPPoEArtifactsReady(ctx context.Context, runner CommandRunner, artifacts []RenderedArtifact) bool {
+func nativePPPoEArtifactsActive(ctx context.Context, runner CommandRunner, artifacts []RenderedArtifact) bool {
 	peerCount := 0
 	for _, artifact := range artifacts {
 		if !strings.HasPrefix(artifact.Path, "/etc/ly-route/pppoe/ly-route-") {
 			continue
-		}
-		instance := strings.TrimSuffix(filepath.Base(artifact.Path), ".json")
-		unit := "ly-route-pppoe@" + instance + ".service"
-		state, err := runner.Output(ctx, "systemctl", "is-active", unit)
-		if err != nil || strings.TrimSpace(state) != "active" {
-			return false
 		}
 		var plan struct {
 			StatusFile string `json:"status_file"`
@@ -278,12 +286,103 @@ func nativePPPoEArtifactsReady(ctx context.Context, runner CommandRunner, artifa
 		if json.Unmarshal([]byte(artifact.Content), &plan) != nil || plan.StatusFile == "" {
 			return false
 		}
-		peerCount++
-		if err := validateNativePPPoEOnce(ctx, runner, plan.StatusFile); err != nil {
+		output, err := runner.Output(ctx, "cat", plan.StatusFile)
+		if err != nil {
+			return false
+		}
+		var status struct {
+			State string `json:"state"`
+		}
+		if json.Unmarshal([]byte(output), &status) != nil {
+			return false
+		}
+		switch strings.TrimSpace(status.State) {
+		case "connected", "connecting", "degraded":
+			peerCount++
+		default:
 			return false
 		}
 	}
 	return peerCount > 0
+}
+
+func pppoeStatusPublished(ctx context.Context, runner CommandRunner, artifacts []RenderedArtifact) error {
+	peers := 0
+	for _, artifact := range artifacts {
+		if !strings.HasPrefix(artifact.Path, "/etc/ly-route/pppoe/ly-route-") {
+			continue
+		}
+		peers++
+		var plan struct {
+			StatusFile string `json:"status_file"`
+		}
+		if json.Unmarshal([]byte(artifact.Content), &plan) != nil || plan.StatusFile == "" {
+			return fmt.Errorf("PPPoE plan %s has no status contract", artifact.Path)
+		}
+		output, err := runner.Output(ctx, "cat", plan.StatusFile)
+		if err != nil {
+			return err
+		}
+		var status struct {
+			State string `json:"state"`
+		}
+		if json.Unmarshal([]byte(output), &status) != nil || strings.TrimSpace(status.State) == "" {
+			return fmt.Errorf("PPPoE status %s is not published", plan.StatusFile)
+		}
+	}
+	if peers == 0 {
+		return fmt.Errorf("PPPoE artifacts contain no peer plans")
+	}
+	return nil
+}
+
+// pppoeApplyStarted only proves that the helper published a status after the
+// start/restart.  Full LCP/IPCP/dataplane convergence is asynchronous and is
+// tracked by runtime/status; apply must not roll back a session that is still
+// legitimately dialing.
+func pppoeApplyStarted(ctx context.Context, runner CommandRunner, artifacts []RenderedArtifact) error {
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		allVisible := true
+		peers := 0
+		for _, artifact := range artifacts {
+			if !strings.HasPrefix(artifact.Path, "/etc/ly-route/pppoe/ly-route-") {
+				continue
+			}
+			peers++
+			var plan struct {
+				StatusFile string `json:"status_file"`
+			}
+			if json.Unmarshal([]byte(artifact.Content), &plan) != nil || plan.StatusFile == "" {
+				allVisible = false
+				continue
+			}
+			output, err := runner.Output(ctx, "cat", plan.StatusFile)
+			if err != nil {
+				allVisible = false
+				continue
+			}
+			var status struct {
+				State string `json:"state"`
+			}
+			if json.Unmarshal([]byte(output), &status) != nil || strings.TrimSpace(status.State) == "" {
+				allVisible = false
+			}
+		}
+		if peers > 0 && allVisible {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("PPPoE status file was not published by the peer unit")
+		case <-ticker.C:
+		}
+	}
 }
 
 func (controller FilesystemController) restoreServiceFromSnapshot(ctx context.Context, service ServiceName, snapshots []artifactSnapshot, current []RenderedArtifact) error {
@@ -329,8 +428,13 @@ func (controller FilesystemController) Stop(ctx context.Context, service Service
 	}
 	var stopErrors []error
 	for _, unit := range units {
-		if err := controller.Runner.Run(ctx, "systemctl", "disable", "--now", unit); err != nil {
-			stopErrors = append(stopErrors, fmt.Errorf("disable %s: %w", unit, err))
+		// Stop, never disable.  A failed apply/rollback must not change
+		// persistent enablement; WAN has to come back after reboot.
+		unitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		err := controller.Runner.Run(unitCtx, "systemctl", "stop", unit)
+		cancel()
+		if err != nil {
+			stopErrors = append(stopErrors, fmt.Errorf("stop %s: %w", unit, err))
 		}
 	}
 	if err := controller.Runner.Run(ctx, "systemctl", "stop", applyUnit(service)); err != nil {
@@ -350,7 +454,10 @@ func (controller FilesystemController) waitForNativePPPoESessionsAbsent(ctx cont
 	for {
 		output, err := controller.Runner.Output(ctx, "vppctl", "show", "pppoe", "session")
 		if err == nil && strings.Contains(output, "No pppoe sessions configured") {
-			return nil
+			clients, clientErr := controller.Runner.Output(ctx, "vppctl", "show", "pppoe", "client")
+			if clientErr == nil && strings.Contains(clients, "No pppoe clients configured") {
+				return nil
+			}
 		}
 		select {
 		case <-ctx.Done():

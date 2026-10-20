@@ -78,6 +78,16 @@ func (controller FilesystemController) Readback(ctx context.Context, request Evi
 		if controller.Runner == nil {
 			return apply.Readback{}, fmt.Errorf("%s readback runner is missing: %w", service, apply.ErrIncompleteEvidence)
 		}
+		if service == PPPoE {
+			// PPPoE convergence is asynchronous.  Evidence only needs the
+			// helper to have published its status; runtime/status tracks the
+			// final connected/dataplane state.  Never hold an apply/readback
+			// for the 30s dial window.
+			if err := pppoeStatusPublished(ctx, controller.Runner, artifacts); err != nil {
+				return apply.Readback{}, fmt.Errorf("%s live readback: %w", service, err)
+			}
+			continue
+		}
 		if err := liveReadback(ctx, controller.Runner, service, artifacts); err != nil {
 			return apply.Readback{}, fmt.Errorf("%s live readback: %w", service, err)
 		}

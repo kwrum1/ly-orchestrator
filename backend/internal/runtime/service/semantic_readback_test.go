@@ -100,12 +100,11 @@ func TestFilesystemController_PPPoE_readback_rejects_disconnected_native_session
 	runner := availableRunner(PPPd, map[string]string{
 		"cat /run/ly-route/pppoe/wan-blue.json": `{"state":"disconnected"}`,
 	})
-	controller := FilesystemController{RootDir: t.TempDir(), Runner: runner}
 
 	// When
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	err = controller.ReloadOrRestart(ctx, PPPd, artifacts)
+	err = liveReadback(ctx, runner, PPPd, artifacts)
 
 	// Then
 	assertReadbackMismatch(t, err, "not connected")
