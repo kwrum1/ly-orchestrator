@@ -138,6 +138,7 @@ func TestOrchestratorUpgradeInstallerHasBackupRollbackAndServiceState(t *testing
 		"capture_services",
 		"ly_route_orchestrator_plugin.so",
 		"ly-route-control-api.service",
+		"version.env",
 		"health_check",
 		"systemctl reboot",
 	} {

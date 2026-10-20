@@ -55,6 +55,7 @@ mkdir -p "$backup"
 if [ -e "$target_dir" ]; then cp -a "$target_dir" "$backup/target"; fi
 if [ -e /opt/ly-route/admin ]; then cp -a /opt/ly-route/admin "$backup/admin"; fi
 if [ -e /etc/nginx/conf.d/ly-route-admin.conf ]; then cp -a /etc/nginx/conf.d/ly-route-admin.conf "$backup/ly-route-admin.conf"; fi
+if [ -e /etc/ly-route/version.env ]; then cp -a /etc/ly-route/version.env "$backup/version.env"; fi
 if [ -e /etc/systemd/system/ly-route-firstboot.service ]; then cp -a /etc/systemd/system/ly-route-firstboot.service "$backup/ly-route-firstboot.service"; fi
 
 restore_backup() {
@@ -69,6 +70,9 @@ restore_backup() {
   fi
   if [ -e "$backup/ly-route-admin.conf" ]; then
     cp -a "$backup/ly-route-admin.conf" /etc/nginx/conf.d/ly-route-admin.conf
+  fi
+  if [ -e "$backup/version.env" ]; then
+    cp -a "$backup/version.env" /etc/ly-route/version.env
   fi
   if [ -e "$backup/ly-route-firstboot.service" ]; then
     cp -a "$backup/ly-route-firstboot.service" /etc/systemd/system/ly-route-firstboot.service
@@ -98,6 +102,9 @@ if [ -d "$tmp/opt/ly-route/admin" ]; then
 fi
 if [ -f "$tmp/etc/nginx/conf.d/ly-route-admin.conf" ]; then
   install -D -m 0644 "$tmp/etc/nginx/conf.d/ly-route-admin.conf" /etc/nginx/conf.d/ly-route-admin.conf
+fi
+if [ -f "$tmp/etc/ly-route/version.env" ]; then
+  install -D -m 0644 "$tmp/etc/ly-route/version.env" /etc/ly-route/version.env
 fi
 systemctl daemon-reload || true
 if ! systemctl restart ly-route-control-api.service; then

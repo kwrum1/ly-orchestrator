@@ -13,6 +13,7 @@ Environment=LY_ROUTE_CONFIG_PATH=/var/lib/ly-route/config.json
 Environment=LY_ROUTE_DEFAULT_CONFIG=/etc/ly-route/default-config.json
 EnvironmentFile=-/etc/ly-route/appliance.env
 EnvironmentFile=-/etc/ly-route/runtime.env
+EnvironmentFile=-/etc/ly-route/version.env
 EnvironmentFile=-/etc/ly-route/control-api.env
 EnvironmentFile=-/var/lib/ly-route/vpp-tuning.env
 ExecStart=/usr/lib/ly-route/ly-route-control

@@ -14,6 +14,7 @@ func TestFirmwareUpgradeInstallerHasBackupRollbackAndDataplaneCheck(t *testing.T
 		"ly-route-conversion",
 		"\"preserve\"",
 		"verify_packages",
+		"version.env",
 		"pppoeclient_plugin.so",
 		"curl -fsS --max-time 2 http://127.0.0.1:8080/api/v1/health",
 		"systemctl reboot",

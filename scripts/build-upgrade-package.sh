@@ -101,7 +101,7 @@ if [ "${LY_ROUTE_BUILD_TAR_ONLY:-0}" != 1 ]; then
 fi
 
 source_commit=$(product_source_commit)
-ly_route_version=${LY_ROUTE_VERSION:-$source_commit}
+ly_route_version=${LY_ROUTE_VERSION:-${PRODUCT_VERSION:-$source_commit}}
 source_epoch=$(product_source_date_epoch)
 created_at=$(date -u -d "@$source_epoch" +%Y-%m-%dT%H:%M:%SZ)
 artifact_base="ly-route-upgrade-${product}-${suite}-${arch}"
@@ -142,6 +142,7 @@ chmod 0755 "$package_root/usr/lib/ly-route/vpp-apply"
 
 copy_product_frontend "$package_root/opt/ly-route/admin" "$frontend_bundle" "$product"
 cp "$PRODUCT_MANIFEST" "$package_root/etc/ly-route/product-manifest.json"
+printf 'LY_ROUTE_VERSION=%s\n' "$ly_route_version" >"$package_root/etc/ly-route/version.env"
 cp "$repo_root/packaging/nginx/ly-route-admin.conf" "$package_root/etc/nginx/conf.d/ly-route-admin.conf"
 if [ "$product" = gateway ]; then
   if [ "${LY_ROUTE_BUILD_TAR_ONLY:-0}" != 1 ]; then
@@ -193,6 +194,7 @@ else
   commercial_css_hash=
 fi
 profile_hash=$(sha256sum "$package_root/etc/ly-route/product-manifest.json" | cut -d' ' -f1)
+version_env_hash=$(sha256sum "$package_root/etc/ly-route/version.env" | cut -d' ' -f1)
 artifact_manifest_hash=$(sha256sum "$package_root/usr/share/ly-route/artifact-manifest.json" | cut -d' ' -f1)
 cat >"$package_root/checksums.sha256" <<EOF
 $control_hash  usr/lib/ly-route/ly-route-control
@@ -208,6 +210,7 @@ $runtime_check_hash  usr/lib/ly-route/runtime-check.sh
 $firstboot_hash  usr/lib/ly-route/firstboot.sh
 $firstboot_service_hash  etc/systemd/system/ly-route-firstboot.service
 $profile_hash  etc/ly-route/product-manifest.json
+$version_env_hash  etc/ly-route/version.env
 $artifact_manifest_hash  usr/share/ly-route/artifact-manifest.json
 EOF
 if [ -n "$commercial_css_hash" ]; then
@@ -226,12 +229,12 @@ node - "$package_root/manifest.json" "$PRODUCT_BUILD_PROFILE" "$product" "$suite
   "$source_commit" "$ly_route_version" "$created_at" "$control_hash" "$vpp_apply_hash" "$app_hash" \
   "$capabilities_hash" "$index_hash" "$shell_hash" "$styles_hash" "$nginx_hash" \
   "$service_hash" "$runtime_check_hash" "$firstboot_hash" "$firstboot_service_hash" \
-  "$commercial_css_hash" "$profile_hash" "$artifact_manifest_hash" <<'NODE'
+  "$commercial_css_hash" "$profile_hash" "$version_env_hash" "$artifact_manifest_hash" <<'NODE'
 const { readFileSync, writeFileSync } = require("node:fs");
 const [output, profilePath, product, suite, arch, commit, version, createdAt,
   controlHash, vppHash, appHash, capabilitiesHash, indexHash, shellHash, stylesHash,
   nginxHash, serviceHash, runtimeCheckHash, firstbootHash, firstbootServiceHash,
-  commercialCSSHash, profileHash, artifactManifestHash] = process.argv.slice(2);
+  commercialCSSHash, profileHash, versionEnvHash, artifactManifestHash] = process.argv.slice(2);
 const profile = JSON.parse(readFileSync(profilePath, "utf8"));
 const checksums = {
   "usr/lib/ly-route/ly-route-control": controlHash,
@@ -247,6 +250,7 @@ const checksums = {
   "usr/lib/ly-route/firstboot.sh": firstbootHash,
   "etc/systemd/system/ly-route-firstboot.service": firstbootServiceHash,
   "etc/ly-route/product-manifest.json": profileHash,
+  "etc/ly-route/version.env": versionEnvHash,
   "usr/share/ly-route/artifact-manifest.json": artifactManifestHash,
 };
 if (commercialCSSHash) checksums["opt/ly-route/admin/commercial.css"] = commercialCSSHash;

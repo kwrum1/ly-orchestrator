@@ -72,6 +72,8 @@ if (JSON.stringify(selected) !== JSON.stringify(canonical)) {
 NODE
 
   PRODUCT_FRONTEND_PRODUCT=$(product_build_json_field frontend_product)
+  PRODUCT_VERSION=$(product_build_json_field version 2>/dev/null || true)
+  [ -n "$PRODUCT_VERSION" ] || PRODUCT_VERSION=unknown
   PRODUCT_DEFAULT_CONFIG="$repo_root/$(product_build_json_field default_config)"
   PRODUCT_DATABASE_PATH=$(product_build_json_field database_path)
   PRODUCT_CONFIG_PATH=$(product_build_json_field config_path)

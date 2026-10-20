@@ -72,6 +72,9 @@ restore_files() {
   if [ -f "$backup_dir/ly-route-control-api.service" ]; then
     cp -a "$backup_dir/ly-route-control-api.service" /etc/systemd/system/ly-route-control-api.service
   fi
+  if [ -f "$backup_dir/version.env" ]; then
+    cp -a "$backup_dir/version.env" /etc/ly-route/version.env
+  fi
   if [ -f "$backup_dir/ly-route-firstboot.service" ]; then
     cp -a "$backup_dir/ly-route-firstboot.service" /etc/systemd/system/ly-route-firstboot.service
   fi
@@ -135,6 +138,7 @@ if [ -e "$target_dir" ]; then cp -a "$target_dir" "$backup_dir/target"; fi
 if [ -e /opt/ly-route/admin ]; then cp -a /opt/ly-route/admin "$backup_dir/admin"; fi
 if [ -e /etc/nginx/conf.d/ly-route-admin.conf ]; then cp -a /etc/nginx/conf.d/ly-route-admin.conf "$backup_dir/ly-route-admin.conf"; fi
 if [ -e /etc/systemd/system/ly-route-control-api.service ]; then cp -a /etc/systemd/system/ly-route-control-api.service "$backup_dir/ly-route-control-api.service"; fi
+if [ -e /etc/ly-route/version.env ]; then cp -a /etc/ly-route/version.env "$backup_dir/version.env"; fi
 if [ -e /etc/systemd/system/ly-route-firstboot.service ]; then cp -a /etc/systemd/system/ly-route-firstboot.service "$backup_dir/ly-route-firstboot.service"; fi
 
 install -d -m 0755 "$target_dir"
@@ -150,6 +154,9 @@ if [ "$target_dir" = "/usr/lib/ly-route" ] && [ -f "$tmp/etc/systemd/system/ly-r
 fi
 if [ "$target_dir" = "/usr/lib/ly-route" ] && [ -f "$tmp/etc/systemd/system/ly-route-control-api.service" ]; then
   install -D -m 0644 "$tmp/etc/systemd/system/ly-route-control-api.service" /etc/systemd/system/ly-route-control-api.service
+fi
+if [ -f "$tmp/etc/ly-route/version.env" ]; then
+  install -D -m 0644 "$tmp/etc/ly-route/version.env" /etc/ly-route/version.env
 fi
 if [ -d "$tmp/opt/ly-route/admin" ]; then
   rm -rf /opt/ly-route/admin.new
