@@ -69,17 +69,27 @@ def parse_session(detail):
     return match.group(1), match.group(2)
 
 
-def remove_stale_addresses(interface, keep):
+def interface_addresses(interface):
     code, out, _ = vppctl("show", "interface", "address", interface)
     if code != 0:
-        return
-    current = None
+        return []
+    addresses = []
     for line in out.splitlines():
         match = re.match(r"\s*L3\s+([0-9a-fA-F:.]+)/(\d+)", line)
         if match:
-            current = f"{match.group(1)}/{match.group(2)}"
-            if current != keep:
-                run("set", "interface", "ip", "address", "del", interface, current)
+            addresses.append(f"{match.group(1)}/{match.group(2)}")
+    return addresses
+
+
+def remove_all_addresses(interface):
+    for address in interface_addresses(interface):
+        run("set", "interface", "ip", "address", "del", interface, address)
+
+
+def ensure_address(interface, local):
+    wanted = f"{local}/32"
+    if wanted not in interface_addresses(interface):
+        run("set", "interface", "ip", "address", interface, wanted)
 
 
 def configure_nat(name, plan):
@@ -154,6 +164,7 @@ def main():
     # Remove a previous instance and stale addresses before reconnecting.
     run("create", "pppoe", "client", wan, "host-uniq", str(host_uniq), "del")
     time.sleep(1)
+    remove_all_addresses(name)
     code, _ = run(
         "create", "pppoe", "client", wan, "host-uniq", str(host_uniq),
         "name", name,
@@ -184,7 +195,7 @@ def main():
         time.sleep(0.5)
 
     if local:
-        remove_stale_addresses(name, local + "/32")
+        ensure_address(name, local)
         configure_nat(name, plan)
         write_status(status_file, "connected", name, local, peer or "")
         log(f"{peer_id} connected {local} peer {peer or '?'} on {name}")
@@ -199,12 +210,10 @@ def main():
             continue
         local, peer = parse_session(detail)
         if local:
+            ensure_address(name, local)
             write_status(status_file, "connected", name, local, peer or "")
         else:
             write_status(status_file, "connecting", name)
-        # A new session can leave the previous address behind.
-        if local:
-            remove_stale_addresses(name, local + "/32")
 
     run("create", "pppoe", "client", wan, "host-uniq", str(host_uniq), "del")
     write_status(status_file, "disconnected", name)
