@@ -17,7 +17,8 @@ import time
 
 STOP = False
 CONNECT_TIMEOUT = 30
-PING_FAILURE_LIMIT = 24
+PING_FAILURE_LIMIT = 3
+DATAPLANE_GRACE = 10
 RECONNECT_DELAY = 5
 MAX_RECONNECT_DELAY = 30
 
@@ -328,6 +329,7 @@ def main():
             log(f"{peer_id} connected session {session['session_id']} {session['local']} peer {session['peer']} on {name}")
 
         failures = 0 if healthy else 1
+        grace_until = time.time() + DATAPLANE_GRACE
         current = session
         while not STOP:
             time.sleep(5)
@@ -352,9 +354,11 @@ def main():
                     if session["local"] != current["local"] or session["session_id"] != current["session_id"]:
                         ensure_address(name, session["local"])
                         configure_nat(name, plan)
+                        grace_until = time.time() + DATAPLANE_GRACE
                     current = session
                     if session_healthy(name, session["peer"], plan.get("default_route", True)):
                         failures = 0
+                        grace_until = 0
                         reconnect_delay = RECONNECT_DELAY
                         write_status(status_file, "connected", name, session["session_id"],
                                      session["local"], session["peer"], session["ac_mac"])
@@ -363,7 +367,7 @@ def main():
                         write_status(status_file, "degraded", name, session["session_id"],
                                      session["local"], session["peer"], session["ac_mac"],
                                      reason="dataplane probe failed")
-            if failures >= PING_FAILURE_LIMIT:
+            if failures >= PING_FAILURE_LIMIT and time.time() >= grace_until:
                 log(f"{peer_id} dataplane probe failed {failures} times; reconnecting")
                 break
 
