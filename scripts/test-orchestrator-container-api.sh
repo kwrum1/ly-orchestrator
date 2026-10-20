@@ -182,6 +182,21 @@ x=json.load(open(sys.argv[1]))
 assert x['validation']['valid'] is True
 assert x['validation']['plan']['dataplane_mode']=='preserve'
 PY
+curl --fail --silent --show-error -b "$tmp/cookies" \
+  "http://127.0.0.1:$port/api/v1/capabilities" > "$tmp/evidence/capabilities.json"
+curl --fail --silent --show-error -b "$tmp/cookies" \
+  "http://127.0.0.1:$port/api/v1/telemetry/dashboard" > "$tmp/evidence/telemetry-dashboard.json"
+curl --fail --silent --show-error -b "$tmp/cookies" \
+  "http://127.0.0.1:$port/api/v1/telemetry/policy-hits" > "$tmp/evidence/telemetry-policy-hits.json"
+python3 - "$tmp/evidence/capabilities.json" "$tmp/evidence/telemetry-dashboard.json" <<'PY'
+import json,sys
+capabilities=json.load(open(sys.argv[1]))
+names={item.get('name') for item in capabilities.get('items',[])}
+for forbidden in ('smartdns','kea','xray','pppoe','linux_routing'):
+    assert forbidden not in names, forbidden
+dashboard=json.load(open(sys.argv[2]))
+assert dashboard.get('data',{}).get('device_mode')=='orchestrator'
+PY
 curl --fail-with-body --silent --show-error -b "$tmp/cookies" -H 'Content-Type: application/json' -X PUT \
   --data-binary @"$repo_root/backend/internal/orchestratorapi/testdata/topology-v1.json" \
   "http://127.0.0.1:$port/api/v1/orchestrator/topology" > "$tmp/evidence/topology-put.json" || {
