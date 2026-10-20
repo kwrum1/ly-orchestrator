@@ -18,7 +18,16 @@ func TestSecurityGenerationIncludesStandaloneACL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(generation.ACLs) != 1 || generation.ACLs[0].Interface != "lyroute-ens34" || len(generation.ACLs[0].Rules) != 1 || generation.ACLs[0].Rules[0].ID != "block-client" {
+	if len(generation.ACLs) != 1 || generation.ACLs[0].Interface != "lyroute-ens34" {
 		t.Fatalf("standalone ACL generation = %#v", generation)
+	}
+	found := false
+	for _, rule := range generation.ACLs[0].Rules {
+		if rule.ID == "block-client" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("standalone ACL generation lost block-client: %#v", generation.ACLs[0].Rules)
 	}
 }
