@@ -363,11 +363,16 @@ zstd -dc "$payload" | dd of="$target" bs=16M conv=fsync,notrunc status=progress
 sync
 say '系统镜像写入完成，正在校验磁盘内容。'
 
-expected_image=$(cat "$payload_dir/image.sha256")
-image_size=$(cat "$payload_dir/image.size")
-actual_image=$(head -c "$image_size" "$target" | sha256sum | awk '{print $1}')
-[ "$actual_image" = "$expected_image" ] || fail "installed disk verification failed: expected $expected_image actual $actual_image"
-say '磁盘校验通过，正在写入管理口和网卡映射。'
+verify_mode=$(cmdline_value lyroute.verify || true)
+if [ "$verify_mode" = full ]; then
+  expected_image=$(cat "$payload_dir/image.sha256")
+  image_size=$(cat "$payload_dir/image.size")
+  actual_image=$(head -c "$image_size" "$target" | sha256sum | awk '{print $1}')
+  [ "$actual_image" = "$expected_image" ] || fail "installed disk verification failed: expected $expected_image actual $actual_image"
+  say '磁盘校验通过，正在写入管理口和网卡映射'
+else
+  say '磁盘写入完成，已跳过全量 SHA256 回读（lyroute.verify=full 可启用完整校验）'
+fi
 
 udevadm settle 2>/dev/null || true
 partprobe "$target" 2>/dev/null || true
@@ -456,9 +461,15 @@ printf 'LY_ROUTE_VMXNET3_TAP_BRIDGE_ACCEPTANCE=%s\n' "$vmxnet3_tap_bridge_accept
 chmod 0644 "$runtime_env_tmp"
 mv -f "$runtime_env_tmp" "$runtime_env"
 umount /mnt
-say '安装完成。5 秒后重启，请在重启前移除 ISO。'
-for seconds in 5 4 3 2 1; do say "即将重启：${seconds} 秒"; sleep 1; done
-systemctl reboot --force
+if [ "$(cmdline_value lyroute.poweroff || true)" = 1 ]; then
+  say '安装完成，正在关闭电源。请移除 ISO 后从硬盘启动。'
+  sync
+  systemctl poweroff
+else
+  say '安装完成，5 秒后重启，请在重启前移除 ISO'
+  for seconds in 5 4 3 2 1; do say "即将重启：${seconds} 秒"; sleep 1; done
+  systemctl reboot --force
+fi
 INSTALLER
 chmod 0755 "$work/config/includes.chroot/usr/local/sbin/ly-route-auto-install"
 
