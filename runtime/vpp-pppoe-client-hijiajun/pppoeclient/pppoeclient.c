@@ -3442,6 +3442,20 @@ show_pppoeclient_detail_one (vlib_main_t *vm, pppoeclient_t *c)
 		       c->pppox_sw_if_index, unit, t->pppoe_session_allocated);
       vlib_cli_output (vm, "    runtime ipv4 local %U peer %U", format_ip4_address, &t->our_addr,
 		       format_ip4_address, &t->his_addr);
+      {
+	vnet_hw_interface_t *debug_hw =
+	  vnet_get_hw_interface (pem->vnet_main, c->hw_if_index);
+	vlib_node_t *debug_node =
+	  vlib_get_node (vm, pppoeclient_session_output_node.index);
+	u32 debug_slot = c->hw_output_next_index;
+	u32 debug_slot_node = ~0;
+	if (debug_node && debug_slot < vec_len (debug_node->next_nodes))
+	  debug_slot_node = debug_node->next_nodes[debug_slot];
+	vlib_cli_output (vm,
+			 "    runtime tx-edge next %u output-node %u physical-output %u slot-node %u",
+			 c->hw_output_next_index, c->hw_output_node_index,
+			 debug_hw ? debug_hw->output_node_index : ~0, debug_slot_node);
+      }
       if (c->dns1)
 	vlib_cli_output (vm, "    runtime peer-dns4 primary %U", format_ip4_address, &c->dns1);
       else

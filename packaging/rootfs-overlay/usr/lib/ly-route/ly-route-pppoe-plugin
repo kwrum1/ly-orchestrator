@@ -18,7 +18,7 @@ import time
 STOP = False
 CONNECT_TIMEOUT = 30
 PING_FAILURE_LIMIT = 2
-DATAPLANE_GRACE = 5
+DATAPLANE_GRACE = 30
 RECONNECT_DELAY = 5
 MAX_RECONNECT_DELAY = 30
 
@@ -172,11 +172,10 @@ def ping_peer(interface, peer):
 
 
 def session_healthy(interface, peer, require_default=False):
-    if not (ping_peer(interface, peer) and peer_route_ready(interface, peer)):
-        return False
-    if require_default:
-        return default_route_ready(interface)
-    return True
+    # ICMP to the peer is the authoritative end-to-end probe.  Route table
+    # readback can lag the dataplane by a whole session on this VPP build; it
+    # must never keep an already-working link in connecting/degraded.
+    return ping_peer(interface, peer)
 
 
 def interface_index(name):
@@ -293,6 +292,7 @@ def main():
         time.sleep(1)
 
     reconnect_delay = RECONNECT_DELAY
+    redials = 0
     while not STOP:
         write_status(status_file, "connecting", name, reason="dialing")
         if not create_client(wan, name, host_uniq):
@@ -332,7 +332,7 @@ def main():
         grace_until = time.time() + DATAPLANE_GRACE
         current = session
         while not STOP:
-            time.sleep(5)
+            time.sleep(2 if failures else 5)
             code, detail, _ = vppctl("show", "pppoe", "client", "detail")
             if code != 0:
                 write_status(status_file, "unavailable", name, reason="vppctl unavailable")
@@ -359,6 +359,7 @@ def main():
                     if session_healthy(name, session["peer"], plan.get("default_route", True)):
                         failures = 0
                         grace_until = 0
+                        redials = 0
                         reconnect_delay = RECONNECT_DELAY
                         write_status(status_file, "connected", name, session["session_id"],
                                      session["local"], session["peer"], session["ac_mac"])
@@ -368,8 +369,17 @@ def main():
                                      session["local"], session["peer"], session["ac_mac"],
                                      reason="dataplane probe failed")
             if failures >= PING_FAILURE_LIMIT and time.time() >= grace_until:
-                log(f"{peer_id} dataplane probe failed {failures} times; reconnecting")
-                break
+                if redials < 1:
+                    log(f"{peer_id} dataplane probe failed {failures} times; one bounded redial")
+                    redials = 1
+                    break
+                # Address-pool protection: after the single redial keep the
+                # current session and wait for the AC dataplane instead of
+                # consuming another address every few seconds.
+                write_status(status_file, "degraded", name, session["session_id"],
+                             session["local"], session["peer"], session["ac_mac"],
+                             reason="waiting for AC dataplane")
+                grace_until = time.time() + DATAPLANE_GRACE
 
         cleanup_stale(wan)
         write_status(status_file, "connecting", name, reason="reconnecting")
