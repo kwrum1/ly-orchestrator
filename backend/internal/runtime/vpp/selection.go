@@ -332,10 +332,11 @@ func LoadNativePathRequestWithSharedManagement(path, management string, interfac
 }
 
 func acceptanceAFPacketProof(enabled bool, proof CapabilityProof) bool {
+	driver := strings.ToLower(strings.TrimSpace(proof.KernelDriver))
 	return enabled && proof.AcceptanceOnly &&
 		((proof.Hook == NativeHookAFPacket && proof.Mode == NativeModeAFPacket) ||
 			(proof.Hook == NativeHookTapBridge && proof.Mode == NativeModeTapBridge)) &&
-		strings.EqualFold(strings.TrimSpace(proof.KernelDriver), "vmxnet3")
+		(driver == "vmxnet3" || driver == "e1000")
 }
 
 func interfaceNameSafe(name string) bool {

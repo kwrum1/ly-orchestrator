@@ -105,10 +105,10 @@ start_cloud_vm() {
       -drive file="$LAB_ROOT/server.qcow2",format=qcow2,if=virtio \
       -drive file="$LAB_ROOT/pppoe-server-seed.iso",format=raw,if=virtio,readonly=on \
       -netdev user,id=mgmt,hostfwd=tcp:127.0.0.1:"$SERVER_SSH_PORT"-:22,hostfwd=tcp:127.0.0.1:"$SERVER_HTTP_PORT"-:8080 \
-      -device e1000,netdev=mgmt,mac="$SERVER_MGMT_MAC" \
+      -device virtio-net-pci,netdev=mgmt,mac="$SERVER_MGMT_MAC" \
       -netdev tap,id=wan,ifname=tap-pppoe-wan,script=no,downscript=no \
-      -device e1000,netdev=wan,mac="$SERVER_WAN_MAC" \
-      -serial file:"$LAB_ROOT/pppoe-server-serial.log" \
+      -device virtio-net-pci,netdev=wan,mac="$SERVER_WAN_MAC" \
+      -serial tcp:127.0.0.1:9201,server,nowait \
       -display none -daemonize -pidfile "$LAB_ROOT/pppoe-server.pid"
   else
     qemu-system-x86_64 \
@@ -117,9 +117,9 @@ start_cloud_vm() {
       -drive file="$LAB_ROOT/client.qcow2",format=qcow2,if=virtio \
       -drive file="$LAB_ROOT/client-seed.iso",format=raw,if=virtio,readonly=on \
       -netdev user,id=mgmt,hostfwd=tcp:127.0.0.1:"$CLIENT_SSH_PORT"-:22 \
-      -device e1000,netdev=mgmt,mac="$CLIENT_MGMT_MAC" \
+      -device virtio-net-pci,netdev=mgmt,mac="$CLIENT_MGMT_MAC" \
       -netdev tap,id=lan,ifname=tap-client-lan,script=no,downscript=no \
-      -device e1000,netdev=lan,mac="$CLIENT_LAN_MAC" \
+      -device virtio-net-pci,netdev=lan,mac="$CLIENT_LAN_MAC" \
       -serial file:"$LAB_ROOT/client-serial.log" \
       -display none -daemonize -pidfile "$LAB_ROOT/client.pid"
   fi

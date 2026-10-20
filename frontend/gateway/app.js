@@ -632,7 +632,7 @@ function systemConfigOperationsHtml() {
 		['配置初始化', '', 'init']
 	];
 	const operationRows = operations.map(([title, description, action]) => `<section class="config-op config-quick-item"><strong>${safeText(title)}</strong>${description ? `<span>${safeText(description)}</span>` : ''}<button class="primary" type="button" data-action="${safeText(action)}">${safeText(title)}</button></section>`).join('');
-	return `<div class="config-ops">${renderManagementNetworkEditor()}<div class="config-quick-actions">${operationRows}</div><section class="config-op config-time-op"><div class="config-op-copy"><strong>系统时间</strong><span>使用当前浏览器时间保存</span></div><div class="config-time-controls"><input data-config-time-input value="${formatBrowserDateTime()}" aria-label="系统时间"><button class="primary" type="button" data-config-time-save>同步当前浏览器时间并保存</button></div></section>${renderFirmwareOperationsHtml()}</div>`;
+	return `<div class="config-ops">${renderManagementNetworkEditor()}${renderRuntimeOperationsHtml()}<div class="config-quick-actions">${operationRows}</div><section class="config-op config-time-op"><div class="config-op-copy"><strong>系统时间</strong><span>使用当前浏览器时间保存</span></div><div class="config-time-controls"><input data-config-time-input value="${formatBrowserDateTime()}" aria-label="系统时间"><button class="primary" type="button" data-config-time-save>同步当前浏览器时间并保存</button></div></section>${renderFirmwareOperationsHtml()}</div>`;
 }
 
 function renderManagementNetworkEditor() {
