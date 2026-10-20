@@ -1772,9 +1772,6 @@ func routePathVia(vppInterface, nextHop, fallback string) string {
 	if via == "" {
 		return strings.TrimSpace(nextHop)
 	}
-	if isRuntimePPPoEInterface(via) {
-		return via
-	}
 	if nextHop = strings.TrimSpace(nextHop); nextHop != "" {
 		return nextHop + " " + via
 	}
