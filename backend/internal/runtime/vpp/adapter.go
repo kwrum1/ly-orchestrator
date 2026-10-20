@@ -1110,6 +1110,8 @@ func natStaticMappingCommandsForBehavior(behavior nat.Behavior, mapping nat.Stat
 		commands = append(commands,
 			fmt.Sprintf("?set interface nat44 in %s output-feature del", mapping.WANInterface),
 			fmt.Sprintf("?set interface nat44 in %s output-feature", mapping.WANInterface),
+			fmt.Sprintf("?set interface nat44 out %s output-feature del", mapping.WANInterface),
+			fmt.Sprintf("?set interface nat44 out %s output-feature", mapping.WANInterface),
 		)
 	}
 	commands = append(commands,
@@ -1149,6 +1151,8 @@ func natPortMappingCommandsForBehavior(behavior nat.Behavior, mapping nat.PortMa
 		commands = append(commands,
 			fmt.Sprintf("?set interface nat44 in %s output-feature del", mapping.WANInterface),
 			fmt.Sprintf("?set interface nat44 in %s output-feature", mapping.WANInterface),
+			fmt.Sprintf("?set interface nat44 out %s output-feature del", mapping.WANInterface),
+			fmt.Sprintf("?set interface nat44 out %s output-feature", mapping.WANInterface),
 		)
 	}
 	if mapping.Hairpin {
