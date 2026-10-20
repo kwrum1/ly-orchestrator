@@ -4965,7 +4965,15 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 	if server.passwordChangeRequired(w, r, session, "/api/v1/runtime/apply", "apply") {
 		return
 	}
-	server.runtimeApplyMu.Lock()
+	if !server.runtimeApplyMu.TryLock() {
+		// A second click must not queue for minutes behind the first apply.
+		// Return the existing transaction state immediately; clients can poll
+		// runtime/status for the committed receipt.
+		transactionID := "runtime-" + newRequestID()
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "denied", "another runtime apply is in progress", r)
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "apply_in_progress", "runtime_state": "degraded", "reason": "another runtime apply is in progress", "transaction_id": transactionID, "request_id": requestID(r)})
+		return
+	}
 	defer server.runtimeApplyMu.Unlock()
 	// A gateway apply owns daemon and VPP transitions that can outlive a reverse
 	// proxy's request timeout. Keep the transaction bounded, but do not cancel a

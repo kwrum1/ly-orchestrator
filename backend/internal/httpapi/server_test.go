@@ -2872,25 +2872,10 @@ func TestRuntimeApplySerializesConcurrentTransactions(t *testing.T) {
 	login := requestBody(t, server, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"secret"}`)
 	cookie := login.Result().Cookies()[0]
 	server.runtimeApplyMu.Lock()
-	started := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		close(started)
-		_ = authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/runtime/apply", `{}`, cookie)
-		close(done)
-	}()
-	<-started
-	select {
-	case <-done:
-		server.runtimeApplyMu.Unlock()
-		t.Fatal("runtime apply bypassed transaction serialization")
-	default:
-	}
+	response := authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/runtime/apply", `{}`, cookie)
 	server.runtimeApplyMu.Unlock()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("serialized runtime apply did not resume")
+	if response.Code != http.StatusAccepted || !strings.Contains(response.Body.String(), `"status":"apply_in_progress"`) {
+		t.Fatalf("concurrent apply status=%d body=%s, want 202 apply_in_progress", response.Code, response.Body.String())
 	}
 }
 
