@@ -4978,6 +4978,15 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": "dataplane_locked", "runtime_state": "degraded", "reason": err.Error(), "transaction_id": transactionID, "request_id": requestID(r)})
 		return
 	}
+	if err := server.applyPersistedOrchestratorState(applyCtx, transactionID); err != nil {
+		cause := "orchestrator apply: " + err.Error()
+		result := degradedRuntimeResult(transactionID, cause, server.now().UTC())
+		result.Status = "apply_failed"
+		server.setRuntimeEvidence(result)
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", cause, r)
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": cause, "transaction_id": transactionID, "request_id": requestID(r)})
+		return
+	}
 	plan, err := server.buildRuntimePlan(applyCtx, transactionID)
 	if err != nil {
 		result := degradedRuntimeResult(transactionID, err.Error(), server.now().UTC())
@@ -7922,7 +7931,7 @@ func (server *Server) handleConfigImport(w http.ResponseWriter, r *http.Request)
 		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
 		return
 	}
-	if err := server.preflightConfigPackage(req.Payload, req.PackageManifest); err != nil {
+	if err := server.preflightConfigPackage(r.Context(), req.Payload, req.PackageManifest); err != nil {
 		code := "invalid_import_package"
 		if errors.Is(err, ErrConfigProductMismatch) {
 			code = "product_mismatch"
@@ -7939,6 +7948,12 @@ func (server *Server) handleConfigImport(w http.ResponseWriter, r *http.Request)
 		writeError(w, r, http.StatusUnprocessableEntity, "invalid_import_package", err.Error())
 		return
 	}
+	orchestratorDocuments, err := server.orchestratorConfigDocuments(r.Context(), req.Payload, server.now().UTC())
+	if err != nil {
+		writeError(w, r, http.StatusUnprocessableEntity, "invalid_import_package", err.Error())
+		return
+	}
+	documents = append(documents, orchestratorDocuments...)
 	packageHash := hashConfigPayload(req.Payload)
 	diffHash := hashObject(map[string]any{"current": "desired_config", "incoming": packageHash})
 	if !req.Confirm {
@@ -8334,7 +8349,20 @@ func (server *Server) exportDesiredConfig(ctx context.Context) (ConfigPackagePay
 			return ConfigPackagePayload{}, err
 		}
 	}
-	return ConfigPackagePayload{SchemaVersion: ConfigPackageSchemaVersion, ContentType: configContentType, Product: server.profile.ID(), DeviceMode: server.profile.ID().String(), Resources: resources, Excluded: []string{"rendered_config", "runtime_state", "audit_logs", "secrets", "snapshots"}}, nil
+	if server.profile.ID() == product.Orchestrator().ID() {
+		orchestratorResources, err := server.orchestratorConfigResources(ctx)
+		if err != nil {
+			return ConfigPackagePayload{}, err
+		}
+		for resourceType, items := range orchestratorResources {
+			resources[resourceType] = items
+		}
+	}
+	excluded := []string{"rendered_config", "runtime_state", "audit_logs", "secrets", "snapshots"}
+	if server.profile.ID() == product.Orchestrator().ID() {
+		excluded = append(excluded, "orchestrator_service_chain_intents")
+	}
+	return ConfigPackagePayload{SchemaVersion: ConfigPackageSchemaVersion, ContentType: configContentType, Product: server.profile.ID(), DeviceMode: server.profile.ID().String(), Resources: resources, Excluded: excluded}, nil
 }
 
 func (server *Server) createConfigSnapshot(ctx context.Context, id, source string) (persistence.RuntimeSnapshot, error) {
@@ -8361,6 +8389,9 @@ func (server *Server) restoreConfigSnapshot(ctx context.Context, snapshot persis
 	if err := json.Unmarshal(snapshot.Payload, &payload); err != nil {
 		return err
 	}
+	if err := server.ensureOrchestratorConfigResources(ctx, &payload); err != nil {
+		return err
+	}
 	if err := payload.ValidateFor(server.profile); err != nil {
 		return err
 	}
@@ -8368,6 +8399,11 @@ func (server *Server) restoreConfigSnapshot(ctx context.Context, snapshot persis
 	if err != nil {
 		return err
 	}
+	orchestratorDocuments, err := server.orchestratorConfigDocuments(ctx, payload, server.now().UTC())
+	if err != nil {
+		return err
+	}
+	documents = append(documents, orchestratorDocuments...)
 	return server.store.ReplaceConfigsForTypes(ctx, managedConfigResourceTypes(server.profile), documents)
 }
 
@@ -8381,11 +8417,24 @@ func managedConfigResourceTypes(profile product.Profile) []string {
 	if resourceAllowed(profile, "proxy_egress") {
 		types = append(types, "proxy_egress")
 	}
+	if profile.ID() == product.Orchestrator().ID() {
+		types = append(types, orchestratorTopologyConfigResource, orchestratorPolicyConfigResource)
+	}
 	return types
 }
 
 func defaultConfigSnapshot(profile product.Profile) (persistence.RuntimeSnapshot, error) {
-	payload := ConfigPackagePayload{SchemaVersion: ConfigPackageSchemaVersion, ContentType: configContentType, Product: profile.ID(), DeviceMode: profile.ID().String(), Resources: map[string][]json.RawMessage{}, Excluded: []string{"rendered_config", "runtime_state", "audit_logs", "secrets", "snapshots"}}
+	resources := map[string][]json.RawMessage{}
+	if profile.ID() == product.Orchestrator().ID() {
+		// A factory snapshot represents empty orchestrator state explicitly so
+		// restore removes topology and policy instead of preserving them.
+		resources[orchestratorTopologyConfigResource] = []json.RawMessage{}
+		resources[orchestratorPolicyConfigResource] = []json.RawMessage{}
+	}
+	payload := ConfigPackagePayload{SchemaVersion: ConfigPackageSchemaVersion, ContentType: configContentType, Product: profile.ID(), DeviceMode: profile.ID().String(), Resources: resources, Excluded: []string{"rendered_config", "runtime_state", "audit_logs", "secrets", "snapshots"}}
+	if profile.ID() == product.Orchestrator().ID() {
+		payload.Excluded = append(payload.Excluded, "orchestrator_service_chain_intents")
+	}
 	raw, hash, err := persistence.MarshalPayload(payload)
 	if err != nil {
 		return persistence.RuntimeSnapshot{}, fmt.Errorf("marshal default config snapshot: %w", err)
@@ -8402,6 +8451,11 @@ func configDocumentsFromImport(payload ConfigPackagePayload, updatedAt time.Time
 	}
 	var documents []persistence.ConfigDocument
 	for resourceType, items := range payload.Resources {
+		if isOrchestratorConfigResource(resourceType) {
+			// Orchestrator topology and policy are compiled and persisted by
+			// orchestratorConfigDocuments so their pair is validated first.
+			continue
+		}
 		for _, item := range items {
 			var object map[string]any
 			if err := json.Unmarshal(item, &object); err != nil {

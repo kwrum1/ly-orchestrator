@@ -203,6 +203,10 @@ assert x['package_manifest']['product']=='orchestrator'
 assert x['payload']['product']=='orchestrator'
 resources=x['payload']['resources']
 assert any(item['id']=='office-runtime' for item in resources['object_group'])
+assert len(resources['orchestrator_topology'])==1
+assert resources['orchestrator_topology'][0]['management_interface']=='eth0'
+assert len(resources['orchestrator_policy'])==1
+assert resources['orchestrator_policy'][0]['policy_groups'][0]['id']=='route'
 for forbidden in ('wan_link','wan_group','nat_static','port_map','dns_policy','dns_upstream','dhcp_server','proxy_node','proxy_subscription'):
     assert forbidden not in resources
 PY
@@ -221,6 +225,15 @@ import json,sys
 x=json.load(open(sys.argv[1]))
 assert x['status']=='restored'
 assert x['snapshot']['id']==sys.argv[2]
+PY
+curl --fail --silent --show-error -b "$tmp/cookies" \
+  "http://127.0.0.1:$port/api/v1/config/export" > "$tmp/evidence/config-export-after-restore.json"
+python3 - "$tmp/evidence/config-export-after-restore.json" <<'PY'
+import json,sys
+resources=json.load(open(sys.argv[1]))['payload']['resources']
+assert len(resources['orchestrator_topology'])==1
+assert len(resources['orchestrator_policy'])==1
+assert resources['orchestrator_policy'][0]['policy_groups'][0]['rules'][0]['action']=={'kind':'via','group':'inline-east'}
 PY
 
 docker rm -f "$name" >/dev/null

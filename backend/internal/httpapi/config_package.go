@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -84,7 +85,7 @@ func (payload ConfigPackagePayload) ValidateFor(profile product.Profile) error {
 }
 
 func resourceAllowed(profile product.Profile, resourceType string) bool {
-	if resourceType != "proxy_egress" {
+	if resourceType != "proxy_egress" && !isOrchestratorConfigResource(resourceType) {
 		if _, ok := desiredResourceDefs[resourceType]; !ok {
 			return false
 		}
@@ -129,7 +130,7 @@ func manifestForPayload(payload ConfigPackagePayload) ConfigPackageManifest {
 	return ConfigPackageManifest{SchemaVersion: ConfigPackageSchemaVersion, ContentType: configContentType, Product: payload.Product, Included: []string{"desired_config"}, Excluded: payload.Excluded, SecretPolicy: "excluded", PackageHash: hashConfigPayload(payload)}
 }
 
-func (server *Server) preflightConfigPackage(payload ConfigPackagePayload, manifest ConfigPackageManifest) error {
+func (server *Server) preflightConfigPackage(ctx context.Context, payload ConfigPackagePayload, manifest ConfigPackageManifest) error {
 	if err := payload.ValidateFor(server.profile); err != nil {
 		return err
 	}
@@ -147,6 +148,9 @@ func (server *Server) preflightConfigPackage(payload ConfigPackagePayload, manif
 	}
 	if manifest.SecretPolicy != "excluded" {
 		return fmt.Errorf("%w: secret_policy must be excluded", ErrInvalidConfigPackage)
+	}
+	if err := server.validateOrchestratorConfigPackage(ctx, payload); err != nil {
+		return err
 	}
 	return nil
 }
