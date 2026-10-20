@@ -58,6 +58,8 @@ func (service *productUpdateService) Version(context.Context) (orchestratorapi.U
 }
 
 func (service *productUpdateService) UpgradeTasks(ctx context.Context) ([]orchestratorapi.UpgradeTask, error) {
+	service.server.productTaskMu.Lock()
+	defer service.server.productTaskMu.Unlock()
 	if service.server.store == nil {
 		return nil, errors.New("orchestrator upgrade store is unavailable")
 	}
@@ -80,6 +82,8 @@ func (service *productUpdateService) UpgradeTasks(ctx context.Context) ([]orches
 }
 
 func (service *productUpdateService) UpgradeTask(ctx context.Context, id string) (orchestratorapi.UpgradeTask, error) {
+	service.server.productTaskMu.Lock()
+	defer service.server.productTaskMu.Unlock()
 	if err := service.reconcileUpgradeTasks(ctx); err != nil {
 		return orchestratorapi.UpgradeTask{}, err
 	}
@@ -163,6 +167,8 @@ func (service *productUpdateService) StageUpgrade(ctx context.Context, request o
 }
 
 func (service *productUpdateService) InstallUpgrade(ctx context.Context, request orchestratorapi.UpgradeActionRequest) (orchestratorapi.UpgradeTask, error) {
+	service.server.productTaskMu.Lock()
+	defer service.server.productTaskMu.Unlock()
 	if !request.Confirm {
 		return orchestratorapi.UpgradeTask{}, fmt.Errorf("%w: install requires confirm_install=true", orchestratorapi.ErrTaskConflict)
 	}
@@ -213,6 +219,8 @@ func (service *productUpdateService) InstallUpgrade(ctx context.Context, request
 }
 
 func (service *productUpdateService) RollbackUpgrade(ctx context.Context, request orchestratorapi.UpgradeActionRequest) (orchestratorapi.UpgradeTask, error) {
+	service.server.productTaskMu.Lock()
+	defer service.server.productTaskMu.Unlock()
 	payload, err := service.loadUpgradeTask(ctx, request.TaskID)
 	if err != nil {
 		return orchestratorapi.UpgradeTask{}, err
@@ -383,6 +391,8 @@ func (service *productUpdateService) ConversionTask(ctx context.Context, id stri
 }
 
 func (service *productUpdateService) PrepareConversion(ctx context.Context, request orchestratorapi.ConversionActionRequest) (orchestratorapi.ConversionTask, error) {
+	service.server.productTaskMu.Lock()
+	defer service.server.productTaskMu.Unlock()
 	payload, err := service.loadConversionTask(ctx, request.TaskID)
 	if err != nil {
 		return orchestratorapi.ConversionTask{}, err
@@ -414,6 +424,8 @@ func (service *productUpdateService) PrepareConversion(ctx context.Context, requ
 }
 
 func (service *productUpdateService) RollbackConversion(ctx context.Context, request orchestratorapi.ConversionActionRequest) (orchestratorapi.ConversionTask, error) {
+	service.server.productTaskMu.Lock()
+	defer service.server.productTaskMu.Unlock()
 	payload, err := service.loadConversionTask(ctx, request.TaskID)
 	if err != nil {
 		return orchestratorapi.ConversionTask{}, err

@@ -183,6 +183,7 @@ type Server struct {
 	orchestratorUpgradeDir        string
 	orchestratorInstallStart      func(orchestratorUpgradeInvocation) error
 	conversionServiceState        productupdate.ServiceStateController
+	productTaskMu                 sync.Mutex
 	dnsSyncToken                  string
 }
 

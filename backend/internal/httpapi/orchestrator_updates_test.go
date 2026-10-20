@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"ly-route/backend/internal/orchestratorapi"
@@ -200,6 +202,47 @@ func TestGatewayConversionPrepareAndRollbackRestoresServiceState(t *testing.T) {
 	blocked := authenticatedJSONRequest(t, server, http.MethodPost, orchestratorapi.ConversionsPath+"/"+body.Item.ID+"/apply", `{}`, cookie)
 	if blocked.Code != http.StatusNotImplemented {
 		t.Fatalf("conversion apply status=%d body=%s", blocked.Code, blocked.Body.String())
+	}
+}
+
+func TestGatewayConversionPrepareIsSerialized(t *testing.T) {
+	server, _, cookie := productTestServer(t, product.Gateway())
+	server.conversionServiceState = &fakeConversionServiceState{state: map[string]string{"vpp.service": "enabled"}}
+	payload := conversionJSON(t, validConversionManifestForTest(), false)
+	created := authenticatedJSONRequest(t, server, http.MethodPost, orchestratorapi.ConversionsPath, payload, cookie)
+	var body struct {
+		Item orchestratorapi.ConversionTask `json:"item"`
+	}
+	decode(t, created, &body)
+	codes := make(chan int, 2)
+	var wait sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			request := httptest.NewRequest(http.MethodPost, orchestratorapi.ConversionsPath+"/"+body.Item.ID+"/prepare", strings.NewReader(`{}`))
+			request.Header.Set("Content-Type", "application/json")
+			request.AddCookie(cookie)
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, request)
+			codes <- response.Code
+		}()
+	}
+	wait.Wait()
+	close(codes)
+	success, conflict := 0, 0
+	for code := range codes {
+		switch code {
+		case http.StatusAccepted:
+			success++
+		case http.StatusConflict:
+			conflict++
+		default:
+			t.Fatalf("prepare status = %d", code)
+		}
+	}
+	if success != 1 || conflict != 1 {
+		t.Fatalf("prepare results success=%d conflict=%d, want 1/1", success, conflict)
 	}
 }
 
