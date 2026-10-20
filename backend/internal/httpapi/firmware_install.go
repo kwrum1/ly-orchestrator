@@ -116,7 +116,7 @@ if [ -f "$tmp/etc/nginx/conf.d/ly-route-admin.conf" ]; then
   install -D -m 0644 "$tmp/etc/nginx/conf.d/ly-route-admin.conf" /etc/nginx/conf.d/ly-route-admin.conf
 fi
 systemctl daemon-reload || true
-if ! systemctl restart ly-route-control-api.service; then
+if ! timeout 15s systemctl restart ly-route-control-api.service; then
   restore_backup
   exit 1
 fi
@@ -124,9 +124,9 @@ systemctl reload nginx.service || systemctl restart nginx.service || true
 
 healthy=0
 i=0
-while [ "$i" -lt 30 ]; do
-  if systemctl is-active --quiet ly-route-control-api.service &&
-     curl -fsS --max-time 2 http://127.0.0.1:8080/api/v1/health >/dev/null 2>&1; then
+while [ "$i" -lt 10 ]; do
+  if timeout 3s systemctl is-active --quiet ly-route-control-api.service &&
+     timeout 3s curl -fsS --max-time 2 http://127.0.0.1:8080/api/v1/health >/dev/null 2>&1; then
     healthy=1
     break
   fi

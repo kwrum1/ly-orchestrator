@@ -455,8 +455,18 @@ func newServer(profile product.Profile, options ...Option) *Server {
 			// systemd unit so it survives the control service restart.
 			if _, err := exec.LookPath("systemd-run"); err == nil {
 				unit := "ly-route-firmware-install-" + strconv.FormatInt(time.Now().UnixNano(), 10)
-				args := []string{"--no-block", "--collect", "--unit=" + unit, invocation.Name}
-				args = append(args, invocation.Args...)
+				scriptPath := filepath.Join(os.TempDir(), unit+".sh")
+				if len(invocation.Args) < 4 || invocation.Args[0] != "-c" {
+					return fmt.Errorf("firmware installer invocation is not a bash -c script")
+				}
+				if err := os.WriteFile(scriptPath, []byte(invocation.Args[1]), 0o700); err != nil {
+					return err
+				}
+				// A huge inline -c script makes systemd-run mistake script
+				// lines for unit properties on some systemd versions.  Execute
+				// the script from a file with the -- command separator.
+				args := []string{"--no-block", "--collect", "--unit=" + unit, "--", "bash", scriptPath}
+				args = append(args, invocation.Args[3:]...)
 				return exec.Command("systemd-run", args...).Run()
 			}
 			return exec.Command(invocation.Name, invocation.Args...).Start()
@@ -2473,13 +2483,6 @@ func (server *Server) compileDNSPolicyResource(ctx context.Context, req DNSPolic
 	expandedPolicy, err := server.expandDNSPolicySourceGroups(ctx, policy)
 	if err != nil {
 		return DNSPolicyResource{}, nil, "", err
-	}
-	for _, rule := range expandedPolicy.Rules {
-		if rule.Outcome.Kind == dns.OutcomeDirect &&
-			strings.TrimSpace(rule.Outcome.UpstreamID) != "" &&
-			strings.TrimSpace(rule.Outcome.WANEgressID) != "" {
-			return DNSPolicyResource{}, nil, "", fmt.Errorf("dns rule %q direct outcome must not select both an upstream and WAN egress", rule.ID)
-		}
 	}
 	compiled, err := dns.CompilePolicy(expandedPolicy, []proxy.Egress{server.proxyEgress})
 	if err != nil {
