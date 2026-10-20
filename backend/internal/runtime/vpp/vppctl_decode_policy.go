@@ -185,7 +185,7 @@ func activeWANPathMatches(path fibPath, expected trafficpolicy.WANPath, member s
 	// VPP resolves a point-to-point PPPoE next hop to 0.0.0.0 in the
 	// forwarding DPO. The configured path-list is verified separately and
 	// retains the negotiated peer address.
-	return strings.HasPrefix(strings.ToLower(expectedVia), "pppoe_session") &&
+	return isRuntimePPPoEInterface(expectedVia) &&
 		strings.Contains(path.via, "0.0.0.0 "+expectedVia)
 }
 

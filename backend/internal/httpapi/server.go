@@ -1136,7 +1136,9 @@ func (server *Server) handleCapabilities(w http.ResponseWriter, r *http.Request)
 		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": server.capabilities(r.Context()), "request_id": requestID(r)})
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, map[string]any{"items": server.capabilities(ctx), "request_id": requestID(r)})
 }
 
 func (server *Server) modeResponse(r *http.Request) (ModeResponse, error) {
@@ -1556,7 +1558,9 @@ func (server *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
 		return
 	}
-	dependencies := server.capabilities(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	dependencies := server.capabilities(ctx)
 	status := "ok"
 	degraded := false
 	for _, dependency := range dependencies {
@@ -1587,7 +1591,9 @@ func (server *Server) handleDashboardSummary(w http.ResponseWriter, r *http.Requ
 		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
 		return
 	}
-	dependencies := server.capabilities(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	dependencies := server.capabilities(ctx)
 	system, systemCapability := readSystemSummary()
 	status := "ok"
 	degraded := !systemCapability.Available
@@ -1696,27 +1702,77 @@ func numberField(item map[string]any, keys ...string) (float64, bool) {
 }
 
 func (server *Server) capabilities(ctx context.Context) []controlapi.CapabilityState {
-	states := []controlapi.CapabilityState{}
+	type capabilityEntry struct {
+		service           serviceRuntime.ServiceName
+		name              string
+		unavailableReason string
+		optional          bool
+	}
+	entries := []capabilityEntry{}
 	if server.profile.AllowsService(product.ServiceVPP) {
-		states = append(states, server.serviceCapability(ctx, serviceRuntime.VPP, "vpp", "VPP apply runtime is not configured"))
+		entries = append(entries, capabilityEntry{serviceRuntime.VPP, "vpp", "VPP apply runtime is not configured", false})
 	}
 	if server.profile.AllowsService(product.ServiceSmartDNS) {
-		states = append(states, server.serviceCapability(ctx, serviceRuntime.SmartDNS, "smartdns", "SmartDNS service runtime is not configured"))
+		entries = append(entries, capabilityEntry{serviceRuntime.SmartDNS, "smartdns", "SmartDNS service runtime is not configured", false})
 	}
 	if server.profile.AllowsService(product.ServiceKea) {
-		states = append(states, server.serviceCapability(ctx, serviceRuntime.Kea, "kea", "Kea service runtime is not configured"))
+		entries = append(entries, capabilityEntry{serviceRuntime.Kea, "kea", "Kea service runtime is not configured", false})
 	}
 	if server.profile.AllowsService(product.ServiceXray) {
-		states = append(states, server.serviceCapability(ctx, serviceRuntime.Xray, "xray", "xray service runtime is not configured"))
+		entries = append(entries, capabilityEntry{serviceRuntime.Xray, "xray", "xray service runtime is not configured", false})
 	}
 	if server.profile.AllowsService(product.ServicePPPoE) {
-		states = append(states, server.optionalCapability(ctx, serviceRuntime.PPPoE, "pppoe", "PPPoE service runtime is not configured"))
+		entries = append(entries, capabilityEntry{serviceRuntime.PPPoE, "pppoe", "PPPoE service runtime is not configured", true})
 	}
 	if server.profile.AllowsService(product.ServiceNftables) {
-		states = append(states, server.serviceCapability(ctx, serviceRuntime.Nftables, "nftables", "nftables service runtime is not configured"))
+		entries = append(entries, capabilityEntry{serviceRuntime.Nftables, "nftables", "nftables service runtime is not configured", false})
 	}
 	if server.profile.AllowsService(product.ServiceLinuxRouting) {
-		states = append(states, server.serviceCapability(ctx, serviceRuntime.LinuxRouting, "linux_routing", "Linux policy routing service runtime is not configured"))
+		entries = append(entries, capabilityEntry{serviceRuntime.LinuxRouting, "linux_routing", "Linux policy routing service runtime is not configured", false})
+	}
+
+	healthByService := map[serviceRuntime.ServiceName]serviceRuntime.Health{}
+	var healthErr error
+	if server.serviceRuntimeConfigured() && len(entries) > 0 {
+		services := make([]serviceRuntime.ServiceName, 0, len(entries))
+		for _, entry := range entries {
+			services = append(services, entry.service)
+		}
+		health, err := server.services.HealthCheck(ctx, services...)
+		healthErr = err
+		for _, item := range health {
+			healthByService[item.Service] = item
+		}
+	}
+
+	states := make([]controlapi.CapabilityState, 0, len(entries)+1)
+	for _, entry := range entries {
+		if !server.serviceRuntimeConfigured() {
+			state := controlapi.CapabilityDegraded
+			if entry.optional {
+				state = controlapi.CapabilityAvailable
+			}
+			states = append(states, controlapi.CapabilityState{Name: entry.name, Available: false, State: state, Reason: entry.unavailableReason})
+			continue
+		}
+		if healthErr != nil {
+			states = append(states, controlapi.CapabilityState{Name: entry.name, Available: false, State: controlapi.CapabilityDegraded, Reason: healthErr.Error()})
+			continue
+		}
+		health := healthByService[entry.service]
+		if !health.Available {
+			reason := serviceUnitReason(entry.service)
+			if strings.TrimSpace(health.Reason) != "" {
+				reason = health.Reason
+			}
+			state := controlapi.CapabilityDegraded
+			if entry.optional {
+				state = controlapi.CapabilityAvailable
+			}
+			states = append(states, controlapi.CapabilityState{Name: entry.name, Available: false, State: state, Reason: reason})
+			continue
+		}
+		states = append(states, controlapi.CapabilityState{Name: entry.name, Available: true, State: controlapi.CapabilityAvailable})
 	}
 	if server.store == nil {
 		states = append(states, controlapi.CapabilityState{Name: "persistence", Available: false, State: controlapi.CapabilityDegraded, Reason: "SQLite store not configured"})
@@ -1762,8 +1818,8 @@ func (server *Server) serviceCapability(ctx context.Context, service serviceRunt
 	return controlapi.CapabilityState{Name: name, Available: true, State: controlapi.CapabilityAvailable}
 }
 
-func (server *Server) runtimeCapability(service serviceRuntime.ServiceName, name, unavailableReason string) controlapi.RuntimeCapability {
-	state := server.serviceCapability(context.Background(), service, name, unavailableReason)
+func (server *Server) runtimeCapability(ctx context.Context, service serviceRuntime.ServiceName, name, unavailableReason string) controlapi.RuntimeCapability {
+	state := server.serviceCapability(ctx, service, name, unavailableReason)
 	return controlapi.RuntimeCapability{Name: name, Available: state.Available, Reason: state.Reason}
 }
 
@@ -1804,7 +1860,7 @@ func (server *Server) handleProxyEgresses(w http.ResponseWriter, r *http.Request
 			writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
 			return
 		}
-		resource, payload, hash, err := server.compileProxyEgressResource(req)
+		resource, payload, hash, err := server.compileProxyEgressResource(r.Context(), req)
 		if err != nil {
 			server.recordAudit(session.Username, session.Role, "/api/v1/proxy/egresses", "create", "failure", err.Error(), r)
 			writeError(w, r, http.StatusUnprocessableEntity, "invalid_proxy_egress", err.Error())
@@ -1847,7 +1903,7 @@ func (server *Server) proxyEgressResources(ctx context.Context) ([]controlapi.Pr
 				if configured, ok := payload["enabled"].(bool); ok {
 					enabled = configured
 				}
-				resource, err := server.proxyEgressResource(egress, name, enabled)
+				resource, err := server.proxyEgressResource(ctx, egress, name, enabled)
 				if err != nil {
 					return nil, err
 				}
@@ -1857,17 +1913,17 @@ func (server *Server) proxyEgressResources(ctx context.Context) ([]controlapi.Pr
 			return items, nil
 		}
 	}
-	resource, err := server.proxyEgressResource(server.proxyEgress, "Default proxy egress", true)
+	resource, err := server.proxyEgressResource(ctx, server.proxyEgress, "Default proxy egress", true)
 	if err != nil {
 		return nil, err
 	}
 	return []controlapi.ProxyEgressResource{resource}, nil
 }
 
-func (server *Server) proxyEgressResource(egress proxy.Egress, name string, enabled bool) (controlapi.ProxyEgressResource, error) {
+func (server *Server) proxyEgressResource(ctx context.Context, egress proxy.Egress, name string, enabled bool) (controlapi.ProxyEgressResource, error) {
 	return controlapi.ProxyEgressWANRow(egress, name, enabled,
-		server.runtimeCapability(serviceRuntime.VPP, "vpp_steering", "VPP apply runtime is not configured"),
-		server.runtimeCapability(serviceRuntime.Xray, "xray_runtime", "xray service runtime is not configured"),
+		server.runtimeCapability(ctx, serviceRuntime.VPP, "vpp_steering", "VPP apply runtime is not configured"),
+		server.runtimeCapability(ctx, serviceRuntime.Xray, "xray_runtime", "xray service runtime is not configured"),
 	)
 
 }
@@ -2098,7 +2154,7 @@ func artifactsForService(artifacts []serviceRuntime.RenderedArtifact, service se
 	return items
 }
 
-func (server *Server) compileProxyEgressResource(req ProxyEgressWriteRequest) (controlapi.ProxyEgressResource, json.RawMessage, string, error) {
+func (server *Server) compileProxyEgressResource(ctx context.Context, req ProxyEgressWriteRequest) (controlapi.ProxyEgressResource, json.RawMessage, string, error) {
 	if strings.TrimSpace(req.ID) == "" {
 		return controlapi.ProxyEgressResource{}, nil, "", fmt.Errorf("proxy egress id is required")
 	}
@@ -2139,7 +2195,7 @@ func (server *Server) compileProxyEgressResource(req ProxyEgressWriteRequest) (c
 	if err != nil {
 		return controlapi.ProxyEgressResource{}, nil, "", err
 	}
-	resource, err := server.proxyEgressResource(egress, nonEmpty(req.Name, req.ID), req.Enabled)
+	resource, err := server.proxyEgressResource(ctx, egress, nonEmpty(req.Name, req.ID), req.Enabled)
 	resource.UnderlayWANID = egress.UnderlayWANID
 	resource.NodeID = egress.NodeID
 	resource.SubscriptionID = egress.SubscriptionID
@@ -2152,7 +2208,7 @@ func (server *Server) handleDefaultFlowIntent(w http.ResponseWriter, r *http.Req
 		return
 	}
 	resource := controlapi.FlowIntent(server.flowIntent,
-		server.runtimeCapability(serviceRuntime.VPP, "vpp_qos_push", "VPP apply runtime is not configured"),
+		server.runtimeCapability(r.Context(), serviceRuntime.VPP, "vpp_qos_push", "VPP apply runtime is not configured"),
 	)
 	writeJSON(w, http.StatusOK, map[string]any{"item": resource, "request_id": requestID(r)})
 }
@@ -2165,7 +2221,7 @@ func (server *Server) handleInterfaceBonds(w http.ResponseWriter, r *http.Reques
 			writeError(w, r, http.StatusInternalServerError, "interface_bond_read_failed", "interface bonds are unavailable")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": items, "capabilities": server.degradedRuntimeCapabilities(), "request_id": requestID(r)})
+		writeJSON(w, http.StatusOK, map[string]any{"items": items, "capabilities": server.degradedRuntimeCapabilities(r.Context()), "request_id": requestID(r)})
 	case http.MethodPost:
 		server.handleInterfaceBondCreate(w, r)
 	default:
@@ -2274,7 +2330,7 @@ func (server *Server) compileInterfaceBond(ctx context.Context, payload map[stri
 			return nil, http.StatusBadRequest, fmt.Errorf("interface bond members must have the same work_mode")
 		}
 	}
-	return map[string]any{"id": id, "name": nonEmpty(stringField(payload, "name"), id), "members": members, "mode": "xor", "load_balance": "l34", "speed": speed, "work_mode": workMode, "runtime_state": "desired_not_applied", "vpp_operation": map[string]any{"name": "vpp.interface-bond", "mode": "xor", "load_balance": "l34", "members": members}, "capabilities": server.degradedRuntimeCapabilities()}, http.StatusOK, nil
+	return map[string]any{"id": id, "name": nonEmpty(stringField(payload, "name"), id), "members": members, "mode": "xor", "load_balance": "l34", "speed": speed, "work_mode": workMode, "runtime_state": "desired_not_applied", "vpp_operation": map[string]any{"name": "vpp.interface-bond", "mode": "xor", "load_balance": "l34", "members": members}, "capabilities": server.degradedRuntimeCapabilities(ctx)}, http.StatusOK, nil
 }
 
 func (server *Server) handleDHCPLeases(w http.ResponseWriter, r *http.Request) {
@@ -2595,7 +2651,7 @@ func (server *Server) handleDesiredCollection(resourceType string) http.HandlerF
 			if resourceType == "traffic_control" {
 				items = server.decorateTrafficControlRuntimeStates(r.Context(), items)
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"items": items, "capabilities": server.degradedRuntimeCapabilities(), "request_id": requestID(r)})
+			writeJSON(w, http.StatusOK, map[string]any{"items": items, "capabilities": server.degradedRuntimeCapabilities(r.Context()), "request_id": requestID(r)})
 		case http.MethodPost:
 			server.handleDesiredMutation(w, r, resourceType, "create", "")
 		default:
@@ -2679,7 +2735,7 @@ func (server *Server) handleDesiredItem(resourceType string) http.HandlerFunc {
 			if resourceType == "traffic_control" {
 				item = server.decorateTrafficControlRuntimeState(r.Context(), item)
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"item": item, "capabilities": server.degradedRuntimeCapabilities(), "request_id": requestID(r)})
+			writeJSON(w, http.StatusOK, map[string]any{"item": item, "capabilities": server.degradedRuntimeCapabilities(r.Context()), "request_id": requestID(r)})
 		case http.MethodPatch, http.MethodPost:
 			server.handleDesiredMutation(w, r, resourceType, actionOrDefault(action, "update"), id)
 		case http.MethodDelete:
@@ -2976,7 +3032,7 @@ func (server *Server) handleObjectGroupImport(w http.ResponseWriter, r *http.Req
 		if importedSource != nil {
 			item["import_source"] = importedSource
 		}
-		item["capabilities"] = server.degradedRuntimeCapabilities()
+		item["capabilities"] = server.degradedRuntimeCapabilities(r.Context())
 		raw, hash, err := persistence.MarshalPayload(item)
 		if err != nil {
 			server.recordAudit(session.Username, session.Role, r.URL.Path, "import", "failure", err.Error(), r)
@@ -3437,7 +3493,7 @@ func (server *Server) handleDesiredMutation(w http.ResponseWriter, r *http.Reque
 	}
 	natRebuild := server.natRebuildImpact(r.Context(), resourceType, id, payload)
 	payload["runtime_state"] = "desired_not_applied"
-	payload["capabilities"] = server.degradedRuntimeCapabilities()
+	payload["capabilities"] = server.degradedRuntimeCapabilities(r.Context())
 	raw, hash, err := persistence.MarshalPayload(payload)
 	if err != nil {
 		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
@@ -4790,13 +4846,51 @@ func firstIntField(item map[string]any, keys ...string) int {
 	return 0
 }
 
-func (server *Server) degradedRuntimeCapabilities() []controlapi.CapabilityState {
-	return []controlapi.CapabilityState{
-		server.serviceCapability(context.Background(), serviceRuntime.VPP, "vpp_runtime_apply", "VPP apply runtime is not configured"),
-		server.serviceCapability(context.Background(), serviceRuntime.SmartDNS, "smartdns_runtime_apply", "SmartDNS service runtime is not configured"),
-		server.serviceCapability(context.Background(), serviceRuntime.Kea, "kea_runtime_apply", "Kea service runtime is not configured"),
-		server.serviceCapability(context.Background(), serviceRuntime.Xray, "xray_runtime_apply", "xray service runtime is not configured"),
+func (server *Server) degradedRuntimeCapabilities(ctx context.Context) []controlapi.CapabilityState {
+	type capabilityService struct {
+		service           serviceRuntime.ServiceName
+		name              string
+		unavailableReason string
 	}
+	entries := []capabilityService{
+		{serviceRuntime.VPP, "vpp_runtime_apply", "VPP apply runtime is not configured"},
+		{serviceRuntime.SmartDNS, "smartdns_runtime_apply", "SmartDNS service runtime is not configured"},
+		{serviceRuntime.Kea, "kea_runtime_apply", "Kea service runtime is not configured"},
+		{serviceRuntime.Xray, "xray_runtime_apply", "xray service runtime is not configured"},
+	}
+	results := make([]controlapi.CapabilityState, 0, len(entries))
+	if !server.serviceRuntimeConfigured() {
+		for _, entry := range entries {
+			results = append(results, controlapi.CapabilityState{Name: entry.name, Available: false, State: controlapi.CapabilityDegraded, Reason: entry.unavailableReason})
+		}
+		return results
+	}
+	services := make([]serviceRuntime.ServiceName, 0, len(entries))
+	for _, entry := range entries {
+		services = append(services, entry.service)
+	}
+	health, err := server.services.HealthCheck(ctx, services...)
+	byService := make(map[serviceRuntime.ServiceName]serviceRuntime.Health, len(health))
+	for _, item := range health {
+		byService[item.Service] = item
+	}
+	for _, entry := range entries {
+		if err != nil {
+			results = append(results, controlapi.CapabilityState{Name: entry.name, Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()})
+			continue
+		}
+		item, ok := byService[entry.service]
+		if !ok || !item.Available {
+			reason := serviceUnitReason(entry.service)
+			if item.Reason != "" {
+				reason = item.Reason
+			}
+			results = append(results, controlapi.CapabilityState{Name: entry.name, Available: false, State: controlapi.CapabilityDegraded, Reason: reason})
+			continue
+		}
+		results = append(results, controlapi.CapabilityState{Name: entry.name, Available: true, State: controlapi.CapabilityAvailable})
+	}
+	return results
 }
 
 func nonEmpty(value, fallback string) string {
@@ -4838,7 +4932,9 @@ func (server *Server) handleRuntimePreview(w http.ResponseWriter, r *http.Reques
 		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
 		return
 	}
-	plan, err := server.buildRuntimePlan(r.Context(), requestID(r))
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	plan, err := server.buildRuntimePlan(ctx, requestID(r))
 	if err != nil {
 		writeError(w, r, http.StatusUnprocessableEntity, "runtime_preview_failed", err.Error())
 		return
@@ -5059,7 +5155,9 @@ func (server *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request
 		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
 		return
 	}
-	plan, err := server.buildRuntimePlan(r.Context(), requestID(r))
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	plan, err := server.buildRuntimePlan(ctx, requestID(r))
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":     "degraded",
@@ -5069,7 +5167,7 @@ func (server *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request
 		})
 		return
 	}
-	components := server.runtimeStatusComponents(r.Context(), plan.RuntimeArtifacts, len(plan.VppOperations) > 0)
+	components := plan.Components
 	server.runtimeMu.Lock()
 	last := server.lastRuntime
 	server.runtimeMu.Unlock()
@@ -5083,6 +5181,7 @@ func (server *Server) lastRuntimeApply() *RuntimeApplyResult {
 }
 
 func (server *Server) buildRuntimePlan(ctx context.Context, requestID string) (RuntimePlan, error) {
+	ctx = withInterfaceAliasCache(ctx)
 	if server.profile.ID() == product.Orchestrator().ID() {
 		return server.buildOrchestratorRuntimePlan(ctx, requestID)
 	}
@@ -5098,10 +5197,28 @@ func (server *Server) buildRuntimePlan(ctx context.Context, requestID string) (R
 }
 
 func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID string, proxyEgress proxy.Egress, hasProxyEgress bool, flowIntent flow.Intent, hasFlowIntent bool) (RuntimePlan, error) {
+	planStart := time.Now()
+	planTiming := os.Getenv("LY_ROUTE_PLAN_TIMING") == "1"
+	mark := func(name string) {
+		if planTiming {
+			fmt.Fprintf(os.Stderr, "ly-route-plan %-24s %s\n", name, time.Since(planStart).Round(time.Millisecond))
+		}
+	}
+	defer mark("total")
+	if server.serviceRuntimeConfigured() {
+		// Warm the per-service health cache while the plan is still reading
+		// desired state.  The component section runs several seconds later;
+		// doing the (bounded) systemctl probes here keeps them off the tail
+		// of the request and out of the 10s status budget.
+		go func() {
+			_, _ = server.services.HealthCheck(ctx, serviceRuntime.VPP, serviceRuntime.SmartDNS, serviceRuntime.Kea, serviceRuntime.Xray, serviceRuntime.PPPoE)
+		}()
+	}
 	addressAssignments, err := server.runtimeAddressAssignments(ctx)
 	if err != nil {
 		return RuntimePlan{}, err
 	}
+	mark("address-assignments")
 	var smartQoSAssignments []vpp.AddressAssignment
 	var compiledProxy proxy.CompiledEgress
 	var compiledFlow flow.CompiledIntent
@@ -5123,10 +5240,12 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 			degradeProxyRuntime(&compiledProxy)
 		}
 	}
+	mark("proxy")
 	smartQoSAssignments, err = server.runtimeSmartQoSAssignments(ctx, addressAssignments, proxyEgress, hasProxyEgress && proxyRuntimeWarning == "")
 	if err != nil {
 		return RuntimePlan{}, err
 	}
+	mark("smart-qos")
 	if hasFlowIntent {
 		var err error
 		runtimeFlowIntent, expandErr := server.expandFlowIntentAddressGroups(ctx, flowIntent)
@@ -5138,14 +5257,28 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 			return RuntimePlan{}, err
 		}
 	}
-	compiledNAT, err := server.currentNATConfig(ctx)
-	if err != nil {
-		return RuntimePlan{}, err
+	mark("flow")
+	var compiledNAT nat.CompiledConfig
+	var compiledPolicy trafficpolicy.Config
+	var natErr, policyErr error
+	var planWait sync.WaitGroup
+	planWait.Add(2)
+	go func() {
+		defer planWait.Done()
+		compiledNAT, natErr = server.currentNATConfig(ctx)
+	}()
+	go func() {
+		defer planWait.Done()
+		compiledPolicy, policyErr = server.currentTrafficPolicyConfig(ctx)
+	}()
+	planWait.Wait()
+	if natErr != nil {
+		return RuntimePlan{}, natErr
 	}
-	compiledPolicy, err := server.currentTrafficPolicyConfig(ctx)
-	if err != nil {
-		return RuntimePlan{}, err
+	if policyErr != nil {
+		return RuntimePlan{}, policyErr
 	}
+	mark("nat+traffic-policy")
 	retiredRoutePolicyIDs, err := server.currentRetiredRoutePolicyIDs(ctx)
 	if err != nil {
 		return RuntimePlan{}, err
@@ -5172,10 +5305,12 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	if err != nil {
 		return RuntimePlan{}, err
 	}
+	mark("security")
 	dnsPolicies, dnsArtifacts, dnsNetworks, err := server.currentDNSPolicies(ctx, proxyEgresses, compiledPolicy)
 	if err != nil {
 		return RuntimePlan{}, err
 	}
+	mark("dns-policies")
 	dnsServiceNetworks = dnsNetworks
 	artifacts = append(artifacts, dnsArtifacts...)
 	if hasProxyEgress && proxyRuntimeWarning == "" {
@@ -5211,11 +5346,13 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	if err != nil {
 		return RuntimePlan{}, err
 	}
+	mark("dhcp")
 	artifacts = append(artifacts, dhcpArtifacts...)
 	pppoePeers, pppoeArtifacts, err := server.currentPPPoEPeers(ctx)
 	if err != nil {
 		return RuntimePlan{}, err
 	}
+	mark("pppoe-peers")
 	artifacts = append(artifacts, pppoeArtifacts...)
 	ipv6Artifacts, ipv6Warning := server.currentIPv6RAArtifacts(ctx)
 	artifacts = append(artifacts, ipv6Artifacts...)
@@ -5229,6 +5366,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	}
 	nativePath := vpp.LoadNativePathRequestWithSharedManagement(proofPath, server.managementInterfaceID(ctx), dataInterfaces, server.now().UTC(), server.managementNetworkShared(ctx))
 	nativePath.RequireSmartQoS = server.requireSmartQoS
+	mark("native-path")
 	dnsInterceptionEnabled := server.profile.ID() == product.Gateway().ID() && hasLANAddressAssignment(addressAssignments)
 	dataplanePrepared := false
 	if composition, ok := server.gatewayTransaction.(apply.ProductionGatewayComposition); ok {
@@ -5253,6 +5391,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	smartQoSEnabled := selectionErr == nil && selectedPath.SmartQoS
 	canonicalGatewayPlan := vpp.Plan{RequestID: requestID, NativePath: nativePath, DataplanePrepared: dataplanePrepared, AddressAssignments: addressAssignments, SmartQoSAssignments: smartQoSAssignments, SmartQoSEnabled: smartQoSEnabled, Proxy: compiledProxy, Flow: gatewayFlow, NAT: compiledNAT, Policy: gatewayPolicy, RetiredRoutePolicyIDs: retiredRoutePolicyIDs, Security: securityGeneration, DNSInterception: dnsInterceptionEnabled, DNSServiceNetworks: dnsServiceNetworks}
 	operations, err := vpp.BuildOperations(canonicalGatewayPlan)
+	mark("build-operations")
 	dataplaneState := "native_ready"
 	var dataplaneProof []vpp.PrerequisiteResult
 	warnings := append([]string(nil), planningWarnings...)
@@ -5300,6 +5439,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		artifacts = append(artifacts, vppArtifacts...)
 	}
 	components := server.runtimeStatusComponents(ctx, artifacts, len(operations) > 0)
+	mark("components")
 	if ipv6Warning != "" {
 		components = markComponentDegraded(components, string(serviceRuntime.IPv6RA), ipv6Warning)
 	}
@@ -7016,19 +7156,45 @@ func livePPPoEPathMatchesVPP(ctx context.Context, output []byte, interfaceName s
 	if !vppInterfaceNameSafe(interfaceName) {
 		return false
 	}
-	sessions, err := runLiveVPP(ctx, "show", "pppoe", "session")
-	if err != nil {
-		return false
-	}
-	needle := fmt.Sprintf("client-ip %s session-id %d", localAddress, status.Session.SessionID)
-	if !strings.Contains(sessions, needle) {
-		return false
+	// The native Hi-Jiajun plugin exposes sessions through
+	// `show pppoe client detail`; `show pppoe session` belongs to the legacy
+	// built-in session table and prints "No pppoe sessions configured" here.
+	detail, detailErr := runLiveVPP(ctx, "show", "pppoe", "client", "detail")
+	if detailErr == nil && strings.Contains(detail, "PPPOE_CLIENT_SESSION") {
+		if !strings.Contains(detail, fmt.Sprintf("session-id %d", status.Session.SessionID)) ||
+			!strings.Contains(detail, fmt.Sprintf("runtime ipv4 local %s", localAddress)) {
+			return false
+		}
+		peer := strings.TrimSpace(pppoeDetailPeer(detail, localAddress.String()))
+		if peer == "" || peer == "0.0.0.0" {
+			return false
+		}
+	} else {
+		sessions, err := runLiveVPP(ctx, "show", "pppoe", "session")
+		if err != nil {
+			return false
+		}
+		needle := fmt.Sprintf("client-ip %s session-id %d", localAddress, status.Session.SessionID)
+		if !strings.Contains(sessions, needle) {
+			return false
+		}
 	}
 	addresses, err := runLiveVPP(ctx, "show", "interface", "address")
 	if err != nil {
 		return false
 	}
 	return vppInterfaceHasAddress(addresses, interfaceName, localAddress.String())
+}
+
+func pppoeDetailPeer(output, localAddress string) string {
+	prefix := "runtime ipv4 local " + localAddress + " peer "
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	return ""
 }
 
 func vppInterfaceHasAddress(output, interfaceName, address string) bool {
@@ -7123,6 +7289,15 @@ func (server *Server) runtimeStatusComponents(ctx context.Context, artifacts []s
 		return components
 	}
 	components := []RuntimeComponentState{}
+	healthByService := map[serviceRuntime.ServiceName]serviceRuntime.Health{}
+	var healthErr error
+	if server.serviceRuntimeConfigured() {
+		health, err := server.services.HealthCheck(ctx, serviceRuntime.SmartDNS, serviceRuntime.Kea, serviceRuntime.Xray, serviceRuntime.PPPoE)
+		healthErr = err
+		for _, item := range health {
+			healthByService[item.Service] = item
+		}
+	}
 	for _, service := range []struct {
 		productService product.Service
 		runtimeService serviceRuntime.ServiceName
@@ -7139,15 +7314,15 @@ func (server *Server) runtimeStatusComponents(ctx context.Context, artifacts []s
 		if !server.serviceRuntimeConfigured() {
 			component.State = "unavailable"
 			component.Reason = "service runtime controller is not configured"
+		} else if healthErr != nil {
+			component.State = "degraded"
+			component.Reason = healthErr.Error()
 		} else {
-			health, err := server.services.HealthCheck(ctx, service.runtimeService)
-			if err != nil {
+			health := healthByService[service.runtimeService]
+			if !health.Available {
 				component.State = "degraded"
-				component.Reason = err.Error()
-			} else if len(health) == 0 || !health[0].Available {
-				component.State = "degraded"
-				if len(health) > 0 {
-					component.Reason = health[0].Reason
+				if strings.TrimSpace(health.Reason) != "" {
+					component.Reason = health.Reason
 				}
 			} else {
 				component.State = "running"
@@ -8769,6 +8944,9 @@ func (server *Server) displayInterfaceName(ctx context.Context, actual string) s
 }
 
 func (server *Server) interfaceAliasSnapshot(ctx context.Context) []map[string]any {
+	if cache := interfaceAliasCacheFromContext(ctx); cache != nil {
+		return cache.snapshot()
+	}
 	items := hostInterfaceInventory()
 	sort.SliceStable(items, func(i, j int) bool {
 		left := strings.TrimSpace(nonEmpty(stringField(items[i], "id"), stringField(items[i], "name")))

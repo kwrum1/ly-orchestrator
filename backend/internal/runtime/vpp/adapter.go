@@ -1768,16 +1768,24 @@ func routePathVia(vppInterface, nextHop, fallback string) string {
 	if via == "" {
 		return strings.TrimSpace(nextHop)
 	}
-	if strings.HasPrefix(strings.ToLower(via), "pppoe_session") || strings.HasPrefix(strings.ToLower(via), "pppoe-runtime:") {
+	if isRuntimePPPoEInterface(via) {
 		return via
 	}
 	if nextHop = strings.TrimSpace(nextHop); nextHop != "" {
 		return nextHop + " " + via
 	}
-	if strings.HasPrefix(strings.ToLower(via), "pppoe_session") || strings.HasPrefix(strings.ToLower(via), "pppoe-runtime:") {
+	if isRuntimePPPoEInterface(via) {
 		return "ip4-lookup-in-table 0"
 	}
 	return via
+}
+
+func isRuntimePPPoEInterface(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	return strings.HasPrefix(lower, "pppoe_session") ||
+		strings.HasPrefix(lower, "pppox") ||
+		strings.HasPrefix(lower, "lyppp-") ||
+		strings.HasPrefix(lower, "pppoe-runtime:")
 }
 
 func nonEmptyList(items []string, fallback string) []string {

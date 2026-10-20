@@ -70,7 +70,7 @@ func TestFilesystemController_semantic_readback_accepts_plan_derived_live_state(
 		{
 			name: "native VPP PPPoE session", service: PPPd, artifacts: pppoeArtifacts,
 			outputs: map[string]string{
-				"cat /run/ly-route/pppoe/wan-blue.json":        `{"state":"connected","interface":"pppoe_session0","session":{"local_address":"198.51.100.8"}}`,
+				"cat /run/ly-route/pppoe/wan-blue.json":        `{"state":"connected","interface":"pppoe_session0","session":{"session_id":7,"local_address":"198.51.100.8","peer_address":"198.51.100.1"}}`,
 				"vppctl show pppoe session":                    "sw_if_index 8 client-ip 198.51.100.8 session-id 7",
 				"vppctl show interface address pppoe_session0": "pppoe_session0 (up): 198.51.100.8/32",
 			},
