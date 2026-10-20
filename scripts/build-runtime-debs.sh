@@ -1329,8 +1329,10 @@ build_vpp_pppoe_client() {
     fetch_fdio_package libvppinfra-dev "$build_debs"
     vpp_dev_dir="$build_debs"
   fi
-  plugin=$(LY_ROUTE_VPP_DEV_DEBS_DIR="$vpp_dev_dir" "$repo_root/scripts/build-vpp-pppoe-client-plugin.sh" | tail -1)
-  [ -f "$plugin" ] || { echo "PPPoE client plugin build did not produce a library" >&2; exit 1; }
+  legacy_plugin=$(LY_ROUTE_VPP_DEV_DEBS_DIR="$vpp_dev_dir" "$repo_root/scripts/build-vpp-pppoe-client-plugin.sh" | tail -1)
+  [ -f "$legacy_plugin" ] || { echo "Legacy PPPoE packet-binding plugin build did not produce a library" >&2; exit 1; }
+  plugin=$(LY_ROUTE_VPP_DEV_DEBS_DIR="$vpp_dev_dir" "$repo_root/scripts/build-vpp-pppoeclient-plugin.sh" | tail -1)
+  [ -f "$plugin" ] || { echo "Native PPPoE client plugin build did not produce a library" >&2; exit 1; }
   case "$deb_arch" in
     amd64) multiarch=x86_64-linux-gnu ;;
     arm64) multiarch=aarch64-linux-gnu ;;
@@ -1339,7 +1341,8 @@ build_vpp_pppoe_client() {
   esac
   plugin_dir="$package_root/usr/lib/$multiarch/vpp_plugins"
   mkdir -p "$package_root/DEBIAN" "$plugin_dir"
-  install -m 0644 "$plugin" "$plugin_dir/ly_route_pppoe_client_plugin.so"
+  install -m 0644 "$legacy_plugin" "$plugin_dir/ly_route_pppoe_client_plugin.so"
+  install -m 0644 "$plugin" "$plugin_dir/pppoeclient_plugin.so"
   cat > "$package_root/DEBIAN/control" <<EOF
 Package: ly-route-vpp-pppoe-client
 Version: $lyroute_plugin_version
@@ -1348,7 +1351,7 @@ Priority: optional
 Architecture: $deb_arch
 Maintainer: Ly Route <root@ly-route.local>
 Depends: vpp (= ${LY_ROUTE_VPP_PACKAGE_VERSION:-$fdio_vpp_version})
-Description: Ly Route native VPP PPPoE client binding
+Description: Ly Route VPP PPPoE client plugin (native and legacy binding)
 EOF
   mkdir -p "$out_dir"
   rm -f "$out_dir/ly-route-vpp-pppoe-client_"*"_${deb_arch}.deb"

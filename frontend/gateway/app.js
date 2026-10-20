@@ -638,13 +638,14 @@ function systemConfigOperationsHtml() {
 function renderManagementNetworkEditor() {
 	const item = state.controlPlane.managementNetwork?.item || state.controlPlane.managementNetwork || {};
 	const iface = item.interface_id || 'eth0';
-	const cidr = item.cidr || item.ip_cidr || '192.168.88.1/24';
+	const cidr = item.cidr || item.ip_cidr || '';
+	const managementLoaded = Boolean(item.cidr || item.ip_cidr);
 	const gateway = item.gateway || '';
 	const interfaceRows = networkRowsForPage('monitor/interface_list');
 	const options = interfaceRows.map((row) => row[0]).filter(Boolean);
 	if (iface && !options.includes(iface)) options.unshift(iface);
 	const interfaceOptions = options.map((value) => `<option value="${escapeAttr(value)}" ${value === iface ? 'selected' : ''}>${safeText(value)}</option>`).join('');
-	return `<section class="config-op management-network-op"><div class="config-op-copy"><strong>管理口设置</strong></div><div class="management-network-form"><label>管理接口<select data-management-interface>${interfaceOptions}</select></label><label>IP/掩码<input data-management-cidr value="${safeText(cidr)}"></label><label>网关<input data-management-gateway value="${safeText(gateway)}"></label><button class="primary" type="button" data-action="management-save">保存管理口</button></div></section>`;
+	return `<section class="config-op management-network-op"><div class="config-op-copy"><strong>管理口设置</strong></div><div class="management-network-form"><label>管理接口<select data-management-interface>${interfaceOptions}</select></label><label>IP/掩码<input data-management-cidr value="${safeText(cidr)}" placeholder="读取中…"></label><label>网关<input data-management-gateway value="${safeText(gateway)}" placeholder="读取中…"></label><button class="primary" type="button" data-action="management-save" ${managementLoaded ? '' : 'disabled'}>保存管理口</button></div></section>`;
 }
 
 function renderFirmwareOperationsHtml() {
@@ -2937,7 +2938,7 @@ function wireWanTypeForm() {
     form.querySelector('[data-proxy-top-n-field]')?.classList.toggle('is-hidden', type.value !== 'proxy' || proxySelection?.value !== 'adaptive');
     form.querySelector('[data-proxy-node-pool]')?.classList.toggle('is-hidden', type.value !== 'proxy' || proxySelection?.value !== 'adaptive');
     const mtu = form.querySelector('[data-wan-mtu]');
-    if (mtu) mtu.value = type.value === 'pppoe' ? '1460' : '1500';
+    if (mtu) mtu.value = type.value === 'pppoe' ? '1492' : '1500';
   };
   type.addEventListener('change', sync);
   proxySelection?.addEventListener('change', sync);
@@ -3139,7 +3140,12 @@ function authFetch(path, options = {}) {
 async function apiJSON(path, options = {}) {
   const response = await authFetch(path, options);
   const text = await response.text();
-  const payload = text ? JSON.parse(text) : {};
+  let payload = {};
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(`服务暂时不可用（HTTP ${response.status}），请稍后重试`);
+  }
   if (!response.ok) throw new Error(payload.error?.message || `服务暂时无法完成操作（${response.status}）`);
   return payload;
 }

@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Ly Route native PPPoE peer driven by the Hi-Jiajun VPP PPPoE plugin.
+
+This replaces the old userspace Go PPPoE client and never invokes pppd.  The
+plugin owns discovery, LCP/PAP/CHAP, IPCP and IPv6CP; this process only maps
+the appliance peer plan to `vppctl` and publishes the status contract.
+"""
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+STOP = False
+
+
+def log(message):
+    print(f"ly-route-pppoe-plugin: {message}", flush=True)
+
+
+def vppctl(*args, timeout=10):
+    try:
+        result = subprocess.run(
+            ["vppctl", *args], capture_output=True, text=True, timeout=timeout
+        )
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+    except Exception as exc:  # noqa: BLE001 - status must survive a dead VPP
+        return 1, "", str(exc)
+
+
+def run(*args, timeout=10):
+    code, out, err = vppctl(*args, timeout=timeout)
+    if code != 0:
+        log(f"vppctl {' '.join(args)} failed: {err or out}")
+    return code, out
+
+
+def write_status(path, state, interface="", local="", peer=""):
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {"state": state, "interface": interface}
+    if local:
+        payload["session"] = {"local_address": local, "peer_address": peer}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"))
+        handle.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def plugin_name(peer_id):
+    digest = hashlib.sha256(peer_id.encode()).hexdigest()[:8]
+    return "lyppp-" + digest
+
+
+def parse_session(detail):
+    match = re.search(
+        r"runtime\s+ipv4\s+local\s+(\S+)\s+peer\s+(\S+)", detail
+    )
+    if not match:
+        return None, None
+    if "PPPOE_CLIENT_SESSION" not in detail:
+        return None, None
+    return match.group(1), match.group(2)
+
+
+def remove_stale_addresses(interface, keep):
+    code, out, _ = vppctl("show", "interface", "address", interface)
+    if code != 0:
+        return
+    current = None
+    for line in out.splitlines():
+        match = re.match(r"\s*L3\s+([0-9a-fA-F:.]+)/(\d+)", line)
+        if match:
+            current = f"{match.group(1)}/{match.group(2)}"
+            if current != keep:
+                run("set", "interface", "ip", "address", "del", interface, current)
+
+
+def configure_nat(name, plan):
+    if not plan.get("nat", True):
+        return
+    behavior = str(plan.get("nat_behavior", "")).lower()
+    if behavior in ("full_cone", "full-cone"):
+        run("nat44", "ei", "plugin", "enable")
+    else:
+        run("nat44", "plugin", "enable")
+    for inside in plan.get("nat_inside_interfaces") or []:
+        inside = str(inside).strip()
+        if inside:
+            if behavior in ("full_cone", "full-cone"):
+                run("set", "interface", "nat44", "ei", "in", inside, "out", name)
+            else:
+                run("set", "interface", "nat44", "in", inside, "out", name)
+    if behavior in ("full_cone", "full-cone"):
+        run("nat44", "ei", "add", "interface", "address", name)
+    else:
+        run("nat44", "add", "interface", "address", name)
+
+
+def stop(*_):
+    global STOP
+    STOP = True
+
+
+def main():
+    global STOP
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    config_path = None
+    args = sys.argv[1:]
+    for index, arg in enumerate(args):
+        if arg == "-config" and index + 1 < len(args):
+            config_path = args[index + 1]
+    if not config_path:
+        print("usage: ly-route-pppoe-plugin -config <peer.json>", file=sys.stderr)
+        return 2
+    with open(config_path, encoding="utf-8") as handle:
+        plan = json.load(handle)
+
+    peer_id = str(plan.get("id") or "wan")
+    wan = str(plan.get("wan_interface") or "").strip()
+    username = str(plan.get("username") or "")
+    password = str(plan.get("password") or "")
+    mru = int(plan.get("mru") or 1492)
+    name = plugin_name(peer_id)
+    status_file = str(plan.get("status_file") or "")
+    host_uniq = int(hashlib.sha256(peer_id.encode()).hexdigest()[:8], 16) or 1
+
+    if not wan.startswith("lyroute-") and wan.startswith("eth"):
+        wan = "lyroute-" + wan
+    if not wan:
+        print("missing wan_interface", file=sys.stderr)
+        return 2
+
+    write_status(status_file, "connecting", name)
+
+    # Remove a previous instance and stale addresses before reconnecting.
+    run("create", "pppoe", "client", wan, "host-uniq", str(host_uniq), "del")
+    time.sleep(1)
+    code, _ = run(
+        "create", "pppoe", "client", wan, "host-uniq", str(host_uniq),
+        "name", name,
+    )
+    if code != 0:
+        write_status(status_file, "failed", name)
+        return 1
+    set_args = [
+        "set", "pppoe", "client", name,
+        "username", username, "password", password,
+        "mru", str(mru), "mtu", str(mru),
+    ]
+    if plan.get("default_route", True):
+        set_args.append("add-default-route")
+    if plan.get("nat", True):
+        set_args.append("use-peer-dns")
+    run(*set_args)
+
+    local = peer = None
+    for _ in range(40):
+        if STOP:
+            break
+        code, detail, _ = vppctl("show", "pppoe", "client", "detail")
+        if code == 0:
+            local, peer = parse_session(detail)
+            if local:
+                break
+        time.sleep(0.5)
+
+    if local:
+        remove_stale_addresses(name, local + "/32")
+        configure_nat(name, plan)
+        write_status(status_file, "connected", name, local, peer or "")
+        log(f"{peer_id} connected {local} peer {peer or '?'} on {name}")
+    else:
+        write_status(status_file, "connecting", name)
+
+    while not STOP:
+        time.sleep(5)
+        code, detail, _ = vppctl("show", "pppoe", "client", "detail")
+        if code != 0:
+            write_status(status_file, "unavailable", name)
+            continue
+        local, peer = parse_session(detail)
+        if local:
+            write_status(status_file, "connected", name, local, peer or "")
+        else:
+            write_status(status_file, "connecting", name)
+        # A new session can leave the previous address behind.
+        if local:
+            remove_stale_addresses(name, local + "/32")
+
+    run("create", "pppoe", "client", wan, "host-uniq", str(host_uniq), "del")
+    write_status(status_file, "disconnected", name)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

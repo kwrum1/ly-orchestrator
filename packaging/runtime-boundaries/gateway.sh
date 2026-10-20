@@ -12,7 +12,7 @@ LY_ROUTE_GATEWAY_CUSTOM_RUNTIME_PACKAGES="libvppinfra vpp vpp-plugin-core vpp-pl
 # These are the only custom VPP-loadable plugins in the Gateway product. The
 # DNS VPP proxy is a user-space VCL adapter, not a VPP .so; it is gated below
 # as a required runtime file and systemd unit.
-LY_ROUTE_GATEWAY_VPP_PLUGINS="ly_route_pppoe_client_plugin.so ly_route_smart_qos_plugin.so ly_route_security_guard_plugin.so ly_route_dns_intercept_plugin.so ly_route_pre_nat_route_plugin.so"
+LY_ROUTE_GATEWAY_VPP_PLUGINS="ly_route_pppoe_client_plugin.so pppoeclient_plugin.so ly_route_smart_qos_plugin.so ly_route_security_guard_plugin.so ly_route_dns_intercept_plugin.so ly_route_pre_nat_route_plugin.so"
 
 # Files that must survive rootfs -> disk image -> ISO installation.
 LY_ROUTE_GATEWAY_RUNTIME_FILES_COMMON="/usr/bin/vpp /usr/bin/vppctl /usr/lib/ly-route/vpp-apply /usr/lib/ly-route/ly-route-pppoe-client /usr/lib/ly-route/ly-route-dns-vpp-proxy /usr/lib/ly-route/ly-route-dns-vpp-proxy-v6 /usr/lib/ly-route/dns-vpp-v6-namespace-apply /usr/lib/ly-route/dns-vpp-session-apply /usr/sbin/smartdns /usr/sbin/kea-dhcp4 /usr/bin/xray /usr/sbin/ipset"

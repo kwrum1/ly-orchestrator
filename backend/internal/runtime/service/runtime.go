@@ -108,7 +108,7 @@ func (SystemctlRunner) Run(ctx context.Context, name string, args ...string) err
 func (SystemctlRunner) Status(ctx context.Context, service ServiceName) (Health, error) {
 	// PID1 can have a stuck job while a runtime apply is in progress. Never
 	// let a health/readback request hang a browser or the apply transaction.
-	statusCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	statusCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	ctx = statusCtx
 	unit := serviceUnit(service)

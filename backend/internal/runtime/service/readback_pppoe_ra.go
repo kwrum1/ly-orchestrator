@@ -74,10 +74,16 @@ func validateNativePPPoEOnce(ctx context.Context, runner CommandRunner, statusFi
 		return fmt.Errorf("native PPPoE status is not connected")
 	}
 	vpp, err := requiredOutput(ctx, runner, "vppctl", "show", "pppoe", "session")
-	if err != nil {
-		return err
+	if err == nil && !strings.Contains(vpp, status.Session.LocalAddress) {
+		// The Hi-Jiajun native plugin owns discovery/IPCP and exposes the
+		// session through `show pppoe client detail`; the built-in pppoe
+		// plugin is intentionally empty when the native client is used.
+		client, clientErr := requiredOutput(ctx, runner, "vppctl", "show", "pppoe", "client", "detail")
+		if clientErr == nil {
+			vpp = client
+		}
 	}
-	if !strings.Contains(vpp, status.Session.LocalAddress) {
+	if err != nil || !strings.Contains(vpp, status.Session.LocalAddress) {
 		return fmt.Errorf("VPP PPPoE readback does not match native client status")
 	}
 	addresses, err := requiredOutput(ctx, runner, "vppctl", "show", "interface", "address", status.Interface)
