@@ -319,7 +319,9 @@ func pppoeStatusPublished(ctx context.Context, runner CommandRunner, artifacts [
 		if json.Unmarshal([]byte(artifact.Content), &plan) != nil || plan.StatusFile == "" {
 			return fmt.Errorf("PPPoE plan %s has no status contract", artifact.Path)
 		}
-		output, err := runner.Output(ctx, "cat", plan.StatusFile)
+		statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		output, err := runner.Output(statusCtx, "cat", plan.StatusFile)
+		cancel()
 		if err != nil {
 			return err
 		}

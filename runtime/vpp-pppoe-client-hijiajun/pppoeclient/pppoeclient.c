@@ -1442,9 +1442,6 @@ pppoeclient_refresh_hw_output (pppoeclient_main_t *pem, pppoeclient_t *c)
   hw = vnet_get_hw_interface (pem->vnet_main, c->hw_if_index);
   if (hw == 0 || hw->output_node_index == 0)
     return;
-  if (c->hw_output_next_index != ~0 &&
-      c->hw_output_node_index == hw->output_node_index)
-    return;
   edge = vlib_node_get_next (pem->vlib_main,
 			     pppoeclient_session_output_node.index,
 			     hw->output_node_index);
@@ -1456,6 +1453,53 @@ pppoeclient_refresh_hw_output (pppoeclient_main_t *pem, pppoeclient_t *c)
     {
       c->hw_output_next_index = edge;
       c->hw_output_node_index = hw->output_node_index;
+    }
+}
+
+/* A PPPoE reconnect can reuse the pppox sw_if_index/adjacency while VPP's
+ * session-output next-slot table still points at the old null slot.  Force a
+ * fresh next slot on every PADS so a new session never inherits the stale
+ * graph edge.  Must run on the main thread. */
+static void
+pppoeclient_force_hw_output (pppoeclient_main_t *pem, pppoeclient_t *c)
+{
+  vnet_hw_interface_t *hw;
+  vlib_node_t *node;
+  uword *slot;
+  u32 edge;
+
+  if (c == 0)
+    return;
+  hw = vnet_get_hw_interface (pem->vnet_main, c->hw_if_index);
+  if (hw == 0 || hw->output_node_index == 0)
+    {
+      c->hw_output_next_index = ~0;
+      c->hw_output_node_index = 0;
+      return;
+    }
+  node = vlib_get_node (pem->vlib_main, pppoeclient_session_output_node.index);
+  if (node == 0)
+    return;
+  slot = hash_get (node->next_slot_by_node, hw->output_node_index);
+  if (slot)
+    {
+      u32 old_slot = slot[0];
+      hash_unset (node->next_slot_by_node, hw->output_node_index);
+      if (old_slot < vec_len (node->next_nodes))
+	node->next_nodes[old_slot] = ~0;
+    }
+  edge = vlib_node_add_next (pem->vlib_main,
+			     pppoeclient_session_output_node.index,
+			     hw->output_node_index);
+  if (edge != ~0)
+    {
+      c->hw_output_next_index = edge;
+      c->hw_output_node_index = hw->output_node_index;
+    }
+  else
+    {
+      c->hw_output_next_index = ~0;
+      c->hw_output_node_index = 0;
     }
 }
 
@@ -2856,6 +2900,7 @@ consume_pppoe_discovery_pkt (u32 bi, vlib_buffer_t *b, pppoe_header_t *pppoe)
       c->consecutive_auth_failures = 0;
       pppoeclient_bind_learned_vlans (pem);
       pppoeclient_update_tx_l2_template (c);
+      pppoeclient_force_hw_output (pem, c);
       pppoeclient_save_session_to_file (c);
       /* when shift to session stage, just give control to user
        * and ppp control plane. */

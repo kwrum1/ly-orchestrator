@@ -5137,7 +5137,22 @@ func (server *Server) refreshVPPNativeProof(ctx context.Context) error {
 		return nil
 	}
 	proofPath := envOrDefault("LY_ROUTE_VPP_CAPABILITY_PROOF", "/var/lib/ly-route/vpp-native-capabilities.json")
-	command := exec.CommandContext(ctx, commandPath)
+	// The probe creates temporary AF_XDP/AF_PACKET interfaces and is expensive.
+	// Reuse a recent non-empty proof; otherwise regenerate with a generous
+	// bound instead of failing the apply after an arbitrary short timeout.
+	if info, err := os.Stat(proofPath); err == nil && time.Since(info.ModTime()) < 15*time.Minute {
+		if payload, readErr := os.ReadFile(proofPath); readErr == nil {
+			var proof struct {
+				Proofs []json.RawMessage `json:"proofs"`
+			}
+			if json.Unmarshal(payload, &proof) == nil && len(proof.Proofs) > 0 {
+				return nil
+			}
+		}
+	}
+	proofCtx, cancel := context.WithTimeout(ctx, 150*time.Second)
+	defer cancel()
+	command := exec.CommandContext(proofCtx, commandPath)
 	command.Env = append(os.Environ(),
 		"LY_ROUTE_MANAGEMENT_INTERFACE="+server.managementInterfaceID(ctx),
 		"LY_ROUTE_MANAGEMENT_SHARED="+strconv.FormatBool(server.managementNetworkShared(ctx)),
