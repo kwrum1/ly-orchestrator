@@ -16,6 +16,18 @@ Do not build a rootfs or ISO during a hotfix. Do not use files from
 `.codex-tmp`, old rootfs trees, previous `dist/` directories, or copied remote
 binaries as current evidence.
 
+## Upstream-First Replacement
+
+If a self-maintained VPP/firmware component has an unstable root cause, a
+long repair cycle, or repeated regressions, evaluate a replacement instead of
+adding another patch. Preference: VPP native plugin/API, then an officially
+maintained upstream implementation, then a mature third-party implementation,
+and only then continued in-tree maintenance. Preserve the existing product
+API/config/readback contract, pin the source/version/license, keep an adapter
+and fallback, retain the old implementation until acceptance, and record the
+candidates, comparison, risks, and rollback in the commit or a document. See
+`docs/upstream-replacement-policy.md`.
+
 ## Read Documents On Demand
 
 - Process or gate change: `docs/product-functional-qa.md`
