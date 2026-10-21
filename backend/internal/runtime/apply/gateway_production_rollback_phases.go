@@ -48,15 +48,24 @@ func (adapter *productionGatewayAdapter) RollbackRestore(ctx context.Context, pl
 		if !supplementalChanged || plan.Previous.GatewayPlan == nil {
 			return nil
 		}
-		_, err := adapter.applySupplemental(ctx, *plan.Previous.GatewayPlan)
+		_, err := adapter.applySupplemental(ctx, priorReconciliationPlan(*plan.Previous.GatewayPlan))
 		return err
 	}
 	_, err = adapter.runPrior(ctx, productionPriorApply{transactionID: plan.Request.TransactionID, gateway: adapter.priorPlan(productionRollbackInput{transactionID: plan.Request.TransactionID, desired: plan.GatewayPlan, prior: prior}), prior: prior})
 	if err != nil || !supplementalChanged || plan.Previous.GatewayPlan == nil {
 		return err
 	}
-	_, err = adapter.applySupplemental(ctx, *plan.Previous.GatewayPlan)
+	_, err = adapter.applySupplemental(ctx, priorReconciliationPlan(*plan.Previous.GatewayPlan))
 	return err
+}
+
+// priorReconciliationPlan marks a persisted prior generation for operation
+// reconstruction. Its native capability proof has legitimately expired by the
+// time a failed apply rolls back, which must not block restoring the prior
+// declarative state.
+func priorReconciliationPlan(prior vpp.Plan) vpp.Plan {
+	prior.AllowUnprovenOperations = true
+	return prior
 }
 
 func (adapter *productionGatewayAdapter) cleanupOperations(diff vpp.GatewayDiff) ([]vpp.Operation, error) {

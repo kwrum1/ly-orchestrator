@@ -178,6 +178,14 @@ func (server *Server) reconcileRuntime(ctx context.Context) {
 	// liveness is established separately from the service runtime health
 	// probes, which is why an unverifiable host still fails closed below.
 	commitTime := runtimeCommitValidationTime(result)
+	if commitTime.After(now.Add(time.Minute)) {
+		reason := "persisted runtime evidence has a future timestamp"
+		degraded := degradedRuntimeResult(snapshot.SourceTransactionID, reason, now)
+		degraded.CapabilityFailures = append([]apply.CapabilityFailureEvidence(nil), result.CapabilityFailures...)
+		degraded.ReconciliationReceipt = apply.ReconciliationReceipt{TransactionID: snapshot.SourceTransactionID, Capability: "runtime.reconciliation", Status: apply.ReceiptDegraded, Cause: reason, Timestamp: now}
+		server.setRuntimeEvidence(degraded)
+		return
+	}
 	if commitComplete := completeRuntimeEvidence(result, commitTime); !commitComplete {
 		reason := "incomplete persisted runtime evidence"
 		if !result.Readback.Timestamp.IsZero() && commitTime.Sub(result.Readback.Timestamp) > apply.ReadbackFreshnessWindow {
