@@ -40,6 +40,11 @@ type Plan struct {
 	DNSInterception       bool
 	DNSServiceNetworks    []DNSServiceNetwork `json:"dns_service_networks,omitempty"`
 	DataplanePrepared     bool                `json:"-"`
+	// AllowUnprovenOperations lets reconciliation derive the operation graph
+	// from declarative plan data even when the live dataplane capability proof
+	// is no longer valid. Apply paths must leave it false so an unprovable
+	// tier still blocks mutation.
+	AllowUnprovenOperations bool `json:"-"`
 }
 
 type DNSTransparentInterception struct {
@@ -231,7 +236,20 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 	}
 	nativePath, err := SelectNativePath(plan.NativePath)
 	if err != nil {
-		return nil, err
+		var locked *DataplaneLockedError
+		if !plan.AllowUnprovenOperations || !errors.As(err, &locked) {
+			return nil, err
+		}
+		// Reconciliation of a desired or persisted plan must still be able to
+		// derive cleanup commands after the live tier proof expired. This is
+		// never used for an apply: only reconciliation helpers set the flag.
+		declarative := plan.NativePath
+		declarative.AllowUnproven = true
+		nativePath, err = SelectNativePath(declarative)
+		if err != nil {
+			return nil, err
+		}
+		plan.DataplanePrepared = true
 	}
 	if nativePath.Tier == DataplaneTierDPDK && !plan.DataplanePrepared {
 		prerequisites := append([]PrerequisiteResult(nil), nativePath.Prerequisites...)

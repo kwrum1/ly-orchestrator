@@ -111,6 +111,54 @@ type NativePathRequest struct {
 	ReportPrerequisites []PrerequisiteResult `json:"report_prerequisites,omitempty"`
 	Now                 time.Time            `json:"-"`
 	AcceptanceAFPacket  bool                 `json:"-"`
+	// AllowUnproven derives the attachment list from declarative assignment
+	// data without re-validating live capability proofs. Reconciliation of a
+	// persisted prior generation needs operation identities and commands, not
+	// a fresh tier decision: its proof window has legitimately expired.
+	AllowUnproven bool `json:"-"`
+}
+
+// declarativeNativePath builds the attachment list a plan already declares.
+// It is only used to derive operations for reconciliation and cleanup.
+func declarativeNativePath(request NativePathRequest) NativePath {
+	attachments := make([]NativeAttachment, 0, len(request.Assignments))
+	tier := DataplaneTierNative
+	for _, assignment := range request.Assignments {
+		name := strings.TrimSpace(assignment.LinuxInterface)
+		if name == "" {
+			continue
+		}
+		proof := assignment.Proof
+		attachmentTier := DataplaneTierNative
+		if proof.Tier == DataplaneTierDPDK || proof.Hook == NativeHookDPDK {
+			attachmentTier = DataplaneTierDPDK
+			tier = DataplaneTierDPDK
+		}
+		vppInterface := strings.TrimSpace(proof.VPPInterface)
+		if vppInterface == "" {
+			vppInterface = "lyroute-" + name
+		}
+		hook := proof.Hook
+		if hook == "" {
+			hook = NativeHookAFXDP
+		}
+		mode := proof.Mode
+		if mode == "" {
+			mode = NativeModeZeroCopy
+		}
+		attachments = append(attachments, NativeAttachment{
+			LinuxInterface: name,
+			VPPInterface:   vppInterface,
+			MACAddress:     proof.MACAddress,
+			Tier:           attachmentTier,
+			Hook:           hook,
+			Mode:           mode,
+			PCIAddress:     proof.PCIAddress,
+			KernelDriver:   proof.KernelDriver,
+			IOMMUGroup:     proof.IOMMUGroup,
+		})
+	}
+	return NativePath{Tier: tier, SmartQoS: request.RequireSmartQoS, Attachments: attachments}
 }
 
 type NativeAttachment struct {
@@ -180,6 +228,9 @@ func (err *DataplaneLockedError) Error() string {
 func (*DataplaneLockedError) Code() string { return "dataplane_locked" }
 
 func SelectNativePath(request NativePathRequest) (NativePath, error) {
+	if request.AllowUnproven {
+		return declarativeNativePath(request), nil
+	}
 	for _, assignment := range request.Assignments {
 		if len(assignment.Candidates) > 0 {
 			return selectCommonDataplanePath(request)

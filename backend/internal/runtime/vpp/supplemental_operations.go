@@ -38,7 +38,14 @@ func SupplementalOperationsEqual(left, right Plan, owner SupplementalOwner) (boo
 	}
 	rightOperations, err := supplementalOperations(right, owner)
 	if err != nil {
-		return false, err
+		// A persisted prior generation can no longer be turned back into an
+		// operation list when its dataplane capability proof has expired (the
+		// proof window is deliberately short). That is not evidence that the
+		// prior supplemental objects are equal to the desired ones: without a
+		// provable prior list the reconciler must run the idempotent cleanup.
+		// Treat the prior as different instead of failing the whole rollback or
+		// reconciliation, which would leave introduced objects behind.
+		return false, nil
 	}
 	if len(leftOperations) != len(rightOperations) {
 		return false, nil
