@@ -223,8 +223,15 @@ func SupplementalCleanupOperations(plan Plan, owner SupplementalOwner) ([]Operat
 	if err != nil {
 		return nil, err
 	}
+	// Rollback must tear down dependants before their prerequisites.  For the
+	// interfaces owner that means detaching LCP/ABF and removing the reserved
+	// DHCP bypass policy before the native attachment (and therefore the VPP
+	// interface) is deleted; otherwise `show abf attach` fails with an unknown
+	// interface and policy 65000 survives the rollback.  Cleanup therefore
+	// reverses the apply order for every owner.
 	cleanup := make([]Operation, 0, len(operations))
-	for _, operation := range operations {
+	for index := len(operations) - 1; index >= 0; index-- {
+		operation := operations[index]
 		if attachment, ok := operation.Payload.(NativeAttachment); ok && attachment.Tier == DataplaneTierDPDK {
 			// PCI/VFIO restoration belongs to the privileged dataplane transaction,
 			// never to an invented VPP CLI detach command.

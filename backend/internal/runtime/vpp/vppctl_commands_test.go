@@ -28,7 +28,8 @@ func TestVPPRouteBatchUsesBoundedChunks(t *testing.T) {
 	for index := range commands {
 		commands[index] = fmt.Sprintf("ip route add table 100 192.0.2.%d/32 via local0", index%256)
 	}
-	results, err := (vppctlChannel{binary: binary}).doVPPRouteBatch(context.Background(), commands)
+	channel := &vppctlChannel{binary: binary}
+	results, err := channel.doVPPRouteBatch(context.Background(), commands)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +57,8 @@ func TestVPPCTLCommandTimeoutStopsHungProcess(t *testing.T) {
 	}
 	t.Setenv("LY_ROUTE_VPPCTL_COMMAND_TIMEOUT", "100ms")
 	start := time.Now()
-	_, err := (vppctlChannel{binary: binary}).doCommands(context.Background(), Operation{
+	channel := &vppctlChannel{binary: binary}
+	_, err := channel.doCommands(context.Background(), Operation{
 		Name:           "vpp.interface.address",
 		VPPCtlCommands: []string{"show version"},
 	})

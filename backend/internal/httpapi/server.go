@@ -5081,24 +5081,13 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	serviceArtifacts := runtimeServiceArtifacts(plan.RuntimeArtifacts, server.gatewayTransaction != nil)
-	// Proxy service next hops are VPP-facing TAP interfaces created by the
-	// Linux policy-routing artifact.  Materialize that handoff before the
-	// gateway transaction validates route/ABF paths; the remaining services are
-	// still applied by the normal transaction phase below.
-	preGatewayArtifacts := make([]serviceRuntime.RenderedArtifact, 0, 1)
-	postGatewayArtifacts := make([]serviceRuntime.RenderedArtifact, 0, len(serviceArtifacts))
-	for _, artifact := range serviceArtifacts {
-		if artifact.Service == serviceRuntime.LinuxRouting {
-			preGatewayArtifacts = append(preGatewayArtifacts, artifact)
-			// The first pass materializes proxy TAPs so the typed VPP transaction
-			// can validate their route/FIB targets. VPP may then switch the NAT
-			// plugin or interface roles, so replay the same idempotent artifact
-			// after the gateway commit to restore the final Linux/VPP handoff.
-			postGatewayArtifacts = append(postGatewayArtifacts, artifact)
-			continue
-		}
-		postGatewayArtifacts = append(postGatewayArtifacts, artifact)
-	}
+	// Linux policy-routing TAPs must exist before the VPP transaction validates
+	// proxy next hops, and PPPoE helpers must publish their status contract
+	// before routes/DNS service networks resolve `pppoe-runtime:` underlays.
+	// Both are a dependency bootstrap in the pre-gateway pass; the same
+	// idempotent artifacts are replayed after the gateway commit so evidence is
+	// authoritative and the final Linux/VPP handoff matches the committed graph.
+	preGatewayArtifacts, postGatewayArtifacts := splitRuntimeArtifactsByPhase(serviceArtifacts, plan.GatewayPlan)
 	evidenceRequest := RuntimeEvidenceRequest{TransactionID: transactionID, Capability: "/api/v1/runtime/apply", Artifacts: serviceArtifacts}
 	var appliedArtifacts []serviceRuntime.RenderedArtifact
 	var capabilityFailures []apply.CapabilityFailureEvidence
@@ -5113,7 +5102,14 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 			report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, preGatewayArtifacts)
 			appliedArtifacts = append(appliedArtifacts, report.AppliedArtifacts...)
 			capabilityFailures = append(capabilityFailures, serviceFailureEvidence(report.Failures)...)
-			return report.Err()
+			if err := report.Err(); err != nil && !onlyPPPoEBootstrapFailures(report.Failures) {
+				return err
+			}
+			// A PPPoE bootstrap failure is not fatal here: the gateway transaction
+			// waits (bounded) for the runtime status and fails with an actionable
+			// route/DNS error if the session never appears, while the post-gateway
+			// pass still applies independent services and preserves their evidence.
+			return nil
 		},
 		Apply: func(ctx context.Context, _ apply.Plan) error {
 			report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, postGatewayArtifacts)
@@ -5203,9 +5199,16 @@ func (server *Server) refreshVPPNativeProof(ctx context.Context) error {
 	}
 	proofPath := envOrDefault("LY_ROUTE_VPP_CAPABILITY_PROOF", "/var/lib/ly-route/vpp-native-capabilities.json")
 	// The probe creates temporary AF_XDP/AF_PACKET interfaces and is expensive.
-	// Reuse a recent non-empty proof; otherwise regenerate with a generous
-	// bound instead of failing the apply after an arbitrary short timeout.
-	if info, err := os.Stat(proofPath); err == nil && time.Since(info.ModTime()) < 15*time.Minute {
+	// Reuse a recent non-empty proof, but never past its own validity window:
+	// an expired acceptance proof makes every data interface fail
+	// `fresh_runtime_proof` even though the probe itself succeeded minutes ago.
+	proofTTL := 5 * time.Minute
+	if raw := strings.TrimSpace(os.Getenv("LY_ROUTE_VPP_PROOF_TTL_SECONDS")); raw != "" {
+		if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+			proofTTL = time.Duration(seconds) * time.Second
+		}
+	}
+	if info, err := os.Stat(proofPath); err == nil && time.Since(info.ModTime()) < proofTTL {
 		if payload, readErr := os.ReadFile(proofPath); readErr == nil {
 			var proof struct {
 				Proofs []json.RawMessage `json:"proofs"`
@@ -5695,6 +5698,59 @@ func runtimeServiceArtifacts(artifacts []serviceRuntime.RenderedArtifact, gatewa
 		result = append(result, serviceRuntime.LinuxRoutingResetArtifact())
 	}
 	return result
+}
+
+// splitRuntimeArtifactsByPhase returns the dependency-bootstrap artifacts that
+// must run before the typed VPP gateway transaction plus the full authoritative
+// set that is applied after the commit.  PPPoE publishes the
+// `pppoe-runtime:` status contract that routes and DNS service networks
+// resolve, so it always precedes the gateway.  Linux policy routing only needs
+// to precede the gateway when its handoff does not depend on a live native
+// PPPoE session: a clean install has no session interface yet, and the
+// artifact's semantic readback correctly rejects a deferred DNS policy.  In
+// that case the post-gateway pass owns the final Linux/VPP handoff.
+func splitRuntimeArtifactsByPhase(artifacts []serviceRuntime.RenderedArtifact, gateway vpp.Plan) ([]serviceRuntime.RenderedArtifact, []serviceRuntime.RenderedArtifact) {
+	preLinuxRouting := !runtimePPPoEUnderlayPending(gateway)
+	pre := make([]serviceRuntime.RenderedArtifact, 0, len(artifacts))
+	post := make([]serviceRuntime.RenderedArtifact, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		switch artifact.Service {
+		case serviceRuntime.PPPoE:
+			pre = append(pre, artifact)
+		case serviceRuntime.LinuxRouting:
+			if preLinuxRouting {
+				pre = append(pre, artifact)
+			}
+		}
+		post = append(post, artifact)
+	}
+	return pre, post
+}
+
+func runtimePPPoEUnderlayPending(gateway vpp.Plan) bool {
+	for _, network := range gateway.DNSServiceNetworks {
+		if strings.HasPrefix(strings.TrimSpace(network.UnderlayRoute), "pppoe-runtime:") {
+			return true
+		}
+	}
+	for _, steering := range gateway.Proxy.VPPSteering {
+		if strings.HasPrefix(strings.TrimSpace(steering.UnderlayRoute), "pppoe-runtime:") {
+			return true
+		}
+	}
+	return false
+}
+
+func onlyPPPoEBootstrapFailures(failures []serviceRuntime.CapabilityFailure) bool {
+	if len(failures) == 0 {
+		return false
+	}
+	for _, failure := range failures {
+		if failure.Service != serviceRuntime.PPPoE && failure.Service != serviceRuntime.PPPd {
+			return false
+		}
+	}
+	return true
 }
 
 func (server *Server) currentNATConfig(ctx context.Context) (nat.CompiledConfig, error) {

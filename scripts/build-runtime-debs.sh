@@ -444,6 +444,10 @@ def bounded_vppctl(argv):
         return subprocess.CompletedProcess(argv, -1, "", f"vppctl timed out after {vppctl_timeout():g}s")
 
 def run_vppctl(vppctl, command):
+    try:
+        command = resolve_runtime_pppoe(command)
+    except (OSError, ValueError, json.JSONDecodeError) as err:
+        return subprocess.CompletedProcess([vppctl], 2, "", f"PPPoE runtime peer is not ready: {err}")
     argv = shlex.split(command)
     if not argv:
         return subprocess.CompletedProcess([vppctl], 2, "", "empty VPP command")
@@ -508,6 +512,10 @@ def run_vpp_exec(vppctl, commands):
     path = temporary.name
     try:
         for command in commands:
+            try:
+                command = resolve_runtime_pppoe(command)
+            except (OSError, ValueError, json.JSONDecodeError) as err:
+                return subprocess.CompletedProcess([vppctl], 2, "", f"PPPoE runtime peer is not ready: {err}")
             temporary.write(command.strip() + "\n")
         temporary.close()
         result = bounded_vppctl([vppctl, "exec", path])
@@ -609,6 +617,82 @@ def expand_command(command):
     if missing:
         raise ValueError(f"missing environment variable for VPP command {command!r}: {', '.join(missing)}")
     return expanded
+
+PPPOE_RUNTIME_PREFIX = "pppoe-runtime:"
+PPPOE_RUNTIME_STATUS_DIR = os.environ.get("LY_ROUTE_PPPOE_RUNTIME_STATUS_DIR", "/run/ly-route/pppoe")
+PPPOE_RUNTIME_PEER = re.compile(r"^[A-Za-z0-9_.@-]+$")
+PPPOE_RUNTIME_INTERFACE = re.compile(r"^(pppoe_session[0-9]+|pppox[0-9]+|lyppp-[A-Za-z0-9_.@-]+)$")
+
+def runtime_pppoe_peers(command):
+    """Return runtime PPPoE peer ids referenced by a replay command."""
+    peers = []
+    for field in str(command).split():
+        if field.startswith(PPPOE_RUNTIME_PREFIX):
+            peers.append(field[len(PPPOE_RUNTIME_PREFIX):])
+    return peers
+
+def read_runtime_pppoe_interface(peer):
+    if not peer or not PPPOE_RUNTIME_PEER.fullmatch(peer):
+        raise ValueError(f"invalid PPPoE runtime peer {peer!r}")
+    path = os.path.join(PPPOE_RUNTIME_STATUS_DIR, peer + ".json")
+    with open(path, "r", encoding="utf-8") as handle:
+        status = json.load(handle)
+    interface = str(status.get("interface") or "").strip()
+    if not PPPOE_RUNTIME_INTERFACE.fullmatch(interface):
+        raise ValueError(f"PPPoE runtime peer {peer!r} has invalid interface {interface!r}")
+    return interface
+
+def resolve_runtime_pppoe(command):
+    """Replace pppoe-runtime:<peer> placeholders with the live session interface."""
+    resolved = []
+    for field in str(command).split():
+        if field.startswith(PPPOE_RUNTIME_PREFIX):
+            resolved.append(read_runtime_pppoe_interface(field[len(PPPOE_RUNTIME_PREFIX):]))
+        else:
+            resolved.append(field)
+    return " ".join(resolved)
+
+def runtime_interface_present(vppctl, interface):
+    result = bounded_vppctl([vppctl, "show", "interface"])
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if fields and fields[0] == interface:
+            return True
+    return False
+
+def wait_runtime_pppoe_ready(vppctl, commands):
+    """Wait for delayed PPPoE status and the session interface before replay.
+
+    The boot transaction must not read a placeholder command or apply routes
+    against an interface that the helper has not created yet.
+    """
+    peers = sorted({peer for command in commands for peer in runtime_pppoe_peers(command)})
+    if not peers:
+        return
+    try:
+        attempts = int(os.environ.get("LY_ROUTE_PPPOE_RUNTIME_READY_ATTEMPTS", "60"))
+        interval = float(os.environ.get("LY_ROUTE_PPPOE_RUNTIME_READY_INTERVAL", "1"))
+    except ValueError:
+        fail_with_receipt("PPPoE runtime readiness retry settings must be positive numbers")
+    if attempts <= 0 or interval <= 0:
+        fail_with_receipt("PPPoE runtime readiness retry settings must be positive numbers")
+    for peer in peers:
+        path = os.path.join(PPPOE_RUNTIME_STATUS_DIR, peer + ".json")
+        for attempt in range(attempts):
+            try:
+                interface = read_runtime_pppoe_interface(peer)
+            except (OSError, ValueError, json.JSONDecodeError):
+                interface = ""
+            if interface and runtime_interface_present(vppctl, interface):
+                break
+            if attempt + 1 < attempts:
+                time.sleep(interval)
+        else:
+            fail_with_receipt(
+                f"PPPoE runtime peer {peer} did not publish a usable status before VPP operation replay"
+            )
 
 def active_abf_acl_ids_by_tag(vppctl, operations, command_map):
     """Resolve managed ACL tags through the ABF policies that currently own them."""
@@ -1065,6 +1149,17 @@ if not dry_run:
         fail_with_receipt("VPP API did not become ready before operation replay")
 
 if not underlay_only:
+    replay_commands = []
+    for operation in operations:
+        operation_commands = commands_from_operation(operation)
+        if not operation_commands:
+            operation_commands = commands_from_map(operation, command_map)
+        replay_commands.extend(operation_commands)
+    try:
+        expanded_replay_commands = [expand_command(command) for command in replay_commands]
+    except ValueError as err:
+        fail_with_receipt(f"failed to expand VPP command before replay: {err}")
+    wait_runtime_pppoe_ready(vppctl, expanded_replay_commands)
     clear_stale_taps(vppctl, operations, command_map, receipt)
 
 acl_ids = {}
@@ -1102,7 +1197,7 @@ for index, operation in enumerate(operations):
         if command == VPP_ROUTE_BATCH_BEGIN:
             try:
                 route_batch, batch_end = collect_route_batch(commands, command_index)
-                expanded_batch = [expand_command(route_command) for route_command in route_batch]
+                expanded_batch = [resolve_runtime_pppoe(expand_command(route_command)) for route_command in route_batch]
             except ValueError as err:
                 entry["results"].append({"command": receipt_command, "status": "failed", "stderr": receipt_text(str(err))})
                 receipt["operations"].append(entry)
@@ -1130,8 +1225,8 @@ for index, operation in enumerate(operations):
             receipt["operations"].append(entry)
             fail_with_receipt(f"unexpected VPP route command batch terminator for operation {name}")
         try:
-            command = expand_command(command)
-        except ValueError as err:
+            command = resolve_runtime_pppoe(expand_command(command))
+        except (ValueError, OSError, json.JSONDecodeError) as err:
             entry["results"].append({"command": receipt_command, "status": "failed", "stderr": receipt_text(str(err))})
             receipt["operations"].append(entry)
             fail_with_receipt(str(err))

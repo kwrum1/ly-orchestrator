@@ -27,7 +27,7 @@ func (channel vppctlChannel) doServiceChainApply(ctx context.Context, operation 
 		if serviceChainPolicyMatches(policy, observed, results) {
 			return serviceChainLifecycleReply(operation, policy, results), nil
 		}
-		cleanup, cleanupErr := channel.removeObservedServiceChainPolicy(ctx, operation, policy, observed)
+		cleanup, cleanupErr := channel.removeObservedServiceChainPolicy(ctx, operation, policy, observed, false)
 		if cleanupErr != nil {
 			return Reply{}, cleanupErr
 		}
@@ -76,9 +76,20 @@ func (channel vppctlChannel) doServiceChainDelete(ctx context.Context, operation
 	if err != nil {
 		return Reply{}, err
 	}
+	unknownIngress := false
 	if present {
 		policy.ACLID = observed.ACLID
-		removed, removeErr := channel.removeObservedServiceChainPolicy(ctx, operation, policy, observed)
+		// The ABF attachment disappears with its interface.  During rollback a
+		// previous cleanup step may already have deleted the LAN interface, in
+		// which case VPP answers `show abf attach` with "unknown input" and the
+		// detach command cannot match.  The policy is still detachable by id.
+		attachments, attachErr := channel.runServiceChainCommands(ctx, operation, attachmentShowCommand(policy))
+		if attachErr != nil {
+			return Reply{}, attachErr
+		}
+		results = append(results, attachments...)
+		unknownIngress = serviceChainIngressUnknown(results, policy)
+		removed, removeErr := channel.removeObservedServiceChainPolicy(ctx, operation, policy, observed, unknownIngress)
 		if removeErr != nil {
 			return Reply{}, removeErr
 		}
@@ -96,19 +107,56 @@ func (channel vppctlChannel) doServiceChainDelete(ctx context.Context, operation
 	}
 	results = append(results, verified...)
 	if !serviceChainPolicyAbsent(results, policy) {
+		// A policy that lost its ingress interface can be left behind with a
+		// zero-length path list.  Retry the delete without the attachment
+		// qualifier and sweep tagged ACLs before failing the rollback.
+		fallback, fallbackErr := channel.forceDeleteServiceChainPolicy(ctx, operation, policy, observed)
+		if fallbackErr != nil {
+			return Reply{}, fallbackErr
+		}
+		results = append(results, fallback...)
+	}
+	if !serviceChainPolicyAbsent(results, policy) {
 		return Reply{}, serviceChainDecodeError("deleted policy %d remains attached or configured", policy.PolicyID)
 	}
 	return serviceChainLifecycleReply(operation, policy, results), nil
 }
 
-func (channel vppctlChannel) removeObservedServiceChainPolicy(ctx context.Context, operation Operation, policy ServiceChainPolicy, observed observedServiceChainABFPolicy) ([]VPPCTLCommandResult, error) {
-	return channel.runServiceChainCommands(ctx, operation,
-		fmt.Sprintf("abf attach %s del policy %d %s", observed.AddressFamily, observed.ID, policy.IngressInterface),
+func (channel vppctlChannel) removeObservedServiceChainPolicy(ctx context.Context, operation Operation, policy ServiceChainPolicy, observed observedServiceChainABFPolicy, unknownIngress bool) ([]VPPCTLCommandResult, error) {
+	commands := make([]string, 0, 6)
+	if !unknownIngress {
+		commands = append(commands, fmt.Sprintf("abf attach %s del policy %d %s", observed.AddressFamily, observed.ID, policy.IngressInterface))
+	}
+	commands = append(commands,
 		fmt.Sprintf("abf policy del id %d acl %d via %s %s", observed.ID, observed.ACLID, observed.NextHop, observed.ServiceInterface),
 		fmt.Sprintf("delete acl-plugin acl index %d", observed.ACLID),
 		fmt.Sprintf("show abf policy %d", observed.ID),
 		fmt.Sprintf("show acl-plugin acl index %d", observed.ACLID),
-		"show abf attach "+policy.IngressInterface)
+		"show abf attach "+policy.IngressInterface,
+	)
+	return channel.runServiceChainCommands(ctx, operation, commands...)
+}
+
+func (channel vppctlChannel) forceDeleteServiceChainPolicy(ctx context.Context, operation Operation, policy ServiceChainPolicy, observed observedServiceChainABFPolicy) ([]VPPCTLCommandResult, error) {
+	observed.ID = policy.PolicyID
+	if observed.ACLID == 0 {
+		observed.ACLID = policy.ACLID
+	}
+	commands := []string{
+		fmt.Sprintf("?abf attach %s del policy %d %s", observed.AddressFamily, observed.ID, policy.IngressInterface),
+		fmt.Sprintf("?abf policy del id %d acl %d", observed.ID, observed.ACLID),
+		fmt.Sprintf("?abf policy del id %d", observed.ID),
+		fmt.Sprintf("?delete acl-plugin acl index %d", observed.ACLID),
+		fmt.Sprintf("show abf policy %d", observed.ID),
+		fmt.Sprintf("show acl-plugin acl index %d", observed.ACLID),
+		"show abf attach " + policy.IngressInterface,
+	}
+	return channel.runServiceChainCommands(ctx, operation, commands...)
+}
+
+func serviceChainIngressUnknown(results []VPPCTLCommandResult, policy ServiceChainPolicy) bool {
+	output := strings.ToLower(resultStdoutLast(results, attachmentShowCommand(policy)))
+	return strings.Contains(output, "unknown input") || strings.Contains(output, "unknown interface") || strings.Contains(output, "no such")
 }
 
 func (channel vppctlChannel) removeTaggedServiceChainACLs(ctx context.Context, operation Operation, tag string) ([]VPPCTLCommandResult, error) {
@@ -176,7 +224,13 @@ func serviceChainPolicyAbsent(results []VPPCTLCommandResult, policy ServiceChain
 	if policyOutput != "" && !strings.Contains(policyOutput, "invalid policy") {
 		return false
 	}
-	for _, field := range strings.Fields(resultStdoutLast(results, attachmentShowCommand(policy))) {
+	attachments := strings.ToLower(resultStdoutLast(results, attachmentShowCommand(policy)))
+	if strings.Contains(attachments, "unknown input") || strings.Contains(attachments, "unknown interface") {
+		// The ingress interface has already been deleted, so no attachment can
+		// remain.  VPP renders this as a CLI parse error with a zero exit code.
+		return true
+	}
+	for _, field := range strings.Fields(attachments) {
 		if field == "policy:"+strconv.Itoa(policy.PolicyID) {
 			return false
 		}

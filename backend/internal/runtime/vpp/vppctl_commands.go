@@ -8,11 +8,17 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const defaultPPPoERuntimeStatusDir = "/run/ly-route/pppoe"
+
+const (
+	defaultPPPoERuntimeReadyAttempts = 60
+	defaultPPPoERuntimeReadyInterval = time.Second
+)
 
 type pppoeRuntimeStatus struct {
 	Interface string `json:"interface"`
@@ -30,6 +36,137 @@ func resolveRuntimePPPoECommand(command string) (string, error) {
 	return strings.Join(fields, " "), nil
 }
 
+// resolveRuntimePPPoECommandReady resolves pppoe-runtime:<peer> placeholders
+// after waiting for the peer helper to publish its status contract and for the
+// negotiated session interface to appear in VPP.  A clean install starts the
+// helper in the pre-gateway phase, but status publication and VPP client
+// creation are asynchronous; routes, DNS service networks and NAT must not be
+// applied against a placeholder or a nonexistent interface.
+func (channel *vppctlChannel) resolveRuntimePPPoECommandReady(ctx context.Context, command string) (string, error) {
+	fields := strings.Fields(command)
+	for index, field := range fields {
+		resolved, err := channel.waitRuntimePPPoEInterface(ctx, field)
+		if err != nil {
+			return "", err
+		}
+		fields[index] = resolved
+	}
+	return strings.Join(fields, " "), nil
+}
+
+func runtimePPPoEReadySettings() (int, time.Duration) {
+	attempts := defaultPPPoERuntimeReadyAttempts
+	if raw := strings.TrimSpace(os.Getenv("LY_ROUTE_PPPOE_RUNTIME_READY_ATTEMPTS")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			attempts = parsed
+		}
+	}
+	interval := defaultPPPoERuntimeReadyInterval
+	if raw := strings.TrimSpace(os.Getenv("LY_ROUTE_PPPOE_RUNTIME_READY_INTERVAL")); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			interval = parsed
+		}
+	}
+	return attempts, interval
+}
+
+func (channel *vppctlChannel) waitRuntimePPPoEInterface(ctx context.Context, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "pppoe-runtime:") {
+		return value, nil
+	}
+	peerID := strings.TrimPrefix(value, "pppoe-runtime:")
+	if peerID == "" || strings.ContainsAny(peerID, "/\\ \t\r\n") {
+		return "", fmt.Errorf("invalid PPPoE runtime peer %q", peerID)
+	}
+	if channel.pppoeResolved != nil {
+		if resolved, ok := channel.pppoeResolved[peerID]; ok {
+			return resolved, nil
+		}
+	}
+	attempts, interval := runtimePPPoEReadySettings()
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		// Stat before decoding: the helper writes the contract atomically, and
+		// a clean install legitimately has no status for the first seconds.
+		path := pppoeRuntimeStatusPath(peerID)
+		if info, err := os.Stat(path); err != nil || info.Size() == 0 {
+			lastErr = fmt.Errorf("PPPoE runtime peer %q status file %s is not published", peerID, path)
+		} else if status, err := readPPPoERuntimeStatus(peerID); err != nil {
+			lastErr = err
+		} else if present, presentErr := channel.runtimeInterfacePresent(ctx, status.Interface); presentErr != nil {
+			lastErr = presentErr
+		} else if present {
+			if channel.pppoeResolved == nil {
+				channel.pppoeResolved = map[string]string{}
+			}
+			channel.pppoeResolved[peerID] = status.Interface
+			return status.Interface, nil
+		} else {
+			lastErr = fmt.Errorf("PPPoE runtime peer %q interface %q is not present in VPP yet", peerID, status.Interface)
+		}
+		if attempt == attempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("PPPoE runtime peer %q status is unavailable", peerID)
+	}
+	return "", fmt.Errorf("PPPoE runtime peer %q is not ready: %w", peerID, lastErr)
+}
+
+func (channel *vppctlChannel) runtimeInterfacePresent(ctx context.Context, name string) (bool, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false, nil
+	}
+	commandCtx, cancel, timeout := vppctlTimeout(ctx, false)
+	defer cancel()
+	cmd := exec.CommandContext(commandCtx, channel.binary, "show", "interface")
+	output, err := cmd.Output()
+	if err != nil {
+		if commandCtx.Err() == context.DeadlineExceeded {
+			return false, fmt.Errorf("vppctl show interface timed out after %s while waiting for %s", timeout, name)
+		}
+		return false, nil
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func pppoeRuntimeStatusPath(peerID string) string {
+	statusDir := strings.TrimSpace(os.Getenv("LY_ROUTE_PPPOE_RUNTIME_STATUS_DIR"))
+	if statusDir == "" {
+		statusDir = defaultPPPoERuntimeStatusDir
+	}
+	return statusDir + "/" + peerID + ".json"
+}
+
+func readPPPoERuntimeStatus(peerID string) (pppoeRuntimeStatus, error) {
+	data, err := os.ReadFile(pppoeRuntimeStatusPath(peerID))
+	if err != nil {
+		return pppoeRuntimeStatus{}, fmt.Errorf("read PPPoE runtime peer %q: %w", peerID, err)
+	}
+	var status pppoeRuntimeStatus
+	if err := json.Unmarshal(data, &status); err != nil {
+		return pppoeRuntimeStatus{}, fmt.Errorf("decode PPPoE runtime peer %q: %w", peerID, err)
+	}
+	if !validRuntimePPPoEInterface(status.Interface) {
+		return pppoeRuntimeStatus{}, fmt.Errorf("PPPoE runtime peer %q has invalid interface %q", peerID, status.Interface)
+	}
+	return status, nil
+}
+
 func resolveRuntimePPPoEInterface(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if !strings.HasPrefix(value, "pppoe-runtime:") {
@@ -39,20 +176,9 @@ func resolveRuntimePPPoEInterface(value string) (string, error) {
 	if peerID == "" || strings.ContainsAny(peerID, "/\\ \t\r\n") {
 		return "", fmt.Errorf("invalid PPPoE runtime peer %q", peerID)
 	}
-	statusDir := strings.TrimSpace(os.Getenv("LY_ROUTE_PPPOE_RUNTIME_STATUS_DIR"))
-	if statusDir == "" {
-		statusDir = defaultPPPoERuntimeStatusDir
-	}
-	data, err := os.ReadFile(statusDir + "/" + peerID + ".json")
+	status, err := readPPPoERuntimeStatus(peerID)
 	if err != nil {
-		return "", fmt.Errorf("read PPPoE runtime peer %q: %w", peerID, err)
-	}
-	var status pppoeRuntimeStatus
-	if err := json.Unmarshal(data, &status); err != nil {
-		return "", fmt.Errorf("decode PPPoE runtime peer %q: %w", peerID, err)
-	}
-	if !validRuntimePPPoEInterface(status.Interface) {
-		return "", fmt.Errorf("PPPoE runtime peer %q has invalid interface %q", peerID, status.Interface)
+		return "", err
 	}
 	return status.Interface, nil
 }
@@ -94,7 +220,7 @@ func vppctlTimeout(ctx context.Context, batch bool) (context.Context, context.Ca
 	return commandCtx, cancel, timeout
 }
 
-func (channel vppctlChannel) doCommands(ctx context.Context, operation Operation) (Reply, error) {
+func (channel *vppctlChannel) doCommands(ctx context.Context, operation Operation) (Reply, error) {
 	results := make([]VPPCTLCommandResult, 0, len(operation.VPPCtlCommands))
 	for index := 0; index < len(operation.VPPCtlCommands); index++ {
 		command := strings.TrimSpace(operation.VPPCtlCommands[index])
@@ -117,7 +243,7 @@ func (channel vppctlChannel) doCommands(ctx context.Context, operation Operation
 		if lanInterface := strings.TrimSpace(os.Getenv("LY_ROUTE_LAN_INTERFACE")); lanInterface != "" {
 			command = strings.ReplaceAll(command, "$LY_ROUTE_LAN_INTERFACE", lanInterface)
 		}
-		resolvedCommand, resolveErr := resolveRuntimePPPoECommand(command)
+		resolvedCommand, resolveErr := channel.resolveRuntimePPPoECommandReady(ctx, command)
 		if resolveErr != nil {
 			if ignoreFailure {
 				results = append(results, VPPCTLCommandResult{Command: logicalCommand, Stderr: resolveErr.Error(), Retval: 1})
@@ -213,7 +339,7 @@ func collectVPPRouteBatch(commands []string, begin int) ([]string, int, error) {
 // control-plane transaction.
 const vppRouteBatchChunkSize = 512
 
-func (channel vppctlChannel) doVPPRouteBatch(ctx context.Context, commands []string) ([]VPPCTLCommandResult, error) {
+func (channel *vppctlChannel) doVPPRouteBatch(ctx context.Context, commands []string) ([]VPPCTLCommandResult, error) {
 	results := make([]VPPCTLCommandResult, 0, (len(commands)+vppRouteBatchChunkSize-1)/vppRouteBatchChunkSize)
 	for begin := 0; begin < len(commands); begin += vppRouteBatchChunkSize {
 		end := begin + vppRouteBatchChunkSize
@@ -229,7 +355,7 @@ func (channel vppctlChannel) doVPPRouteBatch(ctx context.Context, commands []str
 	return results, nil
 }
 
-func (channel vppctlChannel) doVPPRouteBatchChunk(ctx context.Context, commands []string, begin, end, total int) (VPPCTLCommandResult, error) {
+func (channel *vppctlChannel) doVPPRouteBatchChunk(ctx context.Context, commands []string, begin, end, total int) (VPPCTLCommandResult, error) {
 	label := fmt.Sprintf("vpp route command batch %d-%d/%d", begin+1, end, total)
 	file, err := os.CreateTemp("", "ly-route-vpp-batch-*.conf")
 	if err != nil {
@@ -241,7 +367,7 @@ func (channel vppctlChannel) doVPPRouteBatchChunk(ctx context.Context, commands 
 		if lanInterface := strings.TrimSpace(os.Getenv("LY_ROUTE_LAN_INTERFACE")); lanInterface != "" {
 			command = strings.ReplaceAll(command, "$LY_ROUTE_LAN_INTERFACE", lanInterface)
 		}
-		resolvedCommand, err := resolveRuntimePPPoECommand(command)
+		resolvedCommand, err := channel.resolveRuntimePPPoECommandReady(ctx, command)
 		if err != nil {
 			return VPPCTLCommandResult{Command: label}, err
 		}

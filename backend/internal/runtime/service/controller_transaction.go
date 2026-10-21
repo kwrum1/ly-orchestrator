@@ -343,7 +343,18 @@ func pppoeStatusPublished(ctx context.Context, runner CommandRunner, artifacts [
 // tracked by runtime/status; apply must not roll back a session that is still
 // legitimately dialing.
 func pppoeApplyStarted(ctx context.Context, runner CommandRunner, artifacts []RenderedArtifact) error {
-	deadline := time.NewTimer(10 * time.Second)
+	// A helper publishes its status contract before it starts dialing, so this
+	// only waits for process startup.  Virtualized/TCG appliances can take
+	// longer than ten seconds to schedule Python under VPP load; the VPP
+	// gateway transaction has its own bounded runtime-underlay wait, so this
+	// budget only needs to cover helper startup.
+	timeout := 30 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("LY_ROUTE_PPPOE_STATUS_TIMEOUT")); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			timeout = parsed
+		}
+	}
+	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()

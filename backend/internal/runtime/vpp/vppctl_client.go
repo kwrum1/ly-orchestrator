@@ -44,6 +44,7 @@ type vppctlChannel struct {
 	cache                 *vppctlCache
 	natReturnGuardIngress string
 	lanVPPInterface       string
+	pppoeResolved         map[string]string
 }
 
 func (channel *vppctlChannel) setNATReturnGuardIngress(ingress string) {

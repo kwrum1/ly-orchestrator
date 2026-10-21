@@ -1295,7 +1295,7 @@ func renderDNSServiceRoutingSection(networks []vpp.DNSServiceNetwork, proxyEgres
 			underlayInterfaces = append(underlayInterfaces, network.UnderlayRoute)
 		}
 	}
-	readiness, err := renderVPPUnderlayReadiness(underlayInterfaces)
+	readiness, err := renderVPPUnderlayReadinessMode(underlayInterfaces, false)
 	if err != nil {
 		return "", err
 	}
@@ -1352,6 +1352,14 @@ func renderDNSServiceRoutingSection(networks []vpp.DNSServiceNetwork, proxyEgres
 		linuxTableID := network.TableID
 		rulePriority := 10000 + network.TapID
 		markPriority := 20000 + network.TapID
+		// A clean install starts the PPPoE helper asynchronously.  Defer this
+		// service network instead of failing the whole policy-routing artifact;
+		// the next reconciliation installs it once the session interface exists.
+		readinessTarget := serviceUnderlayInterface(network.UnderlayRoute)
+		if strings.TrimSpace(readinessTarget) == "" {
+			readinessTarget = network.UnderlayRoute
+		}
+		builder.WriteString(fmt.Sprintf("if wait_vpp_underlay %s; then\n", readinessTarget))
 		builder.WriteString(fmt.Sprintf("ensure_dns_tap %d %s %s\n", network.TapID, network.HostInterface, network.VPPInterface))
 		if dynamicUnderlay {
 			builder.WriteString(fmt.Sprintf("UNDERLAY_IF=$(resolve_underlay %s)\n", underlayPath))
@@ -1425,6 +1433,9 @@ func renderDNSServiceRoutingSection(networks []vpp.DNSServiceNetwork, proxyEgres
 			builder.WriteString(fmt.Sprintf("printf '%%s %%s %%s %%s\\n' route %s %s %s %d >> $DNS_STATE_TMP\n", resolver, network.HostInterface, network.VPPAddress, linuxTableID))
 		}
 		builder.WriteString(fmt.Sprintf("warm_vpp_resolver %s %s\n", network.HostAddress, network.ResolverServers[0]))
+		builder.WriteString("else\n")
+		builder.WriteString(fmt.Sprintf("  echo \"DNS service network %s deferred until %s is ready\" >&2\n", network.UpstreamID, readinessTarget))
+		builder.WriteString("fi\n")
 	}
 	builder.WriteString("mv $DNS_STATE_TMP $DNS_STATE_FILE\n")
 	builder.WriteString("DNS_STATE_TMP=\n")
@@ -1691,6 +1702,15 @@ func renderRuntimeUnderlayResolver(underlays []string) (string, error) {
 }
 
 func renderVPPUnderlayReadiness(interfaces []string) (string, error) {
+	return renderVPPUnderlayReadinessMode(interfaces, true)
+}
+
+// renderVPPUnderlayReadinessMode renders the resolver and readiness helper used
+// by Linux policy-routing artifacts.  strict=false must be used by artifacts
+// whose underlay may legitimately be unavailable during an apply (a clean
+// install starts PPPoE asynchronously): they defer the dependent section and
+// let the next reconciliation install it once the session exists.
+func renderVPPUnderlayReadinessMode(interfaces []string, strict bool) (string, error) {
 	unique := map[string]struct{}{}
 	for _, name := range interfaces {
 		name = strings.TrimSpace(name)
@@ -1718,25 +1738,39 @@ func renderVPPUnderlayReadiness(interfaces []string) (string, error) {
 	}
 	builder.WriteString(resolver)
 	builder.WriteString("wait_vpp_underlay() {\n")
-	builder.WriteString("  attempts=${LY_ROUTE_VPP_UNDERLAY_READY_ATTEMPTS:-60}\n")
+	builder.WriteString("  attempts=${LY_ROUTE_VPP_UNDERLAY_READY_ATTEMPTS:-10}\n")
 	builder.WriteString("  interval=${LY_ROUTE_VPP_UNDERLAY_READY_INTERVAL:-1}\n")
 	builder.WriteString("  case \"$attempts:$interval\" in *[!0-9:]*|0:*|*:0) echo \"VPP underlay readiness settings must be positive integers\" >&2; return 1 ;; esac\n")
 	builder.WriteString("  attempt=1\n")
 	builder.WriteString("  while :; do\n")
 	builder.WriteString("    underlay_if=$(resolve_underlay \"$1\" 2>/dev/null || true)\n")
-	builder.WriteString("    if [ -n \"$underlay_if\" ] && \"$VPPCTL\" show interface address 2>/dev/null | tr -d '\\r' | grep -A1 -E \"^$underlay_if \" | grep -Eq '^  L3 [0-9]'; then return 0; fi\n")
+	builder.WriteString("    case \"$1\" in\n")
+	// A native PPPoE session interface exists as soon as the client is
+	// created; it does not need an IPCP address before routes/NAT can attach.
+	builder.WriteString("      pppoe-runtime:*)\n")
+	builder.WriteString("        if [ -n \"$underlay_if\" ] && \"$VPPCTL\" show interface 2>/dev/null | awk 'NR > 1 {print $1}' | grep -Fxq \"$underlay_if\"; then return 0; fi\n")
+	builder.WriteString("        ;;\n")
+	builder.WriteString("      *)\n")
+	builder.WriteString("        if [ -n \"$underlay_if\" ] && \"$VPPCTL\" show interface address 2>/dev/null | tr -d '\\r' | grep -A1 -E \"^$underlay_if \" | grep -Eq '^  L3 [0-9]'; then return 0; fi\n")
+	builder.WriteString("        ;;\n")
+	builder.WriteString("    esac\n")
 	builder.WriteString("    [ \"$attempt\" -lt \"$attempts\" ] || { echo \"VPP underlay ${underlay_if:-$1} did not become ready\" >&2; return 1; }\n")
 	builder.WriteString("    sleep \"$interval\"\n")
 	builder.WriteString("    attempt=$((attempt + 1))\n")
 	builder.WriteString("  done\n")
 	builder.WriteString("}\n")
 	// A missing PPPoE/proxy underlay is normal during boot or link
-	// renegotiation. Return failure so systemd retries after the native
-	// session has obtained an address.
+	// renegotiation.  Strict artifacts ask systemd to retry after the native
+	// session has obtained an address; non-strict artifacts defer the section
+	// so an apply can still commit the rest of the generation.
 	for _, name := range ordered {
 		builder.WriteString(fmt.Sprintf("if ! wait_vpp_underlay %s; then\n", name))
-		builder.WriteString(fmt.Sprintf("  echo \"VPP underlay %s is unavailable; retrying dependent policy routing\" >&2\n", name))
-		builder.WriteString("  exit 1\n")
+		if strict {
+			builder.WriteString(fmt.Sprintf("  echo \"VPP underlay %s is unavailable; retrying dependent policy routing\" >&2\n", name))
+			builder.WriteString("  exit 1\n")
+		} else {
+			builder.WriteString(fmt.Sprintf("  echo \"VPP underlay %s is unavailable; deferring dependent policy routing\" >&2\n", name))
+		}
 		builder.WriteString("fi\n")
 	}
 	return builder.String(), nil

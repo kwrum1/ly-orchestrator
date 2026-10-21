@@ -144,6 +144,19 @@ func parseNAT44Rows(output string) ([]liveNATStatic, []liveNATPort, error) {
 			protocol = strings.ToLower(fields[0])
 		}
 		switch {
+		case len(fields) >= 4 && fields[0] == "identity" && fields[1] == "mapping":
+			// VPP prints the outside interface address as an identity mapping
+			// once NAT44 is enabled for a dynamic WAN. It is owned by the
+			// interface, not by a user static/port map, so it must not fail the
+			// snapshot that drives reconciliation and idempotent re-apply.
+			if err := validNATAddress(fields[2]); err != nil {
+				return nil, nil, err
+			}
+			if len(fields) >= 5 && fields[3] == "vrf" {
+				if _, err := strconv.Atoi(fields[4]); err != nil {
+					return nil, nil, snapshotDecodeError("malformed NAT44 identity mapping VRF %q", fields[4])
+				}
+			}
 		case len(fields) == 6 && fields[0] == "local" && fields[2] == "external" && fields[4] == "vrf" && fields[5] == "0":
 			if err := validNATAddress(fields[1]); err != nil {
 				return nil, nil, err
