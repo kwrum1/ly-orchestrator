@@ -7953,7 +7953,11 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		},
 		CapabilityFailures: func() []apply.CapabilityFailureEvidence { return capabilityFailures },
 	}
-	restoreLAN := setApplyLANVPPEnvironment(runtimePlan.GatewayPlan)
+	applyLANPlan := runtimePlan.GatewayPlan
+	if assignments, err := server.runtimeAddressAssignments(r.Context()); err == nil && len(assignments) > 0 {
+		applyLANPlan.AddressAssignments = assignments
+	}
+	restoreLAN := setApplyLANVPPEnvironment(applyLANPlan)
 	defer restoreLAN()
 	result, err := executor.Run(r.Context(), apply.Request{
 		TransactionID:      transactionID,
