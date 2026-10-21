@@ -7993,19 +7993,41 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	serviceArtifacts := runtimeServiceArtifacts(runtimePlan.RuntimeArtifacts, server.gatewayTransaction != nil)
+	preGatewayArtifacts, postGatewayArtifacts := splitRuntimeArtifactsByPhase(serviceArtifacts, runtimePlan.GatewayPlan)
+	// The config transaction only needs the PPPoE status bootstrap before the
+	// gateway graph; Linux service handoffs are applied once in the
+	// authoritative post-gateway pass to avoid duplicate lifecycle events.
+	filteredPre := preGatewayArtifacts[:0]
+	for _, artifact := range preGatewayArtifacts {
+		if artifact.Service == serviceRuntime.PPPoE {
+			filteredPre = append(filteredPre, artifact)
+		}
+	}
+	preGatewayArtifacts = filteredPre
 	evidenceRequest := RuntimeEvidenceRequest{TransactionID: transactionID, Capability: "/api/v1/config/apply", Artifacts: serviceArtifacts}
 	appliedArtifacts := serviceArtifacts
 	var capabilityFailures []apply.CapabilityFailureEvidence
 	executor := apply.Executor{
 		Store: server.store,
 		Now:   server.now,
+		BeforeGateway: func(ctx context.Context, _ apply.Plan) error {
+			if server.services == nil || len(preGatewayArtifacts) == 0 {
+				return nil
+			}
+			report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, preGatewayArtifacts)
+			capabilityFailures = append(capabilityFailures, serviceFailureEvidence(report.Failures)...)
+			if err := report.Err(); err != nil && !onlyPPPoEBootstrapFailures(report.Failures) {
+				return err
+			}
+			return nil
+		},
 		Apply: func(ctx context.Context, _ apply.Plan) error {
 			if server.services == nil {
 				return errors.New("live runtime apply runner is not configured")
 			}
-			report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, serviceArtifacts)
+			report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, postGatewayArtifacts)
 			appliedArtifacts = report.AppliedArtifacts
-			capabilityFailures = serviceFailureEvidence(report.Failures)
+			capabilityFailures = append(capabilityFailures, serviceFailureEvidence(report.Failures)...)
 			evidenceRequest.Artifacts = appliedArtifacts
 			return nil
 		},
