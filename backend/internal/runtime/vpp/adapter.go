@@ -1429,8 +1429,10 @@ func routePolicyCommandsWithOptions(policy trafficpolicy.RoutePolicy, wanGroups 
 	aclID := stableID("route-acl:"+policy.ID, 10000, 49999)
 	policyID := stableID("route-abf:"+policy.ID, 10000, 8999)
 	tableID := stableID("route-table:"+policy.ID, 50000, 49999)
-	if commands, ok := routePolicyRadixCommands(policy, wanGroups, options, policyID, tableID); ok {
-		return commands
+	if len(options.localDestinations) == 0 || options.optimizedIPv4 {
+		if commands, ok := routePolicyRadixCommands(policy, wanGroups, options, policyID, tableID); ok {
+			return commands
+		}
 	}
 	groupTableID := 0
 	if _, ok := wanGroups[policy.Egress]; ok {
@@ -1513,6 +1515,12 @@ func routePolicyRadixCommands(policy trafficpolicy.RoutePolicy, wanGroups map[st
 		commands = append(commands, fmt.Sprintf("?ip route add 0.0.0.0/0 table %d via %s", tableID, plan.routeTarget))
 	} else {
 		commands = append(commands, fmt.Sprintf("?ip route add table %d 0.0.0.0/0 via %s", tableID, plan.routeTarget))
+	}
+	// A destination catch-all must not steal traffic addressed to the local
+	// LAN.  The native radix path is a FIB lookup, so install the LAN prefixes
+	// into the same private table before the catch-all entry.
+	for _, prefix := range options.localDestinations {
+		commands = append(commands, fmt.Sprintf("ip route add table %d %s via lyroute-$LY_ROUTE_LAN_INTERFACE", tableID, prefix))
 	}
 	classifier, applied, err := buildPreNATRoutePolicyCommandsForTable(
 		policy, policyID, tableID, "lyroute-$LY_ROUTE_LAN_INTERFACE", plan.lanPrefix, plan.skipNAT,

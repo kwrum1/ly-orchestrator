@@ -22,7 +22,7 @@ func (client *desiredLiveClient) OpenChannel(context.Context) (vpp.Channel, erro
 func (client *desiredLiveClient) mutations() []vpp.Operation {
 	mutations := make([]vpp.Operation, 0)
 	for _, operation := range client.operations {
-		if !strings.HasSuffix(operation.Name, ".snapshot") && !strings.Contains(operation.Name, ".rollback") {
+		if operation.Name != "vpp.tap.cleanup" && !strings.HasSuffix(operation.Name, ".snapshot") && !strings.Contains(operation.Name, ".rollback") {
 			mutations = append(mutations, operation)
 		}
 	}
@@ -33,6 +33,9 @@ type desiredLiveChannel struct{ client *desiredLiveClient }
 
 func (channel *desiredLiveChannel) Do(_ context.Context, operation vpp.Operation) (vpp.Reply, error) {
 	channel.client.operations = append(channel.client.operations, operation)
+	if operation.Name == "vpp.tap.cleanup" {
+		return vpp.Reply{Payload: vpp.VPPCTLReplyPayload{CommandResults: []vpp.VPPCTLCommandResult{{Command: "show tap"}}}}, nil
+	}
 	if strings.HasSuffix(operation.Name, ".snapshot") {
 		return channel.snapshot(operation), nil
 	}
@@ -91,9 +94,17 @@ func (channel *desiredLiveChannel) mutate(operation vpp.Operation) {
 			channel.client.state.QoS = mutateByID(channel.client.state.QoS, operation, func(item flow.VPPObjectGroup) string { return item.Kind })
 		}
 	case "vpp.nat44-ed.static-mapping":
-		channel.client.state.NAT.StaticMappings = mutateByID(channel.client.state.NAT.StaticMappings, operation, func(item nat.StaticMapping) string { return item.ID })
+		if natMappingDeleteOnly(operation, "static mapping") {
+			channel.client.state.NAT.StaticMappings = removeByID(channel.client.state.NAT.StaticMappings, operation.Resource, func(item nat.StaticMapping) string { return item.ID })
+		} else {
+			channel.client.state.NAT.StaticMappings = mutateByID(channel.client.state.NAT.StaticMappings, operation, func(item nat.StaticMapping) string { return item.ID })
+		}
 	case "vpp.nat44-ed.port-map":
-		channel.client.state.NAT.PortMappings = mutateByID(channel.client.state.NAT.PortMappings, operation, func(item nat.PortMapping) string { return item.ID })
+		if natMappingDeleteOnly(operation, "static mapping") {
+			channel.client.state.NAT.PortMappings = removeByID(channel.client.state.NAT.PortMappings, operation.Resource, func(item nat.PortMapping) string { return item.ID })
+		} else {
+			channel.client.state.NAT.PortMappings = mutateByID(channel.client.state.NAT.PortMappings, operation, func(item nat.PortMapping) string { return item.ID })
+		}
 	}
 }
 
@@ -133,6 +144,18 @@ func mutateByID[T any](items []T, operation vpp.Operation, identity func(T) stri
 		updated = append(updated, payload)
 	}
 	return updated
+}
+
+func natMappingDeleteOnly(operation vpp.Operation, marker string) bool {
+	hasApply := false
+	for _, command := range operation.VPPCtlCommands {
+		command = strings.TrimSpace(strings.TrimPrefix(command, "?"))
+		if strings.Contains(command, "add "+marker) && !strings.HasSuffix(command, " del") {
+			hasApply = true
+			break
+		}
+	}
+	return !hasApply
 }
 
 func mutationClasses(operations []vpp.Operation) []string {

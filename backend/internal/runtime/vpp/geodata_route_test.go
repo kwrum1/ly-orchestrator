@@ -42,7 +42,8 @@ func TestGeoIPRoutePolicyUsesBatchedFIBChain(t *testing.T) {
 	}
 	routeCommands := 0
 	for _, command := range commands {
-		if strings.HasPrefix(strings.TrimPrefix(command, "?"), "ip route add table") {
+		trimmed := strings.TrimPrefix(command, "?")
+		if strings.HasPrefix(trimmed, "ip route add") && strings.Contains(trimmed, " via ") {
 			routeCommands++
 		}
 		if len(command) > 4096 {
