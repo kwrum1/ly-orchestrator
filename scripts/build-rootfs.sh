@@ -69,6 +69,12 @@ geodata_dir=${LY_ROUTE_GEODATA_DIR:-$repo_root/packaging/geodata}
 . "$repo_root/packaging/runtime-boundaries/gateway.sh"
 . "$repo_root/scripts/lib/product-build-profile.sh"
 load_product_build_profile "$repo_root" "$product" "$manifest"
+if [ "$product" = gateway ]; then
+  case ",$extra_packages," in
+    *,nftables,*) ;;
+    *) extra_packages="${extra_packages:+$extra_packages,}nftables,iptables" ;;
+  esac
+fi
 export LY_ROUTE_SOURCE_FINGERPRINT=$(product_source_fingerprint "$repo_root")
 validate_prebuilt_control "$control_binary" "$product"
 if [ -n "$pppoe_client_binary" ]; then
