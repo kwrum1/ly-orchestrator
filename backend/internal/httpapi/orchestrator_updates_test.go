@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -227,6 +228,13 @@ func TestOrchestratorUpgradeUnitArgvMaterializesMultilineScript(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "set -eu") || strings.Contains(strings.Join(argv, " "), "\n") {
 		t.Fatalf("detached script argv is not safe: %#v", argv)
+	}
+	unitArgs, err := orchestratorUpgradeSystemdRunArgs(invocation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(unitArgs, "--no-block") {
+		t.Fatalf("systemd-run args missing --no-block: %#v", unitArgs)
 	}
 }
 

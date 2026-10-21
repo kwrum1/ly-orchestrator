@@ -223,12 +223,25 @@ func startOrchestratorUpgradeUnit(invocation orchestratorUpgradeInvocation) erro
 	if strings.TrimSpace(invocation.Unit) == "" {
 		return fmt.Errorf("orchestrator upgrade unit name is required")
 	}
-	argv, err := orchestratorUpgradeUnitArgv(invocation)
+	unitArgs, err := orchestratorUpgradeSystemdRunArgs(invocation)
 	if err != nil {
 		return err
 	}
+	output, err := exec.Command("systemd-run", unitArgs...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("start detached orchestrator upgrade unit: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func orchestratorUpgradeSystemdRunArgs(invocation orchestratorUpgradeInvocation) ([]string, error) {
+	argv, err := orchestratorUpgradeUnitArgv(invocation)
+	if err != nil {
+		return nil, err
+	}
 	unitArgs := []string{
 		"--collect",
+		"--no-block",
 		"--unit", invocation.Unit,
 		"--property=Type=oneshot",
 		"--property=TimeoutStartSec=300",
@@ -236,12 +249,7 @@ func startOrchestratorUpgradeUnit(invocation orchestratorUpgradeInvocation) erro
 		"--property=StandardError=journal",
 		"--",
 	}
-	unitArgs = append(unitArgs, argv...)
-	output, err := exec.Command("systemd-run", unitArgs...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("start detached orchestrator upgrade unit: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	return nil
+	return append(unitArgs, argv...), nil
 }
 
 func orchestratorUpgradeUnitArgv(invocation orchestratorUpgradeInvocation) ([]string, error) {
