@@ -68,7 +68,8 @@ func expectedNftablesRules(content string) (string, string, []string, error) {
 			family, table = fields[1], fields[2]
 		}
 		normalized := normalizedNftables(line)
-		isDNS := strings.Contains(normalized, "dport 53") && nftablesRuleHasToken(normalized, "redirect")
+		isDNS := strings.Contains(normalized, "dport 53") &&
+			(nftablesRuleHasToken(normalized, "redirect") || nftablesRuleHasToken(normalized, "return"))
 		isTProxy := nftablesRuleHasToken(normalized, "tproxy")
 		if isDNS || isTProxy {
 			rules = append(rules, normalized)

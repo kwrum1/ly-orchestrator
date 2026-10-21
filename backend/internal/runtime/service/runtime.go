@@ -550,6 +550,9 @@ func collectSmartDNSDomainSets(plans []SmartDNSPlan) (map[string][]string, map[s
 	names := make(map[string]string, len(ids))
 	artifacts := make([]smartDNSDomainSetArtifact, 0, len(ids))
 	for _, setID := range ids {
+		if len(sets[setID]) == 0 {
+			continue
+		}
 		name := smartDNSDomainSetName(setID)
 		names[setID] = name
 		artifacts = append(artifacts, smartDNSDomainSetArtifact{
