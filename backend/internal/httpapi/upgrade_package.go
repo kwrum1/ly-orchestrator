@@ -90,7 +90,10 @@ func preflightUpgradeControl(root string) error {
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 		return fmt.Errorf("control binary is not an executable regular file")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// TCG-backed lab instances can take several seconds to start the static
+	// Go control binary. Keep the preflight bounded but not below realistic
+	// cold-start latency; install-time health remains the final gate.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, control, "--version").CombinedOutput()
 	if ctx.Err() != nil {
