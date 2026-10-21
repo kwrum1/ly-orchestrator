@@ -234,7 +234,7 @@ func diffResources[T any](states resourceStates[T], contract resourceContract[T]
 		return resourceDiff[T]{}, err
 	}
 	if repairVerifiedDrift {
-		return diffVerifiedLiveResources(states, desired, live, contract), nil
+		return diffVerifiedLiveResources(states, desired, live, contract)
 	}
 	if len(live) != len(prior) {
 		return resourceDiff[T]{}, fmt.Errorf("%w: %s identity count is %d, want %d", ErrGatewayLiveMismatch, contract.kind, len(live), len(prior))
@@ -271,8 +271,24 @@ func diffResources[T any](states resourceStates[T], contract resourceContract[T]
 // known resource is observed drift, not an incomplete read. Diff from the live
 // generation so the transaction can repair it while preserving the verified
 // live snapshot for rollback.
-func diffVerifiedLiveResources[T any](states resourceStates[T], desired, live map[string]T, contract resourceContract[T]) resourceDiff[T] {
+func diffVerifiedLiveResources[T any](states resourceStates[T], desired, live map[string]T, contract resourceContract[T]) (resourceDiff[T], error) {
 	diff := resourceDiff[T]{}
+	// Absence of a still-desired object that the prior generation owned is not
+	// repairable drift: a missing row can be a genuinely deleted object or a
+	// truncated readback, and the two are indistinguishable here. Fail closed
+	// before any mutation so an incomplete live snapshot cannot silently erase
+	// and rebuild the current generation. Present-but-mismatched objects remain
+	// repair-able verified drift.
+	for _, planned := range states.prior {
+		id := contract.identity(planned)
+		if _, stillDesired := desired[id]; !stillDesired {
+			continue
+		}
+		if _, observed := live[id]; observed {
+			continue
+		}
+		return resourceDiff[T]{}, fmt.Errorf("%w: %s %q is absent from the verified live snapshot", ErrGatewayLiveMismatch, contract.kind, id)
+	}
 	for _, observed := range states.live {
 		id := contract.identity(observed)
 		wanted, found := desired[id]
@@ -300,7 +316,7 @@ func diffVerifiedLiveResources[T any](states resourceStates[T], desired, live ma
 			diff.apply = append(diff.apply, wanted)
 		}
 	}
-	return diff
+	return diff, nil
 }
 
 func indexResources[T any](resources []T, contract resourceContract[T]) (map[string]T, error) {
