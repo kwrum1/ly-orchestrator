@@ -479,14 +479,12 @@ func newServer(profile product.Profile, options ...Option) *Server {
 		firmwareInstallStart: func(invocation firmwareInstallInvocation) error {
 			return exec.Command(invocation.Name, invocation.Args...).Start()
 		},
-		orchestratorUpgradeDir: envOrDefault("LY_ROUTE_ORCHESTRATOR_UPGRADE_DIR", "/var/lib/ly-route/orchestrator/upgrades"),
-		orchestratorInstallStart: func(invocation orchestratorUpgradeInvocation) error {
-			return exec.Command(invocation.Name, invocation.Args...).Start()
-		},
-		conversionServiceState: productupdate.SystemctlController{},
-		subscriptionFetch:      proxy.FetchSubscription,
-		dnsSyncToken:           loadDNSSyncToken(),
-		proxyEgress:            proxy.NewProxyEgress("proxy-egress-default", "xray-tproxy-outbound"),
+		orchestratorUpgradeDir:   envOrDefault("LY_ROUTE_ORCHESTRATOR_UPGRADE_DIR", "/var/lib/ly-route/orchestrator/upgrades"),
+		orchestratorInstallStart: startOrchestratorUpgradeUnit,
+		conversionServiceState:   productupdate.SystemctlController{},
+		subscriptionFetch:        proxy.FetchSubscription,
+		dnsSyncToken:             loadDNSSyncToken(),
+		proxyEgress:              proxy.NewProxyEgress("proxy-egress-default", "xray-tproxy-outbound"),
 		flowIntent: flow.NewIntent("default", []flow.Rule{
 			flow.NewRule("classify-default", flow.RuleGranularity, flow.Classify("best-effort")),
 		}),
@@ -5034,6 +5032,19 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 		server.setRuntimeEvidence(result)
 		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", cause, r)
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": cause, "transaction_id": transactionID, "request_id": requestID(r)})
+		return
+	}
+	if server.profile.ID() == product.Orchestrator().ID() {
+		components, _ := server.orchestratorTransparentRuntimeComponents(applyCtx)
+		state := runtimeState(components)
+		status := "committed"
+		code := http.StatusOK
+		if state != "running" {
+			status = "degraded"
+			code = http.StatusAccepted
+		}
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "success", "", r)
+		writeJSON(w, code, map[string]any{"status": status, "runtime_state": state, "transaction_id": transactionID, "components": components, "request_id": requestID(r)})
 		return
 	}
 	plan, err := server.buildRuntimePlan(applyCtx, transactionID)
