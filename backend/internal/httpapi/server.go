@@ -3469,6 +3469,13 @@ func (server *Server) handleDesiredMutation(w http.ResponseWriter, r *http.Reque
 			return
 		}
 	}
+	if resourceType == "proxy_egress" && r.Method == http.MethodPatch {
+		if _, ok := payload["runtime_profile"]; !ok {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", "proxy_egress runtime_profile is required", r)
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_desired_resource", "proxy_egress runtime_profile is required")
+			return
+		}
+	}
 	if r.Method == http.MethodPatch && strings.TrimSpace(explicitID) != "" {
 		current, exists, err := server.desiredItem(r.Context(), resourceType, explicitID)
 		if err != nil {
@@ -8751,7 +8758,7 @@ func (server *Server) telemetryPayload(ctx context.Context, kind string) (any, [
 			capabilities = append(capabilities, controlapi.CapabilityState{Name: "top_domains", Available: false, State: controlapi.CapabilityDegraded, Reason: reason})
 			return map[string]any{"items": []map[string]any{}, "runtime_state": runtimeStateValue, "degraded": true, "degraded_reason": reason}, capabilities
 		}
-		reason := "SmartDNS domain collector is not configured"
+		reason := "SmartDNS collector is not configured"
 		capabilities = append(capabilities, controlapi.CapabilityState{Name: "top_domains", Available: false, State: controlapi.CapabilityDegraded, Reason: reason})
 		return map[string]any{"items": []map[string]any{}, "runtime_state": runtimeStateValue, "state": "unavailable", "degraded": true, "degraded_reason": reason}, capabilities
 	default:

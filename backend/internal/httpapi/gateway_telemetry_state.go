@@ -40,12 +40,6 @@ func (server *Server) collectGatewayTelemetry(ctx context.Context) error {
 		return fmt.Errorf("gateway telemetry collector is not configured")
 	}
 	server.runtimeMu.Lock()
-	if !server.gatewayState.lastSuccess.IsZero() && server.now().UTC().Sub(server.gatewayState.lastSuccess) < time.Second {
-		server.runtimeMu.Unlock()
-		return nil
-	}
-	server.runtimeMu.Unlock()
-	server.runtimeMu.Lock()
 	server.gatewayState.nextCollection++
 	collection := server.gatewayState.nextCollection
 	server.runtimeMu.Unlock()
