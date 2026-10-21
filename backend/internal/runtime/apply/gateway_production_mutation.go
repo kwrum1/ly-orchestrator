@@ -8,7 +8,7 @@ import (
 	"ly-route/backend/internal/runtime/vpp"
 )
 
-func (adapter *productionGatewayAdapter) deleteDiff(ctx context.Context, diff vpp.GatewayDiff, prior vpp.Snapshot) (vpp.Snapshot, error) {
+func (adapter *productionGatewayAdapter) deleteDiff(ctx context.Context, diff vpp.GatewayDiff, prior vpp.Snapshot, desired vpp.Plan) (vpp.Snapshot, error) {
 	switch adapter.name {
 	case "interfaces":
 		plan := diff.Interfaces
@@ -33,11 +33,13 @@ func (adapter *productionGatewayAdapter) deleteDiff(ctx context.Context, diff vp
 	case "acls":
 		plan := diff.ACLs
 		plan.ACLs = nil
+		plan.IngressVPPInterface = vppGatewayLANInterface(desired)
 		result, err := adapter.reconciler.adapter.ApplyACLQoS(ctx, plan, prior)
 		return result.Readback, err
 	case "qos":
 		plan := diff.QoS
 		plan.QoS = nil
+		plan.IngressVPPInterface = vppGatewayLANInterface(desired)
 		result, err := adapter.reconciler.adapter.ApplyACLQoS(ctx, plan, prior)
 		return result.Readback, err
 	case "nat44":
@@ -91,11 +93,13 @@ func (adapter *productionGatewayAdapter) applyDiff(ctx context.Context, diff vpp
 	case "acls":
 		plan := diff.ACLs
 		plan.DeleteACLs = nil
+		plan.IngressVPPInterface = vppGatewayLANInterface(desired)
 		result, err := adapter.reconciler.adapter.ApplyACLQoS(ctx, plan, prior)
 		return result.Readback, err
 	case "qos":
 		plan := diff.QoS
 		plan.DeleteQoS = nil
+		plan.IngressVPPInterface = vppGatewayLANInterface(desired)
 		result, err := adapter.reconciler.adapter.ApplyACLQoS(ctx, plan, prior)
 		return result.Readback, err
 	case "nat44":

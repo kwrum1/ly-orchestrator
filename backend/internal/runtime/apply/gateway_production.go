@@ -220,7 +220,7 @@ func (adapter *productionGatewayAdapter) Delete(ctx context.Context, plan Plan) 
 	if !found || !gatewayDiffHasDelete(adapter.name, diff) {
 		return false, nil
 	}
-	after, err := adapter.deleteDiff(ctx, diff, prior)
+	after, err := adapter.deleteDiff(ctx, diff, prior, plan.GatewayPlan)
 	if err != nil {
 		return false, fmt.Errorf("%s delete: %w", adapter.name, err)
 	}
