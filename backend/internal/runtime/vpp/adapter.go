@@ -1429,7 +1429,7 @@ func routePolicyCommandsWithOptions(policy trafficpolicy.RoutePolicy, wanGroups 
 	aclID := stableID("route-acl:"+policy.ID, 10000, 49999)
 	policyID := stableID("route-abf:"+policy.ID, 10000, 8999)
 	tableID := stableID("route-table:"+policy.ID, 50000, 49999)
-	if len(options.localDestinations) == 0 || options.optimizedIPv4 {
+	if !routePolicyNeedsLocalACLDeny(policy, options) {
 		if commands, ok := routePolicyRadixCommands(policy, wanGroups, options, policyID, tableID); ok {
 			return commands
 		}
@@ -1638,6 +1638,18 @@ func aclMatchCommands(aclID int, resource string, match trafficpolicy.Match, act
 		}
 	}
 	return []string{fmt.Sprintf("?set acl-plugin acl index %d %s tag ly-route-%s", aclID, strings.Join(rules, ", "), safeTag(resource))}
+}
+
+func routePolicyNeedsLocalACLDeny(policy trafficpolicy.RoutePolicy, options routePolicyCommandOptions) bool {
+	// A source-scoped catch-all on the route/ACL path needs an explicit LAN
+	// deny before the catch-all permit.  NAT and destination-only radix paths
+	// protect the LAN with table routes instead and must keep their native
+	// classifier.
+	return len(options.localDestinations) > 0 &&
+		(policy.Action == "route" || policy.Action == "nat") &&
+		routePolicyHasIPv4CatchAll(policy.Match.Destinations) &&
+		len(policy.Match.Sources) > 0 &&
+		policy.Path == nil
 }
 
 func routePolicyACLCommands(aclID int, resource string, match trafficpolicy.Match, action string, options routePolicyCommandOptions) []string {
