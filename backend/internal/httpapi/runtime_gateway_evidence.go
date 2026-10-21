@@ -197,7 +197,13 @@ func gatewayPlanResources(plan vpp.Plan) map[string]struct{} {
 	if len(plan.Policy.RoutePolicies) > 0 || hasSupplemental(vpp.SupplementalRoutes) {
 		resources["routes"] = struct{}{}
 	}
-	if len(plan.Policy.SecurityACLs) > 0 || hasSupplemental(vpp.SupplementalSecurity) {
+	// The aggregate security generation owns the ACL resource even when the
+	// legacy per-ACL list is empty. Derive ownership from the persisted plan
+	// fields first: rebuilding the operation list can legitimately fail (for
+	// example a dataplane tier proof that is only valid while the privileged
+	// transaction is running), and restart evidence must not degrade because a
+	// best-effort rebuild was locked.
+	if len(plan.Policy.SecurityACLs) > 0 || len(plan.Security.ACLs) > 0 || len(plan.Security.MACIP) > 0 || len(plan.Security.AttackRules) > 0 || hasSupplemental(vpp.SupplementalSecurity) {
 		resources["acls"] = struct{}{}
 	}
 	if len(plan.Flow.VPPGroups) > 0 || len(plan.SmartQoSAssignments) > 0 || hasSupplemental(vpp.SupplementalQoS) {
