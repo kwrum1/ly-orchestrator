@@ -130,18 +130,18 @@ func TestDNSPoliciesMergeByPriorityAndUseDedicatedDefaultMiss(t *testing.T) {
 		t.Fatalf("login status = %d: %s", login.Code, login.Body.String())
 	}
 	cookie := login.Result().Cookies()[0]
-	local := `{"id":"dns-cn","name":"国内","priority":10,"enabled":true,"policy":{"engine":"smartdns","miss":{"kind":"reject"},"rules":[{"id":"cn-rule","domains":["cn.example"],"outcome":{"kind":"direct","upstream_id":"ali","wan_egress_id":"pppoe"}}]}}`
+	local := `{"id":"dns-cn","name":"国内","priority":10,"enabled":true,"policy":{"engine":"smartdns","miss":{"kind":"reject"},"rules":[{"id":"cn-rule","domains":["cn.example"],"outcome":{"kind":"direct","upstream_id":"ali"}}]}}`
 	if res := authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/dns/policies", local, cookie); res.Code != http.StatusOK {
 		t.Fatalf("local DNS policy status = %d: %s", res.Code, res.Body.String())
 	}
-	defaultPolicy := `{"id":"dns-default","name":"缺省","priority":100,"enabled":true,"policy":{"engine":"smartdns","miss":{"kind":"direct","upstream_id":"cf","wan_egress_id":"proxy"},"rules":[]}}`
+	defaultPolicy := `{"id":"dns-default","name":"缺省","priority":100,"enabled":true,"policy":{"engine":"smartdns","miss":{"kind":"direct","wan_egress_id":"proxy"},"rules":[]}}`
 	if res := authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/dns/policies", defaultPolicy, cookie); res.Code != http.StatusOK {
 		t.Fatalf("default DNS policy status = %d: %s", res.Code, res.Body.String())
 	}
 	// A later client-specific policy defaults to reject for requests that
 	// reach its own listener. It must not replace the global fallback used
 	// by SmartDNS's shared listener.
-	clientScoped := `{"id":"client-scoped","name":"client scoped","priority":320,"enabled":true,"policy":{"engine":"smartdns","miss":{"kind":"reject"},"rules":[{"id":"client-rule","source_prefixes":["192.168.50.101/32"],"domains":["client.example"],"outcome":{"kind":"direct","upstream_id":"ali","wan_egress_id":"pppoe"}}]}}`
+	clientScoped := `{"id":"client-scoped","name":"client scoped","priority":320,"enabled":true,"policy":{"engine":"smartdns","miss":{"kind":"reject"},"rules":[{"id":"client-rule","source_prefixes":["192.168.50.101/32"],"domains":["client.example"],"outcome":{"kind":"direct","upstream_id":"ali"}}]}}`
 	if res := authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/dns/policies", clientScoped, cookie); res.Code != http.StatusOK {
 		t.Fatalf("client-scoped DNS policy status = %d: %s", res.Code, res.Body.String())
 	}

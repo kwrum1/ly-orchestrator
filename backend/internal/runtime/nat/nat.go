@@ -311,9 +311,9 @@ func compilePortMapping(item map[string]any, wanAddresses map[string]string) (Po
 	if !hasInternalPort || internalPort <= 0 || internalPort > 65535 {
 		return PortMapping{}, fmt.Errorf("port_map %q requires internal_port in 1..65535", id)
 	}
-	if mapping.Hairpin && externalPort != internalPort {
-		return PortMapping{}, fmt.Errorf("port_map %q hairpin requires identical external_port and internal_port on the qualified VPP NAT44 ED path", id)
-	}
+	// Hairpin port rewriting is supported by the NAT44 ED static mapping:
+	// the external listener and the internal service do not have to use the
+	// same port.  Both port ranges were validated above.
 	return mapping, nil
 }
 

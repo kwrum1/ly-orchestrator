@@ -2484,6 +2484,13 @@ func (server *Server) compileDNSPolicyResource(ctx context.Context, req DNSPolic
 	if err != nil {
 		return DNSPolicyResource{}, nil, "", err
 	}
+	for _, rule := range expandedPolicy.Rules {
+		if rule.Outcome.Kind == dns.OutcomeDirect &&
+			strings.TrimSpace(rule.Outcome.UpstreamID) != "" &&
+			strings.TrimSpace(rule.Outcome.WANEgressID) != "" {
+			return DNSPolicyResource{}, nil, "", fmt.Errorf("dns rule %q direct outcome must not select both an upstream and WAN egress", rule.ID)
+		}
+	}
 	compiled, err := dns.CompilePolicy(expandedPolicy, []proxy.Egress{server.proxyEgress})
 	if err != nil {
 		return DNSPolicyResource{}, nil, "", err
@@ -3451,6 +3458,10 @@ func (server *Server) handleDesiredMutation(w http.ResponseWriter, r *http.Reque
 		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
 		return
 	}
+	hairpinProvided := false
+	if resourceType == "port_map" {
+		_, hairpinProvided = payload["hairpin"]
+	}
 	if resourceType == "proxy_node" {
 		if err := normalizeProxyNodeURIPayload(payload); err != nil {
 			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
@@ -3480,6 +3491,12 @@ func (server *Server) handleDesiredMutation(w http.ResponseWriter, r *http.Reque
 			}
 			payload = merged
 		}
+	}
+	if resourceType == "port_map" && !hairpinProvided {
+		// PATCH omitting hairpin means false, not "inherit the previous
+		// mapping's hairpin flag".  This makes a 5353 -> 53 rewrite explicit
+		// and prevents an old hairpin attribute from silently carrying over.
+		payload["hairpin"] = false
 	}
 	id := nonEmpty(explicitID, stringField(payload, "id"))
 	if id == "" {

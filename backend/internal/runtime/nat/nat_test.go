@@ -185,13 +185,17 @@ func TestBindWANInterfacesRejectsUnknownWAN(t *testing.T) {
 	}
 }
 
-func TestCompileConfigRejectsUnqualifiedHairpinPortRewrite(t *testing.T) {
-	_, err := CompileConfig(nil, []map[string]any{{
-		"id": "unsafe-hairpin", "protocol": "tcp", "external_address": "203.0.113.10",
+func TestCompileConfigAllowsHairpinPortRewrite(t *testing.T) {
+	config, err := CompileConfig(nil, []map[string]any{{
+		"id": "hairpin-rewrite", "protocol": "tcp", "external_address": "203.0.113.10",
 		"external_port": 8443, "internal_host": "192.168.88.20", "internal_port": 443, "hairpin": true,
 	}})
-	if err == nil || !strings.Contains(err.Error(), "identical external_port and internal_port") {
-		t.Fatalf("hairpin port rewrite error = %v", err)
+	if err != nil {
+		t.Fatalf("hairpin port rewrite rejected: %v", err)
+	}
+	if len(config.PortMappings) != 1 || config.PortMappings[0].ExternalPort != 8443 ||
+		config.PortMappings[0].InternalPort != 443 || !config.PortMappings[0].Hairpin {
+		t.Fatalf("hairpin rewrite mapping = %#v", config.PortMappings)
 	}
 }
 
