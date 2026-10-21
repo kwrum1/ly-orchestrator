@@ -94,7 +94,12 @@ func proveDesiredGatewayResource(evidence apply.GatewayResourceEvidence, desired
 			// A committed gateway transaction has already completed the privileged
 			// DPDK bind/restart/readback phase. Reconstruct supplemental operations
 			// in that prepared state instead of re-triggering the pre-apply gate.
+			// The persisted plan's native capability proof has also legitimately
+			// expired by the time a restart validates the committed evidence, so
+			// derive the operations declaratively instead of failing with
+			// dataplane_locked (which surfaced as snapshot_mismatch on restart).
 			evidencePlan.DataplanePrepared = true
+			evidencePlan.AllowUnprovenOperations = true
 			if err := vpp.ValidateSupplementalReadback(evidencePlan, owner, evidence.SupplementalReadback, evidence.Readback.Timestamp); err != nil {
 				return gatewayEvidenceError(apply.GatewayEvidenceSnapshotMismatch, evidence.Resource, "supplemental_readback", "persisted desired operation payloads", err.Error())
 			}
