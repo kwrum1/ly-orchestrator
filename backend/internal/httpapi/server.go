@@ -7953,6 +7953,8 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		},
 		CapabilityFailures: func() []apply.CapabilityFailureEvidence { return capabilityFailures },
 	}
+	restoreLAN := setApplyLANVPPEnvironment(runtimePlan.GatewayPlan)
+	defer restoreLAN()
 	result, err := executor.Run(r.Context(), apply.Request{
 		TransactionID:      transactionID,
 		Actor:              session.Username,
@@ -7979,6 +7981,41 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 	}
 	server.setRuntimeEvidence(runtimeResult)
 	writeJSON(w, statusCode, map[string]any{"status": runtimeResult.Status, "runtime_state": runtimeResult.RuntimeState, "reason": runtimeResult.Reason, "transaction_id": transactionID, "apply_receipt": result.Receipt, "readback": result.Readback, "capability_failures": capabilityFailures, "gateway_resources": result.GatewayResult.Order, "events": applyEventResponses(result.Events), "request_id": requestID(r)})
+}
+
+// setApplyLANVPPEnvironment binds legacy VPP command placeholders to the LAN
+// assignment for the duration of one apply transaction. It is scoped here (and
+// restored before the response) so previews and concurrent readers never see a
+// mutable process-wide value.
+func setApplyLANVPPEnvironment(plan vpp.Plan) func() {
+	linux := ""
+	for _, assignment := range plan.AddressAssignments {
+		if strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			linux = strings.TrimSpace(assignment.LinuxInterface)
+			break
+		}
+	}
+	if linux == "" {
+		for _, state := range plan.Interfaces {
+			name := strings.TrimSpace(state.Name)
+			if strings.HasPrefix(name, "lyroute-") && len(state.Addresses) > 0 {
+				linux = strings.TrimPrefix(name, "lyroute-")
+				break
+			}
+		}
+	}
+	if linux == "" {
+		return func() {}
+	}
+	previous, found := os.LookupEnv("LY_ROUTE_LAN_INTERFACE")
+	_ = os.Setenv("LY_ROUTE_LAN_INTERFACE", linux)
+	return func() {
+		if found {
+			_ = os.Setenv("LY_ROUTE_LAN_INTERFACE", previous)
+			return
+		}
+		_ = os.Unsetenv("LY_ROUTE_LAN_INTERFACE")
+	}
 }
 
 func (server *Server) configApplyPlan(ctx context.Context, requestID string, overrideProxy *proxy.Egress, overrideFlow *flow.Intent) (RuntimePlan, proxy.Egress, flow.Intent, error) {
