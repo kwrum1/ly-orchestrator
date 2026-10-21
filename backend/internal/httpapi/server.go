@@ -5626,6 +5626,33 @@ func dnsLCPGuardPlan(assignments []vpp.AddressAssignment) serviceRuntime.DNSInte
 	return serviceRuntime.DNSInterceptionPlan{LCPGuardAddresses: addresses}
 }
 
+func dataplaneLockedReason(proof []vpp.PrerequisiteResult, warnings []string) string {
+	failed := make([]string, 0, len(proof))
+	for _, item := range proof {
+		if item.Passed {
+			continue
+		}
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			continue
+		}
+		reason := strings.TrimSpace(item.Reason)
+		if reason != "" {
+			name += " (" + reason + ")"
+		}
+		failed = append(failed, name)
+	}
+	if len(failed) > 0 {
+		return "dataplane_locked: " + strings.Join(failed, ", ")
+	}
+	for _, warning := range warnings {
+		if value := strings.TrimSpace(warning); value != "" {
+			return "dataplane_locked: " + value
+		}
+	}
+	return "dataplane_locked: forwarding prerequisites failed"
+}
+
 func runtimePolicyForAddressAssignments(policy trafficpolicy.Config, assignments []vpp.AddressAssignment) trafficpolicy.Config {
 	for _, assignment := range assignments {
 		if strings.EqualFold(strings.TrimSpace(assignment.Role), "wan") && strings.TrimSpace(assignment.VPPInterface) != "" {
@@ -7897,10 +7924,7 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if runtimePlan.DataplaneState == "dataplane_locked" {
-		reason := "dataplane_locked: forwarding prerequisites failed"
-		if len(runtimePlan.Warnings) > 0 {
-			reason = runtimePlan.Warnings[0]
-		}
+		reason := dataplaneLockedReason(runtimePlan.DataplaneProof, runtimePlan.Warnings)
 		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", reason, r)
 		writeJSON(w, http.StatusLocked, map[string]any{
 			"status":                  "dataplane_locked",
