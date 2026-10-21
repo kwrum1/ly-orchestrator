@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -57,7 +58,10 @@ func TestProductionGatewayHTTPCommitsOnlyAfterEightVPPCTLReadbacksAndRestarts(t 
 	firstShow := strings.Index(trace, "show interface address")
 	firstMutation := strings.Index(trace, "set interface state")
 	wanApply := strings.Index(trace, "ip route add table")
-	routeApply := strings.Index(trace, "abf policy add")
+	// The LAN control plane reserves ABF policy 65000 for the DHCP broadcast
+	// bypass, so the first `abf policy add` in the trace is not the user route.
+	// Assert the dependency against this generation's route policy identity.
+	routeApply := strings.Index(trace, fmt.Sprintf("abf policy add id %d", proofStableID("route-abf:route-office", 10000, 8999)))
 	if firstShow < 0 || firstMutation < 0 || firstShow > firstMutation || wanApply < 0 || routeApply < 0 || wanApply > routeApply {
 		t.Fatalf("production command order is incomplete:\n%s", trace)
 	}
