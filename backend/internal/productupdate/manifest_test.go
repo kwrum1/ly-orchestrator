@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"ly-route/backend/internal/product"
 )
@@ -138,15 +139,45 @@ func TestSystemctlControllerCapturesAndRestoresEnableState(t *testing.T) {
 	if err := controller.Restore(context.Background(), restore); err != nil {
 		t.Fatal(err)
 	}
-	if len(commands) != 3 {
-		t.Fatalf("restore commands = %#v, want enable/disable/mask only", commands)
-	}
-	want := map[string]string{"enable": "systemctl enable enabled.service", "disable": "systemctl disable disabled.service", "mask": "systemctl mask masked.service"}
+	mutations := 0
 	for _, command := range commands {
-		key := command[1]
-		if got := strings.Join(command, " "); got != want[key] {
-			t.Fatalf("restore command = %q, want %q", got, want[key])
+		if len(command) > 1 && command[1] != "is-enabled" {
+			mutations++
 		}
+	}
+	if mutations != 0 {
+		t.Fatalf("restore commands = %#v, want no-op for unchanged units", commands)
+	}
+}
+
+func TestSystemctlControllerRestoresChangedStateOnly(t *testing.T) {
+	commands := [][]string{}
+	controller := SystemctlController{Run: func(_ context.Context, name string, args ...string) ([]byte, error) {
+		commands = append(commands, append([]string{name}, args...))
+		if len(args) > 0 && args[0] == "is-enabled" {
+			switch args[len(args)-1] {
+			case "enabled.service":
+				return []byte("disabled\n"), nil
+			case "disabled.service":
+				return []byte("enabled\n"), nil
+			case "masked.service":
+				return []byte("disabled\n"), nil
+			}
+		}
+		return nil, nil
+	}}
+	state := map[string]string{"enabled.service": "enabled", "disabled.service": "disabled", "masked.service": "masked", "static.service": "static"}
+	if err := controller.Restore(context.Background(), state); err != nil {
+		t.Fatal(err)
+	}
+	mutations := 0
+	for _, command := range commands {
+		if len(command) > 1 && command[1] != "is-enabled" {
+			mutations++
+		}
+	}
+	if mutations != 3 {
+		t.Fatalf("restore commands = %#v, want enable/disable/mask only", commands)
 	}
 }
 
@@ -165,6 +196,20 @@ func TestPackagedConversionFixtureIsValid(t *testing.T) {
 	}
 	if validation.Plan.DataplaneMode != "preserve" || validation.Plan.ToProduct != product.Orchestrator().ID() {
 		t.Fatalf("conversion fixture plan = %#v", validation.Plan)
+	}
+}
+
+func TestSystemctlControllerTimesOutHungCommands(t *testing.T) {
+	controller := SystemctlController{Timeout: 10 * time.Millisecond, Run: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	state, err := controller.Capture(context.Background(), []string{"vpp.service"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state["vpp.service"] != "missing" {
+		t.Fatalf("timed out capture = %#v, want missing", state)
 	}
 }
 

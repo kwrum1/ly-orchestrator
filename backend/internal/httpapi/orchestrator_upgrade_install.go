@@ -1,10 +1,18 @@
 package httpapi
 
-import "strconv"
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+)
 
 type orchestratorUpgradeInvocation struct {
 	Name string
 	Args []string
+	Unit string
 }
 
 const orchestratorUpgradeScript = `
@@ -47,16 +55,21 @@ restore_services() {
   [ -f "$backup_dir/services.state" ] || return 0
   while IFS='|' read -r unit state; do
     [ -n "$unit" ] || continue
+    current=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    [ "$current" != "$state" ] || continue
     case "$state" in
-      enabled) systemctl enable "$unit" >/dev/null 2>&1 || true ;;
-      disabled) systemctl disable "$unit" >/dev/null 2>&1 || true ;;
-      masked) systemctl mask "$unit" >/dev/null 2>&1 || true ;;
+      enabled) timeout 15 systemctl enable "$unit" >/dev/null 2>&1 || true ;;
+      disabled) timeout 15 systemctl disable "$unit" >/dev/null 2>&1 || true ;;
+      masked) timeout 15 systemctl mask "$unit" >/dev/null 2>&1 || true ;;
       *) : ;;
     esac
   done <"$backup_dir/services.state"
 }
 
 restore_files() {
+  # Publish the failure before touching the live payload: even if a service
+  # manager call blocks, the control task must not stay "installing".
+  write_result failed "install failed; restoring backup"
   echo "restoring orchestrator payload from $backup_dir" >&2
   if [ -d "$backup_dir/target" ]; then
     rm -rf "$target_dir"
@@ -79,9 +92,9 @@ restore_files() {
     cp -a "$backup_dir/ly-route-firstboot.service" /etc/systemd/system/ly-route-firstboot.service
   fi
   restore_services
-  systemctl daemon-reload || true
-  systemctl restart ly-route-control-api.service || true
-  systemctl reload nginx.service || systemctl restart nginx.service || true
+  timeout 30 systemctl daemon-reload || true
+  timeout 30 systemctl restart ly-route-control-api.service || true
+  timeout 30 systemctl reload nginx.service || timeout 30 systemctl restart nginx.service || true
 }
 
 health_check() {
@@ -168,12 +181,12 @@ fi
 if [ -f "$tmp/etc/nginx/conf.d/ly-route-admin.conf" ]; then
   install -D -m 0644 "$tmp/etc/nginx/conf.d/ly-route-admin.conf" /etc/nginx/conf.d/ly-route-admin.conf
 fi
-systemctl daemon-reload || true
-if ! systemctl restart ly-route-control-api.service; then
+timeout 30 systemctl daemon-reload || true
+if ! timeout 30 systemctl restart ly-route-control-api.service; then
   restore_files
   fail "control API restart failed"
 fi
-systemctl reload nginx.service || systemctl restart nginx.service || true
+timeout 30 systemctl reload nginx.service || timeout 30 systemctl restart nginx.service || true
 if ! health_check; then
   restore_files
   fail "health check failed after install"
@@ -189,4 +202,61 @@ func orchestratorUpgradeScriptInvocation(action, packagePath, packageHash, targe
 		Name: "bash",
 		Args: []string{"-c", orchestratorUpgradeScript, "ly-route-orchestrator-upgrade", action, packagePath, packageHash, targetDir, backupDir, resultPath, strconv.FormatBool(reboot)},
 	}
+}
+
+func orchestratorUpgradeUnitName(taskID string) string {
+	name := strings.ToLower(strings.TrimSpace(taskID))
+	name = strings.ReplaceAll(name, "_", "-")
+	name = strings.ReplaceAll(name, ".", "-")
+	name = strings.Trim(name, "-")
+	if name == "" {
+		name = "unknown"
+	}
+	return "ly-route-orch-upgrade-" + name
+}
+
+// startOrchestratorUpgradeUnit runs the installer outside the control-api
+// service cgroup.  The installer restarts ly-route-control-api.service, and a
+// plain child process would be terminated by systemd before it can write the
+// result file or restore the backup.
+func startOrchestratorUpgradeUnit(invocation orchestratorUpgradeInvocation) error {
+	if strings.TrimSpace(invocation.Unit) == "" {
+		return fmt.Errorf("orchestrator upgrade unit name is required")
+	}
+	argv, err := orchestratorUpgradeUnitArgv(invocation)
+	if err != nil {
+		return err
+	}
+	unitArgs := []string{
+		"--collect",
+		"--unit", invocation.Unit,
+		"--property=Type=oneshot",
+		"--property=TimeoutStartSec=300",
+		"--property=StandardOutput=journal",
+		"--property=StandardError=journal",
+		"--",
+	}
+	unitArgs = append(unitArgs, argv...)
+	output, err := exec.Command("systemd-run", unitArgs...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("start detached orchestrator upgrade unit: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func orchestratorUpgradeUnitArgv(invocation orchestratorUpgradeInvocation) ([]string, error) {
+	name := invocation.Name
+	args := append([]string(nil), invocation.Args...)
+	// systemd-run writes its command line into a transient unit file.  A
+	// multi-line `bash -c` payload would be parsed as unit directives, so
+	// materialize the installer script and pass only its path to systemd.
+	if name == "bash" && len(args) >= 3 && args[0] == "-c" {
+		scriptPath := filepath.Join(os.TempDir(), invocation.Unit+".sh")
+		if err := os.WriteFile(scriptPath, []byte(args[1]), 0o700); err != nil {
+			return nil, fmt.Errorf("write detached orchestrator upgrade script: %w", err)
+		}
+		name = "bash"
+		args = append([]string{scriptPath}, args[3:]...)
+	}
+	return append([]string{name}, args...), nil
 }

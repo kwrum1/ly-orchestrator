@@ -206,6 +206,7 @@ func (service *productUpdateService) InstallUpgrade(ctx context.Context, request
 		return orchestratorapi.UpgradeTask{}, err
 	}
 	invocation := orchestratorUpgradeScriptInvocation("install", payload.PackagePath, payload.Task.PackageSHA256, "/usr/lib/ly-route", payload.BackupDir, payload.ResultPath, request.Reboot)
+	invocation.Unit = orchestratorUpgradeUnitName(payload.Task.ID)
 	if err := service.server.orchestratorInstallStart(invocation); err != nil {
 		payload.Task.State = orchestratorapi.UpgradeStateFailed
 		payload.Task.Reason = err.Error()
@@ -242,6 +243,7 @@ func (service *productUpdateService) RollbackUpgrade(ctx context.Context, reques
 		return orchestratorapi.UpgradeTask{}, err
 	}
 	invocation := orchestratorUpgradeScriptInvocation("rollback", payload.PackagePath, payload.Task.PackageSHA256, "/usr/lib/ly-route", payload.BackupDir, payload.ResultPath, false)
+	invocation.Unit = orchestratorUpgradeUnitName(payload.Task.ID) + "-rollback"
 	if err := service.server.orchestratorInstallStart(invocation); err != nil {
 		payload.Task.State = orchestratorapi.UpgradeStateRollbackFailed
 		payload.Task.Reason = err.Error()

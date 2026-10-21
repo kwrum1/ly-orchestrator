@@ -146,6 +146,38 @@ func TestUpgradeInstallerScriptsParse(t *testing.T) {
 	}
 }
 
+func TestOrchestratorUpgradeUnitArgvMaterializesMultilineScript(t *testing.T) {
+	invocation := orchestratorUpgradeScriptInvocation("install", "/tmp/pkg", "hash", "/usr/lib/ly-route", "/tmp/backup", "/tmp/result", false)
+	invocation.Unit = "ly-route-orch-upgrade-test-argv"
+	argv, err := orchestratorUpgradeUnitArgv(invocation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(argv) < 3 || argv[0] != "bash" || argv[2] != "install" {
+		t.Fatalf("detached argv = %#v", argv)
+	}
+	body, err := os.ReadFile(argv[1])
+	if err != nil {
+		t.Fatalf("read materialized script: %v", err)
+	}
+	if !strings.Contains(string(body), "set -eu") || strings.Contains(strings.Join(argv, " "), "\n") {
+		t.Fatalf("detached script argv is not safe: %#v", argv)
+	}
+}
+
+func TestOrchestratorUpgradeUnitNameIsStableAndSafe(t *testing.T) {
+	if got := orchestratorUpgradeUnitName("upgrade-ABC_123.4"); got != "ly-route-orch-upgrade-upgrade-abc-123-4" {
+		t.Fatalf("unit name = %q", got)
+	}
+	if got := orchestratorUpgradeUnitName("  "); got != "ly-route-orch-upgrade-unknown" {
+		t.Fatalf("empty unit name = %q", got)
+	}
+	invocation := orchestratorUpgradeScriptInvocation("install", "/tmp/pkg", "hash", "/usr/lib/ly-route", "/tmp/backup", "/tmp/result", false)
+	if invocation.Args[3] != "install" || invocation.Args[8] != "/tmp/result" {
+		t.Fatalf("invocation args = %#v", invocation.Args)
+	}
+}
+
 func TestOrchestratorUpgradeInstallerHasBackupRollbackAndServiceState(t *testing.T) {
 	script := orchestratorUpgradeScript
 	for _, required := range []string{
@@ -155,6 +187,8 @@ func TestOrchestratorUpgradeInstallerHasBackupRollbackAndServiceState(t *testing
 		"ly_route_orchestrator_plugin.so",
 		"ly-route-control-api.service",
 		"version.env",
+		"timeout 30 systemctl restart ly-route-control-api.service",
+		"write_result failed \"install failed; restoring backup\"",
 		"health_check",
 		"systemctl reboot",
 	} {
