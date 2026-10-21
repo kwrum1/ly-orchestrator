@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 
 	"ly-route/backend/internal/runtime/dataplane"
@@ -66,6 +68,34 @@ func (transaction *productionGatewayWithDataplane) attachNativeUnderlay(ctx cont
 	return transaction.adapter.ExecuteOperations(ctx, attach)
 }
 
+// setPlanLANVPPEnvironment scopes the legacy VPP command placeholder to the
+// LAN assignment of the current transaction. Existing command templates still
+// contain $LY_ROUTE_LAN_INTERFACE, and the vppctl channel intentionally reads
+// that process variable for backwards compatibility. Leaving it unset makes a
+// command name literal "lyroute-$LY_ROUTE_...", which the VPP CLI cannot
+// recover from; the plan is authoritative while the transaction runs.
+func setPlanLANVPPEnvironment(plan vpp.Plan) func() {
+	for _, assignment := range plan.AddressAssignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		linux := strings.TrimSpace(assignment.LinuxInterface)
+		if linux == "" {
+			continue
+		}
+		previous, found := os.LookupEnv("LY_ROUTE_LAN_INTERFACE")
+		_ = os.Setenv("LY_ROUTE_LAN_INTERFACE", linux)
+		return func() {
+			if found {
+				_ = os.Setenv("LY_ROUTE_LAN_INTERFACE", previous)
+				return
+			}
+			_ = os.Unsetenv("LY_ROUTE_LAN_INTERFACE")
+		}
+	}
+	return func() {}
+}
+
 func (transaction *productionGatewayWithDataplane) Run(ctx context.Context, plan Plan) (GatewayTransactionResult, error) {
 	if len(plan.GatewayPlan.NativePath.Assignments) == 0 {
 		return transaction.inner.Run(ctx, plan)
@@ -87,6 +117,8 @@ func (transaction *productionGatewayWithDataplane) Run(ctx context.Context, plan
 			return GatewayTransactionResult{}, fmt.Errorf("attach native VPP underlay: %w", err)
 		}
 	}
+	restoreLAN := setPlanLANVPPEnvironment(plan.GatewayPlan)
+	defer restoreLAN()
 	plan.GatewayPlan.DataplanePrepared = true
 	result, applyErr := transaction.inner.Run(ctx, plan)
 	if applyErr != nil {

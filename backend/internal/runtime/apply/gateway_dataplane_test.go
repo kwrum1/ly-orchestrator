@@ -3,6 +3,7 @@ package apply
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
 	"testing"
 
@@ -42,6 +43,20 @@ func TestProductionDataplaneWrapperMarksPlanPreparedBeforeGateway(t *testing.T) 
 	}
 	if !reflect.DeepEqual(trace, []string{"dataplane-apply", "gateway-run", "gateway-rollback", "dataplane-rollback"}) {
 		t.Fatalf("rollback trace=%v", trace)
+	}
+}
+
+func TestSetPlanLANVPPEnvironmentScopesLegacyTemplate(t *testing.T) {
+	t.Setenv("LY_ROUTE_LAN_INTERFACE", "before")
+	plan := nativeGatewayPlan("txn-lan-env")
+	plan.GatewayPlan.AddressAssignments = []vpp.AddressAssignment{{Role: "lan", LinuxInterface: "eth2", VPPInterface: "lyroute-eth2"}}
+	restore := setPlanLANVPPEnvironment(plan.GatewayPlan)
+	if got := os.Getenv("LY_ROUTE_LAN_INTERFACE"); got != "eth2" {
+		t.Fatalf("during apply LY_ROUTE_LAN_INTERFACE=%q, want eth2", got)
+	}
+	restore()
+	if got := os.Getenv("LY_ROUTE_LAN_INTERFACE"); got != "before" {
+		t.Fatalf("after apply LY_ROUTE_LAN_INTERFACE=%q, want before", got)
 	}
 }
 
