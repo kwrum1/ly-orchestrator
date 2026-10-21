@@ -39,6 +39,7 @@ var (
 	ErrTaskNotFound               = errors.New("product task not found")
 	ErrTaskConflict               = errors.New("product task state conflict")
 	ErrUpgradeUnsupported         = errors.New("orchestrator upgrade is not supported")
+	ErrInvalidUpgradePackage      = errors.New("invalid upgrade package")
 	ErrConversionExecutionBlocked = errors.New("conversion execution is not implemented")
 )
 
@@ -53,6 +54,8 @@ type UpdateService interface {
 	StageUpgrade(context.Context, UpgradeStageRequest) (UpgradeTask, error)
 	InstallUpgrade(context.Context, UpgradeActionRequest) (UpgradeTask, error)
 	RollbackUpgrade(context.Context, UpgradeActionRequest) (UpgradeTask, error)
+	StartUpgrade(context.Context, UpgradeActionRequest) error
+	StartRollback(context.Context, UpgradeActionRequest) error
 
 	ValidateConversion(context.Context, productupdate.Manifest) (productupdate.Validation, error)
 	ConversionTasks(context.Context) ([]ConversionTask, error)

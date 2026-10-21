@@ -11,12 +11,77 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"ly-route/backend/internal/orchestratorapi"
 	"ly-route/backend/internal/persistence"
 	"ly-route/backend/internal/product"
 	"ly-route/backend/internal/productupdate"
 )
+
+func waitForUpgradeState(t *testing.T, server *Server, cookie *http.Cookie, taskID, want string) *httptest.ResponseRecorder {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var last *httptest.ResponseRecorder
+	for time.Now().Before(deadline) {
+		last = authenticatedJSONRequest(t, server, http.MethodGet, orchestratorapi.UpgradesPath+"/"+taskID, "", cookie)
+		if last.Code == http.StatusOK {
+			var body struct {
+				Item orchestratorapi.UpgradeTask `json:"item"`
+			}
+			if json.Unmarshal(last.Body.Bytes(), &body) == nil && body.Item.State == want {
+				return last
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return last
+}
+
+func TestOrchestratorUpgradeAcceptsBeforeStartingInstaller(t *testing.T) {
+	server, _, cookie := orchestratorPackageServer(t)
+	server.orchestratorUpgradeDir = t.TempDir()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server.orchestratorInstallStart = func(invocation orchestratorUpgradeInvocation) error {
+		close(started)
+		<-release
+		resultPath := invocation.Args[8]
+		if err := os.MkdirAll(filepath.Dir(resultPath), 0o750); err != nil {
+			return err
+		}
+		return os.WriteFile(resultPath, []byte(`{"state":"installed","reason":"test"}`), 0o600)
+	}
+	pkg := testUpgradePackage(t, product.Orchestrator().ID(), false)
+	staged := authenticatedMultipartRequest(t, server, orchestratorapi.UpgradesPath, map[string][]byte{"package": pkg}, cookie)
+	var body struct {
+		Item orchestratorapi.UpgradeTask `json:"item"`
+	}
+	decode(t, staged, &body)
+
+	response := authenticatedJSONRequest(t, server, http.MethodPost, orchestratorapi.UpgradesPath+"/"+body.Item.ID+"/install", `{"confirm_install":true}`, cookie)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("install status = %d: %s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Location") != orchestratorapi.UpgradesPath+"/"+body.Item.ID {
+		t.Fatalf("Location = %q", response.Header().Get("Location"))
+	}
+	if !containsAll(response.Body.String(), `"task_id":"`+body.Item.ID+`"`, `"status":"installing"`, `"poll":"`) {
+		t.Fatalf("accepted body = %s", response.Body.String())
+	}
+	select {
+	case <-started:
+		t.Fatal("installer started before the 202 response was observed")
+	default:
+	}
+	close(release)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("installer did not start asynchronously")
+	}
+	waitForUpgradeState(t, server, cookie, body.Item.ID, orchestratorapi.UpgradeStateInstalled)
+}
 
 func TestOrchestratorUpgradeTaskLifecyclePersistsAndRollsBack(t *testing.T) {
 	server, _, cookie := orchestratorPackageServer(t)
@@ -65,8 +130,8 @@ func TestOrchestratorUpgradeTaskLifecyclePersistsAndRollsBack(t *testing.T) {
 	if installedBody.Item.State != orchestratorapi.UpgradeStateInstalling {
 		t.Fatalf("install task state = %q", installedBody.Item.State)
 	}
-	readback := authenticatedJSONRequest(t, server, http.MethodGet, orchestratorapi.UpgradesPath+"/"+stagedBody.Item.ID, "", cookie)
-	if readback.Code != http.StatusOK || !containsAll(readback.Body.String(), `"state":"installed"`) {
+	readback := waitForUpgradeState(t, server, cookie, stagedBody.Item.ID, orchestratorapi.UpgradeStateInstalled)
+	if readback.Code != http.StatusOK {
 		t.Fatalf("install readback status=%d body=%s", readback.Code, readback.Body.String())
 	}
 	if len(invocations) != 1 || invocations[0].Args[3] != "install" {
@@ -77,8 +142,8 @@ func TestOrchestratorUpgradeTaskLifecyclePersistsAndRollsBack(t *testing.T) {
 	if rolled.Code != http.StatusAccepted {
 		t.Fatalf("rollback status = %d: %s", rolled.Code, rolled.Body.String())
 	}
-	rollbackReadback := authenticatedJSONRequest(t, server, http.MethodGet, orchestratorapi.UpgradesPath+"/"+stagedBody.Item.ID, "", cookie)
-	if rollbackReadback.Code != http.StatusOK || !containsAll(rollbackReadback.Body.String(), `"state":"rolled_back"`) {
+	rollbackReadback := waitForUpgradeState(t, server, cookie, stagedBody.Item.ID, orchestratorapi.UpgradeStateRolledBack)
+	if rollbackReadback.Code != http.StatusOK {
 		t.Fatalf("rollback readback status=%d body=%s", rollbackReadback.Code, rollbackReadback.Body.String())
 	}
 	if len(invocations) != 2 || invocations[1].Args[3] != "rollback" {

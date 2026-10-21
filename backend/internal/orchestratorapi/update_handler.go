@@ -1,6 +1,7 @@
 package orchestratorapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -128,7 +129,9 @@ func (handler *Handler) handleUpgradeItem(writer http.ResponseWriter, request *h
 				writeUpdateError(writer, err)
 				return
 			}
-			writeJSON(writer, http.StatusAccepted, map[string]any{"item": task})
+			handler.writeAcceptedUpgrade(writer, request, task, "install", func(ctx context.Context) error {
+				return handler.updates.StartUpgrade(ctx, actionRequest)
+			})
 			return
 		}
 		if action == "rollback" {
@@ -137,7 +140,9 @@ func (handler *Handler) handleUpgradeItem(writer http.ResponseWriter, request *h
 				writeUpdateError(writer, err)
 				return
 			}
-			writeJSON(writer, http.StatusAccepted, map[string]any{"item": task})
+			handler.writeAcceptedUpgrade(writer, request, task, "rollback", func(ctx context.Context) error {
+				return handler.updates.StartRollback(ctx, actionRequest)
+			})
 			return
 		}
 		writeAPIError(writer, http.StatusNotFound, ErrTaskNotFound)
@@ -279,12 +284,38 @@ func (handler *Handler) handleConversionItem(writer http.ResponseWriter, request
 	}
 }
 
+func (handler *Handler) writeAcceptedUpgrade(writer http.ResponseWriter, request *http.Request, task UpgradeTask, action string, start func(context.Context) error) {
+	pollPath := UpgradesPath + "/" + task.ID
+	writer.Header().Set("Location", pollPath)
+	writer.Header().Set("Retry-After", "2")
+	writer.Header().Set("X-LY-Route-Task-ID", task.ID)
+	writeJSON(writer, http.StatusAccepted, map[string]any{
+		"item": task, "task_id": task.ID, "status": task.State, "action": action, "poll": pollPath,
+	})
+	if flusher, ok := writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	base := context.WithoutCancel(request.Context())
+	go func() {
+		// Give the HTTP response a chance to leave the server before the
+		// installer restarts the control API.
+		time.Sleep(250 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(base, 30*time.Second)
+		defer cancel()
+		_ = start(ctx)
+	}()
+}
+
 func writeUpdateError(writer http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
 		writeAPIError(writer, http.StatusNotFound, err)
 	case errors.Is(err, ErrTaskConflict), errors.Is(err, productupdate.ErrConversionNotApplicable):
 		writeAPIError(writer, http.StatusConflict, err)
+	case errors.Is(err, ErrUpgradeUnsupported):
+		writeAPIError(writer, http.StatusConflict, err)
+	case errors.Is(err, ErrInvalidUpgradePackage):
+		writeAPIError(writer, http.StatusUnprocessableEntity, err)
 	case errors.Is(err, ErrConversionExecutionBlocked):
 		writeAPIError(writer, http.StatusNotImplemented, err)
 	case errors.Is(err, productupdate.ErrInvalidConversionManifest):

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
+	"time"
 
 	"ly-route/backend/internal/orchestratorapi"
 	"ly-route/backend/internal/persistence"
@@ -34,6 +35,7 @@ type upgradeTaskPayload struct {
 	PackagePath string                      `json:"package_path,omitempty"`
 	ResultPath  string                      `json:"result_path,omitempty"`
 	BackupDir   string                      `json:"backup_dir,omitempty"`
+	Started     bool                        `json:"started,omitempty"`
 }
 
 type conversionTaskPayload struct {
@@ -133,9 +135,9 @@ func (service *productUpdateService) StageUpgrade(ctx context.Context, request o
 	}
 	manifest, inspectErr := inspectUpgradePackage(packagePath, product.Orchestrator().ID())
 	if inspectErr != nil {
-		err = inspectErr
-		server.recordAuditWithTransaction(request.Actor, request.Role, orchestratorapi.UpgradesPath, "stage", "failure", inspectErr.Error(), request.TransactionID)
-		return orchestratorapi.UpgradeTask{}, inspectErr
+		err = fmt.Errorf("%w: %s", orchestratorapi.ErrInvalidUpgradePackage, sanitizeUpgradeError(inspectErr))
+		server.recordAuditWithTransaction(request.Actor, request.Role, orchestratorapi.UpgradesPath, "stage", "failure", err.Error(), request.TransactionID)
+		return orchestratorapi.UpgradeTask{}, err
 	}
 	toVersion := strings.TrimSpace(manifest.Version)
 	if toVersion == "" {
@@ -201,22 +203,46 @@ func (service *productUpdateService) InstallUpgrade(ctx context.Context, request
 	payload.Task.State = orchestratorapi.UpgradeStateInstalling
 	payload.Task.BackupID = payload.Task.ID
 	payload.Task.Reason = ""
+	payload.Started = false
 	payload.Task.UpdatedAt = service.server.now().UTC()
 	if err := service.saveUpgradeTask(ctx, payload); err != nil {
 		return orchestratorapi.UpgradeTask{}, err
+	}
+	service.server.recordAuditWithTransaction(request.Actor, request.Role, orchestratorapi.UpgradesPath, "install", "accepted", "", request.TransactionID)
+	return payload.Task, nil
+}
+
+func (service *productUpdateService) StartUpgrade(ctx context.Context, request orchestratorapi.UpgradeActionRequest) error {
+	service.server.productTaskMu.Lock()
+	defer service.server.productTaskMu.Unlock()
+	payload, err := service.loadUpgradeTask(ctx, request.TaskID)
+	if err != nil {
+		return err
+	}
+	if payload.Task.State != orchestratorapi.UpgradeStateInstalling {
+		return fmt.Errorf("%w: task is %s", orchestratorapi.ErrTaskConflict, payload.Task.State)
+	}
+	if payload.Started {
+		return nil
+	}
+	payload.Started = true
+	payload.Task.UpdatedAt = service.server.now().UTC()
+	if err := service.saveUpgradeTask(ctx, payload); err != nil {
+		return err
 	}
 	invocation := orchestratorUpgradeScriptInvocation("install", payload.PackagePath, payload.Task.PackageSHA256, "/usr/lib/ly-route", payload.BackupDir, payload.ResultPath, request.Reboot)
 	invocation.Unit = orchestratorUpgradeUnitName(payload.Task.ID)
 	if err := service.server.orchestratorInstallStart(invocation); err != nil {
 		payload.Task.State = orchestratorapi.UpgradeStateFailed
-		payload.Task.Reason = err.Error()
+		payload.Task.Reason = sanitizeUpgradeError(err)
+		payload.Started = false
 		payload.Task.UpdatedAt = service.server.now().UTC()
 		_ = service.saveUpgradeTask(context.WithoutCancel(ctx), payload)
-		service.server.recordAuditWithTransaction(request.Actor, request.Role, orchestratorapi.UpgradesPath, "install", "failure", err.Error(), request.TransactionID)
-		return orchestratorapi.UpgradeTask{}, err
+		service.server.recordAuditWithTransaction(request.Actor, request.Role, orchestratorapi.UpgradesPath, "install", "failure", payload.Task.Reason, request.TransactionID)
+		return err
 	}
 	service.server.recordAuditWithTransaction(request.Actor, request.Role, orchestratorapi.UpgradesPath, "install", "success", "", request.TransactionID)
-	return payload.Task, nil
+	return nil
 }
 
 func (service *productUpdateService) RollbackUpgrade(ctx context.Context, request orchestratorapi.UpgradeActionRequest) (orchestratorapi.UpgradeTask, error) {
@@ -238,22 +264,46 @@ func (service *productUpdateService) RollbackUpgrade(ctx context.Context, reques
 	}
 	payload.Task.State = orchestratorapi.UpgradeStateRollingBack
 	payload.Task.Reason = ""
+	payload.Started = false
 	payload.Task.UpdatedAt = service.server.now().UTC()
 	if err := service.saveUpgradeTask(ctx, payload); err != nil {
 		return orchestratorapi.UpgradeTask{}, err
+	}
+	service.server.recordAuditWithTransaction(request.Actor, request.Role, orchestratorapi.UpgradesPath, "rollback", "accepted", "", request.TransactionID)
+	return payload.Task, nil
+}
+
+func (service *productUpdateService) StartRollback(ctx context.Context, request orchestratorapi.UpgradeActionRequest) error {
+	service.server.productTaskMu.Lock()
+	defer service.server.productTaskMu.Unlock()
+	payload, err := service.loadUpgradeTask(ctx, request.TaskID)
+	if err != nil {
+		return err
+	}
+	if payload.Task.State != orchestratorapi.UpgradeStateRollingBack {
+		return fmt.Errorf("%w: task is %s", orchestratorapi.ErrTaskConflict, payload.Task.State)
+	}
+	if payload.Started {
+		return nil
+	}
+	payload.Started = true
+	payload.Task.UpdatedAt = service.server.now().UTC()
+	if err := service.saveUpgradeTask(ctx, payload); err != nil {
+		return err
 	}
 	invocation := orchestratorUpgradeScriptInvocation("rollback", payload.PackagePath, payload.Task.PackageSHA256, "/usr/lib/ly-route", payload.BackupDir, payload.ResultPath, false)
 	invocation.Unit = orchestratorUpgradeUnitName(payload.Task.ID) + "-rollback"
 	if err := service.server.orchestratorInstallStart(invocation); err != nil {
 		payload.Task.State = orchestratorapi.UpgradeStateRollbackFailed
-		payload.Task.Reason = err.Error()
+		payload.Task.Reason = sanitizeUpgradeError(err)
+		payload.Started = false
 		payload.Task.UpdatedAt = service.server.now().UTC()
 		_ = service.saveUpgradeTask(context.WithoutCancel(ctx), payload)
-		service.server.recordAuditWithTransaction(request.Actor, request.Role, orchestratorapi.UpgradesPath, "rollback", "failure", err.Error(), request.TransactionID)
-		return orchestratorapi.UpgradeTask{}, err
+		service.server.recordAuditWithTransaction(request.Actor, request.Role, orchestratorapi.UpgradesPath, "rollback", "failure", payload.Task.Reason, request.TransactionID)
+		return err
 	}
 	service.server.recordAuditWithTransaction(request.Actor, request.Role, orchestratorapi.UpgradesPath, "rollback", "success", "", request.TransactionID)
-	return payload.Task, nil
+	return nil
 }
 
 func (service *productUpdateService) loadUpgradeTask(ctx context.Context, id string) (upgradeTaskPayload, error) {
@@ -301,6 +351,29 @@ func (service *productUpdateService) reconcileUpgradeTasks(ctx context.Context) 
 		if payload.ResultPath == "" || (payload.Task.State != orchestratorapi.UpgradeStateInstalling && payload.Task.State != orchestratorapi.UpgradeStateRollingBack) {
 			continue
 		}
+		if age := service.server.now().UTC().Sub(payload.Task.UpdatedAt); age > 30*time.Second {
+			originalState := payload.Task.State
+			if !payload.Started {
+				payload.Task.State = orchestratorapi.UpgradeStateFailed
+				if originalState == orchestratorapi.UpgradeStateRollingBack {
+					payload.Task.State = orchestratorapi.UpgradeStateRollbackFailed
+				}
+				payload.Task.Reason = "installer was accepted but did not start before the control process restarted"
+				payload.Task.UpdatedAt = service.server.now().UTC()
+				_ = service.saveUpgradeTask(ctx, payload)
+				continue
+			}
+			if age > 15*time.Minute {
+				payload.Task.State = orchestratorapi.UpgradeStateFailed
+				if originalState == orchestratorapi.UpgradeStateRollingBack {
+					payload.Task.State = orchestratorapi.UpgradeStateRollbackFailed
+				}
+				payload.Task.Reason = "installer did not report a result"
+				payload.Task.UpdatedAt = service.server.now().UTC()
+				_ = service.saveUpgradeTask(ctx, payload)
+				continue
+			}
+		}
 		body, readErr := os.ReadFile(payload.ResultPath)
 		if readErr != nil {
 			continue
@@ -335,6 +408,21 @@ func (service *productUpdateService) reconcileUpgradeTasks(ctx context.Context) 
 		}
 	}
 	return nil
+}
+
+func sanitizeUpgradeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := err.Error()
+	for _, replacement := range []struct{ old, new string }{
+		{"signal: killed", "upgrade validation process was terminated"},
+		{"signal: terminated", "upgrade process was terminated"},
+		{"context canceled", "upgrade operation was canceled"},
+	} {
+		text = strings.ReplaceAll(text, replacement.old, replacement.new)
+	}
+	return text
 }
 
 func (service *productUpdateService) ValidateConversion(_ context.Context, manifest productupdate.Manifest) (productupdate.Validation, error) {
