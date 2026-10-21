@@ -62,6 +62,17 @@ ACL 等外围配置。配置导入完成后 UI 又提示“需执行运行时应
 4. 不得以“自研可控”为由拒绝成熟实现，也不得为省事直接替换而破坏契约。
 5. 每次评估记录候选、对比、选择理由、风险和回退方式。
 6. 节点纳管、策略下发、遥测、升级等模块若已有成熟上游组件，先评估集成。
+7. **外部软件导致修复困难时允许平替**：SmartDNS、Kea、Xray 或其它外部组件在
+   Orchestrator 集成中若难以稳定修复，允许使用 VPP 原生能力或成熟第三方实现；
+   前提是功能等价，不能降低策略、遥测、配置恢复、升级回滚等产品行为。
+8. **选择最快、最容易修复、最成熟且功能等价的实现**：顺序为 VPP 原生 →
+   成熟第三方 → 继续自研/原组件；保留 API/配置/数据契约，提供 adapter/feature
+   flag/回退，旧路径至少保留一个发布周期；记录版本 pin、许可证、provenance、
+   迁移步骤；必须有功能等价和故障测试；不得静默删功能或降低可观测性。
+
+当前 P1/P2 修复属于升级/错误/可观测契约，不涉及外部组件替换。若后续
+SmartDNS/Kea/Xray 进入 Orchestrator 运行时，先按上述原则评估 VPP 原生或上游
+实现，并保留现有 HTTP/配置/遥测契约。
 
 ### 当前平替评估
 
@@ -70,6 +81,9 @@ ACL 等外围配置。配置导入完成后 UI 又提示“需执行运行时应
 | VPP 转发/策略/服务链 | 自研 `ly_route_orchestrator_plugin`，已基于 VPP 原生接口 | VPP 原生 ACL/ABF/接口与 stats API | 继续使用插件；新增能力前先确认 VPP 原生是否已覆盖。插件 CLI/代际不变，可回退到 direct/disable |
 | 遥测采集 | Go 解析 `vppctl` 文本（`show interface`、`show ly-route orchestrator`） | VPP stats segment / 二进制 API / 上游 JSON 输出 | `show ly-route orchestrator` 由自有插件定义，保持；若通用 VPP 文本解析继续反复失败，评估 stats segment，HTTP 契约不变 |
 | 节点/网关纳管 | 当前产品未设计多站点纳管 | NetBox/Nautobot 等成熟 inventory（需核实许可证与版本） | 需求出现时先做只读 inventory 适配层，不直接替换本地拓扑模型 |
+| SmartDNS | Orchestrator profile 不包含该服务 | VPP 原生 DNS/上游 resolver；成熟 DNS 组件 | 若未来集成且难以稳定修复，保留 API/配置契约并加 adapter/flag |
+| Kea DHCP | Orchestrator profile 不包含该服务 | VPP 原生/上游 DHCP；成熟 DHCP 组件 | 同上；不得降低配置恢复和遥测 |
+| Xray 代理 | Orchestrator profile 不包含该服务 | VPP service-chain/上游代理 | 同上；保留策略/遥测/升级回滚契约 |
 | 升级/回滚 | 现有 upgrade 包 + 自定义安装脚本 | RAUC / SWUpdate / Mender（需核实许可证、版本与 A/B 分区支持） | 仅在现有脚本无法满足回滚/原子性时评估；保留现有包格式与 manifest |
 | 认证/会话/审计 | 自研 Go session + SQLite 审计 | 上游 OIDC/Keycloak（如未来需要集中身份） | 当前内部离线场景保持自研；适配层需保留现有 Cookie/Bearer 与审计字段 |
 | 数据库/HTTP | `modernc.org/sqlite` + `net/http` | 已是成熟上游 | 不替换 |
