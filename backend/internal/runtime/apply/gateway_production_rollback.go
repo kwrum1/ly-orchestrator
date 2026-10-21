@@ -29,6 +29,16 @@ func vppGatewayLANInterface(gateway vpp.Plan) string {
 			return strings.TrimSpace(assignment.VPPInterface)
 		}
 	}
+	// Migration/recovery plans created before address assignments were
+	// persisted still carry the rendered interface states. The LAN is the
+	// managed lyroute-* interface with a static address; WAN native interfaces
+	// are addressless until PPPoE/DHCP completes.
+	for _, state := range gateway.Interfaces {
+		name := strings.TrimSpace(state.Name)
+		if strings.HasPrefix(name, "lyroute-") && len(state.Addresses) > 0 {
+			return name
+		}
+	}
 	return ""
 }
 

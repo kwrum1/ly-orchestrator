@@ -75,25 +75,35 @@ func (transaction *productionGatewayWithDataplane) attachNativeUnderlay(ctx cont
 // command name literal "lyroute-$LY_ROUTE_...", which the VPP CLI cannot
 // recover from; the plan is authoritative while the transaction runs.
 func setPlanLANVPPEnvironment(plan vpp.Plan) func() {
+	linux := ""
 	for _, assignment := range plan.AddressAssignments {
-		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
-			continue
-		}
-		linux := strings.TrimSpace(assignment.LinuxInterface)
-		if linux == "" {
-			continue
-		}
-		previous, found := os.LookupEnv("LY_ROUTE_LAN_INTERFACE")
-		_ = os.Setenv("LY_ROUTE_LAN_INTERFACE", linux)
-		return func() {
-			if found {
-				_ = os.Setenv("LY_ROUTE_LAN_INTERFACE", previous)
-				return
-			}
-			_ = os.Unsetenv("LY_ROUTE_LAN_INTERFACE")
+		if strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			linux = strings.TrimSpace(assignment.LinuxInterface)
+			break
 		}
 	}
-	return func() {}
+	if linux == "" {
+		// Older persisted plans may only contain rendered interface states.
+		for _, state := range plan.Interfaces {
+			name := strings.TrimSpace(state.Name)
+			if strings.HasPrefix(name, "lyroute-") && len(state.Addresses) > 0 {
+				linux = strings.TrimPrefix(name, "lyroute-")
+				break
+			}
+		}
+	}
+	if linux == "" {
+		return func() {}
+	}
+	previous, found := os.LookupEnv("LY_ROUTE_LAN_INTERFACE")
+	_ = os.Setenv("LY_ROUTE_LAN_INTERFACE", linux)
+	return func() {
+		if found {
+			_ = os.Setenv("LY_ROUTE_LAN_INTERFACE", previous)
+			return
+		}
+		_ = os.Unsetenv("LY_ROUTE_LAN_INTERFACE")
+	}
 }
 
 func (transaction *productionGatewayWithDataplane) Run(ctx context.Context, plan Plan) (GatewayTransactionResult, error) {
