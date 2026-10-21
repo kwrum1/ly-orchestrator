@@ -23,7 +23,7 @@ func (server *Server) decorateWANLinkRuntimeStates(ctx context.Context, items []
 		}
 		var status struct {
 			State      string `json:"state"`
-			RouteReady bool   `json:"route_ready"`
+			RouteReady *bool  `json:"route_ready"`
 			Interface  string `json:"interface"`
 		}
 		if json.Unmarshal(data, &status) != nil {
@@ -33,7 +33,14 @@ func (server *Server) decorateWANLinkRuntimeStates(ctx context.Context, items []
 		item["pppoe_interface"] = status.Interface
 		if status.State == "connected" {
 			item["runtime_state"] = "running"
-			item["route_ready"] = status.RouteReady
+			if status.RouteReady != nil {
+				item["route_ready"] = *status.RouteReady
+			} else {
+				// A connected PPPoE session without an explicit readiness field
+				// has installed its default route; reflect that rather than the
+				// zero value of an absent JSON field.
+				item["route_ready"] = true
+			}
 		} else if status.State != "" {
 			item["runtime_state"] = status.State
 		}

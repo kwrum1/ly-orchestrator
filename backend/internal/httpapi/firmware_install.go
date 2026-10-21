@@ -58,6 +58,9 @@ fi
 if [ -e /usr/lib/ly-route/recover-runtime.sh ]; then
   cp -a /usr/lib/ly-route/recover-runtime.sh "$backup/recover"
 fi
+if [ -e /usr/share/ly-route/artifact-manifest.json ]; then
+  cp -a /usr/share/ly-route/artifact-manifest.json "$backup/artifact-manifest.json"
+fi
 
 restore_backup() {
   echo "upgrade failed; restoring $backup" >&2
@@ -84,6 +87,9 @@ restore_backup() {
   if [ -e "$backup/recover" ]; then
     install -m 0755 "$backup/recover" /usr/lib/ly-route/recover-runtime.sh
   fi
+  if [ -e "$backup/artifact-manifest.json" ]; then
+    install -D -m 0644 "$backup/artifact-manifest.json" /usr/share/ly-route/artifact-manifest.json
+  fi
   systemctl daemon-reload || true
   systemctl restart ly-route-control-api.service || true
   systemctl reload nginx.service || systemctl restart nginx.service || true
@@ -108,6 +114,9 @@ for runtime_script in runtime-check.sh firstboot.sh; do
 done
 if [ "$target_dir" = "/usr/lib/ly-route" ] && [ -f "$tmp/etc/systemd/system/ly-route-firstboot.service" ]; then
   install -D -m 0644 "$tmp/etc/systemd/system/ly-route-firstboot.service" /etc/systemd/system/ly-route-firstboot.service
+fi
+if [ -f "$tmp/usr/share/ly-route/artifact-manifest.json" ]; then
+  install -D -m 0644 "$tmp/usr/share/ly-route/artifact-manifest.json" /usr/share/ly-route/artifact-manifest.json
 fi
 if [ -d "$tmp/opt/ly-route/admin" ]; then
   rm -rf /opt/ly-route/admin.new
