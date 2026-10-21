@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	healthCacheTTL      = 30 * time.Second
+	healthCacheTTL      = time.Second
 	healthCheckTimeout  = 8 * time.Second
 	healthUnknownTTL    = time.Second
 	healthUnknownReason = "health probe timed out"

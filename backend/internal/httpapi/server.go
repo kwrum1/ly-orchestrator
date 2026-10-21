@@ -2679,6 +2679,12 @@ func (server *Server) handleDesiredCollection(resourceType string) http.HandlerF
 			if resourceType == "traffic_control" {
 				items = server.decorateTrafficControlRuntimeStates(r.Context(), items)
 			}
+			if resourceType == "dns_upstream" || resourceType == "dns_policy" {
+				items = server.decorateDNSRuntimeCapabilities(r.Context(), items)
+			}
+			if resourceType == "wan_link" {
+				items = server.decorateWANLinkRuntimeStates(r.Context(), items)
+			}
 			writeJSON(w, http.StatusOK, map[string]any{"items": items, "capabilities": server.degradedRuntimeCapabilities(r.Context()), "request_id": requestID(r)})
 		case http.MethodPost:
 			server.handleDesiredMutation(w, r, resourceType, "create", "")
@@ -2762,6 +2768,12 @@ func (server *Server) handleDesiredItem(resourceType string) http.HandlerFunc {
 			}
 			if resourceType == "traffic_control" {
 				item = server.decorateTrafficControlRuntimeState(r.Context(), item)
+			}
+			if resourceType == "dns_upstream" || resourceType == "dns_policy" {
+				item = server.decorateDNSRuntimeCapabilities(r.Context(), []map[string]any{item})[0]
+			}
+			if resourceType == "wan_link" {
+				item = server.decorateWANLinkRuntimeStates(r.Context(), []map[string]any{item})[0]
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"item": item, "capabilities": server.degradedRuntimeCapabilities(r.Context()), "request_id": requestID(r)})
 		case http.MethodPatch, http.MethodPost:
@@ -6478,7 +6490,8 @@ func (server *Server) currentDNSPolicies(ctx context.Context, proxyEgresses []pr
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	resource := DNSPolicyResource{ID: "default", Kind: "policy", Name: "Default DNS Policy", Priority: 1000, Enabled: true, Policy: policy, Render: compiled.RenderSmartDNS(), Capabilities: []controlapi.CapabilityState{{Name: "smartdns", Available: false, State: controlapi.CapabilityDegraded, Reason: "SmartDNS process manager not wired"}}}
+	dnsCapability := server.serviceCapability(ctx, serviceRuntime.SmartDNS, "smartdns", "SmartDNS service runtime is not configured")
+	resource := DNSPolicyResource{ID: "default", Kind: "policy", Name: "Default DNS Policy", Priority: 1000, Enabled: true, Policy: policy, Render: compiled.RenderSmartDNS(), Capabilities: []controlapi.CapabilityState{dnsCapability}}
 	artifacts, err := serviceRuntime.RenderSmartDNSBundle([]serviceRuntime.SmartDNSPlan{{ID: resource.ID, Render: resource.Render, Upstreams: upstreams, Cache: cache, DomainSets: domainSets}})
 	return []DNSPolicyResource{resource}, artifacts, networks, err
 }
@@ -8254,6 +8267,7 @@ func (server *Server) handleFirmwareUpdateStage(w http.ResponseWriter, r *http.R
 			writeError(w, r, http.StatusInternalServerError, "firmware_stage_cleanup_failed", removeErr.Error())
 			return
 		}
+		server.recordAudit(session.Username, session.Role, "/api/v1/firmware/update/stage", "firmware_stage", "failure", err.Error(), r)
 		writeError(w, r, http.StatusUnprocessableEntity, "invalid_upgrade_package", err.Error())
 		return
 	}
@@ -8339,9 +8353,11 @@ func (server *Server) handleFirmwareUpdateInstall(w http.ResponseWriter, r *http
 		server.firmwareStatus.InstallStatus = "failed"
 		server.firmwareStatus.Reason = err.Error()
 		server.firmwareMu.Unlock()
+		server.recordAudit(session.Username, session.Role, "/api/v1/firmware/update/install", "firmware_install", "failure", err.Error(), r)
 		writeError(w, r, http.StatusInternalServerError, "firmware_install_failed", err.Error())
 		return
 	}
+	server.recordAudit(session.Username, session.Role, "/api/v1/firmware/update/install", "firmware_install", "accepted", status.ImageHash, r)
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": status, "target_dir": targetDir, "reboot": req.Reboot, "request_id": requestID(r)})
 }
 

@@ -4015,7 +4015,7 @@ func testUpgradePackage(t *testing.T, productID product.ID, corruptChecksum bool
 			t.Fatalf("write %s: %v", fullPath, err)
 		}
 	}
-	mustWrite("usr/lib/ly-route/ly-route-control", "#!/bin/sh\nexit 0\n", 0o755)
+	mustWrite("usr/lib/ly-route/ly-route-control", "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo test-version; exit 0; fi\nexit 0\n", 0o755)
 	mustWrite("usr/lib/ly-route/vpp-apply", "#!/bin/sh\nexit 0\n", 0o755)
 	mustWrite("opt/ly-route/admin/app.js", "console.log('upgrade');\n", 0o644)
 	mustWrite("etc/nginx/conf.d/ly-route-admin.conf", "server { listen 443 ssl; }\n", 0o644)

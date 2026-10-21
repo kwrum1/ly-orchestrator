@@ -3,6 +3,7 @@ package httpapi
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"ly-route/backend/internal/product"
 )
@@ -68,7 +70,39 @@ func validateUpgradePackage(packagePath string, expectedProduct product.ID) erro
 	if manifest.Product != expectedProduct {
 		return &UpgradeProductMismatchError{Package: manifest.Product, Server: expectedProduct}
 	}
-	return verifyUpgradeChecksums(tmp, manifest)
+	if err := verifyUpgradeChecksums(tmp, manifest); err != nil {
+		return err
+	}
+	return preflightUpgradeControl(tmp)
+}
+
+// preflightUpgradeControl catches structurally invalid or knowingly broken
+// control binaries at stage time. The install-time health check remains the
+// final authority, but it must not be the first line of defense: a package
+// whose control exits immediately otherwise opens an avoidable crash-loop
+// window after it has already replaced the live binary.
+func preflightUpgradeControl(root string) error {
+	control := filepath.Join(root, "usr/lib/ly-route/ly-route-control")
+	info, err := os.Lstat(control)
+	if err != nil {
+		return fmt.Errorf("control binary is missing: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("control binary is not an executable regular file")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, control, "--version").CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("control binary --version preflight timed out")
+	}
+	if err != nil {
+		return fmt.Errorf("control binary --version preflight failed: %w", err)
+	}
+	if strings.TrimSpace(string(output)) == "" {
+		return fmt.Errorf("control binary --version preflight returned no version")
+	}
+	return nil
 }
 
 func extractUpgradePackage(packagePath, root string) (err error) {

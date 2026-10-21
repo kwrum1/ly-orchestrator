@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -21,9 +22,42 @@ import (
 )
 
 func Run() {
+	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		fmt.Println(Version())
+		return
+	}
 	if err := run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// Version is the release identity reported by /health and the installer
+// preflight. Prefer an explicit environment value, then the immutable build
+// provenance shipped in the rootfs/upgrade package.
+func Version() string {
+	if value := strings.TrimSpace(os.Getenv("LY_ROUTE_VERSION")); value != "" && !strings.EqualFold(value, "dev") {
+		return value
+	}
+	path := strings.TrimSpace(os.Getenv("LY_ROUTE_ARTIFACT_MANIFEST"))
+	if path == "" {
+		path = "/usr/share/ly-route/artifact-manifest.json"
+	}
+	data, err := os.ReadFile(path)
+	if err == nil {
+		var manifest struct {
+			SourceCommit string `json:"source_commit"`
+			Commit       string `json:"commit"`
+			Version      string `json:"version"`
+		}
+		if json.Unmarshal(data, &manifest) == nil {
+			for _, candidate := range []string{manifest.SourceCommit, manifest.Commit, manifest.Version} {
+				if value := strings.TrimSpace(candidate); value != "" {
+					return value
+				}
+			}
+		}
+	}
+	return "dev"
 }
 
 func run() error {
@@ -49,7 +83,7 @@ func run() error {
 	}
 	dataplaneController := productionDataplaneController()
 	options := []httpapi.Option{
-		httpapi.WithVersion(env("LY_ROUTE_VERSION", "dev")),
+		httpapi.WithVersion(Version()),
 		httpapi.WithStore(store),
 		httpapi.WithAuthConfig(gatewayAuthConfig()),
 		httpapi.WithGatewayTransaction(productionGatewayTransactionWithController(dataplaneController)),
