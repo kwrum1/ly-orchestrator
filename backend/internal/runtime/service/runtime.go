@@ -542,6 +542,11 @@ func collectSmartDNSDomainSets(plans []SmartDNSPlan) (map[string][]string, map[s
 		}
 	}
 
+	for setID, entries := range sets {
+		if len(entries) == 0 {
+			delete(sets, setID)
+		}
+	}
 	ids := make([]string, 0, len(sets))
 	for setID := range sets {
 		ids = append(ids, setID)
@@ -628,12 +633,21 @@ func writeSmartDNSDomainSetDeclarations(builder *strings.Builder, domainSets map
 		ids = append(ids, setID)
 	}
 	slices.Sort(ids)
-	builder.WriteString("# Domain sets are kept in separate list files to avoid per-domain rule expansion.\n")
+	declared := 0
 	for _, setID := range ids {
-		name := domainSetNames[setID]
+		name := strings.TrimSpace(domainSetNames[setID])
+		if name == "" {
+			continue
+		}
+		if declared == 0 {
+			builder.WriteString("# Domain sets are kept in separate list files to avoid per-domain rule expansion.\n")
+		}
 		fmt.Fprintf(builder, "domain-set -name %s -type list -file /etc/smartdns/domain-sets/%s.list\n", name, name)
+		declared++
 	}
-	builder.WriteByte('\n')
+	if declared > 0 {
+		builder.WriteByte('\n')
+	}
 }
 
 func normalizeSmartDNSDomain(value, matchKind string) (string, error) {
