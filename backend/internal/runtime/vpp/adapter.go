@@ -1487,9 +1487,8 @@ func routePolicyCommandsWithOptions(policy trafficpolicy.RoutePolicy, wanGroups 
 			}
 		}
 		if strings.HasPrefix(routeTarget, "ip4-lookup-in-table ") || strings.HasPrefix(routeTarget, "ip6-lookup-in-table ") {
-			// VPP accepts the table before the prefix for regular next hops, but
-			// lookup DPOs require the documented prefix-before-table form.
-			commands = append(commands, fmt.Sprintf("?ip route add 0.0.0.0/0 table %d via %s", tableID, routeTarget))
+			// VPP accepts the table-first form for lookup DPOs as well.
+			commands = append(commands, fmt.Sprintf("?ip route add table %d 0.0.0.0/0 via %s", tableID, routeTarget))
 		} else {
 			commands = append(commands, fmt.Sprintf("?ip route add table %d 0.0.0.0/0 via %s", tableID, routeTarget))
 		}
@@ -1529,11 +1528,7 @@ func routePolicyRadixCommands(policy trafficpolicy.RoutePolicy, wanGroups map[st
 		fmt.Sprintf("?ip table add %d", tableID),
 		fmt.Sprintf("?set ip flow-hash table %d src dst sport dport proto", tableID),
 	}
-	if strings.HasPrefix(plan.routeTarget, "ip4-lookup-in-table ") {
-		commands = append(commands, fmt.Sprintf("?ip route add 0.0.0.0/0 table %d via %s", tableID, plan.routeTarget))
-	} else {
-		commands = append(commands, fmt.Sprintf("?ip route add table %d 0.0.0.0/0 via %s", tableID, plan.routeTarget))
-	}
+	commands = append(commands, fmt.Sprintf("?ip route add table %d 0.0.0.0/0 via %s", tableID, plan.routeTarget))
 	// A destination catch-all must not steal traffic addressed to the local
 	// LAN.  The native radix path is a FIB lookup, so install the LAN prefixes
 	// into the same private table before the catch-all entry.
