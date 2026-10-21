@@ -2,6 +2,7 @@ package vpp
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"ly-route/backend/internal/runtime/flow"
@@ -67,7 +68,7 @@ func TestGatewayLifecycleCharacterization_compilers_emit_current_operation_seque
 		{name: "vpp.qos.classify", resource: "vpp.qos.classify"},
 		{name: "vpp.qos.record", resource: "vpp.qos.record"},
 		{name: "vpp.qos.store", resource: "vpp.qos.store"},
-		{name: "vpp.qos.classify", resource: "classify-voice"},
+		{name: "vpp.nat44.initialize", resource: "endpoint_dependent"},
 		{name: "vpp.nat44-ed.static-mapping", resource: "nat-main"},
 		{name: "vpp.nat44-ed.static-mapping", resource: "port-web"},
 		{name: "vpp.pbr.next-hop-group", resource: "wan-primary"},
@@ -81,5 +82,17 @@ func TestGatewayLifecycleCharacterization_compilers_emit_current_operation_seque
 		if len(operation.VPPCtlCommands) == 0 {
 			t.Fatalf("operation %s/%s has no executable or readback commands", operation.Name, operation.Resource)
 		}
+	}
+	initialize := 0
+	for _, operation := range operations {
+		if operation.Name == "vpp.nat44.initialize" {
+			initialize++
+			if !strings.Contains(strings.Join(operation.VPPCtlCommands, "\n"), "nat44 plugin enable") {
+				t.Fatalf("NAT initialize command is not idempotent enable: %#v", operation.VPPCtlCommands)
+			}
+		}
+	}
+	if initialize != 1 {
+		t.Fatalf("NAT initialize operation count = %d, want exactly one", initialize)
 	}
 }

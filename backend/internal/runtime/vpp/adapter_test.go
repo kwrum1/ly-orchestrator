@@ -313,7 +313,7 @@ func TestWANGroupCommandsReplaceStaleDefaultRouteBeforeAddingMembers(t *testing.
 	joined := strings.Join(commands, "\n")
 	addIndex := strings.Index(joined, "ip table add")
 	deleteIndex := strings.Index(joined, "ip route del table")
-	memberIndex := strings.Index(joined, "ip route add 0.0.0.0/1 table")
+	memberIndex := strings.Index(joined, "ip route add table "+fmt.Sprint(wanGroupTableID("reconnect"))+" 0.0.0.0/1")
 	if addIndex < 0 || deleteIndex < 0 || memberIndex < 0 || !(addIndex < deleteIndex && deleteIndex < memberIndex) {
 		t.Fatalf("WAN-group commands do not replace the old default route first: %s", joined)
 	}
@@ -321,7 +321,7 @@ func TestWANGroupCommandsReplaceStaleDefaultRouteBeforeAddingMembers(t *testing.
 		if !strings.Contains(joined, "ip route del table "+fmt.Sprint(wanGroupTableID("reconnect"))+" "+prefix) {
 			t.Fatalf("WAN-group commands do not clear stale %s: %s", prefix, joined)
 		}
-		command := "ip route add " + prefix + " table " + fmt.Sprint(wanGroupTableID("reconnect"))
+		command := "ip route add table " + fmt.Sprint(wanGroupTableID("reconnect")) + " " + prefix
 		if strings.Count(joined, command) != 1 || !strings.Contains(joined, command+" via wan0 weight 1 preference 0 via wan1 weight 1 preference 0") {
 			t.Fatalf("WAN-group command should atomically install both %s paths: %s", prefix, joined)
 		}
@@ -518,9 +518,14 @@ func TestBuildOperationsAddsGatewayDNSTransparentInterception(t *testing.T) {
 			break
 		}
 	}
-	for _, required := range []string{"dport 53-53", "ip table add 100", "0.0.0.0/0 via local", "192.168.88.1/24 via lyroute-enp2s0", "abf attach ip4", "abf attach ip6", "ip4-lookup-in-table 100", "ip6-lookup-in-table 101", "2001:db8:88::1/64 via lyroute-enp2s0"} {
+	for _, required := range []string{"set ly-route dns-intercept interface lyroute-enp2s0 table 100", "ip table add 100", "0.0.0.0/0 via local", "192.168.88.1/24 via lyroute-enp2s0", "show ly-route dns-intercept", "show ip fib table 100"} {
 		if !strings.Contains(commands, required) {
 			t.Fatalf("transparent DNS commands are missing %q:\n%s", required, commands)
+		}
+	}
+	for _, forbidden := range []string{"abf policy add", "abf attach", "dport 53-53"} {
+		if strings.Contains(commands, forbidden) {
+			t.Fatalf("transparent DNS custom plugin path must not emit legacy ACL/ABF command %q:\n%s", forbidden, commands)
 		}
 	}
 	for _, command := range strings.Split(commands, "\n") {

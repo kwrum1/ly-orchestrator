@@ -1603,7 +1603,7 @@ func wanGroupCommands(group trafficpolicy.WANGroup) []string {
 		commands = append(commands, fmt.Sprintf("?set ip flow-hash table %d src dst sport dport proto", tableID))
 	}
 	for _, prefix := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
-		command := fmt.Sprintf("?ip route add %s table %d", prefix, tableID)
+		command := fmt.Sprintf("?ip route add table %d %s", tableID, prefix)
 		for index, member := range group.Members {
 			path := group.Paths[member]
 			via := routePathVia(path.VPPInterface, path.NextHop, member)
