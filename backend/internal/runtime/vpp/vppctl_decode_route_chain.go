@@ -39,7 +39,16 @@ func decodeVPPCTLRoutes(request SnapshotRequest, results []VPPCTLCommandResult) 
 		candidate := observedCandidates[strings.TrimSpace(id)]
 		policyID := stableID("route-abf:"+candidate.ID, 10000, 8999)
 		tableID := stableID("route-table:"+candidate.ID, 50000, 49999)
-		if radixPlan, radix := compileRoutePolicyRadixPlan(candidate, groups, routeOptions[candidate.ID]); radix {
+		radixPlan, radix := compileRoutePolicyRadixPlan(candidate, groups, routeOptions[candidate.ID])
+		if radix && routePolicyNeedsLocalACLDeny(candidate, routeOptions[candidate.ID]) {
+			// A source-scoped catch-all policy keeps the ACL/ABF representation
+			// because it must deny the LAN prefix before its permit rule. The
+			// compiler deliberately skips the native pre-NAT classifier for
+			// that shape, so requiring it during readback would report a policy
+			// the transaction just installed as missing.
+			radix = false
+		}
+		if radix {
 			preNATOutput, preNATErr := commandOutput(results, "show ly-route pre-nat-route")
 			if preNATErr != nil {
 				return RoutePolicyReadback{}, preNATErr
