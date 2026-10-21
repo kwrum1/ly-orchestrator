@@ -87,6 +87,10 @@ restore_backup() {
   systemctl daemon-reload || true
   systemctl restart ly-route-control-api.service || true
   systemctl reload nginx.service || systemctl restart nginx.service || true
+  mkdir -p /var/lib/ly-route/firmware-update
+  printf '{"timestamp":"%s","backup":"%s","reason":"upgrade health check failed"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$backup" \
+    >> /var/lib/ly-route/firmware-update/rollback-audit.jsonl
 }
 
 install -d -m 0755 "$target_dir"

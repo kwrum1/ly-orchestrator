@@ -9564,13 +9564,50 @@ func (server *Server) auditEvents(ctx context.Context) ([]AuditEvent, error) {
 				RequestID: event.TransactionID,
 			})
 		}
-		return events, nil
+		return appendFirmwareRollbackAudit(events), nil
 	}
 	server.auditMu.Lock()
 	defer server.auditMu.Unlock()
 	events := make([]AuditEvent, len(server.audit))
 	copy(events, server.audit)
-	return events, nil
+	return appendFirmwareRollbackAudit(events), nil
+}
+
+// The installer may replace a failed control binary and restart it before it
+// can persist an audit row. It leaves a durable marker instead; surface that
+// marker through the same audit feed so stage/install/rollback remains
+// traceable across the restart.
+func appendFirmwareRollbackAudit(events []AuditEvent) []AuditEvent {
+	data, err := os.ReadFile("/var/lib/ly-route/firmware-update/rollback-audit.jsonl")
+	if err != nil {
+		return events
+	}
+	for lineNumber, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var item struct {
+			Timestamp string `json:"timestamp"`
+			Backup    string `json:"backup"`
+			Reason    string `json:"reason"`
+		}
+		if json.Unmarshal([]byte(line), &item) != nil {
+			continue
+		}
+		timestamp, _ := time.Parse(time.RFC3339, item.Timestamp)
+		events = append(events, AuditEvent{
+			ID:        fmt.Sprintf("firmware-rollback-%d-%s", lineNumber, item.Timestamp),
+			Timestamp: timestamp,
+			Actor:     "system",
+			Role:      "system",
+			Resource:  "/api/v1/firmware/update/install",
+			Action:    "firmware_rollback",
+			Status:    "success",
+			Error:     item.Reason + " backup=" + item.Backup,
+		})
+	}
+	return events
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
