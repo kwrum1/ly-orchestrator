@@ -22,11 +22,21 @@ func (client *desiredLiveClient) OpenChannel(context.Context) (vpp.Channel, erro
 func (client *desiredLiveClient) mutations() []vpp.Operation {
 	mutations := make([]vpp.Operation, 0)
 	for _, operation := range client.operations {
-		if operation.Name != "vpp.tap.cleanup" && !strings.HasSuffix(operation.Name, ".snapshot") && !strings.Contains(operation.Name, ".rollback") {
-			mutations = append(mutations, operation)
+		name := operation.Name
+		if name == "vpp.tap.cleanup" || strings.HasSuffix(name, ".snapshot") || strings.Contains(name, ".rollback") || isRouteStagingOperation(name) {
+			continue
 		}
+		mutations = append(mutations, operation)
 	}
 	return mutations
+}
+
+// isRouteStagingOperation reports internal steps of the staged route rebuild.
+// They move private FIB tables and pre-clean the same route identity; they are
+// not additional resource mutations, so the dependency-order assertions count
+// the replay operation as the route mutation.
+func isRouteStagingOperation(name string) bool {
+	return strings.HasPrefix(name, "vpp.route-table.") || strings.HasSuffix(name, ".pre-delete")
 }
 
 type desiredLiveChannel struct{ client *desiredLiveClient }
@@ -87,6 +97,15 @@ func (channel *desiredLiveChannel) mutate(operation vpp.Operation) {
 		} else {
 			channel.client.state.ACLs = mutateByID(channel.client.state.ACLs, operation, func(item trafficpolicy.SecurityACL) string { return item.ID })
 		}
+	case "vpp.route-policy.pre-delete":
+		// The staged rebuild removes every live policy before replaying the
+		// desired chain, so its readback must observe the object as gone.
+		channel.client.state.RoutePolicies = removeByID(channel.client.state.RoutePolicies, operation.Resource, func(item trafficpolicy.RoutePolicy) string { return item.ID })
+	case "vpp.route-policy.replay":
+		channel.client.state.RoutePolicies = mutateByID(channel.client.state.RoutePolicies, operation, func(item trafficpolicy.RoutePolicy) string { return item.ID })
+	case "vpp.route-table.prepare", "vpp.route-table.populate", "vpp.nat44.initialize":
+		// Private FIB tables and NAT plugin state are already represented by
+		// the typed snapshot; these staged operations only carry commands.
 	case "vpp.qos":
 		if strings.Contains(strings.Join(operation.VPPCtlCommands, " "), "delete") || strings.Contains(strings.Join(operation.VPPCtlCommands, " "), "disable") || strings.Contains(strings.Join(operation.VPPCtlCommands, " "), "policer del") {
 			channel.client.state.QoS = removeByID(channel.client.state.QoS, operation.Resource, func(item flow.VPPObjectGroup) string { return item.Kind })
@@ -161,7 +180,7 @@ func natMappingDeleteOnly(operation vpp.Operation, marker string) bool {
 func mutationClasses(operations []vpp.Operation) []string {
 	classes := make([]string, 0, len(operations))
 	for _, operation := range operations {
-		classes = append(classes, map[string]string{"vpp.interface.address": "interfaces", "vpp.interface-bond": "bonds", "vpp.pbr.next-hop-group": "wan-groups", "vpp.route-policy": "routes", "vpp.security-acl": "acls", "vpp.qos": "qos", "vpp.nat44-ed.static-mapping": "nat44", "vpp.nat44-ed.port-map": "port-maps"}[operation.Name])
+		classes = append(classes, map[string]string{"vpp.interface.address": "interfaces", "vpp.interface-bond": "bonds", "vpp.pbr.next-hop-group": "wan-groups", "vpp.route-policy": "routes", "vpp.route-policy.replay": "routes", "vpp.route-policy.pre-delete": "routes", "vpp.security-acl": "acls", "vpp.qos": "qos", "vpp.nat44-ed.static-mapping": "nat44", "vpp.nat44-ed.port-map": "port-maps"}[operation.Name])
 	}
 	return classes
 }
