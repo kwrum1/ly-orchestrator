@@ -340,6 +340,16 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 		operation.VPPCtlCommands = flowGroupCommands(group)
 		operations = append(operations, operation)
 	}
+	for _, target := range plan.Flow.Targets {
+		if targetOwnedByGroup(plan.Flow.VPPGroups, target) {
+			continue
+		}
+		resource := strings.TrimSpace(target.RuleID)
+		if resource == "" {
+			resource = target.Kind
+		}
+		operations = append(operations, Operation{Name: target.Kind, RequestID: plan.RequestID, Resource: resource, Payload: target, VPPCtlCommands: flowTargetCommands(target)})
+	}
 	if planRequiresNAT(plan) {
 		operations = append(operations, Operation{
 			Name:           "vpp.nat44.initialize",
@@ -789,6 +799,7 @@ func proxySteeringCommands(steering proxy.VPPSteeringInstruction, behavior nat.B
 		underlayFields := strings.Fields(underlay)
 		if behavior == nat.BehaviorFullCone && len(underlayFields) > 0 {
 			wanInterface := underlayFields[len(underlayFields)-1]
+			commands = append(commands, natInitializeCommands(behavior)...)
 			commands = append(commands,
 				fmt.Sprintf("?set interface nat44 ei in %s out %s output-feature del", network.EgressVPPInterface, wanInterface),
 				fmt.Sprintf("?set interface nat44 ei in %s out %s", network.EgressVPPInterface, wanInterface),
@@ -869,6 +880,7 @@ func dnsServiceNetworkCommands(network DNSServiceNetwork, behavior nat.Behavior)
 		"show tap",
 	}
 	if behavior == nat.BehaviorFullCone {
+		commands = append(commands, natInitializeCommands(behavior)...)
 		return append(commands,
 			fmt.Sprintf("?set interface nat44 ei in %s out %s output-feature del", network.VPPInterface, underlayInterface),
 			fmt.Sprintf("set interface nat44 ei in %s out %s", network.VPPInterface, underlayInterface),
@@ -934,6 +946,12 @@ func flowTargetCommands(target flow.Target) []string {
 	case "vpp.behavior.rate":
 		commands := []string{}
 		commands = append(commands, flowRateRuleCommands(target)...)
+		if len(commands) == 0 {
+			// A policy can define a rate/policer without an explicit ACL
+			// attachment; keep a concrete policer create command so the
+			// replacement lifecycle has something to apply.
+			commands = append(commands, fmt.Sprintf("?policer add name %s type 1r2c cir %d cb %d rate kbps conform-action transmit exceed-action drop violate-action drop", policerName, policerRate, policerBurst))
+		}
 		commands = append(commands, "show ly-route flow-rate")
 		return commands
 	case "vpp.qos.classify":

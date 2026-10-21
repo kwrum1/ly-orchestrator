@@ -26,6 +26,7 @@ func TestApplySupplementalAllowsEmptyInitialLifecycleInventory(t *testing.T) {
 		{Command: "show abf policy " + strconv.Itoa(v6Policy), Stdout: "abf:[1]: policy:" + strconv.Itoa(v6Policy) + " acl:1"},
 		{Command: "show abf attach lyroute-eth1", Stdout: "ipv4: policy:" + strconv.Itoa(v4Policy) + " priority:0\nipv6: policy:" + strconv.Itoa(v6Policy) + " priority:0"},
 		{Command: "show acl-plugin acl", Stdout: "acl-index 0 count 2 tag {ly-route-dns-transparent-v4}\nacl-index 1 count 2 tag {ly-route-dns-transparent-v6}\n"},
+		{Command: "show ly-route dns-intercept", Stdout: "enabled 1 interface lyroute-eth1 table 100\n"},
 		{Command: "show ip fib table 100", Stdout: "0.0.0.0/0\n192.0.2.0/24\n"},
 		{Command: "show ip6 fib table 101", Stdout: "::/0\n2001:db8:1::/64\n"},
 	}}
