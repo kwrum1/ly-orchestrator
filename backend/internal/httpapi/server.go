@@ -5768,6 +5768,16 @@ func (server *Server) currentTrafficPolicyConfig(ctx context.Context) (trafficpo
 	if err != nil {
 		return trafficpolicy.Config{}, err
 	}
+	hasLocalLAN := false
+	for _, item := range objectGroupItems {
+		if stringField(item, "id") == "obj-local-lan" {
+			hasLocalLAN = true
+			break
+		}
+	}
+	if !hasLocalLAN {
+		objectGroupItems = append(objectGroupItems, server.localLANObjectGroupItems(ctx)...)
+	}
 	domainIPSetItems, err := server.desiredItems(ctx, "domain_ip_set")
 	if err != nil {
 		return trafficpolicy.Config{}, err
@@ -5797,6 +5807,34 @@ func (server *Server) currentTrafficPolicyConfig(ctx context.Context) (trafficpo
 		return trafficpolicy.Config{}, err
 	}
 	return compiled, nil
+}
+
+// localLANObjectGroupItems keeps the retired `obj-local-lan` selector usable in
+// persisted route and security policies. Its value is runtime-derived, so it is
+// injected only into the compiler input and never exposed as desired state.
+func (server *Server) localLANObjectGroupItems(ctx context.Context) []map[string]any {
+	assignments, err := server.runtimeAddressAssignments(ctx)
+	if err != nil {
+		return nil
+	}
+	entries := make([]string, 0, len(assignments))
+	for _, assignment := range assignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		cidr := strings.TrimSpace(assignment.CIDR)
+		if cidr == "" {
+			continue
+		}
+		if prefix, prefixErr := netip.ParsePrefix(cidr); prefixErr == nil {
+			cidr = prefix.Masked().String()
+		}
+		entries = append(entries, cidr)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	return []map[string]any{{"id": "obj-local-lan", "kind": "ip", "entries": entries}}
 }
 
 // dnsFixedWANRouteItems turns observed SmartDNS answers into short-lived,
