@@ -184,6 +184,8 @@ type Server struct {
 	orchestratorInstallStart      func(orchestratorUpgradeInvocation) error
 	conversionServiceState        productupdate.ServiceStateController
 	productTaskMu                 sync.Mutex
+	operationMu                   sync.Mutex
+	operation                     orchestratorapi.OperationState
 	dnsSyncToken                  string
 }
 
@@ -512,6 +514,7 @@ func (server *Server) Handler() http.Handler {
 			return normalizeManagementMode(stringField(item, "mode")) == "shared_lan" && stringField(item, "interface_id") == interfaceID
 		})
 		handler.SetUpdateService(newOrchestratorUpdateService(server))
+		handler.SetOperationTracker(server)
 		handler.RegisterRoutes(mux)
 		if _, transparent := server.orchestratorRuntime.(orchestratorapi.TransparentRuntime); !transparent {
 			handler.StartServiceChainReconciler(context.Background(), server.orchestratorReconcileInterval)
@@ -5014,6 +5017,10 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 	}
 	server.runtimeApplyMu.Lock()
 	defer server.runtimeApplyMu.Unlock()
+	if server.profile.ID() == product.Orchestrator().ID() {
+		server.BeginOperation("runtime-apply", "orchestrator runtime")
+		defer server.EndOperation()
+	}
 	// A gateway apply owns daemon and VPP transitions that can outlive a reverse
 	// proxy's request timeout. Keep the transaction bounded, but do not cancel a
 	// valid commit just because the browser or nginx closed its HTTP request.
@@ -8017,7 +8024,7 @@ func (server *Server) handleConfigImport(w http.ResponseWriter, r *http.Request)
 	packageHash := hashConfigPayload(req.Payload)
 	diffHash := hashObject(map[string]any{"current": "desired_config", "incoming": packageHash})
 	if !req.Confirm {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "dry_run", "safe_to_apply": true, "rollback_snapshot_required": true, "package_hash": packageHash, "diff_hash": diffHash, "confirmation_token": newRequestID(), "confirmation_actor": session.Username, "confirmation_expires_at": server.now().UTC().Add(15 * time.Minute), "request_id": requestID(r)})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "dry_run", "safe_to_apply": true, "rollback_snapshot_required": true, "package_hash": packageHash, "diff_hash": diffHash, "confirmation_package_hash": packageHash, "confirmation_diff_hash": diffHash, "confirmation_token": newRequestID(), "confirmation_actor": session.Username, "confirmation_expires_at": server.now().UTC().Add(15 * time.Minute), "request_id": requestID(r)})
 		return
 	}
 	if err := server.validateImportConfirmation(req, session.Username, packageHash, diffHash); err != nil {
@@ -8285,6 +8292,41 @@ func (server *Server) handleConfigSnapshots(w http.ResponseWriter, r *http.Reque
 }
 
 func (server *Server) handleConfigSnapshotRestore(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		if _, ok := server.sessionFromRequest(r); !ok {
+			writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		if server.store == nil {
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+			return
+		}
+		id, _ := splitPathRemainder("/api/v1/config/snapshots/", r.URL.Path)
+		if id == "" {
+			writeError(w, r, http.StatusNotFound, "snapshot_not_found", "snapshot id is required")
+			return
+		}
+		snapshot, err := server.store.RuntimeSnapshot(r.Context(), id)
+		if errors.Is(err, persistence.ErrNotFound) {
+			writeError(w, r, http.StatusNotFound, "snapshot_not_found", "snapshot not found")
+			return
+		}
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "snapshot_read_failed", "snapshot could not be read")
+			return
+		}
+		if err := persistence.VerifyPayload(snapshot.Payload, snapshot.PayloadHash); err != nil {
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_snapshot", "snapshot integrity verification failed")
+			return
+		}
+		var payload ConfigPackagePayload
+		if err := json.Unmarshal(snapshot.Payload, &payload); err != nil {
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_snapshot", "snapshot payload is invalid")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"snapshot": snapshotResponse(snapshot, server.profile.ID()), "payload": payload, "request_id": requestID(r)})
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
 		return

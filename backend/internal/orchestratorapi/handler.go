@@ -32,6 +32,7 @@ type Handler struct {
 	access           AccessController
 	runtime          ServiceChainRuntime
 	updates          UpdateService
+	operations       OperationTracker
 	managementShared func(context.Context, string) bool
 	reconcile        reconcileState
 }
@@ -128,6 +129,9 @@ func (handler *Handler) RegisterRoutes(mux *http.ServeMux) {
 		mux.HandleFunc(UpgradesPath+"/", handler.handleUpgradeItem)
 		mux.HandleFunc(ConversionsPath, handler.handleConversions)
 		mux.HandleFunc(ConversionsPath+"/", handler.handleConversionItem)
+	}
+	if handler.operations != nil {
+		mux.HandleFunc(OperationsPath, handler.handleCurrentOperation)
 	}
 }
 
@@ -269,7 +273,7 @@ func (handler *Handler) handleGroups(writer http.ResponseWriter, request *http.R
 			return
 		}
 		if err := handler.applyTransparent(request.Context(), candidate, policy); err != nil {
-			writeAPIError(writer, http.StatusUnprocessableEntity, err)
+			writeOrchestrationApplyError(writer, err)
 			return
 		}
 		if err := handler.repository.CreateGroup(request.Context(), group); err != nil {
@@ -337,7 +341,7 @@ func (handler *Handler) handleGroup(writer http.ResponseWriter, request *http.Re
 			return
 		}
 		if err := handler.applyTransparent(request.Context(), candidate, policy); err != nil {
-			writeAPIError(writer, http.StatusUnprocessableEntity, err)
+			writeOrchestrationApplyError(writer, err)
 			return
 		}
 		if err := handler.repository.ReplaceGroup(request.Context(), name, group); err != nil {
@@ -370,7 +374,7 @@ func (handler *Handler) handleGroup(writer http.ResponseWriter, request *http.Re
 			return
 		}
 		if err := handler.applyTransparent(request.Context(), candidate, policy); err != nil {
-			writeAPIError(writer, http.StatusUnprocessableEntity, err)
+			writeOrchestrationApplyError(writer, err)
 			return
 		}
 		if err := handler.repository.DeleteGroup(request.Context(), name); err != nil {
@@ -408,6 +412,10 @@ func (handler *Handler) applyTransparent(ctx context.Context, topology orchestra
 	runtime, ok := handler.runtime.(TransparentRuntime)
 	if !ok {
 		return nil
+	}
+	if handler.operations != nil {
+		handler.operations.BeginOperation("transparent-apply", "orchestrator topology/policy")
+		defer handler.operations.EndOperation()
 	}
 	requestID := fmt.Sprintf("orchestrator-transparent-%d", time.Now().UnixNano())
 	return runtime.ApplyTransparent(ctx, requestID, topology, policy)
@@ -508,6 +516,18 @@ func groupNameFromPath(path string) (string, error) {
 		return "", orchestrator.ErrGroupNotFound
 	}
 	return name, nil
+}
+
+func writeOrchestrationApplyError(writer http.ResponseWriter, err error) {
+	var locked *vpp.DataplaneLockedError
+	if errors.As(err, &locked) {
+		writeJSON(writer, http.StatusUnprocessableEntity, errorResponse{Error: errorBody{
+			Code:    "prerequisite_unmet",
+			Message: "no qualified dataplane path is available for the requested orchestration group; remove or rebind a group, or add a free data interface",
+		}})
+		return
+	}
+	writeAPIError(writer, http.StatusUnprocessableEntity, err)
 }
 
 func writeMutationError(writer http.ResponseWriter, err error) {

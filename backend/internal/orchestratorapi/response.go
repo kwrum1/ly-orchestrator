@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"ly-route/backend/internal/orchestrator"
 	"ly-route/backend/internal/productupdate"
+	"ly-route/backend/internal/runtime/vpp"
 )
 
 type topologyResponse struct {
@@ -89,6 +91,8 @@ func codeForError(err error) string {
 		return "task_conflict"
 	case errors.Is(err, ErrUpgradeUnsupported):
 		return "upgrade_unsupported"
+	case errors.Is(err, ErrInvalidUpgradePackage):
+		return "invalid_upgrade_package"
 	case errors.Is(err, ErrConversionExecutionBlocked):
 		return "conversion_execution_blocked"
 	case errors.Is(err, productupdate.ErrInvalidConversionManifest):
@@ -96,6 +100,16 @@ func codeForError(err error) string {
 	case errors.Is(err, productupdate.ErrConversionNotApplicable):
 		return "conversion_not_applicable"
 	default:
+		var locked *vpp.DataplaneLockedError
+		if errors.As(err, &locked) {
+			return "prerequisite_unmet"
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "unknown field") {
+			return "unknown_field"
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "invalid json") {
+			return "invalid_json"
+		}
 		return "internal_error"
 	}
 }

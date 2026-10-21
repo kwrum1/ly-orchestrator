@@ -17,8 +17,21 @@
 | GET | `/api/v1/orchestrator/upgrades` | read | current version plus upgrade tasks |
 | POST | `/api/v1/orchestrator/upgrades` | admin | multipart upload (`package` or `firmware`) |
 | GET | `/api/v1/orchestrator/upgrades/{id}` | read | task status |
-| POST | `/api/v1/orchestrator/upgrades/{id}/install` | admin | `{"confirm_install":true,"reboot":false}` |
-| POST | `/api/v1/orchestrator/upgrades/{id}/rollback` | admin | restore the pre-install payload |
+| POST | `/api/v1/orchestrator/upgrades/{id}/install` | admin | `{"confirm_install":true,"reboot":false}` → **202 accepted** |
+| POST | `/api/v1/orchestrator/upgrades/{id}/rollback` | admin | → **202 accepted** |
+
+Install and rollback are **accepted before execution**:
+
+- the handler persists `installing`/`rolling_back`, returns
+  `202 {"task_id","status","poll","item"}` with `Location` and `Retry-After: 2`;
+- the response is flushed, then a detached `systemd-run` unit starts the
+  installer/rollback after a short delay, so restarting the control API cannot
+  cut the already-accepted HTTP response;
+- clients poll `GET /api/v1/orchestrator/upgrades/{id}` until
+  `installed/failed/rolled_back/rollback_failed`.
+- If the control process exits after acceptance but before the unit starts, the
+  next GET marks the task `failed`/`rollback_failed` after 30 seconds instead of
+  leaving it stuck in `installing`.
 
 States: `staged → installing → installed`, with `failed`,
 `rolling_back`, `rolled_back`, `rollback_failed`.
@@ -72,6 +85,33 @@ when `dataplane.preserve=true` and `verify_packages` are present it does not
 require the Gateway-only PPPoE plugin or a fabricated
 `includes_dataplane=true`. The normal Gateway upgrade path still requires its
 own dataplane/PPPoE check.
+
+## Error and observability contract
+
+| Case | Status | Code |
+|---|---|---|
+| Orchestration group/topology needs an unavailable dataplane tier | 422 | `prerequisite_unmet` (clean message, no internal prerequisite list) |
+| Invalid upgrade payload/checksum/archive | 422 | `invalid_upgrade_package`; process signals such as `signal: killed` are sanitized |
+| Unknown JSON field | 400 | `unknown_field` with the field name in the message |
+| Malformed JSON | 400 | `invalid_json` |
+| Config import confirmation | 200 | accepts both `package_hash`/`diff_hash` and `confirmation_package_hash`/`confirmation_diff_hash`; dry-run returns both names |
+
+Read-only snapshot content:
+
+```
+GET /api/v1/config/snapshots/{id}
+→ 200 { "snapshot": {...}, "payload": { "resources": {...} } }
+```
+
+Long topology/policy apply progress:
+
+```
+GET /api/v1/orchestrator/operations/current
+→ { "operation": { "name": "transparent-apply", "state": "running|complete|idle", "started_at": ... } }
+```
+
+Topology/policy PUT remains synchronous for transaction/rollback integrity; the
+operation endpoint lets clients show progress while the request is in flight.
 
 ## Persistence and audit
 

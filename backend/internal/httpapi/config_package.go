@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -51,6 +52,28 @@ type ConfigImportRequest struct {
 	ConfirmationDiffHash    string                `json:"diff_hash,omitempty"`
 	PackageManifest         ConfigPackageManifest `json:"package_manifest"`
 	Payload                 ConfigPackagePayload  `json:"payload"`
+}
+
+func (request *ConfigImportRequest) UnmarshalJSON(data []byte) error {
+	type requestAlias ConfigImportRequest
+	var wire struct {
+		*requestAlias
+		ConfirmationPackageHashAlias string `json:"confirmation_package_hash,omitempty"`
+		ConfirmationDiffHashAlias    string `json:"confirmation_diff_hash,omitempty"`
+	}
+	wire.requestAlias = (*requestAlias)(request)
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return err
+	}
+	if request.ConfirmationPackageHash == "" {
+		request.ConfirmationPackageHash = wire.ConfirmationPackageHashAlias
+	}
+	if request.ConfirmationDiffHash == "" {
+		request.ConfirmationDiffHash = wire.ConfirmationDiffHashAlias
+	}
+	return nil
 }
 
 type ConfigProductMismatchError struct {
