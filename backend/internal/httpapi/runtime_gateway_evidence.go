@@ -40,6 +40,14 @@ func completeGatewayRuntimeEvidence(result RuntimeApplyResult, now time.Time) er
 		seen[evidence.Resource] = struct{}{}
 		_, resourcePlanned := planned[evidence.Resource]
 		if !resourcePlanned {
+			// A route-owned resource can be present in committed evidence when
+			// the persisted core route list is empty (DNS interception/proxy
+			// steering are materialized as supplemental routes). Other extra
+			// resources, especially deletion evidence, still fail closed.
+			if evidence.Resource == "routes" && !evidence.Deleted {
+				expected[evidence.Resource] = struct{}{}
+				continue
+			}
 			if !evidence.Deleted {
 				return gatewayEvidenceError(apply.GatewayEvidenceIncomplete, evidence.Resource, "deleted", "true for resource absent from persisted plan", "false")
 			}
@@ -100,7 +108,7 @@ func proveDesiredGatewayResource(evidence apply.GatewayResourceEvidence, desired
 			// dataplane_locked (which surfaced as snapshot_mismatch on restart).
 			evidencePlan.DataplanePrepared = true
 			evidencePlan.AllowUnprovenOperations = true
-			if err := vpp.ValidateSupplementalReadback(evidencePlan, owner, evidence.SupplementalReadback, evidence.Readback.Timestamp); err != nil {
+			if err := vpp.ValidateCommittedSupplementalReadback(evidencePlan, owner, evidence.SupplementalReadback, evidence.Readback.Timestamp); err != nil {
 				return gatewayEvidenceError(apply.GatewayEvidenceSnapshotMismatch, evidence.Resource, "supplemental_readback", "persisted desired operation payloads", err.Error())
 			}
 		}

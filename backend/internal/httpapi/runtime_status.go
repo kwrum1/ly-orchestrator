@@ -51,6 +51,66 @@ func incompleteRuntimeEvidenceReason(result RuntimeApplyResult, now time.Time) s
 	return runtimeEvidenceReason(result)
 }
 
+// statusHealthComponents is the restart-safe component inventory. It probes
+// live service health without rebuilding the full gateway plan, so the first
+// status request after a restart stays inside the plan budget.
+func (server *Server) statusHealthComponents(ctx context.Context) []RuntimeComponentState {
+	components := []RuntimeComponentState{}
+	for _, item := range []struct {
+		name    string
+		service serviceRuntime.ServiceName
+	}{
+		{"smartdns", serviceRuntime.SmartDNS},
+		{"kea", serviceRuntime.Kea},
+		{"xray", serviceRuntime.Xray},
+		{"pppoe", serviceRuntime.PPPoE},
+	} {
+		component := RuntimeComponentState{Name: item.name}
+		if !server.serviceRuntimeConfigured() {
+			component.State = "unavailable"
+			component.Reason = "service runtime controller is not configured"
+			components = append(components, component)
+			continue
+		}
+		health, err := server.services.HealthCheck(ctx, item.service)
+		if err != nil || len(health) == 0 || !health[0].Available {
+			component.State = "degraded"
+			if err != nil {
+				component.Reason = err.Error()
+			} else if len(health) > 0 {
+				component.Reason = health[0].Reason
+			}
+		} else {
+			component.State = "running"
+			component.Available = true
+		}
+		components = append(components, component)
+	}
+	if server.serviceRuntimeConfigured() {
+		health, err := server.services.HealthCheck(ctx, serviceRuntime.VPP)
+		vpp := RuntimeComponentState{Name: "vpp"}
+		if err == nil && len(health) > 0 && health[0].Available {
+			vpp.State = "running"
+			vpp.Available = true
+			vpp.Reason = "VPP service is healthy"
+		} else {
+			vpp.State = "degraded"
+			if err != nil {
+				vpp.Reason = err.Error()
+			} else if len(health) > 0 {
+				vpp.Reason = health[0].Reason
+			}
+		}
+		components = append(components, vpp)
+	}
+	if server.store == nil {
+		components = append(components, RuntimeComponentState{Name: "persistence", State: "unavailable", Reason: "local store is not configured"})
+	} else {
+		components = append(components, RuntimeComponentState{Name: "persistence", State: "running", Available: true})
+	}
+	return components
+}
+
 func (server *Server) runtimeEvidence() RuntimeApplyResult {
 	server.runtimeMu.Lock()
 	defer server.runtimeMu.Unlock()

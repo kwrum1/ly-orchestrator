@@ -5239,6 +5239,11 @@ func (server *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request
 		// part (proxy/TLS preparation, geo data, artifact rendering) and its
 		// result cannot change until the next apply.
 		components = server.reprobeRuntimeComponents(ctx, last.Components)
+	} else if last != nil && last.ReconciliationReceipt.Status == apply.ReceiptApplied {
+		// Persisted restart evidence does not carry a rendered component
+		// inventory. Probe live service health directly; apply/preview still
+		// rebuild and validate the full plan.
+		components = server.statusHealthComponents(ctx)
 	} else {
 		plan, err := server.buildRuntimePlan(ctx, requestID(r))
 		if err != nil {

@@ -148,6 +148,33 @@ func targetOwnedByGroup(groups []flow.VPPObjectGroup, target flow.Target) bool {
 	return false
 }
 
+// ValidateCommittedSupplementalReadback validates the persisted evidence of an
+// already-committed transaction without rebuilding payload hashes from live
+// capability proofs. The payload hashes and show output were validated when
+// the transaction committed; after a restart the proof window may legitimately
+// have expired, which must not turn a healthy committed gateway into stale
+// degraded state. Missing or malformed evidence still fails closed.
+func ValidateCommittedSupplementalReadback(plan Plan, owner SupplementalOwner, actual []SupplementalOperationReadback, referenceTime time.Time) error {
+	plan.NativePath.Now = referenceTime
+	operations, err := supplementalOperations(plan, owner)
+	if err != nil {
+		return err
+	}
+	if len(operations) != len(actual) {
+		return fmt.Errorf("%w: supplemental %s evidence count is %d, want %d", ErrSnapshotIncomplete, owner, len(actual), len(operations))
+	}
+	for index, operation := range operations {
+		item := actual[index]
+		if item.Name == "" || item.Resource == "" || item.PayloadHash == "" || len(item.Shows) == 0 {
+			return fmt.Errorf("%w: supplemental %s committed evidence is incomplete", ErrSnapshotIncomplete, owner)
+		}
+		if item.Name != operation.Name || item.Resource != operation.Resource {
+			return fmt.Errorf("%w: supplemental %s committed evidence does not match operation %q", ErrSnapshotIncomplete, owner, operation.Name)
+		}
+	}
+	return nil
+}
+
 func ValidateSupplementalReadback(plan Plan, owner SupplementalOwner, actual []SupplementalOperationReadback, referenceTime time.Time) error {
 	evidencePlan := plan
 	evidencePlan.NativePath.Now = referenceTime
