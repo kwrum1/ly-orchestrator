@@ -5223,23 +5223,83 @@ func (server *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request
 		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	// Keep the response inside the 10s gate with headroom for serialization.
+	// Component probes get their own detached budget inside the plan builder,
+	// so a slow plan read cannot starve them and vice versa.
+	ctx, cancel := context.WithTimeout(r.Context(), statusPlanBudget)
 	defer cancel()
-	plan, err := server.buildRuntimePlan(ctx, requestID(r))
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status":     "degraded",
-			"components": []RuntimeComponentState{{Name: "配置检查", State: "degraded", Available: false, Reason: serviceRuntime.Redact(err.Error())}},
-			"last_apply": server.lastRuntimeApply(),
-			"request_id": requestID(r),
-		})
-		return
-	}
-	components := plan.Components
 	server.runtimeMu.Lock()
 	last := server.lastRuntime
 	server.runtimeMu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"status": runtimeState(components), "components": components, "last_apply": last, "request_id": requestID(r)})
+	var components []RuntimeComponentState
+	if last != nil && len(last.Components) > 0 {
+		// A committed generation already fixed the rendered component
+		// inventory. Re-probe live health instead of recompiling the whole
+		// gateway plan on every status poll: the plan build is the expensive
+		// part (proxy/TLS preparation, geo data, artifact rendering) and its
+		// result cannot change until the next apply.
+		components = server.reprobeRuntimeComponents(ctx, last.Components)
+	} else {
+		plan, err := server.buildRuntimePlan(ctx, requestID(r))
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status":     "degraded",
+				"components": []RuntimeComponentState{{Name: "配置检查", State: "degraded", Available: false, Reason: serviceRuntime.Redact(err.Error())}},
+				"last_apply": server.lastRuntimeApply(),
+				"request_id": requestID(r),
+			})
+			return
+		}
+		components = plan.Components
+		server.runtimeMu.Lock()
+		if server.lastRuntime != nil {
+			server.lastRuntime.Components = append([]RuntimeComponentState(nil), components...)
+		}
+		server.runtimeMu.Unlock()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": runtimeState(components), "components": components, "last_apply": server.lastRuntimeApply(), "request_id": requestID(r)})
+}
+
+// reprobeRuntimeComponents refreshes the live state of an already-rendered
+// component inventory without rebuilding the runtime plan.
+func (server *Server) reprobeRuntimeComponents(ctx context.Context, components []RuntimeComponentState) []RuntimeComponentState {
+	updated := append([]RuntimeComponentState(nil), components...)
+	services := make([]serviceRuntime.ServiceName, 0, len(updated))
+	index := make(map[string]int, len(updated))
+	for position, component := range updated {
+		switch serviceRuntime.ServiceName(component.Name) {
+		case serviceRuntime.SmartDNS, serviceRuntime.Kea, serviceRuntime.Xray, serviceRuntime.PPPoE:
+			services = append(services, serviceRuntime.ServiceName(component.Name))
+			index[component.Name] = position
+		}
+	}
+	if server.serviceRuntimeConfigured() && len(services) > 0 {
+		health, err := server.services.HealthCheck(ctx, services...)
+		if err == nil {
+			for _, item := range health {
+				position, found := index[string(item.Service)]
+				if !found {
+					continue
+				}
+				if item.Available {
+					updated[position].State = "running"
+					updated[position].Available = true
+					updated[position].Reason = ""
+				} else {
+					updated[position].State = "degraded"
+					updated[position].Available = false
+					updated[position].Reason = item.Reason
+				}
+			}
+		}
+	}
+	for position := range updated {
+		if updated[position].Name == "vpp" {
+			live := server.vppRuntimeComponent(ctx, updated[position].State == "rendered")
+			updated[position] = live
+		}
+	}
+	return server.applyRuntimeEvidence(updated)
 }
 
 func (server *Server) lastRuntimeApply() *RuntimeApplyResult {
@@ -5506,7 +5566,9 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		}
 		artifacts = append(artifacts, vppArtifacts...)
 	}
-	components := server.runtimeStatusComponents(ctx, artifacts, len(operations) > 0)
+	componentCtx, cancelComponents := context.WithTimeout(context.WithoutCancel(ctx), statusComponentBudget)
+	components := server.runtimeStatusComponents(componentCtx, artifacts, len(operations) > 0)
+	cancelComponents()
 	mark("components")
 	if ipv6Warning != "" {
 		components = markComponentDegraded(components, string(serviceRuntime.IPv6RA), ipv6Warning)
@@ -7559,10 +7621,14 @@ func (server *Server) vppRuntimeComponent(ctx context.Context, rendered bool) Ru
 	if receipt.Status != "applied" && receipt.Status != "ready" {
 		return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: "VPP apply receipt status is " + receipt.Status}
 	}
-	age := server.now().UTC().Sub(receipt.ReadbackAt)
-	if receipt.TransactionID == "" || receipt.TransactionID != server.runtimeEvidence().TransactionID || receipt.AppliedAt.IsZero() || receipt.ReadbackAt.IsZero() || age < 0 || age > apply.ReadbackFreshnessWindow {
-		return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: "VPP apply receipt/readback timestamp is incomplete or stale"}
+	if receipt.TransactionID == "" || receipt.TransactionID != server.runtimeEvidence().TransactionID || receipt.AppliedAt.IsZero() || receipt.ReadbackAt.IsZero() {
+		return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: "VPP apply receipt identity or timestamps are incomplete"}
 	}
+	// The VPP apply receipt is a commit artifact: ReadbackAt records when the
+	// generation was applied. Its age must not degrade a running VPP service,
+	// otherwise every gateway silently turns degraded five minutes after a
+	// successful apply. Live availability is proved by the VPP service health
+	// probe above and by the command results recorded in the receipt.
 	if len(receipt.Operations) == 0 {
 		return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: "VPP apply receipt has no operations"}
 	}
