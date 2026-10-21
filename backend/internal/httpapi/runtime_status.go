@@ -15,6 +15,12 @@ import (
 const (
 	RuntimeStatusCommitted = "committed"
 	RuntimeStateRunning    = "running"
+
+	// statusPlanBudget bounds the status request end to end. The component
+	// phase gets its own detached budget (statusComponentBudget) so health
+	// probes cannot inherit an exhausted plan deadline.
+	statusPlanBudget      = 7500 * time.Millisecond
+	statusComponentBudget = 2500 * time.Millisecond
 )
 
 type RuntimeEvidenceProvider = serviceRuntime.RuntimeEvidenceProvider
@@ -22,11 +28,16 @@ type RuntimeEvidenceProvider = serviceRuntime.RuntimeEvidenceProvider
 type RuntimeEvidenceRequest = serviceRuntime.EvidenceRequest
 
 func (server *Server) setRuntimeEvidence(result RuntimeApplyResult) {
-	now := server.now().UTC()
-	if (result.Status == RuntimeStatusCommitted || result.RuntimeState == RuntimeStateRunning) && !completeRuntimeEvidence(result, now) {
+	// Validate the commit at its own commit time. The receipt/readback pair is
+	// immutable commit evidence: its age must not retroactively degrade a
+	// generation that was fresh when it committed (a restart hours later would
+	// otherwise always report degraded). Apply-time freshness is still enforced
+	// by the executor before the receipt is persisted.
+	commitTime := runtimeCommitValidationTime(result)
+	if (result.Status == RuntimeStatusCommitted || result.RuntimeState == RuntimeStateRunning) && !completeRuntimeEvidence(result, commitTime) {
 		result.Status = apply.ReceiptDegraded
 		result.RuntimeState = "degraded"
-		result.Reason = incompleteRuntimeEvidenceReason(result, now)
+		result.Reason = incompleteRuntimeEvidenceReason(result, commitTime)
 	}
 	server.runtimeMu.Lock()
 	server.lastRuntime = &result
@@ -153,23 +164,53 @@ func (server *Server) reconcileRuntime(ctx context.Context) {
 		server.setRuntimeEvidence(degradedRuntimeResult(snapshot.SourceTransactionID, fmt.Sprintf("runtime snapshot integrity failed: %v", err), server.now().UTC()))
 		return
 	}
+	now := server.now().UTC()
 	result, err := runtimeResultFromSnapshot(snapshot)
-	if err != nil || !completeRuntimeEvidence(result, server.now().UTC()) {
-		reason := "incomplete persisted runtime evidence"
-		if err != nil {
-			reason = fmt.Sprintf("incomplete persisted runtime evidence: %v", err)
-		} else if !result.Readback.Timestamp.IsZero() && server.now().UTC().Sub(result.Readback.Timestamp) > apply.ReadbackFreshnessWindow {
-			reason = "stale persisted runtime readback"
-		} else if gatewayErr := completeGatewayRuntimeEvidence(result, server.now().UTC()); gatewayErr != nil {
-			reason = fmt.Sprintf("incomplete persisted gateway resource evidence: %v", gatewayErr)
-		}
-		degraded := degradedRuntimeResult(snapshot.SourceTransactionID, reason, server.now().UTC())
-		degraded.CapabilityFailures = append([]apply.CapabilityFailureEvidence(nil), result.CapabilityFailures...)
-		degraded.ReconciliationReceipt = apply.ReconciliationReceipt{TransactionID: snapshot.SourceTransactionID, Capability: "runtime.reconciliation", Status: apply.ReceiptDegraded, Cause: reason, Timestamp: server.now().UTC()}
+	if err != nil {
+		degraded := degradedRuntimeResult(snapshot.SourceTransactionID, fmt.Sprintf("incomplete persisted runtime evidence: %v", err), now)
 		server.setRuntimeEvidence(degraded)
 		return
 	}
-	result.ReconciliationReceipt = apply.ReconciliationReceipt{TransactionID: result.TransactionID, Capability: "runtime.reconciliation", Status: apply.ReceiptApplied, Cause: "persisted runtime evidence reconciled", Timestamp: server.now().UTC()}
+	// The persisted receipt and typed readback are immutable commit evidence:
+	// their timestamps record when the generation was applied, not a lease on
+	// liveness. Validate them at the generation's own commit time so a restart
+	// does not turn a legitimately committed generation into drift. Live
+	// liveness is established separately from the service runtime health
+	// probes, which is why an unverifiable host still fails closed below.
+	commitTime := runtimeCommitValidationTime(result)
+	if commitComplete := completeRuntimeEvidence(result, commitTime); !commitComplete {
+		reason := "incomplete persisted runtime evidence"
+		if !result.Readback.Timestamp.IsZero() && commitTime.Sub(result.Readback.Timestamp) > apply.ReadbackFreshnessWindow {
+			reason = "stale persisted runtime readback"
+		} else if gatewayErr := completeGatewayRuntimeEvidence(result, commitTime); gatewayErr != nil {
+			reason = fmt.Sprintf("incomplete persisted gateway resource evidence: %v", gatewayErr)
+		}
+		degraded := degradedRuntimeResult(snapshot.SourceTransactionID, reason, now)
+		degraded.CapabilityFailures = append([]apply.CapabilityFailureEvidence(nil), result.CapabilityFailures...)
+		degraded.ReconciliationReceipt = apply.ReconciliationReceipt{TransactionID: snapshot.SourceTransactionID, Capability: "runtime.reconciliation", Status: apply.ReceiptDegraded, Cause: reason, Timestamp: now}
+		server.setRuntimeEvidence(degraded)
+		return
+	}
+	cause := "persisted runtime evidence reconciled"
+	if !completeRuntimeEvidence(result, now) {
+		if !server.serviceRuntimeConfigured() {
+			// Without a live service-runtime probe there is no way to prove the
+			// generation is still running; keep the stale-readback failure
+			// instead of reporting an unverified running state.
+			reason := "stale persisted runtime readback"
+			degraded := degradedRuntimeResult(snapshot.SourceTransactionID, reason, now)
+			degraded.CapabilityFailures = append([]apply.CapabilityFailureEvidence(nil), result.CapabilityFailures...)
+			degraded.ReconciliationReceipt = apply.ReconciliationReceipt{TransactionID: snapshot.SourceTransactionID, Capability: "runtime.reconciliation", Status: apply.ReceiptDegraded, Cause: reason, Timestamp: now}
+			server.setRuntimeEvidence(degraded)
+			return
+		}
+		// The commit is structurally complete and every configured component is
+		// probed live by the status path. Report the readback as not currently
+		// fresh (components carry Fresh=false) while keeping the committed
+		// generation authoritative.
+		cause = "persisted runtime commit evidence verified; live component health probed"
+	}
+	result.ReconciliationReceipt = apply.ReconciliationReceipt{TransactionID: result.TransactionID, Capability: "runtime.reconciliation", Status: apply.ReceiptApplied, Cause: cause, Timestamp: now}
 	server.setRuntimeEvidence(result)
 }
 
