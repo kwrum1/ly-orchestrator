@@ -30,8 +30,6 @@ type productionVPPProof struct {
 	cookie *http.Cookie
 	clock  apply.Clock
 	trace  string
-	state  string
-	lcp    string
 }
 
 func newProductionVPPProof(t *testing.T, seedPrior bool) *productionVPPProof {
@@ -58,27 +56,26 @@ func newProductionVPPProof(t *testing.T, seedPrior bool) *productionVPPProof {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proof := &productionVPPProof{store: store, client: &http.Client{Timeout: 10 * time.Second}, clock: clock, trace: filepath.Join(directory, "vppctl.trace"), state: filepath.Join(directory, "interface.state"), lcp: filepath.Join(directory, "lcp.state")}
+	proof := &productionVPPProof{store: store, client: &http.Client{Timeout: 10 * time.Second}, clock: clock, trace: filepath.Join(directory, "vppctl.trace")}
+	for _, assignment := range plan.GatewayPlan.AddressAssignments {
+		if strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") && assignment.LinuxInterface != "" {
+			// The dynamic VPP lifecycles resolve the LAN placeholder from the
+			// process environment. The proof data LAN is eth1, not the
+			// management interface the package default refers to.
+			t.Setenv("LY_ROUTE_LAN_INTERFACE", assignment.LinuxInterface)
+			break
+		}
+	}
+	prior := vpp.Plan{}
 	if seedPrior {
-		seedProductionProofPrior(t, store, compiler.proxyEgress, productionProofFlow(), plan.GatewayPlan)
+		prior = seedProductionProofPrior(t, store, compiler.proxyEgress, productionProofFlow(), plan.GatewayPlan)
 	}
-	if err := os.WriteFile(proof.state, []byte("prior\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(proof.lcp, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	natState := filepath.Join(directory, "nat.state")
-	if err := os.WriteFile(natState, []byte("empty\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	binaryPath := writeProductionVPPCTL(t, directory, plan.GatewayPlan)
+	stateDirectory := seedFixtureState(t, plan.GatewayPlan, prior)
 	t.Setenv("FAKE_VPPCTL_TRACE", proof.trace)
-	t.Setenv("FAKE_VPPCTL_STATE", proof.state)
-	t.Setenv("FAKE_VPPCTL_LCP_STATE", proof.lcp)
-	t.Setenv("FAKE_VPPCTL_NAT_STATE", natState)
+	t.Setenv("FAKE_VPPCTL_STATE_DIR", stateDirectory)
+	binaryPath := fakeVPPCTL(t)
 	controller := &productionProofServiceController{clock: clock}
-	transaction := apply.NewProductionGatewayTransaction(vpp.Adapter{Client: vpp.NewVPPCTLClient(binaryPath)}, clock)
+	transaction := apply.NewProductionGatewayTransaction(vpp.Adapter{Client: vpp.NewProductionVPPCTLClient(binaryPath)}, clock)
 	server := New(WithStore(store), WithClock(clock), WithAuthConfig(AuthConfig{AdminUsername: "admin", AdminPassword: "secret"}), WithFlowIntent(productionProofFlow()), WithServiceRuntime(serviceRuntime.Runtime{Controller: controller}), WithGatewayTransaction(transaction))
 	proof.server = httptest.NewServer(server.Handler())
 	t.Cleanup(proof.server.Close)
@@ -179,18 +176,26 @@ func productionProofFlow() flow.Intent {
 	return flow.Intent{ID: "proof", Rules: []flow.Rule{{ID: "voice", Granularity: flow.ClassGranularity, Class: "voice", Actions: []flow.Action{{Kind: flow.ActionRemark, DSCP: "46"}}}}}
 }
 
-func seedProductionProofPrior(t *testing.T, store *persistence.Store, proxyEgress proxy.Egress, intent flow.Intent, desired vpp.Plan) {
+func seedProductionProofPrior(t *testing.T, store *persistence.Store, proxyEgress proxy.Egress, intent flow.Intent, desired vpp.Plan) vpp.Plan {
 	t.Helper()
 	prior := vpp.Plan{NativePath: desired.NativePath, Interfaces: append([]vpp.InterfaceState(nil), desired.Interfaces...)}
 	prior.Interfaces = prior.Interfaces[:1]
-	payload, hash, err := persistence.MarshalPayload(apply.SnapshotPayload{Proxy: proxyEgress, Flow: intent, GatewayPlan: &prior})
+	created := fixedClock()().Add(-time.Minute)
+	payload, hash, err := persistence.MarshalPayload(apply.SnapshotPayload{
+		Proxy:       proxyEgress,
+		Flow:        intent,
+		GatewayPlan: &prior,
+		Receipt:     apply.ApplyReceipt{TransactionID: "txn-proof-prior", Capability: "/api/v1/config/apply", Status: apply.ReceiptApplied, AppliedAt: created},
+		Readback:    apply.Readback{TransactionID: "txn-proof-prior", Capability: "/api/v1/config/apply", Timestamp: created, Fresh: true},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = store.SaveApply(context.Background(), persistence.ApplyRecord{Snapshot: persistence.RuntimeSnapshot{ID: "snapshot-proof-prior", SourceTransactionID: "txn-proof-prior", Payload: payload, PayloadHash: hash, CreatedAt: fixedClock()().Add(-time.Minute)}})
+	err = store.SaveApply(context.Background(), persistence.ApplyRecord{Snapshot: persistence.RuntimeSnapshot{ID: "snapshot-proof-prior", SourceTransactionID: "txn-proof-prior", Payload: payload, PayloadHash: hash, CreatedAt: created}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	return prior
 }
 
 func decodeProofSnapshot(t *testing.T, snapshot persistence.RuntimeSnapshot) apply.SnapshotPayload {
