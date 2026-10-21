@@ -17,6 +17,7 @@ type DataplaneController interface {
 
 type productionGatewayWithDataplane struct {
 	inner      GatewayTransactionRunner
+	adapter    vpp.Adapter
 	dataplane  DataplaneController
 	mu         sync.Mutex
 	dpdkActive map[string]bool
@@ -36,7 +37,33 @@ func (transaction *productionGatewayWithDataplane) HasDataplaneController() bool
 }
 
 func NewProductionGatewayTransactionWithDataplane(adapter vpp.Adapter, controller DataplaneController, now Clock) GatewayTransactionRunner {
-	return &productionGatewayWithDataplane{inner: NewProductionGatewayTransaction(adapter, now), dataplane: controller, dpdkActive: map[string]bool{}}
+	return &productionGatewayWithDataplane{inner: NewProductionGatewayTransaction(adapter, now), adapter: adapter, dataplane: controller, dpdkActive: map[string]bool{}}
+}
+
+// attachNativeUnderlay materializes the AF_PACKET/AF_XDP/TAP native underlay
+// before any higher-level resource adapter runs. The gateway resource adapters
+// own addresses, routes, NAT and PPPoE; they deliberately do not create the
+// host attachment. A fresh image therefore has to replay the attach operations
+// explicitly, otherwise the first PPPoE operation targets a non-existent VPP
+// interface and the transaction hangs.
+func (transaction *productionGatewayWithDataplane) attachNativeUnderlay(ctx context.Context, plan Plan) error {
+	operations, err := vpp.BuildOperations(plan.GatewayPlan)
+	if err != nil {
+		return fmt.Errorf("build native attach operations: %w", err)
+	}
+	attach := make([]vpp.Operation, 0, len(operations))
+	for _, operation := range operations {
+		if operation.Name == "vpp.dataplane.attach" {
+			attach = append(attach, operation)
+		}
+	}
+	if len(attach) == 0 {
+		return nil
+	}
+	if transaction.adapter.Client == nil {
+		return fmt.Errorf("vpp client is not configured for native attach")
+	}
+	return transaction.adapter.ExecuteOperations(ctx, attach)
 }
 
 func (transaction *productionGatewayWithDataplane) Run(ctx context.Context, plan Plan) (GatewayTransactionResult, error) {
@@ -54,6 +81,11 @@ func (transaction *productionGatewayWithDataplane) Run(ctx context.Context, plan
 	dataplaneReceipt, err := transaction.dataplane.Apply(ctx, request)
 	if err != nil {
 		return GatewayTransactionResult{}, err
+	}
+	if path.Tier == vpp.DataplaneTierNative {
+		if err := transaction.attachNativeUnderlay(ctx, plan); err != nil {
+			return GatewayTransactionResult{}, fmt.Errorf("attach native VPP underlay: %w", err)
+		}
 	}
 	plan.GatewayPlan.DataplanePrepared = true
 	result, applyErr := transaction.inner.Run(ctx, plan)

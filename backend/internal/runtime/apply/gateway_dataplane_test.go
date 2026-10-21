@@ -45,6 +45,29 @@ func TestProductionDataplaneWrapperMarksPlanPreparedBeforeGateway(t *testing.T) 
 	}
 }
 
+func TestProductionDataplaneWrapperAttachesNativeUnderlayBeforeGateway(t *testing.T) {
+	trace := []string{}
+	inner := &fakeGatewayRunner{trace: &trace}
+	controller := &fakeDataplaneController{trace: &trace}
+	client := &recordingVPPClient{trace: &trace}
+	transaction := &productionGatewayWithDataplane{inner: inner, adapter: vpp.Adapter{Client: client}, dataplane: controller, dpdkActive: map[string]bool{}}
+	plan := nativeGatewayPlan("txn-native-attach")
+
+	_, err := transaction.Run(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"dataplane-apply", "vpp:vpp.dataplane.attach", "gateway-run"}; !reflect.DeepEqual(trace, want) {
+		t.Fatalf("trace=%v, want=%v", trace, want)
+	}
+	if len(client.operations) != 1 || client.operations[0].Name != "vpp.dataplane.attach" {
+		t.Fatalf("operations=%#v, want one native attach", client.operations)
+	}
+	if !inner.prepared {
+		t.Fatal("gateway plan was not marked dataplane-prepared")
+	}
+}
+
 func TestProductionDataplaneWrapperRebindsKeaAfterVPPRecreatesGatewayTAPs(t *testing.T) {
 	// Given
 	trace := []string{}
@@ -82,6 +105,25 @@ func TestProductionDataplaneWrapperDoesNotRebindKeaWithoutVPPRestart(t *testing.
 		t.Fatalf("trace=%v, want=%v", trace, want)
 	}
 }
+
+type recordingVPPClient struct {
+	trace      *[]string
+	operations []vpp.Operation
+}
+
+func (client *recordingVPPClient) OpenChannel(context.Context) (vpp.Channel, error) {
+	return &recordingVPPChannel{client: client}, nil
+}
+
+type recordingVPPChannel struct{ client *recordingVPPClient }
+
+func (channel *recordingVPPChannel) Do(_ context.Context, operation vpp.Operation) (vpp.Reply, error) {
+	channel.client.operations = append(channel.client.operations, operation)
+	*channel.client.trace = append(*channel.client.trace, "vpp:"+operation.Name)
+	return vpp.Reply{}, nil
+}
+
+func (channel *recordingVPPChannel) Close() error { return nil }
 
 type fakeGatewayRunner struct {
 	trace    *[]string
@@ -137,4 +179,20 @@ func dpdkGatewayPlan(id string) Plan {
 	now := fixedGatewayPlanClock()()
 	proof := vpp.CapabilityProof{Tier: vpp.DataplaneTierDPDK, Hook: vpp.NativeHookDPDK, Mode: vpp.NativeModeDPDKVFIO, Source: vpp.ProofSourceRuntimeProbe, RuntimeVerified: true, HighPerformance: true, ObservedAt: now.Add(-1), ValidUntil: now.Add(1), PCIAddress: "0000:03:00.0", KernelDriver: "ixgbe", IOMMUGroup: "17", IOMMUProtected: true, VFIOAvailable: true, HugepagesAvailable: true, DPDKPluginAvailable: true}
 	return Plan{Request: Request{TransactionID: id}, GatewayPlan: vpp.Plan{NativePath: vpp.NativePathRequest{ManagementInterface: "eth0", Now: now, Assignments: []vpp.NativeAssignment{{LinuxInterface: "eth1", Explicit: true, Candidates: []vpp.CapabilityProof{proof}}}}}}
+}
+
+func nativeGatewayPlan(id string) Plan {
+	now := fixedGatewayPlanClock()()
+	proof := vpp.CapabilityProof{
+		Tier:            vpp.DataplaneTierNative,
+		Hook:            vpp.NativeHookAFXDP,
+		Mode:            vpp.NativeModeZeroCopy,
+		Source:          vpp.ProofSourceRuntimeProbe,
+		RuntimeVerified: true,
+		Native:          true,
+		HighPerformance: true,
+		ObservedAt:      now.Add(-1),
+		ValidUntil:      now.Add(1),
+	}
+	return Plan{Request: Request{TransactionID: id}, GatewayPlan: vpp.Plan{NativePath: vpp.NativePathRequest{ManagementInterface: "eth0", Now: now, Assignments: []vpp.NativeAssignment{{LinuxInterface: "eth1", Explicit: true, Proof: proof}}}}}
 }

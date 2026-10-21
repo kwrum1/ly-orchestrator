@@ -430,11 +430,24 @@ def receipt_text(value):
         return ""
     return "captured output omitted"
 
+def vppctl_timeout():
+    try:
+        return max(1.0, float(os.environ.get("LY_ROUTE_VPPCTL_TIMEOUT", "30")))
+    except ValueError:
+        return 30.0
+
+def bounded_vppctl(argv):
+    try:
+        return subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=vppctl_timeout())
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, -1, "", f"vppctl timed out after {vppctl_timeout():g}s")
+
 def run_vppctl(vppctl, command):
     argv = shlex.split(command)
     if not argv:
         return subprocess.CompletedProcess([vppctl], 2, "", "empty VPP command")
-    return subprocess.run([vppctl] + argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return bounded_vppctl([vppctl] + argv)
 
 def truthy(value):
     return str(value).lower() in {"1", "true", "yes", "on"}
@@ -497,7 +510,7 @@ def run_vpp_exec(vppctl, commands):
         for command in commands:
             temporary.write(command.strip() + "\n")
         temporary.close()
-        result = subprocess.run([vppctl, "exec", path], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = bounded_vppctl([vppctl, "exec", path])
         combined = (result.stdout + "\n" + result.stderr).lower()
         if result.returncode == 0 and not any(marker in combined for marker in ("cli line error", "unknown input", "parse error")):
             return result
@@ -631,8 +644,7 @@ def active_abf_acl_ids_by_tag(vppctl, operations, command_map):
 
 def existing_acl_ids_by_tag(vppctl, active_acl_ids=None):
     """Map managed ACL tags to their live VPP indexes for idempotent replay."""
-    result = subprocess.run([vppctl, "show", "acl-plugin", "acl"], text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = bounded_vppctl([vppctl, "show", "acl-plugin", "acl"])
     if result.returncode != 0:
         fail_with_receipt(f"failed to inspect existing VPP ACLs: {result.stderr.strip()}")
     tagged = {}
@@ -758,8 +770,7 @@ def clear_stale_taps(vppctl, operations, command_map, receipt):
 
     def managed_name(name):
         return any(name.startswith(prefix) for prefix in managed_prefixes)
-    result = subprocess.run([vppctl, "show", "tap"], text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = bounded_vppctl([vppctl, "show", "tap"])
     if result.returncode != 0:
         fail_with_receipt(f"failed to inspect VPP TAP interfaces: {result.stderr.strip()}")
     records = []
@@ -956,7 +967,7 @@ if len(arguments) != 1:
 operations_path = arguments[0]
 command_map_path = os.environ.get("LY_ROUTE_VPP_COMMAND_MAP", "/etc/ly-route/vpp-command-map.json")
 receipt_path = os.environ.get("LY_ROUTE_VPP_RECEIPT", "/var/lib/ly-route/vpp-apply-receipt.json")
-receipt = {"status": "ready", "dry_run": dry_run, "underlay_only": underlay_only, "operations": []}
+receipt = {"status": "ready", "underlay_ready": False, "dry_run": dry_run, "underlay_only": underlay_only, "operations": []}
 
 def fail_with_receipt(message):
     receipt["status"] = "failed"
@@ -988,13 +999,11 @@ def wait_for_pppoe_underlay(vppctl, operations, command_map):
     if attempts <= 0 or interval <= 0:
         fail_with_receipt("PPPoE readiness retry settings must be positive numbers")
     for attempt in range(attempts):
-        session = subprocess.run([vppctl, "show", "pppoe", "session"], text=True,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        session = bounded_vppctl([vppctl, "show", "pppoe", "session"])
         session_ready = session.returncode == 0 and bool(session.stdout.strip())
         interfaces_ready = True
         for interface in interfaces:
-            result = subprocess.run([vppctl, "show", "interface", interface], text=True,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            result = bounded_vppctl([vppctl, "show", "interface", interface])
             if result.returncode != 0 or interface not in result.stdout:
                 interfaces_ready = False
                 break
@@ -1032,6 +1041,9 @@ if os.path.exists(command_map_path):
         fail_with_receipt("vpp command map must be a JSON object")
 
 if not operations:
+    receipt["status"] = "noop"
+    receipt["underlay_ready"] = False
+    receipt["reason"] = "no operations requested"
     write_receipt(receipt_path, receipt)
     sys.exit(0)
 
@@ -1044,7 +1056,7 @@ if not dry_run:
     if ready_attempts <= 0 or ready_interval <= 0:
         fail_with_receipt("VPP readiness retry settings must be positive numbers")
     for attempt in range(ready_attempts):
-        version_result = subprocess.run([vppctl, "show", "version"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        version_result = bounded_vppctl([vppctl, "show", "version"])
         if version_result.returncode == 0:
             break
         if attempt + 1 < ready_attempts:
@@ -1156,7 +1168,7 @@ for index, operation in enumerate(operations):
             continue
         receipt["in_progress"] = {"operation": name, "resource": resource, "command": receipt_command}
         write_receipt(receipt_path, receipt)
-        result = subprocess.run([vppctl] + argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = bounded_vppctl([vppctl] + argv)
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()
         if vpp_cli_failed(result):
@@ -1183,6 +1195,7 @@ if not underlay_only:
     install_pre_nat_routes(vppctl, operations, receipt)
 
 receipt["status"] = "applied"
+receipt["underlay_ready"] = bool(underlay_only or any(operation_name(operation) == "vpp.dataplane.attach" for operation in operations))
 receipt.pop("in_progress", None)
 write_receipt(receipt_path, receipt)
 EOF

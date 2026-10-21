@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestVPPRouteBatchUsesBoundedChunks(t *testing.T) {
@@ -41,5 +42,28 @@ func TestVPPRouteBatchUsesBoundedChunks(t *testing.T) {
 	want := fmt.Sprintf("%d\n%d\n3", vppRouteBatchChunkSize, vppRouteBatchChunkSize)
 	if got := strings.TrimSpace(string(logged)); got != want {
 		t.Fatalf("batch sizes = %q, want %q", got, want)
+	}
+}
+
+func TestVPPCTLCommandTimeoutStopsHungProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a POSIX shell")
+	}
+	tempDir := t.TempDir()
+	binary := filepath.Join(tempDir, "vppctl")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nsleep 5\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LY_ROUTE_VPPCTL_COMMAND_TIMEOUT", "100ms")
+	start := time.Now()
+	_, err := (vppctlChannel{binary: binary}).doCommands(context.Background(), Operation{
+		Name:           "vpp.interface.address",
+		VPPCtlCommands: []string{"show version"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("error=%v, want bounded timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Fatalf("timeout took %s, want under 1.5s", elapsed)
 	}
 }

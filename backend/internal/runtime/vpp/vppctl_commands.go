@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 const defaultPPPoERuntimeStatusDir = "/run/ly-route/pppoe"
@@ -71,6 +72,28 @@ func validRuntimePPPoEInterface(name string) bool {
 		strings.HasPrefix(lower, "lyppp-")
 }
 
+const (
+	defaultVPPCTLCommandTimeout = 30 * time.Second
+	defaultVPPCTLBatchTimeout   = 2 * time.Minute
+)
+
+func vppctlTimeout(ctx context.Context, batch bool) (context.Context, context.CancelFunc, time.Duration) {
+	name := "LY_ROUTE_VPPCTL_COMMAND_TIMEOUT"
+	fallback := defaultVPPCTLCommandTimeout
+	if batch {
+		name = "LY_ROUTE_VPPCTL_BATCH_TIMEOUT"
+		fallback = defaultVPPCTLBatchTimeout
+	}
+	timeout := fallback
+	if raw := strings.TrimSpace(os.Getenv(name)); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			timeout = parsed
+		}
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, timeout)
+	return commandCtx, cancel, timeout
+}
+
 func (channel vppctlChannel) doCommands(ctx context.Context, operation Operation) (Reply, error) {
 	results := make([]VPPCTLCommandResult, 0, len(operation.VPPCtlCommands))
 	for index := 0; index < len(operation.VPPCtlCommands); index++ {
@@ -116,16 +139,24 @@ func (channel vppctlChannel) doCommands(ctx context.Context, operation Operation
 		args := strings.Fields(command)
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		cmd := exec.CommandContext(ctx, channel.binary, args...)
+		commandCtx, cancel, timeout := vppctlTimeout(ctx, false)
+		cmd := exec.CommandContext(commandCtx, channel.binary, args...)
+		cmd.WaitDelay = timeout / 2
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
 		err := cmd.Run()
+		timedOut := commandCtx.Err() == context.DeadlineExceeded
+		cancel()
 		retval := int32(0)
 		if err != nil {
 			var exitErr *exec.ExitError
 			if errors.As(err, &exitErr) {
 				retval = int32(exitErr.ExitCode())
 			} else {
+				retval = -1
+			}
+			if timedOut {
+				err = fmt.Errorf("vppctl command %q timed out after %s", command, timeout)
 				retval = -1
 			}
 		}
@@ -224,13 +255,20 @@ func (channel vppctlChannel) doVPPRouteBatchChunk(ctx context.Context, commands 
 		return VPPCTLCommandResult{Command: label}, fmt.Errorf("close %s: %w", label, err)
 	}
 	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, channel.binary, "exec", path)
+	commandCtx, cancel, timeout := vppctlTimeout(ctx, true)
+	cmd := exec.CommandContext(commandCtx, channel.binary, "exec", path)
+	cmd.WaitDelay = timeout / 2
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	runErr := cmd.Run()
+	timedOut := commandCtx.Err() == context.DeadlineExceeded
+	cancel()
 	result := VPPCTLCommandResult{Command: label, Stdout: stdout.String(), Stderr: stderr.String()}
 	channel.cache.invalidate()
 	if runErr != nil {
+		if timedOut {
+			return result, fmt.Errorf("vppctl exec %s timed out after %s", label, timeout)
+		}
 		return result, fmt.Errorf("vppctl exec %s failed: %w: %s", label, runErr, strings.TrimSpace(stderr.String()))
 	}
 	combined := strings.ToLower(stdout.String() + "\n" + stderr.String())
