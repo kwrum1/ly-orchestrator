@@ -109,4 +109,7 @@ func TestFirmwareUpgradeHealthWindowAllowsColdControlStart(t *testing.T) {
 	if !strings.Contains(firmwareUpgradeInstallScript, `while [ "$i" -lt 60 ]`) {
 		t.Fatal("health check window is too short for cold start")
 	}
+	if !strings.Contains(firmwareUpgradeInstallScript, "curl -fsS --max-time 10 http://127.0.0.1:8080/api/v1/health") {
+		t.Fatal("health probe timeout is too short for a loaded TCG control start")
+	}
 }

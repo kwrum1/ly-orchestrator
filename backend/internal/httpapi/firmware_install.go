@@ -42,6 +42,32 @@ if [ ! -f "$dataplane_plugin" ] ||
 fi
 test -f "$tmp/usr/lib/ly-route/ly-route-pppoe-plugin"
 
+record_firmware_audit() {
+  status=$1
+  reason=$2
+  backup_path=$3
+  python3 - "$status" "$reason" "$backup_path" <<'AUDIT_PY' || true
+import sqlite3, sys, uuid
+from datetime import datetime, timezone
+status, reason, backup = sys.argv[1:4]
+now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+try:
+    db = sqlite3.connect("/var/lib/ly-route/gateway/ly-route.db", timeout=5)
+    db.execute(
+        "insert or replace into audit_events "
+        "(id,timestamp,actor,role,resource,action,status,error,transaction_id) "
+        "values (?,?,?,?,?,?,?,?,?)",
+        ("firmware-install-" + str(uuid.uuid4()), now, "system", "system",
+         "/api/v1/firmware/update/install", "firmware_install", status,
+         reason + (" backup=" + backup if backup else ""), None),
+    )
+    db.commit()
+    db.close()
+except Exception as exc:
+    print("firmware audit insert failed: " + str(exc), file=sys.stderr)
+AUDIT_PY
+}
+
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 backup=/var/lib/ly-route/firmware-update/backup-$stamp
 mkdir -p "$backup"
@@ -97,6 +123,7 @@ restore_backup() {
   printf '{"timestamp":"%s","backup":"%s","reason":"upgrade health check failed"}\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$backup" \
     >> /var/lib/ly-route/firmware-update/rollback-audit.jsonl
+  record_firmware_audit failure "upgrade health check failed" "$backup"
 }
 
 install -d -m 0755 "$target_dir"
@@ -139,7 +166,7 @@ healthy=0
 i=0
 while [ "$i" -lt 60 ]; do
   if timeout 3s systemctl is-active --quiet ly-route-control-api.service &&
-     timeout 3s curl -fsS --max-time 2 http://127.0.0.1:8080/api/v1/health >/dev/null 2>&1; then
+     timeout 12s curl -fsS --max-time 10 http://127.0.0.1:8080/api/v1/health >/dev/null 2>&1; then
     healthy=1
     break
   fi
@@ -151,6 +178,7 @@ if [ "$healthy" != 1 ]; then
   echo "upgrade health check failed" >&2
   exit 1
 fi
+record_firmware_audit success "upgrade installed" "$backup"
 
 if [ "$reboot_requested" = true ]; then
   # Request a graceful reboot; never force it while the new control API has
