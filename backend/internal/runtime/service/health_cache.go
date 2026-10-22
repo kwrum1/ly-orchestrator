@@ -8,7 +8,7 @@ import (
 
 const (
 	healthCacheTTL      = time.Second
-	healthCheckTimeout  = 8 * time.Second
+	healthCheckTimeout  = 25 * time.Second
 	healthUnknownTTL    = time.Second
 	healthUnknownReason = "health probe timed out"
 )
@@ -54,6 +54,22 @@ func (cache *runtimeHealthCache) check(ctx context.Context, service ServiceName,
 		return entry.health, nil
 	}
 	if flight, ok := cache.flights[service]; ok {
+		// A caller with a short status budget must not turn a slow PID1 query
+		// into a false component failure. If this service was healthy before,
+		// return that last known state with an explicit stale reason while the
+		// detached probe continues; only a service with no known state is
+		// reported as unknown.
+		if entry, cached := cache.entries[service]; cached && entry.health.Available {
+			health := entry.health
+			health.Reason = "health probe is slow; using last known running state"
+			cache.mu.Unlock()
+			select {
+			case <-flight.done:
+				return flight.health, flight.err
+			case <-ctx.Done():
+				return health, nil
+			}
+		}
 		cache.mu.Unlock()
 		select {
 		case <-flight.done:
@@ -79,6 +95,14 @@ func (cache *runtimeHealthCache) check(ctx context.Context, service ServiceName,
 	}
 	if err != nil {
 		health = Health{Service: service, Available: false, TimedOut: true, Reason: err.Error()}
+	}
+	if health.TimedOut {
+		// Preserve a recent successful observation. A slow PID1 probe is not
+		// evidence that an already-active Kea/Xray process failed.
+		if previous, ok := cache.entries[service]; ok && previous.health.Available {
+			health = previous.health
+			health.Reason = "health probe timed out; using last known running state"
+		}
 	}
 
 	cache.mu.Lock()

@@ -19,8 +19,8 @@ const (
 	// statusPlanBudget bounds the status request end to end. The component
 	// phase gets its own detached budget (statusComponentBudget) so health
 	// probes cannot inherit an exhausted plan deadline.
-	statusPlanBudget      = 7500 * time.Millisecond
-	statusComponentBudget = 2500 * time.Millisecond
+	statusPlanBudget      = 12 * time.Second
+	statusComponentBudget = 5 * time.Second
 )
 
 type RuntimeEvidenceProvider = serviceRuntime.RuntimeEvidenceProvider

@@ -126,7 +126,7 @@ func (SystemctlRunner) Status(ctx context.Context, service ServiceName) (Health,
 	// just by the child context.  A timeout is reported as unknown/degraded,
 	// never as "the unit is not active".
 	unit := serviceUnit(service)
-	_, err := runCommandBounded(ctx, 6*time.Second, "systemctl", "is-active", "--quiet", unit)
+	_, err := runCommandBounded(ctx, 20*time.Second, "systemctl", "is-active", "--quiet", unit)
 	if err == nil {
 		return Health{Service: service, Available: true}, nil
 	}
