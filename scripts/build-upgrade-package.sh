@@ -96,6 +96,23 @@ if [ -z "$vpp_apply_binary" ]; then
   done
   [ -n "$selected_vpp_deb" ] || product_build_fail "Missing ly-route-vpp-apply package for architecture: $arch"
 fi
+
+selected_orchestrator_plugin=
+if [ "$product" = orchestrator ]; then
+  if [ -n "${LY_ROUTE_VPP_ORCHESTRATOR_PLUGIN_BINARY:-}" ]; then
+    [ -f "$LY_ROUTE_VPP_ORCHESTRATOR_PLUGIN_BINARY" ] || product_build_fail "VPP orchestrator plugin binary does not exist: $LY_ROUTE_VPP_ORCHESTRATOR_PLUGIN_BINARY"
+    selected_orchestrator_plugin=$LY_ROUTE_VPP_ORCHESTRATOR_PLUGIN_BINARY
+  else
+    runtime_debs_dir=${LY_ROUTE_EXTRA_DEBS_DIR:-$repo_root/runtime-debs}
+    [ -d "$runtime_debs_dir" ] || product_build_fail "Runtime deb directory does not exist: $runtime_debs_dir"
+    for package_path in "$runtime_debs_dir"/ly-route-vpp-orchestrator_*.deb; do
+      [ -f "$package_path" ] || continue
+      package_arch=$(dpkg-deb -f "$package_path" Architecture 2>/dev/null || true)
+      [ "$package_arch" != "$arch" ] || selected_orchestrator_plugin=$package_path
+    done
+    [ -n "$selected_orchestrator_plugin" ] || product_build_fail "Missing ly-route-vpp-orchestrator package for architecture: $arch"
+  fi
+fi
 if [ "${LY_ROUTE_BUILD_TAR_ONLY:-0}" != 1 ]; then
   command -v zstd >/dev/null 2>&1 || product_build_fail "zstd is required to build upgrade packages"
 fi
@@ -139,6 +156,25 @@ else
 fi
 product_build_require_file "$package_root/usr/lib/ly-route/vpp-apply"
 chmod 0755 "$package_root/usr/lib/ly-route/vpp-apply"
+
+orchestrator_plugin_hash=
+if [ "$product" = orchestrator ]; then
+  case "$arch" in
+    amd64) plugin_multiarch=x86_64-linux-gnu ;;
+    arm64) plugin_multiarch=aarch64-linux-gnu ;;
+    *) product_build_fail "Unsupported VPP plugin architecture: $arch" ;;
+  esac
+  plugin_dest="$package_root/usr/lib/$plugin_multiarch/vpp_plugins/ly_route_orchestrator_plugin.so"
+  mkdir -p "$(dirname "$plugin_dest")"
+  case "$selected_orchestrator_plugin" in
+    *.deb)
+      dpkg-deb -x "$selected_orchestrator_plugin" "$work_parent/orchestrator-plugin"
+      install -m 0644 "$work_parent/orchestrator-plugin/usr/lib/$plugin_multiarch/vpp_plugins/ly_route_orchestrator_plugin.so" "$plugin_dest"
+      ;;
+    *) install -m 0644 "$selected_orchestrator_plugin" "$plugin_dest" ;;
+  esac
+  orchestrator_plugin_hash=$(sha256sum "$plugin_dest" | cut -d' ' -f1)
+fi
 
 copy_product_frontend "$package_root/opt/ly-route/admin" "$frontend_bundle" "$product"
 cp "$PRODUCT_MANIFEST" "$package_root/etc/ly-route/product-manifest.json"
@@ -213,6 +249,9 @@ $profile_hash  etc/ly-route/product-manifest.json
 $version_env_hash  etc/ly-route/version.env
 $artifact_manifest_hash  usr/share/ly-route/artifact-manifest.json
 EOF
+if [ -n "$orchestrator_plugin_hash" ]; then
+  printf '%s  usr/lib/%s/vpp_plugins/ly_route_orchestrator_plugin.so\n' "$orchestrator_plugin_hash" "$plugin_multiarch" >>"$package_root/checksums.sha256"
+fi
 if [ -n "$commercial_css_hash" ]; then
   printf '%s  opt/ly-route/admin/commercial.css\n' "$commercial_css_hash" >>"$package_root/checksums.sha256"
 fi
@@ -226,13 +265,13 @@ if [ -d "$package_root/usr/share/ly-route/geodata" ]; then
 fi
 
 node - "$package_root/manifest.json" "$PRODUCT_BUILD_PROFILE" "$product" "$suite" "$arch" \
-  "$source_commit" "$ly_route_version" "$created_at" "$control_hash" "$vpp_apply_hash" "$app_hash" \
+  "$source_commit" "$ly_route_version" "$created_at" "$control_hash" "$vpp_apply_hash" "$orchestrator_plugin_hash" "$app_hash" \
   "$capabilities_hash" "$index_hash" "$shell_hash" "$styles_hash" "$nginx_hash" \
   "$service_hash" "$runtime_check_hash" "$firstboot_hash" "$firstboot_service_hash" \
   "$commercial_css_hash" "$profile_hash" "$version_env_hash" "$artifact_manifest_hash" <<'NODE'
 const { readFileSync, writeFileSync } = require("node:fs");
 const [output, profilePath, product, suite, arch, commit, version, createdAt,
-  controlHash, vppHash, appHash, capabilitiesHash, indexHash, shellHash, stylesHash,
+  controlHash, vppHash, orchestratorPluginHash, appHash, capabilitiesHash, indexHash, shellHash, stylesHash,
   nginxHash, serviceHash, runtimeCheckHash, firstbootHash, firstbootServiceHash,
   commercialCSSHash, profileHash, versionEnvHash, artifactManifestHash] = process.argv.slice(2);
 const profile = JSON.parse(readFileSync(profilePath, "utf8"));
@@ -253,6 +292,11 @@ const checksums = {
   "etc/ly-route/version.env": versionEnvHash,
   "usr/share/ly-route/artifact-manifest.json": artifactManifestHash,
 };
+if (orchestratorPluginHash) checksums["usr/lib/x86_64-linux-gnu/vpp_plugins/ly_route_orchestrator_plugin.so"] = orchestratorPluginHash;
+if (orchestratorPluginHash && product === "orchestrator" && arch === "arm64") {
+  delete checksums["usr/lib/x86_64-linux-gnu/vpp_plugins/ly_route_orchestrator_plugin.so"];
+  checksums["usr/lib/aarch64-linux-gnu/vpp_plugins/ly_route_orchestrator_plugin.so"] = orchestratorPluginHash;
+}
 if (commercialCSSHash) checksums["opt/ly-route/admin/commercial.css"] = commercialCSSHash;
 const manifest = {
   package_type: "ly-route-upgrade",

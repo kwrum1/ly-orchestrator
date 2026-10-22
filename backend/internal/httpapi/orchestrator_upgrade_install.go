@@ -27,6 +27,8 @@ result_path=$6
 reboot_requested=${7:-false}
 result_dir=$(dirname "$result_path")
 mkdir -p "$result_dir"
+plugin_path=/usr/lib/x86_64-linux-gnu/vpp_plugins/ly_route_orchestrator_plugin.so
+plugin_payload=
 
 write_result() {
   state=$1
@@ -91,7 +93,15 @@ restore_files() {
   if [ -f "$backup_dir/ly-route-firstboot.service" ]; then
     cp -a "$backup_dir/ly-route-firstboot.service" /etc/systemd/system/ly-route-firstboot.service
   fi
+  if [ -f "$backup_dir/ly_route_orchestrator_plugin.so" ]; then
+    install -D -m 0644 "$backup_dir/ly_route_orchestrator_plugin.so" "$plugin_path"
+  elif [ -f "$backup_dir/plugin.absent" ]; then
+    rm -f "$plugin_path"
+  fi
   restore_services
+  if [ -f "$backup_dir/plugin.changed" ]; then
+    timeout 60 systemctl restart vpp.service || true
+  fi
   timeout 30 systemctl daemon-reload || true
   timeout 30 systemctl restart ly-route-control-api.service || true
   timeout 30 systemctl reload nginx.service || timeout 30 systemctl restart nginx.service || true
@@ -100,7 +110,7 @@ restore_files() {
 health_check() {
   healthy=0
   i=0
-  while [ "$i" -lt 30 ]; do
+  while [ "$i" -lt 120 ]; do
     if systemctl is-active --quiet ly-route-control-api.service &&
        curl -fsS --max-time 2 http://127.0.0.1:8080/api/v1/health >/dev/null 2>&1; then
       healthy=1
@@ -140,13 +150,19 @@ test -x "$tmp/usr/lib/ly-route/vpp-apply" || fail "vpp-apply is missing"
 # An Orchestrator upgrade must never silently downgrade the dataplane.  The
 # base appliance owns the VPP orchestrator plugin; accept it either from the
 # system or from a conversion payload explicitly carrying the plugin.
-plugin_path=/usr/lib/x86_64-linux-gnu/vpp_plugins/ly_route_orchestrator_plugin.so
-if [ ! -f "$plugin_path" ] && [ ! -f "$tmp/usr/lib/x86_64-linux-gnu/vpp_plugins/ly_route_orchestrator_plugin.so" ]; then
+plugin_payload="$tmp/usr/lib/x86_64-linux-gnu/vpp_plugins/ly_route_orchestrator_plugin.so"
+if [ ! -f "$plugin_path" ] && [ ! -f "$plugin_payload" ]; then
   fail "VPP orchestrator plugin is not installed and the payload does not include it"
 fi
 
 mkdir -p "$backup_dir"
 capture_services
+if [ -f "$plugin_path" ]; then
+  cp -a "$plugin_path" "$backup_dir/ly_route_orchestrator_plugin.so"
+  : >"$backup_dir/plugin.present"
+else
+  : >"$backup_dir/plugin.absent"
+fi
 if [ -e "$target_dir" ]; then cp -a "$target_dir" "$backup_dir/target"; fi
 if [ -e /opt/ly-route/admin ]; then cp -a /opt/ly-route/admin "$backup_dir/admin"; fi
 if [ -e /etc/nginx/conf.d/ly-route-admin.conf ]; then cp -a /etc/nginx/conf.d/ly-route-admin.conf "$backup_dir/ly-route-admin.conf"; fi
@@ -157,6 +173,12 @@ if [ -e /etc/systemd/system/ly-route-firstboot.service ]; then cp -a /etc/system
 install -d -m 0755 "$target_dir"
 install -m 0755 "$tmp/usr/lib/ly-route/ly-route-control" "$target_dir/ly-route-control"
 install -m 0755 "$tmp/usr/lib/ly-route/vpp-apply" "$target_dir/vpp-apply"
+if [ -f "$plugin_payload" ]; then
+  if [ ! -f "$plugin_path" ] || ! cmp -s "$plugin_payload" "$plugin_path"; then
+    install -D -m 0644 "$plugin_payload" "$plugin_path"
+    : >"$backup_dir/plugin.changed"
+  fi
+fi
 for runtime_script in runtime-check.sh firstboot.sh; do
   if [ -f "$tmp/usr/lib/ly-route/$runtime_script" ]; then
     install -m 0755 "$tmp/usr/lib/ly-route/$runtime_script" "$target_dir/$runtime_script"
@@ -182,6 +204,12 @@ if [ -f "$tmp/etc/nginx/conf.d/ly-route-admin.conf" ]; then
   install -D -m 0644 "$tmp/etc/nginx/conf.d/ly-route-admin.conf" /etc/nginx/conf.d/ly-route-admin.conf
 fi
 timeout 30 systemctl daemon-reload || true
+if [ -f "$backup_dir/plugin.changed" ]; then
+  if ! timeout 60 systemctl restart vpp.service; then
+    restore_files
+    fail "VPP restart failed"
+  fi
+fi
 if ! timeout 30 systemctl restart ly-route-control-api.service; then
   restore_files
   fail "control API restart failed"
