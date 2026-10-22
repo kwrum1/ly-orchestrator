@@ -116,6 +116,7 @@ LY_ROUTE_UI_DIST=$PWD/frontend/gateway/dist \
 - 路由/页面：21 个页面路由均可访问；旧 hash 映射可用。
 - 1440×900：21 页截图；1920×1080：总览/流量/策略/网卡/配置截图。
 - 控制台：除登录前 `/auth/session` 预期 401 外无错误；无失败请求。
+- Lighthouse（登录页）：Accessibility 100、Best Practices 100；SEO 0.6（管理界面已加 `noindex`，不计入验收）。
 - 截图路径（构建机）：`/root/work/ui-sandbox/final/`。
 - Playwright 脚本：`/root/work/ui-sandbox/final-evidence.cjs`、`e2e-seed.cjs`、`e2e-visual.cjs`。
 
