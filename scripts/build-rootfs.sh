@@ -213,6 +213,7 @@ install_extra_debs() {
     if [ -f "$target/etc/smartdns/smartdns.conf" ]; then
       sed -i 's/^bind .*/bind 127.0.0.1:1053 -no-speed-check/; s/^bind-tcp .*/bind-tcp 127.0.0.1:1053 -no-speed-check/; /^server /d' "$target/etc/smartdns/smartdns.conf"
       sed -i 's#^conf-file .*#conf-file /etc/smartdns/conf.d/ly-route-active.conf#' "$target/etc/smartdns/smartdns.conf"
+    grep -q '^bind 192.168.88.1:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind 192.168.88.1:53 -no-speed-check\nbind-tcp 192.168.88.1:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
     fi
     vcl_library=$(find "$target/usr/lib" -type f -name 'libvcl_ldpreload.so.*' -print -quit)
     if [ -n "$vcl_library" ]; then
@@ -234,6 +235,7 @@ install_extra_debs() {
   if [ -f "$target/etc/smartdns/smartdns.conf" ]; then
     sed -i 's/^bind .*/bind 127.0.0.1:1053 -no-speed-check/; s/^bind-tcp .*/bind-tcp 127.0.0.1:1053 -no-speed-check/; /^server /d' "$target/etc/smartdns/smartdns.conf"
     sed -i 's#^conf-file .*#conf-file /etc/smartdns/conf.d/ly-route-active.conf#' "$target/etc/smartdns/smartdns.conf"
+    grep -q '^bind 192.168.88.1:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind 192.168.88.1:53 -no-speed-check\nbind-tcp 192.168.88.1:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
   fi
 }
 

@@ -1,9 +1,0 @@
-[Unit]
-Description=Ly Route LAN DNS forwarder
-Requires=ly-route-dns-lan.socket smartdns.service
-After=ly-route-dns-lan.socket smartdns.service
-
-[Service]
-ExecStart=/lib/systemd/systemd-socket-proxyd --exit-idle-time=0 127.0.0.1:1053
-Restart=always
-RestartSec=2

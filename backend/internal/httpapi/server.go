@@ -2621,7 +2621,7 @@ var desiredResourceDefs = map[string]desiredResourceDef{
 	"proxy_node":         {CollectionPath: "/api/v1/proxy/nodes", Defaults: []map[string]any{}},
 	"proxy_subscription": {CollectionPath: "/api/v1/proxy/subscriptions", Defaults: []map[string]any{}},
 	"proxy_group":        {CollectionPath: "/api/v1/proxy/groups", Defaults: []map[string]any{{"id": "proxy-group-default", "kind": "group", "name": "Default Proxy Group", "enabled": true, "members": []string{"proxy-egress-default"}, "degraded": true}}},
-	"dns_policy":         {CollectionPath: "/api/v1/dns/policies", Defaults: []map[string]any{{"id": "default", "kind": "policy", "name": "Default DNS Policy", "enabled": true, "policy": map[string]any{"engine": "smartdns", "miss": map[string]any{"kind": "reject"}, "rules": []any{}}, "degraded": true}}},
+	"dns_policy":         {CollectionPath: "/api/v1/dns/policies", Defaults: []map[string]any{{"id": "default", "kind": "policy", "name": "Default DNS Policy", "enabled": true, "policy": map[string]any{"engine": "smartdns", "miss": map[string]any{"kind": "direct", "upstream_id": "dns-direct-default"}, "rules": []any{}}, "degraded": true}}},
 	"domain_ip_set":      {CollectionPath: "/api/v1/dns/domain-ip-sets", Defaults: []map[string]any{}},
 	"dns_upstream": {CollectionPath: "/api/v1/dns/upstreams", Defaults: []map[string]any{
 		{"id": "dns-direct-default", "name": "Default Direct Resolvers", "engine": "smartdns", "servers": []string{"1.1.1.1", "8.8.8.8"}, "cache_size": 32768, "ttl_min_seconds": 60, "ttl_max_seconds": 600, "prefetch": true, "degraded": true, "degraded_reason": "SmartDNS process manager not wired"},
@@ -6611,7 +6611,14 @@ func (server *Server) currentDNSPolicies(ctx context.Context, proxyEgresses []pr
 			return resources, artifacts, networks, nil
 		}
 	}
-	policy := dns.NewPolicy(dns.Reject(), []dns.Rule{})
+	defaultOutcome := dns.Reject()
+	if len(upstreams) > 0 {
+		// An appliance with configured resolvers must not turn every LAN query
+		// into a synthetic reject when no explicit catch-all rule exists.
+		// No-upstream installations retain fail-closed NODATA semantics.
+		defaultOutcome = dns.Direct()
+	}
+	policy := dns.NewPolicy(defaultOutcome, []dns.Rule{})
 	compiled, err := dns.CompilePolicy(policy, proxyEgresses)
 	if err != nil {
 		return nil, nil, nil, err
