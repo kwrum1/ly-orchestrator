@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -43,10 +44,13 @@ import (
 )
 
 const (
-	DefaultVersion      = "dev"
-	HeaderRequestID     = "X-Request-ID"
-	HeaderDNSSyncToken  = "X-LY-Route-DNS-Sync-Token"
-	runtimeApplyTimeout = 8 * time.Minute
+	DefaultVersion            = "dev"
+	HeaderRequestID           = "X-Request-ID"
+	HeaderDNSSyncToken        = "X-LY-Route-DNS-Sync-Token"
+	headerConfigApplyWorker   = "X-LY-Route-Apply-Worker"
+	headerConfigApplyTxn      = "X-LY-Route-Apply-Transaction-ID"
+	configApplyAsyncQueryPath = "/api/v1/config/apply/status"
+	runtimeApplyTimeout       = 8 * time.Minute
 )
 
 type HealthResponse struct {
@@ -174,6 +178,9 @@ type Server struct {
 	requireSmartQoS               bool
 	runtimeMu                     sync.Mutex
 	runtimeApplyMu                sync.Mutex
+	configApplyAsyncMu            sync.Mutex
+	configApplyAsync              map[string]ConfigApplyAsyncState
+	latestConfigApplyAsync        string
 	lastRuntime                   *RuntimeApplyResult
 	firmwareMu                    sync.Mutex
 	firmwareStageDir              string
@@ -270,6 +277,16 @@ type RuntimeApplyResult struct {
 	RollbackReceipt       apply.RollbackReceipt             `json:"rollback_receipt,omitempty"`
 	ReconciliationReceipt apply.ReconciliationReceipt       `json:"reconciliation_receipt,omitempty"`
 	CapabilityFailures    []apply.CapabilityFailureEvidence `json:"capability_failures,omitempty"`
+}
+
+type ConfigApplyAsyncState struct {
+	TransactionID string    `json:"transaction_id"`
+	Status        string    `json:"status"`
+	RuntimeState  string    `json:"runtime_state"`
+	Reason        string    `json:"reason,omitempty"`
+	HTTPStatus    int       `json:"http_status"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	Query         string    `json:"query,omitempty"`
 }
 
 type FirmwareUpdateStatus struct {
@@ -8088,6 +8105,10 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
 		return
 	}
+	if configApplyAsyncEnabled() && r.Header.Get(headerConfigApplyWorker) == "" {
+		server.handleConfigApplyAsync(w, r)
+		return
+	}
 	server.runtimeApplyMu.Lock()
 	defer server.runtimeApplyMu.Unlock()
 	var req ConfigApplyRequest
@@ -8097,7 +8118,13 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	transactionID := "txn-" + newRequestID()
+	transactionID := ""
+	if r.Header.Get(headerConfigApplyWorker) == "1" {
+		transactionID = strings.TrimSpace(r.Header.Get(headerConfigApplyTxn))
+	}
+	if transactionID == "" {
+		transactionID = "txn-" + newRequestID()
+	}
 	// Capability proofs are intentionally short-lived. The UI writes through
 	// this endpoint, so refresh the proof before compiling the transaction
 	// rather than relying on the boot-time readiness check.
@@ -8204,6 +8231,103 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 	}
 	server.setRuntimeEvidence(runtimeResult)
 	writeJSON(w, statusCode, map[string]any{"status": runtimeResult.Status, "runtime_state": runtimeResult.RuntimeState, "reason": runtimeResult.Reason, "transaction_id": transactionID, "apply_receipt": result.Receipt, "readback": result.Readback, "capability_failures": capabilityFailures, "gateway_resources": result.GatewayResult.Order, "events": applyEventResponses(result.Events), "request_id": requestID(r)})
+}
+
+func configApplyAsyncEnabled() bool {
+	return envBoolOrDefault("LY_ROUTE_CONFIG_APPLY_ASYNC", false)
+}
+
+func (server *Server) handleConfigApplyAsync(w http.ResponseWriter, r *http.Request) {
+	if server.configApplyInProgress() {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"status": "apply_in_progress", "runtime_state": "applying",
+			"reason": "another configuration apply is in progress",
+			"query":  configApplyAsyncQueryPath, "request_id": requestID(r),
+		})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body could not be read")
+		return
+	}
+	transactionID := "txn-" + newRequestID()
+	server.setConfigApplyState(ConfigApplyAsyncState{
+		TransactionID: transactionID, Status: "apply_in_progress", RuntimeState: "applying",
+		HTTPStatus: http.StatusAccepted, UpdatedAt: server.now().UTC(),
+		Query: configApplyAsyncQueryPath + "?transaction_id=" + url.QueryEscape(transactionID),
+	})
+	worker := r.Clone(context.WithoutCancel(r.Context()))
+	worker.Body = io.NopCloser(bytes.NewReader(body))
+	worker.Header.Set(headerConfigApplyWorker, "1")
+	worker.Header.Set(headerConfigApplyTxn, transactionID)
+	go func() {
+		recorder := httptest.NewRecorder()
+		server.handleConfigApply(recorder, worker)
+		state := ConfigApplyAsyncState{
+			TransactionID: transactionID, Status: "apply_failed", RuntimeState: "degraded",
+			HTTPStatus: recorder.Code, UpdatedAt: server.now().UTC(),
+			Query: configApplyAsyncQueryPath + "?transaction_id=" + url.QueryEscape(transactionID),
+		}
+		var response map[string]any
+		if json.Unmarshal(recorder.Body.Bytes(), &response) == nil {
+			state.Status = stringField(response, "status")
+			state.RuntimeState = stringField(response, "runtime_state")
+			state.Reason = stringField(response, "reason")
+		}
+		if state.Status == "" {
+			state.Status = "apply_failed"
+		}
+		if state.RuntimeState == "" {
+			state.RuntimeState = "degraded"
+		}
+		server.setConfigApplyState(state)
+	}()
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status": "apply_in_progress", "runtime_state": "applying", "transaction_id": transactionID,
+		"query":      configApplyAsyncQueryPath + "?transaction_id=" + url.QueryEscape(transactionID),
+		"request_id": requestID(r),
+	})
+}
+
+func (server *Server) configApplyInProgress() bool {
+	server.configApplyAsyncMu.Lock()
+	defer server.configApplyAsyncMu.Unlock()
+	state, ok := server.configApplyAsync[server.latestConfigApplyAsync]
+	return ok && state.Status == "apply_in_progress"
+}
+
+func (server *Server) setConfigApplyState(state ConfigApplyAsyncState) {
+	server.configApplyAsyncMu.Lock()
+	defer server.configApplyAsyncMu.Unlock()
+	if server.configApplyAsync == nil {
+		server.configApplyAsync = make(map[string]ConfigApplyAsyncState)
+	}
+	server.configApplyAsync[state.TransactionID] = state
+	server.latestConfigApplyAsync = state.TransactionID
+}
+
+func (server *Server) handleConfigApplyStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	if _, ok := server.sessionFromRequest(r); !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	transactionID := strings.TrimSpace(r.URL.Query().Get("transaction_id"))
+	server.configApplyAsyncMu.Lock()
+	if transactionID == "" {
+		transactionID = server.latestConfigApplyAsync
+	}
+	state, ok := server.configApplyAsync[transactionID]
+	server.configApplyAsyncMu.Unlock()
+	if !ok {
+		writeError(w, r, http.StatusNotFound, "apply_not_found", "no apply transaction matches this ID")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": state.Status, "runtime_state": state.RuntimeState, "reason": state.Reason, "transaction_id": state.TransactionID, "http_status": state.HTTPStatus, "updated_at": state.UpdatedAt, "query": state.Query, "request_id": requestID(r)})
 }
 
 // setApplyLANVPPEnvironment binds legacy VPP command placeholders to the LAN

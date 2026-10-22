@@ -16,16 +16,17 @@ type StaticMapping struct {
 }
 
 type PortMapping struct {
-	ID              string `json:"id"`
-	Protocol        string `json:"protocol"`
-	ExternalAddress string `json:"external_address,omitempty"`
-	ExternalPort    int    `json:"external_port"`
-	InternalHost    string `json:"internal_host"`
-	InternalPort    int    `json:"internal_port"`
-	WANInterface    string `json:"wan_interface,omitempty"`
-	WANNextHop      string `json:"wan_next_hop,omitempty"`
-	Hairpin         bool   `json:"hairpin,omitempty"`
-	ReturnPathGuard bool   `json:"return_path_guard,omitempty"`
+	ID                      string `json:"id"`
+	Protocol                string `json:"protocol"`
+	ExternalAddress         string `json:"external_address,omitempty"`
+	ExternalAddressExplicit bool   `json:"external_address_explicit,omitempty"`
+	ExternalPort            int    `json:"external_port"`
+	InternalHost            string `json:"internal_host"`
+	InternalPort            int    `json:"internal_port"`
+	WANInterface            string `json:"wan_interface,omitempty"`
+	WANNextHop              string `json:"wan_next_hop,omitempty"`
+	Hairpin                 bool   `json:"hairpin,omitempty"`
+	ReturnPathGuard         bool   `json:"return_path_guard,omitempty"`
 }
 
 // Behavior selects the NAT44 connection-tracking semantics for the gateway.
@@ -273,10 +274,17 @@ func compilePortMapping(item map[string]any, wanAddresses map[string]string) (Po
 	if mapping.Protocol == "" {
 		mapping.Protocol = "tcp"
 	}
-	if mapping.WANInterface != "" {
-		// Port mappings created from the router UI are bound to a WAN, not to a
-		// transient PPPoE lease. Prefer the live WAN address on every compile so
-		// reconnects cannot leave a stale public address in VPP.
+	// An explicit external address is an independent NAT pool/VIP, not the
+	// transient WAN lease. Hairpin requires this address to be distinct from the
+	// PPPoE interface address; overwriting it with the live lease re-creates the
+	// unsupported "hairpin to the WAN's own address" case.
+	// Hairpin requires an independent VIP/NAT-pool address. An explicitly
+	// supplied external address on a hairpin mapping is that VIP and must not be
+	// overwritten by the transient WAN lease. Non-hairpin mappings retain the
+	// legacy behavior: an external address that looks like a WAN lease is
+	// refreshed on reconnect.
+	mapping.ExternalAddressExplicit = strings.TrimSpace(mapping.ExternalAddress) != "" && mapping.Hairpin
+	if mapping.WANInterface != "" && !mapping.ExternalAddressExplicit {
 		if liveAddress := strings.TrimSpace(wanAddresses[mapping.WANInterface]); liveAddress != "" {
 			mapping.ExternalAddress = liveAddress
 		}
@@ -311,9 +319,9 @@ func compilePortMapping(item map[string]any, wanAddresses map[string]string) (Po
 	if !hasInternalPort || internalPort <= 0 || internalPort > 65535 {
 		return PortMapping{}, fmt.Errorf("port_map %q requires internal_port in 1..65535", id)
 	}
-	// Hairpin port rewriting is supported by the NAT44 ED static mapping:
-	// the external listener and the internal service do not have to use the
-	// same port.  Both port ranges were validated above.
+	if mapping.Hairpin {
+		return PortMapping{}, fmt.Errorf("port_map %q hairpin is not supported by the VPP 26.06 NAT44 path; use a routed external VIP without hairpin or configure the source network to reach the internal service directly", id)
+	}
 	return mapping, nil
 }
 

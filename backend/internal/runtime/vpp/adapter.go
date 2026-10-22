@@ -392,7 +392,7 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 	for _, mapping := range plan.NAT.StaticMappings {
 		operation := Operation{Name: "vpp.nat44-ed.static-mapping", RequestID: plan.RequestID, Resource: mapping.ID, Payload: mapping}
 		operation.VPPCtlCommands = natStaticMappingCommandsForBehavior(plan.NAT.Behavior, mapping)
-		operation.VPPCtlCommands = tokenizePersistedWANAddress(operation.VPPCtlCommands, mapping.WANInterface, mapping.ExternalAddress)
+		operation.VPPCtlCommands = tokenizePersistedWANAddress(operation.VPPCtlCommands, mapping.WANInterface, mapping.ExternalAddress, false)
 		operations = append(operations, operation)
 	}
 	for _, mapping := range plan.NAT.PortMappings {
@@ -405,7 +405,7 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 		// with stable identities so the standalone replay service can rebuild
 		// the complete forwarding contract before status is read.
 		operation.VPPCtlCommands = append(operation.VPPCtlCommands, natReturnGuardPersistentCommands(mapping, gatewayLANPrefix(plan))...)
-		operation.VPPCtlCommands = tokenizePersistedWANAddress(operation.VPPCtlCommands, mapping.WANInterface, mapping.ExternalAddress)
+		operation.VPPCtlCommands = tokenizePersistedWANAddress(operation.VPPCtlCommands, mapping.WANInterface, mapping.ExternalAddress, mapping.ExternalAddressExplicit)
 		operations = append(operations, operation)
 	}
 	for _, group := range plan.Policy.WANGroups {
@@ -1853,10 +1853,10 @@ func gatewayLANPrefix(plan Plan) string {
 // replay commands with a token resolved from the current session status.  A
 // lease can change while the box is down; persisting the old public address
 // makes the boot replay fail its own readback and leaves NAT without a mapping.
-func tokenizePersistedWANAddress(commands []string, wanInterface, externalAddress string) []string {
+func tokenizePersistedWANAddress(commands []string, wanInterface, externalAddress string, explicit bool) []string {
 	wanInterface = strings.TrimSpace(wanInterface)
 	externalAddress = strings.TrimSpace(externalAddress)
-	if wanInterface == "" || externalAddress == "" || !isRuntimePPPoEInterface(wanInterface) {
+	if explicit || wanInterface == "" || externalAddress == "" || !isRuntimePPPoEInterface(wanInterface) {
 		return commands
 	}
 	token := "ly-route-wan-ip:" + wanInterface

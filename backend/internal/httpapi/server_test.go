@@ -969,7 +969,7 @@ func TestNATPortMapCRUDDecoratesStatsAndUpdatesRuntimePreview(t *testing.T) {
 		t.Fatalf("assign WAN status = %d: %s", assigned.Code, assigned.Body.String())
 	}
 
-	create := authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/gateway/nat/port-maps", `{"id":"nas-service","wan_link":"wan0","external_address":"203.0.113.10","external_port":9443,"internal_host":"192.168.10.30","internal_port":9443,"protocol":"tcp","hairpin":true}`, cookie)
+	create := authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/gateway/nat/port-maps", `{"id":"nas-service","wan_link":"wan0","external_address":"203.0.113.10","external_port":9443,"internal_host":"192.168.10.30","internal_port":9443,"protocol":"tcp","hairpin":false}`, cookie)
 	if create.Code != http.StatusOK {
 		t.Fatalf("create port map status = %d, want 200: %s", create.Code, create.Body.String())
 	}

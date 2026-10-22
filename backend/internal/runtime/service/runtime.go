@@ -93,10 +93,11 @@ func (SystemctlRunner) Run(ctx context.Context, name string, args ...string) err
 	timeout := 2 * time.Minute
 	if name == "systemctl" {
 		// Enable/restart talks to PID1, which can be slow while VPP is
-		// polling a core.  A 45s cap caused otherwise-valid applies to roll
-		// back; keep the outer transaction budget but give each unit command
-		// a realistic window.
-		timeout = 2 * time.Minute
+		// polling a core or a unit is waiting for a VPP TAP. Keep this larger
+		// than the unit's own TimeoutStartSec so a valid slow start is not
+		// misreported as a component failure. The outer apply transaction
+		// remains bounded by runtimeApplyTimeout.
+		timeout = 4 * time.Minute
 	}
 	output, err := runCommandBounded(ctx, timeout, name, args...)
 	if err != nil {

@@ -97,6 +97,7 @@ func productRoutes() []productRoute {
 		{pattern: "/api/v1/runtime/preview", capability: product.CapabilityRuntime, handler: bindHandler((*Server).handleRuntimePreview)},
 		{pattern: "/api/v1/runtime/apply", capability: product.CapabilityRuntime, handler: bindHandler((*Server).handleRuntimeApply)},
 		{pattern: "/api/v1/runtime/status", capability: product.CapabilityRuntime, handler: bindHandler((*Server).handleRuntimeStatus)},
+		{pattern: "/api/v1/config/apply/status", capability: product.CapabilityConfig, handler: bindHandler((*Server).handleConfigApplyStatus)},
 		{pattern: "/api/v1/config/apply", capability: product.CapabilityConfig, handler: bindHandler((*Server).handleConfigApply)},
 		{pattern: "/api/v1/config/export", capability: product.CapabilityConfig, handler: bindHandler((*Server).handleConfigExport)},
 		{pattern: "/api/v1/config/import", capability: product.CapabilityConfig, handler: bindHandler((*Server).handleConfigImport)},

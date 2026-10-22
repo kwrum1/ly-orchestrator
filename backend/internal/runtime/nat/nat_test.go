@@ -8,7 +8,7 @@ import (
 func TestCompileConfigBuildsStaticAndPortMappings(t *testing.T) {
 	compiled, err := CompileConfig(
 		[]map[string]any{{"id": "static-main", "external_address": "203.0.113.10", "internal_address": "192.168.88.10", "wan_link": "wan0"}},
-		[]map[string]any{{"id": "web", "protocol": "TCP", "external_address": "203.0.113.10", "external_port": float64(8443), "internal_target": "192.168.88.20:8443", "hairpin": true}},
+		[]map[string]any{{"id": "web", "protocol": "TCP", "external_address": "203.0.113.10", "external_port": float64(8443), "internal_target": "192.168.88.20:8443"}},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -20,7 +20,7 @@ func TestCompileConfigBuildsStaticAndPortMappings(t *testing.T) {
 		t.Fatalf("port mappings = %#v", compiled.PortMappings)
 	}
 	mapping := compiled.PortMappings[0]
-	if mapping.Protocol != "tcp" || mapping.InternalHost != "192.168.88.20" || mapping.InternalPort != 8443 || mapping.ExternalPort != 8443 || !mapping.Hairpin {
+	if mapping.Protocol != "tcp" || mapping.InternalHost != "192.168.88.20" || mapping.InternalPort != 8443 || mapping.ExternalPort != 8443 || mapping.Hairpin {
 		t.Fatalf("port mapping = %#v", mapping)
 	}
 }
@@ -108,6 +108,16 @@ func TestCompileConfigRefreshesStalePPPoEWANAddressForPortMap(t *testing.T) {
 	}
 }
 
+func TestCompileConfigRejectsHairpinAsUnsupported(t *testing.T) {
+	_, err := CompileConfigWithWANs(nil,
+		[]map[string]any{{"id": "vip-web", "protocol": "tcp", "wan_link": "wan0", "external_address": "198.51.100.50", "external_port": 8443, "internal_host": "192.168.88.20", "internal_port": 443, "hairpin": true}},
+		[]map[string]any{{"id": "wan0", "current_address": "10.67.0.10/32"}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "hairpin is not supported") {
+		t.Fatalf("hairpin must fail closed, got %v", err)
+	}
+}
+
 func TestCompileConfigRefreshesStalePPPoEWANAddressForStaticMapping(t *testing.T) {
 	compiled, err := CompileConfigWithWANs(
 		[]map[string]any{{"id": "host", "wan_link": "wan0", "external_address": "10.67.0.13", "internal_address": "192.168.88.20"}},
@@ -185,17 +195,13 @@ func TestBindWANInterfacesRejectsUnknownWAN(t *testing.T) {
 	}
 }
 
-func TestCompileConfigAllowsHairpinPortRewrite(t *testing.T) {
-	config, err := CompileConfig(nil, []map[string]any{{
+func TestCompileConfigRejectsHairpinPortRewrite(t *testing.T) {
+	_, err := CompileConfig(nil, []map[string]any{{
 		"id": "hairpin-rewrite", "protocol": "tcp", "external_address": "203.0.113.10",
 		"external_port": 8443, "internal_host": "192.168.88.20", "internal_port": 443, "hairpin": true,
 	}})
-	if err != nil {
-		t.Fatalf("hairpin port rewrite rejected: %v", err)
-	}
-	if len(config.PortMappings) != 1 || config.PortMappings[0].ExternalPort != 8443 ||
-		config.PortMappings[0].InternalPort != 443 || !config.PortMappings[0].Hairpin {
-		t.Fatalf("hairpin rewrite mapping = %#v", config.PortMappings)
+	if err == nil || !strings.Contains(err.Error(), "hairpin is not supported") {
+		t.Fatalf("hairpin must fail closed, got %v", err)
 	}
 }
 

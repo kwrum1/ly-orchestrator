@@ -200,7 +200,7 @@ func portMapContract() resourceContract[nat.PortMapping] {
 		kind:     "NAT44 port mapping",
 		identity: func(mapping nat.PortMapping) string { return mapping.ID },
 		equal: func(left, right nat.PortMapping) bool {
-			return left.ID == right.ID && left.Protocol == right.Protocol && left.ExternalAddress == right.ExternalAddress && left.ExternalPort == right.ExternalPort && left.InternalHost == right.InternalHost && left.InternalPort == right.InternalPort && left.WANInterface == right.WANInterface && left.WANNextHop == right.WANNextHop && left.Hairpin == right.Hairpin && left.ReturnPathGuard == right.ReturnPathGuard
+			return left.ID == right.ID && left.Protocol == right.Protocol && left.ExternalAddress == right.ExternalAddress && left.ExternalAddressExplicit == right.ExternalAddressExplicit && left.ExternalPort == right.ExternalPort && left.InternalHost == right.InternalHost && left.InternalPort == right.InternalPort && left.WANInterface == right.WANInterface && left.WANNextHop == right.WANNextHop && left.Hairpin == right.Hairpin && left.ReturnPathGuard == right.ReturnPathGuard
 		},
 	}
 }

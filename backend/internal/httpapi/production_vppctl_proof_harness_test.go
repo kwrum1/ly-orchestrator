@@ -163,7 +163,7 @@ func saveProductionProofConfig(t *testing.T, store *persistence.Store) {
 		configDocument(t, "route_policy", "route-office", map[string]any{"id": "route-office", "priority": float64(100), "action": "route", "egress": "wan-primary", "match": map[string]any{"sources": []any{"10.0.0.0/24"}, "destinations": []any{"0.0.0.0/0"}, "protocols": []any{"tcp"}, "source_ports": []any{"any"}, "dest_ports": []any{"443"}}}, now),
 		configDocument(t, "security_acl", "acl-guest", map[string]any{"id": "acl-guest", "priority": float64(50), "action": "deny", "match": map[string]any{"sources": []any{"192.168.88.0/24"}, "destinations": []any{"0.0.0.0/0"}, "protocols": []any{"tcp"}, "source_ports": []any{"any"}, "dest_ports": []any{"443"}, "direction": "input"}}, now),
 		configDocument(t, "nat_static", "static-main", map[string]any{"id": "static-main", "external_address": "203.0.113.10", "internal_address": "192.168.88.10", "wan_link": "wan0"}, now),
-		configDocument(t, "port_map", "web", map[string]any{"id": "web", "protocol": "tcp", "external_address": "203.0.113.10", "external_port": float64(8443), "internal_host": "192.168.88.20", "internal_port": float64(8443), "wan_link": "wan0", "hairpin": true}, now),
+		configDocument(t, "port_map", "web", map[string]any{"id": "web", "protocol": "tcp", "external_address": "203.0.113.10", "external_port": float64(8443), "internal_host": "192.168.88.20", "internal_port": float64(8443), "wan_link": "wan0", "hairpin": false}, now),
 	}
 	for _, document := range documents {
 		if err := store.SaveConfig(context.Background(), document); err != nil {

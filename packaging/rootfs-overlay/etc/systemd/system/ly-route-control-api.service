@@ -11,6 +11,7 @@ Environment=LY_ROUTE_API_HOST=127.0.0.1
 Environment=LY_ROUTE_API_PORT=8080
 Environment=LY_ROUTE_CONFIG_PATH=/var/lib/ly-route/config.json
 Environment=LY_ROUTE_DEFAULT_CONFIG=/etc/ly-route/default-config.json
+Environment=LY_ROUTE_CONFIG_APPLY_ASYNC=1
 EnvironmentFile=-/etc/ly-route/appliance.env
 EnvironmentFile=-/etc/ly-route/runtime.env
 EnvironmentFile=-/etc/ly-route/control-api.env
