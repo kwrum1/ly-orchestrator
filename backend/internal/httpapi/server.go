@@ -8161,6 +8161,35 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		writeError(w, r, http.StatusUnprocessableEntity, "config_apply_plan_failed", err.Error())
 		return
 	}
+	// A clean boot can compile the plan before PPPoE has an address. Port maps
+	// bound to that dynamic WAN are deliberately deferred by the NAT compiler,
+	// so the first transaction would otherwise commit without them. Start the
+	// PPPoE helper from the already-rendered artifacts, wait for the live lease,
+	// then rebuild the plan before creating the transaction.
+	if configApplyAsyncEnabled() && server.portMapsAwaitingDynamicWAN(r.Context(), runtimePlan) && server.serviceRuntimeConfigured() {
+		pppoeArtifacts := artifactsForService(runtimePlan.RuntimeArtifacts, serviceRuntime.PPPoE)
+		if len(pppoeArtifacts) > 0 {
+			report := server.services.ApplyCapabilitiesForTransaction(r.Context(), transactionID, pppoeArtifacts)
+			if err := report.Err(); err != nil {
+				server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", "PPPoE bootstrap: "+err.Error(), r)
+				writeJSON(w, http.StatusAccepted, map[string]any{"status": "apply_failed", "runtime_state": "degraded", "reason": "PPPoE bootstrap: " + err.Error(), "transaction_id": transactionID, "request_id": requestID(r)})
+				return
+			}
+			deadline := server.now().Add(90 * time.Second)
+			for server.now().Before(deadline) {
+				current, currentErr := server.currentNATConfig(r.Context())
+				if currentErr == nil && len(current.PortMappings) >= server.desiredPortMapCount(r.Context()) {
+					break
+				}
+				time.Sleep(2 * time.Second)
+			}
+			runtimePlan, proxyEgress, flowIntent, err = server.configApplyPlan(r.Context(), transactionID, req.ProxyEgress, req.FlowIntent)
+			if err != nil {
+				writeError(w, r, http.StatusUnprocessableEntity, "config_apply_plan_failed", err.Error())
+				return
+			}
+		}
+	}
 	if runtimePlan.DataplaneState == "dataplane_locked" {
 		reason := dataplaneLockedReason(runtimePlan.DataplaneProof, runtimePlan.Warnings)
 		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", reason, r)
@@ -8379,6 +8408,26 @@ func setApplyLANVPPEnvironment(plan vpp.Plan) func() {
 		}
 		_ = os.Unsetenv("LY_ROUTE_LAN_INTERFACE")
 	}
+}
+
+func (server *Server) desiredPortMapCount(ctx context.Context) int {
+	items, err := server.desiredItems(ctx, "port_map")
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, item := range items {
+		if value, ok := item["enabled"]; ok && !truthy(value) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func (server *Server) portMapsAwaitingDynamicWAN(ctx context.Context, plan RuntimePlan) bool {
+	desired := server.desiredPortMapCount(ctx)
+	return desired > 0 && len(plan.CompiledNAT.PortMappings) < desired
 }
 
 func (server *Server) configApplyPlan(ctx context.Context, requestID string, overrideProxy *proxy.Egress, overrideFlow *flow.Intent) (RuntimePlan, proxy.Egress, flow.Intent, error) {
