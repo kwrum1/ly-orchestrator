@@ -193,6 +193,38 @@ def reconcile_wan_port_maps(previous, current, wan):
             log(f"port-map {local_host}:{local_port} moved {previous}->{current} on {wan}")
 
 
+def reconcile_nat_return_guards(previous, current):
+    """Update the WAN-address source in return-path ACLs after an address change."""
+    if not previous or not current or previous == current:
+        return
+    code, out, _ = vppctl("show", "acl-plugin", "acl")
+    if code != 0:
+        return
+    blocks = out.split("acl-index ")
+    for block in blocks[1:]:
+        lines = block.splitlines()
+        if not lines:
+            continue
+        head = lines[0]
+        match = re.match(r"(\d+).*?tag \{([^}]+)\}", head)
+        if not match:
+            continue
+        acl_index, tag = match.group(1), match.group(2)
+        if not tag.startswith("ly-route-nat_return"):
+            continue
+        if not any(("src " + previous + "/32") in line for line in lines[1:]):
+            continue
+        code, err = run(
+            "set", "acl-plugin", "acl", "index", acl_index,
+            "permit", "src", current + "/32", "dst", "0.0.0.0/0",
+            "proto", "0", "sport", "0-65535", "dport", "0-65535", "tag", tag,
+        )
+        if code == 0:
+            log(f"return guard {tag} moved {previous}->{current}")
+        else:
+            log(f"return guard {tag} update failed: {err}")
+
+
 def remove_identity(local):
     if local:
         run("nat44", "add", "identity", "mapping", local, "del")
@@ -374,6 +406,7 @@ def main():
         ensure_address(name, session["local"])
         configure_nat(name, plan, session["local"])
         reconcile_wan_port_maps(last_wan_address, session["local"], name)
+        reconcile_nat_return_guards(last_wan_address, session["local"])
         last_wan_address = session["local"]
         healthy = session_healthy(name, session["peer"], plan.get("default_route", True))
         if not healthy:
@@ -415,6 +448,7 @@ def main():
                         ensure_address(name, session["local"])
                         configure_nat(name, plan, session["local"])
                         reconcile_wan_port_maps(previous_local, session["local"], name)
+                        reconcile_nat_return_guards(previous_local, session["local"])
                         last_wan_address = session["local"]
                         grace_until = time.time() + DATAPLANE_GRACE
                     current = session
