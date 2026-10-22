@@ -502,6 +502,7 @@ func newServer(profile product.Profile, options ...Option) *Server {
 	for _, option := range options {
 		option(server)
 	}
+	server.ingestFirmwareRollbackAudit()
 	server.reconcileRuntime(context.Background())
 	return server
 }
@@ -10003,6 +10004,72 @@ func appendFirmwareRollbackAudit(events []AuditEvent) []AuditEvent {
 		})
 	}
 	return events
+}
+
+// ingestFirmwareRollbackAudit moves the installer's durable rollback marker
+// into audit_events once control starts again. The marker exists because the
+// failed control binary may be unable to persist an audit row before it is
+// replaced; the API feed still falls back to the marker if ingestion has not
+// happened yet.
+func (server *Server) ingestFirmwareRollbackAudit() {
+	path := "/var/lib/ly-route/firmware-update/rollback-audit.jsonl"
+	data, err := os.ReadFile(path)
+	if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+		return
+	}
+	var events []AuditEvent
+	for lineNumber, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var item struct {
+			Timestamp string `json:"timestamp"`
+			Backup    string `json:"backup"`
+			Reason    string `json:"reason"`
+		}
+		if json.Unmarshal([]byte(line), &item) != nil {
+			continue
+		}
+		timestamp, err := time.Parse(time.RFC3339, item.Timestamp)
+		if err != nil {
+			timestamp = server.now().UTC()
+		}
+		events = append(events, AuditEvent{
+			ID:        fmt.Sprintf("firmware-rollback-ingested-%d-%d", lineNumber, timestamp.UnixNano()),
+			Timestamp: timestamp.UTC(),
+			Actor:     "system",
+			Role:      "system",
+			Resource:  "/api/v1/firmware/update/install",
+			Action:    "firmware_rollback",
+			Status:    "failure",
+			Error:     auditSafeText(item.Reason + " backup=" + item.Backup),
+		})
+	}
+	if len(events) == 0 {
+		return
+	}
+	server.audit = append(server.audit, events...)
+	if server.store != nil {
+		persisted := make([]persistence.AuditEvent, 0, len(events))
+		for _, event := range events {
+			persisted = append(persisted, persistence.AuditEvent{
+				ID:            event.ID,
+				Timestamp:     event.Timestamp,
+				Actor:         event.Actor,
+				Role:          event.Role,
+				Resource:      event.Resource,
+				Action:        event.Action,
+				Status:        event.Status,
+				Error:         event.Error,
+				TransactionID: event.RequestID,
+			})
+		}
+		if err := server.store.SaveAuditEvents(context.Background(), persisted); err != nil {
+			return
+		}
+	}
+	_ = os.Rename(path, path+".ingested")
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

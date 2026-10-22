@@ -99,3 +99,14 @@ func unsafeUpgradePackage(t *testing.T, header tar.Header) string {
 	}
 	return packagePath
 }
+
+func TestFirmwareUpgradeHealthWindowAllowsColdControlStart(t *testing.T) {
+	// final3 failed on a TCG lab because control needed 15-17s while the old
+	// health loop only waited ~10s. Keep a bounded but realistic window.
+	if !strings.Contains(firmwareUpgradeInstallScript, "timeout 30s systemctl restart ly-route-control-api.service") {
+		t.Fatal("control restart timeout is too short for cold start")
+	}
+	if !strings.Contains(firmwareUpgradeInstallScript, `while [ "$i" -lt 60 ]`) {
+		t.Fatal("health check window is too short for cold start")
+	}
+}

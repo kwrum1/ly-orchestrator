@@ -1456,51 +1456,19 @@ pppoeclient_refresh_hw_output (pppoeclient_main_t *pem, pppoeclient_t *c)
     }
 }
 
-/* A PPPoE reconnect can reuse the pppox sw_if_index/adjacency while VPP's
- * session-output next-slot table still points at the old null slot.  Force a
- * fresh next slot on every PADS so a new session never inherits the stale
- * graph edge.  Must run on the main thread. */
+/* A PPPoE reconnect may create a new physical output edge.  Reuse the
+ * existing edge when it is present and only add one when the output node
+ * really changed.  Do NOT remove/invalidate the previous slot here: a worker
+ * may already have loaded c->hw_output_next_index and be enqueueing into that
+ * edge.  Writing ~0 into node->next_nodes[old_slot] turns that in-flight
+ * index into an out-of-range next node and crashes vlib_get_next_frame.  The
+ * stale edge is harmless and bounded by the number of physical output nodes;
+ * keeping it valid is the only safe reclaim strategy without a worker
+ * barrier.  Must run on the main thread. */
 static void
 pppoeclient_force_hw_output (pppoeclient_main_t *pem, pppoeclient_t *c)
 {
-  vnet_hw_interface_t *hw;
-  vlib_node_t *node;
-  uword *slot;
-  u32 edge;
-
-  if (c == 0)
-    return;
-  hw = vnet_get_hw_interface (pem->vnet_main, c->hw_if_index);
-  if (hw == 0 || hw->output_node_index == 0)
-    {
-      c->hw_output_next_index = ~0;
-      c->hw_output_node_index = 0;
-      return;
-    }
-  node = vlib_get_node (pem->vlib_main, pppoeclient_session_output_node.index);
-  if (node == 0)
-    return;
-  slot = hash_get (node->next_slot_by_node, hw->output_node_index);
-  if (slot)
-    {
-      u32 old_slot = slot[0];
-      hash_unset (node->next_slot_by_node, hw->output_node_index);
-      if (old_slot < vec_len (node->next_nodes))
-	node->next_nodes[old_slot] = ~0;
-    }
-  edge = vlib_node_add_next (pem->vlib_main,
-			     pppoeclient_session_output_node.index,
-			     hw->output_node_index);
-  if (edge != ~0)
-    {
-      c->hw_output_next_index = edge;
-      c->hw_output_node_index = hw->output_node_index;
-    }
-  else
-    {
-      c->hw_output_next_index = ~0;
-      c->hw_output_node_index = 0;
-    }
+  pppoeclient_refresh_hw_output (pem, c);
 }
 
 static uword

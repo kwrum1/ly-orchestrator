@@ -147,6 +147,52 @@ def configure_nat(name, plan, local):
         run("nat44", "add", "identity", "mapping", local)
 
 
+def reconcile_wan_port_maps(previous, current, wan):
+    """Move WAN-self port maps to the new PPPoE address.
+
+    The control-plane apply owns the desired map and its return guard.  This
+    helper only handles the address transition between two live sessions: a
+    static map whose external address was the old WAN address is re-created
+    with the new one.  Explicit VIP maps (address != previous) are left alone.
+    """
+    if not previous or not current or previous == current:
+        return
+    code, out, _ = vppctl("show", "nat44", "static", "mappings")
+    if code != 0:
+        return
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        proto = fields[0].lower()
+        if proto not in ("tcp", "udp") or fields[1] != "local":
+            continue
+        try:
+            local_host, local_port = fields[2].rsplit(":", 1)
+            external_host, external_port = fields[4].rsplit(":", 1)
+        except ValueError:
+            continue
+        if external_host != previous:
+            continue
+        code, err = run(
+            "nat44", "add", "static", "mapping", proto,
+            "local", local_host, local_port,
+            "external", previous, external_port, "del",
+        )
+        if code != 0:
+            log(f"port-map {local_host}:{local_port} delete old WAN {previous} failed: {err}")
+            continue
+        code, err = run(
+            "nat44", "add", "static", "mapping", proto,
+            "local", local_host, local_port,
+            "external", current, external_port,
+        )
+        if code != 0:
+            log(f"port-map {local_host}:{local_port} add new WAN {current} failed: {err}")
+        else:
+            log(f"port-map {local_host}:{local_port} moved {previous}->{current} on {wan}")
+
+
 def remove_identity(local):
     if local:
         run("nat44", "add", "identity", "mapping", local, "del")
@@ -302,6 +348,7 @@ def main():
 
     reconnect_delay = RECONNECT_DELAY
     redials = 0
+    last_wan_address = ""
     while not STOP:
         write_status(status_file, "connecting", name, reason="dialing")
         if not create_client(wan, name, host_uniq):
@@ -326,6 +373,8 @@ def main():
 
         ensure_address(name, session["local"])
         configure_nat(name, plan, session["local"])
+        reconcile_wan_port_maps(last_wan_address, session["local"], name)
+        last_wan_address = session["local"]
         healthy = session_healthy(name, session["peer"], plan.get("default_route", True))
         if not healthy:
             write_status(status_file, "degraded", name, session["session_id"],
@@ -361,9 +410,12 @@ def main():
                         break
                 else:
                     if session["local"] != current["local"] or session["session_id"] != current["session_id"]:
+                        previous_local = current["local"]
                         remove_identity(current["local"])
                         ensure_address(name, session["local"])
                         configure_nat(name, plan, session["local"])
+                        reconcile_wan_port_maps(previous_local, session["local"], name)
+                        last_wan_address = session["local"]
                         grace_until = time.time() + DATAPLANE_GRACE
                     current = session
                     if session_healthy(name, session["peer"], plan.get("default_route", True)):
