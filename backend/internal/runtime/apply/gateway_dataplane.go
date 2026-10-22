@@ -38,6 +38,13 @@ func (transaction *productionGatewayWithDataplane) HasDataplaneController() bool
 	return transaction.dataplane != nil
 }
 
+func (transaction *productionGatewayWithDataplane) ApplyGraphSupported() bool {
+	if provider, ok := transaction.inner.(ApplyGraphProvider); ok {
+		return provider.ApplyGraphSupported()
+	}
+	return false
+}
+
 func NewProductionGatewayTransactionWithDataplane(adapter vpp.Adapter, controller DataplaneController, now Clock) GatewayTransactionRunner {
 	return &productionGatewayWithDataplane{inner: NewProductionGatewayTransaction(adapter, now), adapter: adapter, dataplane: controller, dpdkActive: map[string]bool{}}
 }

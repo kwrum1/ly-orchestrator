@@ -5081,62 +5081,26 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	serviceArtifacts := runtimeServiceArtifacts(plan.RuntimeArtifacts, server.gatewayTransaction != nil)
-	// Linux policy-routing TAPs must exist before the VPP transaction validates
-	// proxy next hops, and PPPoE helpers must publish their status contract
-	// before routes/DNS service networks resolve `pppoe-runtime:` underlays.
-	// Both are a dependency bootstrap in the pre-gateway pass; the same
-	// idempotent artifacts are replayed after the gateway commit so evidence is
-	// authoritative and the final Linux/VPP handoff matches the committed graph.
-	preGatewayArtifacts, postGatewayArtifacts := splitRuntimeArtifactsByPhase(serviceArtifacts, plan.GatewayPlan)
 	evidenceRequest := RuntimeEvidenceRequest{TransactionID: transactionID, Capability: "/api/v1/runtime/apply", Artifacts: serviceArtifacts}
 	var appliedArtifacts []serviceRuntime.RenderedArtifact
 	var capabilityFailures []apply.CapabilityFailureEvidence
+	var hooks *apply.ApplyHooks
 	executor := apply.Executor{
 		Store:   server.store,
 		Now:     server.now,
 		Gateway: server.gatewayTransaction,
-		BeforeGateway: func(ctx context.Context, _ apply.Plan) error {
-			if len(preGatewayArtifacts) == 0 {
-				return nil
-			}
-			report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, preGatewayArtifacts)
-			appliedArtifacts = append(appliedArtifacts, report.AppliedArtifacts...)
-			capabilityFailures = append(capabilityFailures, serviceFailureEvidence(report.Failures)...)
-			if err := report.Err(); err != nil && !onlyPPPoEBootstrapFailures(report.Failures) {
-				return err
-			}
-			// A PPPoE bootstrap failure is not fatal here: the gateway transaction
-			// waits (bounded) for the runtime status and fails with an actionable
-			// route/DNS error if the session never appears, while the post-gateway
-			// pass still applies independent services and preserves their evidence.
-			return nil
-		},
-		Apply: func(ctx context.Context, _ apply.Plan) error {
-			report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, postGatewayArtifacts)
-			// The post-gateway pass is the authoritative evidence pass. The
-			// pre-gateway run is only a dependency bootstrap and is intentionally
-			// replaced here instead of appended, so each service/path is recorded
-			// exactly once.
-			appliedArtifacts = append([]serviceRuntime.RenderedArtifact(nil), report.AppliedArtifacts...)
-			capabilityFailures = append(capabilityFailures, serviceFailureEvidence(report.Failures)...)
-			evidenceRequest.Artifacts = appliedArtifacts
-			return nil
-		},
 		Receipt: func(ctx context.Context, _ apply.Plan) (apply.ApplyReceipt, error) {
 			return server.runtimeReceipt(ctx, evidenceRequest)
 		},
 		Readback: func(ctx context.Context, _ apply.Plan) (apply.Readback, error) {
 			return server.runtimeReadback(ctx, evidenceRequest)
 		},
-		Rollback: func(ctx context.Context, applyPlan apply.Plan) error {
-			serviceErr := server.services.Rollback(ctx, appliedArtifacts)
-			var gatewayErr error
-			if server.gatewayTransaction != nil {
-				gatewayErr = server.gatewayTransaction.Rollback(ctx, applyPlan)
-			}
-			return errors.Join(serviceErr, gatewayErr)
-		},
 		CapabilityFailures: func() []apply.CapabilityFailureEvidence { return capabilityFailures },
+	}
+	if gatewaySupportsApplyGraph(server.gatewayTransaction) {
+		hooks = server.buildApplyHooks(transactionID, serviceArtifacts, &evidenceRequest, &appliedArtifacts, &capabilityFailures)
+	} else {
+		server.configureLegacyServiceStages(&executor, transactionID, serviceArtifacts, &evidenceRequest, &appliedArtifacts, &capabilityFailures)
 	}
 	execution, err := executor.Run(applyCtx, apply.Request{
 		TransactionID:      transactionID,
@@ -5149,6 +5113,7 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 		PreviousSnapshotID: server.latestRuntimeSnapshotID(applyCtx),
 		RollbackID:         "rollback-" + transactionID,
 		GatewayPlan:        plan.GatewayPlan,
+		Hooks:              hooks,
 	})
 	if err != nil {
 		cause := "runtime transaction: " + err.Error()
@@ -5700,45 +5665,123 @@ func runtimeServiceArtifacts(artifacts []serviceRuntime.RenderedArtifact, gatewa
 	return result
 }
 
-// splitRuntimeArtifactsByPhase returns the dependency-bootstrap artifacts that
-// must run before the typed VPP gateway transaction plus the full authoritative
-// set that is applied after the commit.  PPPoE publishes the
-// `pppoe-runtime:` status contract that routes and DNS service networks
-// resolve, so it always precedes the gateway.  Linux policy routing only needs
-// to precede the gateway when its handoff does not depend on a live native
-// PPPoE session: a clean install has no session interface yet, and the
-// artifact's semantic readback correctly rejects a deferred DNS policy.  In
-// that case the post-gateway pass owns the final Linux/VPP handoff.
-func splitRuntimeArtifactsByPhase(artifacts []serviceRuntime.RenderedArtifact, gateway vpp.Plan) ([]serviceRuntime.RenderedArtifact, []serviceRuntime.RenderedArtifact) {
-	preLinuxRouting := !runtimePPPoEUnderlayPending(gateway)
-	pre := make([]serviceRuntime.RenderedArtifact, 0, len(artifacts))
-	post := make([]serviceRuntime.RenderedArtifact, 0, len(artifacts))
-	for _, artifact := range artifacts {
-		switch artifact.Service {
-		case serviceRuntime.PPPoE:
-			pre = append(pre, artifact)
-		case serviceRuntime.LinuxRouting:
-			if preLinuxRouting {
-				pre = append(pre, artifact)
-			}
-		}
-		post = append(post, artifact)
+func artifactsExceptService(artifacts []serviceRuntime.RenderedArtifact, excluded ...serviceRuntime.ServiceName) []serviceRuntime.RenderedArtifact {
+	skip := make(map[serviceRuntime.ServiceName]bool, len(excluded))
+	for _, service := range excluded {
+		skip[service] = true
 	}
-	return pre, post
+	filtered := make([]serviceRuntime.RenderedArtifact, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		if skip[artifact.Service] {
+			continue
+		}
+		filtered = append(filtered, artifact)
+	}
+	return filtered
 }
 
-func runtimePPPoEUnderlayPending(gateway vpp.Plan) bool {
-	for _, network := range gateway.DNSServiceNetworks {
-		if strings.HasPrefix(strings.TrimSpace(network.UnderlayRoute), "pppoe-runtime:") {
-			return true
+func gatewaySupportsApplyGraph(runner apply.GatewayTransactionRunner) bool {
+	provider, ok := runner.(apply.ApplyGraphProvider)
+	return ok && provider.ApplyGraphSupported()
+}
+
+// configureLegacyServiceStages keeps third-party/test gateway doubles working.
+// The production transaction advertises ApplyGraphSupported and uses Plan.Hooks
+// instead; this path is only a compatibility adapter, not a production phase.
+func (server *Server) configureLegacyServiceStages(
+	executor *apply.Executor,
+	transactionID string,
+	serviceArtifacts []serviceRuntime.RenderedArtifact,
+	evidenceRequest *RuntimeEvidenceRequest,
+	appliedArtifacts *[]serviceRuntime.RenderedArtifact,
+	capabilityFailures *[]apply.CapabilityFailureEvidence,
+) {
+	pppoeArtifacts := artifactsForService(serviceArtifacts, serviceRuntime.PPPoE)
+	otherArtifacts := artifactsExceptService(serviceArtifacts, serviceRuntime.PPPoE)
+	executor.BeforeGateway = func(ctx context.Context, _ apply.Plan) error {
+		if server.services == nil || len(pppoeArtifacts) == 0 {
+			return nil
 		}
-	}
-	for _, steering := range gateway.Proxy.VPPSteering {
-		if strings.HasPrefix(strings.TrimSpace(steering.UnderlayRoute), "pppoe-runtime:") {
-			return true
+		report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, pppoeArtifacts)
+		*appliedArtifacts = append(*appliedArtifacts, report.AppliedArtifacts...)
+		*capabilityFailures = append(*capabilityFailures, serviceFailureEvidence(report.Failures)...)
+		if err := report.Err(); err != nil && !onlyPPPoEBootstrapFailures(report.Failures) {
+			return err
 		}
+		return nil
 	}
-	return false
+	executor.Apply = func(ctx context.Context, _ apply.Plan) error {
+		if server.services == nil {
+			return errors.New("live runtime apply runner is not configured")
+		}
+		report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, otherArtifacts)
+		*appliedArtifacts = append(*appliedArtifacts, report.AppliedArtifacts...)
+		*capabilityFailures = append(*capabilityFailures, serviceFailureEvidence(report.Failures)...)
+		evidenceRequest.Artifacts = *appliedArtifacts
+		return nil
+	}
+	executor.Rollback = func(ctx context.Context, _ apply.Plan) error {
+		if server.services == nil {
+			return nil
+		}
+		return server.services.Rollback(ctx, *appliedArtifacts)
+	}
+}
+
+// buildApplyHooks wires the host services into the gateway dependency graph.
+// PPPoE is a first-class graph node (status publication before dependent
+// networks); every other artifact is an authoritative service node after the
+// VPP graph.  The graph owns ordering and reverse rollback; this function only
+// adapts the service controller.
+func (server *Server) buildApplyHooks(
+	transactionID string,
+	serviceArtifacts []serviceRuntime.RenderedArtifact,
+	evidenceRequest *RuntimeEvidenceRequest,
+	appliedArtifacts *[]serviceRuntime.RenderedArtifact,
+	capabilityFailures *[]apply.CapabilityFailureEvidence,
+) *apply.ApplyHooks {
+	if server.services == nil {
+		return nil
+	}
+	pppoeArtifacts := artifactsForService(serviceArtifacts, serviceRuntime.PPPoE)
+	otherArtifacts := artifactsExceptService(serviceArtifacts, serviceRuntime.PPPoE)
+	return &apply.ApplyHooks{
+		EnsurePPPoE: func(ctx context.Context, _ apply.Plan) error {
+			report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, pppoeArtifacts)
+			*appliedArtifacts = append(*appliedArtifacts, report.AppliedArtifacts...)
+			*capabilityFailures = append(*capabilityFailures, serviceFailureEvidence(report.Failures)...)
+			if err := report.Err(); err != nil {
+				return fmt.Errorf("PPPoE helper start: %w", err)
+			}
+			return nil
+		},
+		VerifyPPPoE: func(ctx context.Context, _ apply.Plan) error {
+			return server.verifyPPPoEArtifacts(ctx, pppoeArtifacts)
+		},
+		RollbackPPPoE: func(ctx context.Context, _ apply.Plan) error {
+			return server.services.Rollback(ctx, pppoeArtifacts)
+		},
+		ApplyServices: func(ctx context.Context, _ apply.Plan) error {
+			report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, otherArtifacts)
+			*appliedArtifacts = append(*appliedArtifacts, report.AppliedArtifacts...)
+			*capabilityFailures = append(*capabilityFailures, serviceFailureEvidence(report.Failures)...)
+			evidenceRequest.Artifacts = *appliedArtifacts
+			// Service capability failures are evidence/degraded state, not a
+			// reason to discard an otherwise committed VPP graph.
+			return nil
+		},
+		RollbackServices: func(ctx context.Context, _ apply.Plan) error {
+			return server.services.Rollback(ctx, artifactsExceptService(*appliedArtifacts, serviceRuntime.PPPoE))
+		},
+		VerifyServiceNetworks: func(ctx context.Context, plan apply.Plan) error {
+			adapter := vpp.Adapter{Client: vpp.NewProductionVPPCTLClient(liveVPPBinary())}
+			return adapter.VerifyDNSServiceNetworks(ctx, plan.GatewayPlan)
+		},
+		VerifyNAT44: func(ctx context.Context, plan apply.Plan) error {
+			adapter := vpp.Adapter{Client: vpp.NewProductionVPPCTLClient(liveVPPBinary())}
+			return adapter.VerifyNAT44Ready(ctx, plan.GatewayPlan)
+		},
+	}
 }
 
 func onlyPPPoEBootstrapFailures(failures []serviceRuntime.CapabilityFailure) bool {
@@ -7121,6 +7164,65 @@ func runLiveVPP(ctx context.Context, args ...string) (string, error) {
 	return text, nil
 }
 
+func (server *Server) verifyPPPoEArtifacts(ctx context.Context, artifacts []serviceRuntime.RenderedArtifact) error {
+	for _, artifact := range artifacts {
+		if !strings.HasPrefix(artifact.Path, "/etc/ly-route/pppoe/ly-route-") {
+			continue
+		}
+		var plan struct {
+			ID         string `json:"id"`
+			StatusFile string `json:"status_file"`
+		}
+		if err := json.Unmarshal([]byte(artifact.Content), &plan); err != nil {
+			return fmt.Errorf("PPPoE peer plan %s is invalid: %w", artifact.Path, err)
+		}
+		if strings.TrimSpace(plan.StatusFile) == "" {
+			return fmt.Errorf("PPPoE peer %q has no status file contract", plan.ID)
+		}
+		content, err := os.ReadFile(plan.StatusFile)
+		if err != nil || strings.TrimSpace(string(content)) == "" {
+			return fmt.Errorf("PPPoE peer %q status %s is not published yet", plan.ID, plan.StatusFile)
+		}
+		var status struct {
+			State     string `json:"state"`
+			Interface string `json:"interface"`
+		}
+		if err := json.Unmarshal(content, &status); err != nil {
+			return fmt.Errorf("PPPoE peer %q status is malformed: %w", plan.ID, err)
+		}
+		if strings.TrimSpace(status.State) == "" {
+			return fmt.Errorf("PPPoE peer %q status has no state", plan.ID)
+		}
+		if strings.TrimSpace(status.Interface) == "" {
+			return fmt.Errorf("PPPoE peer %q status has no session interface", plan.ID)
+		}
+		if !vppInterfacePresent(ctx, status.Interface) {
+			return fmt.Errorf("PPPoE peer %q interface %q is not present in VPP yet (state=%s)", plan.ID, status.Interface, status.State)
+		}
+	}
+	return nil
+}
+
+func vppInterfacePresent(ctx context.Context, name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(commandCtx, liveVPPBinary(), "show", "interface").Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == name {
+			return true
+		}
+	}
+	return false
+}
+
 func liveVPPBinary() string {
 	binary := strings.TrimSpace(os.Getenv("LY_ROUTE_VPPCTL"))
 	if binary == "" {
@@ -7993,44 +8095,13 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	serviceArtifacts := runtimeServiceArtifacts(runtimePlan.RuntimeArtifacts, server.gatewayTransaction != nil)
-	preGatewayArtifacts, postGatewayArtifacts := splitRuntimeArtifactsByPhase(serviceArtifacts, runtimePlan.GatewayPlan)
-	// The config transaction only needs the PPPoE status bootstrap before the
-	// gateway graph; Linux service handoffs are applied once in the
-	// authoritative post-gateway pass to avoid duplicate lifecycle events.
-	filteredPre := preGatewayArtifacts[:0]
-	for _, artifact := range preGatewayArtifacts {
-		if artifact.Service == serviceRuntime.PPPoE {
-			filteredPre = append(filteredPre, artifact)
-		}
-	}
-	preGatewayArtifacts = filteredPre
 	evidenceRequest := RuntimeEvidenceRequest{TransactionID: transactionID, Capability: "/api/v1/config/apply", Artifacts: serviceArtifacts}
-	appliedArtifacts := serviceArtifacts
+	appliedArtifacts := make([]serviceRuntime.RenderedArtifact, 0, len(serviceArtifacts))
 	var capabilityFailures []apply.CapabilityFailureEvidence
+	var hooks *apply.ApplyHooks
 	executor := apply.Executor{
-		Store: server.store,
-		Now:   server.now,
-		BeforeGateway: func(ctx context.Context, _ apply.Plan) error {
-			if server.services == nil || len(preGatewayArtifacts) == 0 {
-				return nil
-			}
-			report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, preGatewayArtifacts)
-			capabilityFailures = append(capabilityFailures, serviceFailureEvidence(report.Failures)...)
-			if err := report.Err(); err != nil && !onlyPPPoEBootstrapFailures(report.Failures) {
-				return err
-			}
-			return nil
-		},
-		Apply: func(ctx context.Context, _ apply.Plan) error {
-			if server.services == nil {
-				return errors.New("live runtime apply runner is not configured")
-			}
-			report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, postGatewayArtifacts)
-			appliedArtifacts = report.AppliedArtifacts
-			capabilityFailures = append(capabilityFailures, serviceFailureEvidence(report.Failures)...)
-			evidenceRequest.Artifacts = appliedArtifacts
-			return nil
-		},
+		Store:   server.store,
+		Now:     server.now,
 		Gateway: server.gatewayTransaction,
 		Receipt: func(ctx context.Context, _ apply.Plan) (apply.ApplyReceipt, error) {
 			return server.runtimeReceipt(ctx, evidenceRequest)
@@ -8056,17 +8127,12 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		Readback: func(ctx context.Context, _ apply.Plan) (apply.Readback, error) {
 			return server.runtimeReadback(ctx, evidenceRequest)
 		},
-		Rollback: func(ctx context.Context, plan apply.Plan) error {
-			if !plan.Previous.Available {
-				return server.rollbackRuntimePlan(ctx, RuntimePlan{}, plan)
-			}
-			previous, err := server.buildRuntimePlanFromConfig(ctx, transactionID+"-rollback", plan.Previous.ProxyEgress, true, plan.Previous.FlowIntent, true)
-			if err != nil {
-				return fmt.Errorf("build prior runtime snapshot: %w", err)
-			}
-			return server.rollbackRuntimePlan(ctx, previous, plan)
-		},
 		CapabilityFailures: func() []apply.CapabilityFailureEvidence { return capabilityFailures },
+	}
+	if gatewaySupportsApplyGraph(server.gatewayTransaction) {
+		hooks = server.buildApplyHooks(transactionID, serviceArtifacts, &evidenceRequest, &appliedArtifacts, &capabilityFailures)
+	} else {
+		server.configureLegacyServiceStages(&executor, transactionID, serviceArtifacts, &evidenceRequest, &appliedArtifacts, &capabilityFailures)
 	}
 	applyLANPlan := runtimePlan.GatewayPlan
 	if assignments, err := server.runtimeAddressAssignments(r.Context()); err == nil && len(assignments) > 0 {
@@ -8085,6 +8151,7 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		PreviousSnapshotID: server.latestRuntimeSnapshotID(r.Context()),
 		RollbackID:         "rollback-" + transactionID,
 		GatewayPlan:        runtimePlan.GatewayPlan,
+		Hooks:              hooks,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": "apply_failed", "runtime_state": "degraded", "reason": err.Error(), "transaction_id": transactionID, "rollback": rollbackResponse(result.Rollback), "rollback_receipt": result.RollbackReceipt, "events": applyEventResponses(result.Events), "request_id": requestID(r)})

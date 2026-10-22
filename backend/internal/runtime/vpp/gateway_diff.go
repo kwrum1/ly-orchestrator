@@ -273,21 +273,20 @@ func diffResources[T any](states resourceStates[T], contract resourceContract[T]
 // live snapshot for rollback.
 func diffVerifiedLiveResources[T any](states resourceStates[T], desired, live map[string]T, contract resourceContract[T]) (resourceDiff[T], error) {
 	diff := resourceDiff[T]{}
-	// Absence of a still-desired object that the prior generation owned is not
-	// repairable drift: a missing row can be a genuinely deleted object or a
-	// truncated readback, and the two are indistinguishable here. Fail closed
-	// before any mutation so an incomplete live snapshot cannot silently erase
-	// and rebuild the current generation. Present-but-mismatched objects remain
-	// repair-able verified drift.
-	for _, planned := range states.prior {
-		id := contract.identity(planned)
-		if _, stillDesired := desired[id]; !stillDesired {
-			continue
+	// A fully empty verified live snapshot is a clean rollback/restart state and
+	// may be rebuilt. A partially missing snapshot is ambiguous with a truncated
+	// readback and still fails closed before mutation.
+	if len(states.live) > 0 {
+		for _, planned := range states.prior {
+			id := contract.identity(planned)
+			if _, stillDesired := desired[id]; !stillDesired {
+				continue
+			}
+			if _, observed := live[id]; observed {
+				continue
+			}
+			return resourceDiff[T]{}, fmt.Errorf("%w: %s %q is absent from the verified live snapshot", ErrGatewayLiveMismatch, contract.kind, id)
 		}
-		if _, observed := live[id]; observed {
-			continue
-		}
-		return resourceDiff[T]{}, fmt.Errorf("%w: %s %q is absent from the verified live snapshot", ErrGatewayLiveMismatch, contract.kind, id)
 	}
 	for _, observed := range states.live {
 		id := contract.identity(observed)

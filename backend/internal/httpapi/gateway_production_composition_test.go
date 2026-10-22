@@ -62,7 +62,7 @@ func TestGatewayProductionComposition_literalHTTPSuccessAndFailurePreserveGenera
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantTrace := "apply interfaces\napply bonds\napply wan-groups\napply routes\napply acls\napply qos\nrollback acls\nrollback routes\nrollback wan-groups\nrollback bonds\nrollback interfaces\n"
+	wantTrace := "apply interfaces\napply bonds\napply wan-groups\napply routes\napply acls\napply qos\nrollback qos\nrollback acls\nrollback routes\nrollback wan-groups\nrollback bonds\nrollback interfaces\n"
 	if string(trace) != wantTrace {
 		t.Fatalf("rollback process trace = %q, want %q", trace, wantTrace)
 	}
@@ -70,8 +70,8 @@ func TestGatewayProductionComposition_literalHTTPSuccessAndFailurePreserveGenera
 		t.Fatalf("WAN-group apply count = %d, want one", strings.Count(string(trace), "apply wan-groups\n"))
 	}
 	vppRollback := controller.rolledBackArtifacts[serviceRuntime.VPP]
-	if len(vppRollback) != 1 || vppRollback[0].ReloadMode != serviceRuntime.ReloadModePersistOnly {
-		t.Fatalf("service rollback VPP persistence artifacts = %#v, want one persist-only recovery plan", vppRollback)
+	if len(vppRollback) != 0 {
+		t.Fatalf("service rollback VPP persistence artifacts = %#v, want none before the service node ran", vppRollback)
 	}
 }
 

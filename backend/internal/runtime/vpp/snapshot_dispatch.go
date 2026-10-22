@@ -2,9 +2,12 @@ package vpp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"ly-route/backend/internal/runtime/nat"
 )
 
 func (a Adapter) snapshot(ctx context.Context, request SnapshotRequest) (Snapshot, error) {
@@ -96,6 +99,10 @@ func (a Adapter) snapshotOnChannel(ctx context.Context, channel Channel, request
 		case SnapshotCapabilityACLs:
 			reply, readErr := channel.Do(ctx, snapshotOperation(request, capability))
 			if readErr != nil {
+				if request.AllowMissing && errors.Is(readErr, ErrSnapshotIncomplete) {
+					snapshot.ACLs = nil
+					break
+				}
 				return Snapshot{}, fmt.Errorf("%w: ACL readback command: %w", ErrSnapshotIncomplete, readErr)
 			}
 			if retvalErr := NormalizeRetval("vpp.security-acl.snapshot", transactionID, reply.Retval); retvalErr != nil {
@@ -103,12 +110,20 @@ func (a Adapter) snapshotOnChannel(ctx context.Context, channel Channel, request
 			}
 			acls, parseErr := parseACLReadback(reply.Payload)
 			if parseErr != nil {
+				if request.AllowMissing && errors.Is(parseErr, ErrSnapshotIncomplete) {
+					snapshot.ACLs = nil
+					break
+				}
 				return Snapshot{}, parseErr
 			}
 			snapshot.ACLs, err = selectACLs(acls, request)
 		case SnapshotCapabilityQoS:
 			reply, readErr := channel.Do(ctx, snapshotOperation(request, capability))
 			if readErr != nil {
+				if request.AllowMissing && errors.Is(readErr, ErrSnapshotIncomplete) {
+					snapshot.QoS = nil
+					break
+				}
 				return Snapshot{}, fmt.Errorf("%w: QoS readback command: %w", ErrSnapshotIncomplete, readErr)
 			}
 			if retvalErr := NormalizeRetval("vpp.qos.snapshot", transactionID, reply.Retval); retvalErr != nil {
@@ -116,12 +131,20 @@ func (a Adapter) snapshotOnChannel(ctx context.Context, channel Channel, request
 			}
 			qos, parseErr := parseQoSReadback(reply.Payload)
 			if parseErr != nil {
+				if request.AllowMissing && errors.Is(parseErr, ErrSnapshotIncomplete) {
+					snapshot.QoS = nil
+					break
+				}
 				return Snapshot{}, parseErr
 			}
 			snapshot.QoS, err = selectQoS(qos, request)
 		case SnapshotCapabilityNAT44:
 			reply, readErr := channel.Do(ctx, snapshotOperation(request, capability))
 			if readErr != nil {
+				if request.AllowMissing && errors.Is(readErr, ErrSnapshotIncomplete) {
+					snapshot.NAT = nat.CompiledConfig{}
+					break
+				}
 				return Snapshot{}, fmt.Errorf("%w: NAT44 readback command: %w", ErrSnapshotIncomplete, readErr)
 			}
 			if retvalErr := NormalizeRetval("vpp.nat44-ed.snapshot", transactionID, reply.Retval); retvalErr != nil {
@@ -129,6 +152,10 @@ func (a Adapter) snapshotOnChannel(ctx context.Context, channel Channel, request
 			}
 			natState, parseErr := parseNAT44Readback(reply.Payload)
 			if parseErr != nil {
+				if request.AllowMissing && errors.Is(parseErr, ErrSnapshotIncomplete) {
+					snapshot.NAT = nat.CompiledConfig{}
+					break
+				}
 				return Snapshot{}, parseErr
 			}
 			snapshot.NAT.StaticMappings, snapshot.NAT.PortMappings, err = selectNAT44(natState, request)

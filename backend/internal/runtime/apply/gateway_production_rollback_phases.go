@@ -3,6 +3,7 @@ package apply
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"ly-route/backend/internal/runtime/vpp"
 )
@@ -39,6 +40,11 @@ func (adapter *productionGatewayAdapter) RollbackRestore(ctx context.Context, pl
 	_, prior, found := adapter.reconciler.state(plan.Request.TransactionID)
 	if !found {
 		return fmt.Errorf("%s rollback restore: prior snapshot is unavailable", adapter.name)
+	}
+	if adapter.name == "interfaces" {
+		if err := adapter.restoreNativeAttachments(ctx, plan); err != nil {
+			return err
+		}
 	}
 	supplementalChanged, err := adapter.supplementalChanged(plan)
 	if err != nil {
@@ -77,6 +83,10 @@ func (adapter *productionGatewayAdapter) cleanupOperations(diff vpp.GatewayDiff)
 		return vpp.BuildInterfaceBondOperations(vpp.InterfaceBondPlan{TransactionID: diff.Bonds.TransactionID, ManagementInterface: diff.Bonds.ManagementInterface, DeleteBonds: bondStateNames(diff.Bonds.Bonds)})
 	case "wan-groups":
 		return vpp.BuildRouteWANGroupOperations(vpp.RouteWANGroupPlan{TransactionID: diff.WANGroups.TransactionID, DeleteWANGroups: wanGroupNames(diff.WANGroups.WANGroups), DeleteWANState: diff.WANGroups.WANGroups})
+	case "service-networks":
+		// Service handoffs are supplemental-only; cleanup is provided by
+		// SupplementalCleanupOperations for the same owner.
+		return nil, nil
 	case "routes":
 		// Route cleanup must use the same resolved LAN ingress as the apply
 		// plan.  Delete operations still need to detach the ABF policy from
@@ -100,6 +110,45 @@ func (adapter *productionGatewayAdapter) cleanupOperations(diff vpp.GatewayDiff)
 	default:
 		return nil, fmt.Errorf("unsupported production gateway resource %q", adapter.name)
 	}
+}
+
+// restoreNativeAttachments recreates the native AF_PACKET/AF_XDP/TAP underlay
+// that cleanup removed, before interface state is replayed onto it. The prior
+// plan's capability proof is intentionally allowed to be stale here: this is a
+// declarative restore, never a new apply.
+func (adapter *productionGatewayAdapter) restoreNativeAttachments(ctx context.Context, plan Plan) error {
+	if plan.Previous.GatewayPlan == nil {
+		return nil
+	}
+	prior := *plan.Previous.GatewayPlan
+	prior.AllowUnprovenOperations = true
+	prior.DataplanePrepared = true
+	// Persisted plans strip the verified proof but keep the observed candidate.
+	// Reuse it so a declarative restore recreates the same AF_PACKET/AF_XDP
+	// attachment instead of defaulting to an unsupported hook.
+	for index := range prior.NativePath.Assignments {
+		assignment := &prior.NativePath.Assignments[index]
+		if strings.TrimSpace(string(assignment.Proof.Hook)) == "" && len(assignment.Candidates) > 0 {
+			assignment.Proof = assignment.Candidates[0]
+		}
+	}
+	operations, err := vpp.BuildOperations(prior)
+	if err != nil {
+		return fmt.Errorf("rebuild prior native attachments: %w", err)
+	}
+	attach := make([]vpp.Operation, 0)
+	for _, operation := range operations {
+		if operation.Name == "vpp.dataplane.attach" {
+			attach = append(attach, operation)
+		}
+	}
+	if len(attach) == 0 {
+		return nil
+	}
+	if err := adapter.reconciler.adapter.ExecuteOperations(ctx, attach); err != nil {
+		return fmt.Errorf("restore native attachments: %w", err)
+	}
+	return nil
 }
 
 func interfaceStateNames(states []vpp.InterfaceState) []string {

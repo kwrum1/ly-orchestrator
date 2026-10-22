@@ -125,8 +125,8 @@ func verifyDNSServiceNetworkReadback(network DNSServiceNetwork, results []VPPCTL
 	if err := requireSupplementalIdentity(results, "show ip fib table "+strconv.Itoa(network.TableID), strconv.Itoa(network.TableID)); err != nil {
 		return err
 	}
-	natInterfaces, natErr := commandOutput(results, "show nat44 interfaces")
-	natEIInterfaces, natEIErr := commandOutput(results, "show nat44 ei interfaces")
+	natInterfaces, natErr := commandOutputLast(results, "show nat44 interfaces")
+	natEIInterfaces, natEIErr := commandOutputLast(results, "show nat44 ei interfaces")
 	if natErr != nil && natEIErr != nil {
 		return natErr
 	}

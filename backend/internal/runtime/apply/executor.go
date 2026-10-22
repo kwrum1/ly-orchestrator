@@ -36,7 +36,7 @@ type StepFunc func(context.Context, Plan) error
 type Clock func() time.Time
 
 type Executor struct {
-	Store              *persistence.Store
+	Store *persistence.Store
 	// BeforeGateway runs the small set of host-side handoff artifacts that
 	// must exist before VPP validates service-chain next hops.  The gateway
 	// graph itself is still committed atomically immediately afterwards.
@@ -63,6 +63,7 @@ type Request struct {
 	PreviousSnapshotID string
 	RollbackID         string
 	GatewayPlan        vpp.Plan
+	Hooks              *ApplyHooks
 }
 
 type Plan struct {
@@ -72,6 +73,9 @@ type Plan struct {
 	SnapshotHash  string
 	Previous      PreviousState
 	GatewayPlan   vpp.Plan
+	// Hooks carry per-transaction service steps into the gateway dependency
+	// graph. They are not persisted.
+	Hooks *ApplyHooks
 }
 
 type PreviousState struct {
@@ -152,7 +156,7 @@ func (e Executor) Run(ctx context.Context, request Request) (Result, error) {
 		events.add(PhaseSnapshot, StatusFailure, snapshotHash, snapshotHash, err)
 		return e.persistAuditFailure(ctx, events.events, err)
 	}
-	plan := Plan{Request: request, CompiledProxy: compiledProxy, CompiledFlow: compiledFlow, SnapshotHash: snapshotHash, Previous: previous, GatewayPlan: request.GatewayPlan}
+	plan := Plan{Request: request, CompiledProxy: compiledProxy, CompiledFlow: compiledFlow, SnapshotHash: snapshotHash, Previous: previous, GatewayPlan: request.GatewayPlan, Hooks: request.Hooks}
 	if e.BeforeGateway != nil {
 		if err := e.BeforeGateway(ctx, plan); err != nil {
 			return e.fail(ctx, plan, events, snapshotHash, PhaseApply, err)

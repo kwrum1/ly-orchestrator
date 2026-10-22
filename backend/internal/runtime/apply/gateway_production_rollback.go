@@ -50,6 +50,9 @@ func (adapter *productionGatewayAdapter) rollback(ctx context.Context, input pro
 func (adapter *productionGatewayAdapter) runPrior(ctx context.Context, input productionPriorApply) (vpp.Snapshot, error) {
 	transactionID, gateway, prior, attempted := input.transactionID, input.gateway, input.prior, input.attempted
 	switch adapter.name {
+	case "service-networks":
+		// Supplemental-only owner; restore is handled by applySupplemental.
+		return prior, nil
 	case "interfaces":
 		result, err := adapter.reconciler.adapter.ApplyInterfaceBond(ctx, vpp.InterfaceBondPlan{TransactionID: transactionID, ManagementInterface: gateway.NativePath.ManagementInterface, Interfaces: gateway.Interfaces}, prior, attempted.Interfaces)
 		return result.Readback, err

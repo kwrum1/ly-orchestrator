@@ -42,7 +42,7 @@ func TestGatewayTransactionFailureRunsPhasedCleanupForEveryAppliedResource(t *te
 	want := []string{
 		"interfaces", "bonds", "wan-groups", "routes",
 		"cleanup:routes", "cleanup:wan-groups", "cleanup:bonds", "cleanup:interfaces",
-		"restore:interfaces", "restore:bonds", "restore:wan-groups", "restore:routes", "restore:acls", "restore:qos", "restore:nat44", "restore:port-maps",
+		"restore:interfaces", "restore:bonds", "restore:wan-groups", "restore:routes",
 	}
 	if !reflect.DeepEqual(trace, want) {
 		t.Fatalf("rollback trace = %#v, want %#v", trace, want)

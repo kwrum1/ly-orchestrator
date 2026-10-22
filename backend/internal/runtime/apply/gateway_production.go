@@ -94,6 +94,19 @@ func (adapter *productionGatewayAdapter) Apply(ctx context.Context, plan Plan) (
 	if !found {
 		return GatewayResourceResult{}, fmt.Errorf("%s apply: reconciliation is unavailable", adapter.name)
 	}
+	if adapter.name == "service-networks" && plan.Previous.GatewayPlan != nil {
+		owner := adapter.supplementalOwner()
+		equal, equalErr := vpp.SupplementalOperationsEqual(plan.GatewayPlan, *plan.Previous.GatewayPlan, owner)
+		if equalErr == nil && equal {
+			if readback, readErr := adapter.reconciler.adapter.ReadbackSupplemental(ctx, plan.GatewayPlan, owner); readErr == nil {
+				result := adapter.result(plan.Request.TransactionID, false, prior, prior)
+				result.SupplementalReadback = readback
+				return result, nil
+			}
+			// A failed readback means the live handoff drifted (for example a
+			// missing NAT44 role); fall through to the idempotent apply/repair.
+		}
+	}
 	supplemental, err := adapter.reconcileSupplemental(ctx, plan)
 	if err != nil {
 		return GatewayResourceResult{}, fmt.Errorf("%s supplemental apply: %w", adapter.name, err)
@@ -130,6 +143,8 @@ func (adapter *productionGatewayAdapter) supplementalOwner() vpp.SupplementalOwn
 	switch adapter.name {
 	case "interfaces":
 		return vpp.SupplementalInterfaces
+	case "service-networks":
+		return vpp.SupplementalServiceNetworks
 	case "routes":
 		return vpp.SupplementalRoutes
 	case "acls":

@@ -13,8 +13,6 @@ import (
 
 var ErrGatewayTransactionFailed = errors.New("gateway multi-resource transaction failed")
 
-var gatewayResourceOrder = []string{"interfaces", "bonds", "wan-groups", "routes", "acls", "qos", "nat44", "port-maps"}
-
 type GatewayResourceAdapter interface {
 	Name() string
 	Apply(context.Context, Plan) (GatewayResourceResult, error)
@@ -58,12 +56,19 @@ type GatewayMultiResourceTransaction struct {
 	Now      Clock
 	Prepare  func(context.Context, Plan) error
 	mu       sync.Mutex
-	active   map[string][]GatewayResourceAdapter
+	active   map[string]*gatewayGraphExecution
 }
 
 type GatewayTransactionRunner interface {
 	Run(context.Context, Plan) (GatewayTransactionResult, error)
 	Rollback(context.Context, Plan) error
+}
+
+// ApplyGraphProvider marks a runner that executes Plan.Hooks through the
+// dependency graph. Legacy/test doubles do not implement it and are driven by
+// the compatibility before/apply callbacks.
+type ApplyGraphProvider interface {
+	ApplyGraphSupported() bool
 }
 
 func (transaction *GatewayMultiResourceTransaction) Run(ctx context.Context, plan Plan) (GatewayTransactionResult, error) {
@@ -76,10 +81,11 @@ func (transaction *GatewayMultiResourceTransaction) Run(ctx context.Context, pla
 	if err != nil {
 		return GatewayTransactionResult{}, err
 	}
-	now := transaction.now
+	now := transaction.now()
+	execution := newGatewayGraphExecution(transaction, plan, adapters, now)
 	result := GatewayTransactionResult{Deletions: map[string]bool{}}
-	completed := make([]GatewayResourceAdapter, 0, len(adapters))
-	applied := make([]GatewayResourceAdapter, 0, len(adapters))
+	// Stale resources are removed in reverse dependency order before the graph
+	// applies the desired generation.
 	for index := len(adapters) - 1; index >= 0; index-- {
 		adapter := adapters[index]
 		deleter, ok := adapter.(GatewayResourceDeleter)
@@ -91,50 +97,39 @@ func (transaction *GatewayMultiResourceTransaction) Run(ctx context.Context, pla
 		deleted, deleteErr := deleter.Delete(ctx, resourcePlan)
 		if deleteErr != nil {
 			result.FailedName = adapter.Name()
-			return transaction.fail(ctx, plan, result, completed, []GatewayResourceAdapter{adapter}, adapters, deleteErr, now())
+			execution.restore[adapter.Name()] = true
+			return transaction.fail(ctx, plan, result, execution, deleteErr, now)
 		}
 		if deleted {
-			completed = append(completed, adapter)
+			execution.restore[adapter.Name()] = true
 			result.Deletions[adapter.Name()] = true
 		}
 	}
-	for _, adapter := range adapters {
-		resourcePlan := plan
-		resourcePlan.Request.Resource = adapter.Name()
-		resource, applyErr := adapter.Apply(ctx, resourcePlan)
-		if applyErr != nil {
-			result.FailedName = adapter.Name()
-			return transaction.fail(ctx, plan, result, completed, append(applied, adapter), adapters, applyErr, now())
-		}
-		applied = append(applied, adapter)
-		if err := resource.Receipt.validate(resourcePlan.Request, now()); err != nil {
-			result.FailedName = adapter.Name()
-			return transaction.fail(ctx, plan, result, completed, applied, adapters, err, now())
-		}
-		if err := resource.Readback.validate(resourcePlan.Request, now()); err != nil {
-			result.FailedName = adapter.Name()
-			return transaction.fail(ctx, plan, result, completed, applied, adapters, err, now())
-		}
-		if !containsGatewayAdapter(completed, adapter) {
-			completed = append(completed, adapter)
-		}
-		result.Order = append(result.Order, adapter.Name())
-		result.Receipts = append(result.Receipts, resource.Receipt)
-		result.Readbacks = append(result.Readbacks, resource.Readback)
-		result.Deletions[adapter.Name()] = resource.Deleted
-		evidence, evidenceErr := gatewayEvidence(resource, adapter.Name(), plan.Request.TransactionID, now())
-		if evidenceErr != nil {
-			result.FailedName = adapter.Name()
-			return transaction.fail(ctx, plan, result, completed, applied, adapters, evidenceErr, now())
-		}
-		result.Evidence = append(result.Evidence, evidence)
+	graph, err := execution.buildGraph()
+	if err != nil {
+		return GatewayTransactionResult{}, fmt.Errorf("build gateway dependency graph: %w", err)
 	}
-	result.Rollback = RollbackReceipt{TransactionID: plan.Request.TransactionID, Capability: plan.Request.Resource, Status: ReceiptApplied, Cause: "multi-resource transaction committed", Timestamp: now()}
+	graphResult, runErr := graph.Run(ctx)
+	execution.executed = append(execution.executed, graphResult.Executed...)
+	for _, name := range execution.executed {
+		if _, ok := execution.adapter(name); ok {
+			execution.restore[name] = true
+		}
+	}
+	if runErr != nil {
+		var graphErr *GraphError
+		if errors.As(runErr, &graphErr) && graphErr.Node != "" {
+			result.FailedName = graphErr.Node
+		}
+		return transaction.fail(ctx, plan, result, execution, runErr, now)
+	}
+	result = execution.applyResult()
+	result.Rollback = RollbackReceipt{TransactionID: plan.Request.TransactionID, Capability: plan.Request.Resource, Status: ReceiptApplied, Cause: "multi-resource transaction committed", Timestamp: now}
 	transaction.mu.Lock()
 	if transaction.active == nil {
-		transaction.active = map[string][]GatewayResourceAdapter{}
+		transaction.active = map[string]*gatewayGraphExecution{}
 	}
-	transaction.active[plan.Request.TransactionID] = adapters
+	transaction.active[plan.Request.TransactionID] = execution
 	transaction.mu.Unlock()
 	return result, nil
 }
@@ -148,42 +143,19 @@ func containsGatewayAdapter(adapters []GatewayResourceAdapter, wanted GatewayRes
 	return false
 }
 
-func (transaction *GatewayMultiResourceTransaction) fail(ctx context.Context, plan Plan, result GatewayTransactionResult, completed, applied, ordered []GatewayResourceAdapter, cause error, now time.Time) (GatewayTransactionResult, error) {
+func (transaction *GatewayMultiResourceTransaction) fail(ctx context.Context, plan Plan, result GatewayTransactionResult, execution *gatewayGraphExecution, cause error, now time.Time) (GatewayTransactionResult, error) {
 	rollback := RollbackReceipt{TransactionID: plan.Request.TransactionID, Capability: plan.Request.Resource, Status: ReceiptRolledBack, Cause: cause.Error(), Timestamp: now}
-	rollbackErrors := make([]error, 0)
-	phased := true
-	for _, adapter := range ordered {
-		if _, ok := adapter.(GatewayResourceRollbackPhases); !ok {
-			phased = false
-			break
-		}
+	var rollbackErr error
+	if execution != nil {
+		rollbackErr = execution.rollback(ctx)
 	}
-	if phased {
-		for index := len(applied) - 1; index >= 0; index-- {
-			adapter := applied[index]
-			if err := adapter.(GatewayResourceRollbackPhases).RollbackCleanup(ctx, plan); err != nil {
-				rollbackErrors = append(rollbackErrors, fmt.Errorf("rollback cleanup %s: %w", adapter.Name(), err))
-			}
-		}
-		for _, adapter := range ordered {
-			if err := adapter.(GatewayResourceRollbackPhases).RollbackRestore(ctx, plan); err != nil {
-				rollbackErrors = append(rollbackErrors, fmt.Errorf("rollback restore %s: %w", adapter.Name(), err))
-			}
-		}
-	} else {
-		for index := len(completed) - 1; index >= 0; index-- {
-			if err := completed[index].Rollback(ctx, plan); err != nil {
-				rollbackErrors = append(rollbackErrors, fmt.Errorf("rollback %s: %w", completed[index].Name(), err))
-			}
-		}
-	}
-	if len(rollbackErrors) > 0 {
+	if rollbackErr != nil {
 		rollback.Status = ReceiptFailed
-		rollback.RollbackError = errors.Join(rollbackErrors...).Error()
+		rollback.RollbackError = rollbackErr.Error()
 	}
 	result.Rollback = rollback
 	result.Evidence = nil
-	return result, &GatewayTransactionError{Resource: result.FailedName, Cause: cause, Rollback: rollback, RollbackErr: errors.Join(rollbackErrors...)}
+	return result, &GatewayTransactionError{Resource: result.FailedName, Cause: cause, Rollback: rollback, RollbackErr: rollbackErr}
 }
 
 type GatewayTransactionError struct {
@@ -210,37 +182,13 @@ func (err *GatewayTransactionError) Is(target error) bool {
 
 func (transaction *GatewayMultiResourceTransaction) Rollback(ctx context.Context, plan Plan) error {
 	transaction.mu.Lock()
-	completed := transaction.active[plan.Request.TransactionID]
+	execution := transaction.active[plan.Request.TransactionID]
 	delete(transaction.active, plan.Request.TransactionID)
 	transaction.mu.Unlock()
-	rollbackErrors := make([]error, 0)
-	phased := true
-	for _, adapter := range completed {
-		if _, ok := adapter.(GatewayResourceRollbackPhases); !ok {
-			phased = false
-			break
-		}
+	if execution == nil {
+		return nil
 	}
-	if phased {
-		for index := len(completed) - 1; index >= 0; index-- {
-			adapter := completed[index]
-			if err := adapter.(GatewayResourceRollbackPhases).RollbackCleanup(ctx, plan); err != nil {
-				rollbackErrors = append(rollbackErrors, fmt.Errorf("rollback cleanup %s: %w", adapter.Name(), err))
-			}
-		}
-		for _, adapter := range completed {
-			if err := adapter.(GatewayResourceRollbackPhases).RollbackRestore(ctx, plan); err != nil {
-				rollbackErrors = append(rollbackErrors, fmt.Errorf("rollback restore %s: %w", adapter.Name(), err))
-			}
-		}
-	} else {
-		for index := len(completed) - 1; index >= 0; index-- {
-			if err := completed[index].Rollback(ctx, plan); err != nil {
-				rollbackErrors = append(rollbackErrors, fmt.Errorf("rollback %s: %w", completed[index].Name(), err))
-			}
-		}
-	}
-	return errors.Join(rollbackErrors...)
+	return execution.rollback(ctx)
 }
 
 func (transaction *GatewayMultiResourceTransaction) orderedAdapters(plan Plan) ([]GatewayResourceAdapter, error) {
@@ -277,3 +225,5 @@ func (transaction *GatewayMultiResourceTransaction) now() time.Time {
 	}
 	return transaction.Now().UTC()
 }
+
+func (*GatewayMultiResourceTransaction) ApplyGraphSupported() bool { return true }

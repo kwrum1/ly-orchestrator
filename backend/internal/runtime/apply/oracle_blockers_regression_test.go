@@ -46,10 +46,10 @@ func TestGatewayMixedDeleteApplyFailureCleansReverseThenRestoresForward(t *testi
 		t.Fatalf("error = %v, want failed mixed transaction", err)
 	}
 	want := []string{
-		"delete:port-maps", "delete:nat44", "delete:qos", "delete:acls", "delete:routes", "delete:wan-groups", "delete:bonds", "delete:interfaces",
-		"apply:interfaces", "apply:bonds", "apply:wan-groups", "apply:routes", "apply:acls", "apply:qos",
-		"rollback-cleanup:qos", "rollback-cleanup:acls", "rollback-cleanup:routes", "rollback-cleanup:wan-groups", "rollback-cleanup:bonds", "rollback-cleanup:interfaces",
-		"rollback-restore:interfaces", "rollback-restore:bonds", "rollback-restore:wan-groups", "rollback-restore:routes", "rollback-restore:acls", "rollback-restore:qos", "rollback-restore:nat44", "rollback-restore:port-maps",
+		"delete:port-maps", "delete:nat44", "delete:qos", "delete:acls", "delete:routes", "delete:service-networks", "delete:wan-groups", "delete:bonds", "delete:interfaces",
+		"apply:interfaces", "apply:bonds", "apply:wan-groups", "apply:service-networks", "apply:routes", "apply:acls", "apply:qos",
+		"rollback-cleanup:qos", "rollback-cleanup:acls", "rollback-cleanup:routes", "rollback-cleanup:service-networks", "rollback-cleanup:wan-groups", "rollback-cleanup:bonds", "rollback-cleanup:interfaces",
+		"rollback-restore:interfaces", "rollback-restore:bonds", "rollback-restore:wan-groups", "rollback-restore:service-networks", "rollback-restore:routes", "rollback-restore:acls", "rollback-restore:qos", "rollback-restore:nat44", "rollback-restore:port-maps",
 	}
 	if !reflect.DeepEqual(trace, want) {
 		t.Fatalf("mixed rollback trace = %#v, want %#v", trace, want)
@@ -79,8 +79,8 @@ func TestGatewayCommittedTransactionLaterRollbackCleansReverseThenRestoresForwar
 		t.Fatal(err)
 	}
 	want := []string{
-		"rollback-cleanup:port-maps", "rollback-cleanup:nat44", "rollback-cleanup:qos", "rollback-cleanup:acls", "rollback-cleanup:routes", "rollback-cleanup:wan-groups", "rollback-cleanup:bonds", "rollback-cleanup:interfaces",
-		"rollback-restore:interfaces", "rollback-restore:bonds", "rollback-restore:wan-groups", "rollback-restore:routes", "rollback-restore:acls", "rollback-restore:qos", "rollback-restore:nat44", "rollback-restore:port-maps",
+		"rollback-cleanup:port-maps", "rollback-cleanup:nat44", "rollback-cleanup:qos", "rollback-cleanup:acls", "rollback-cleanup:routes", "rollback-cleanup:service-networks", "rollback-cleanup:wan-groups", "rollback-cleanup:bonds", "rollback-cleanup:interfaces",
+		"rollback-restore:interfaces", "rollback-restore:bonds", "rollback-restore:wan-groups", "rollback-restore:service-networks", "rollback-restore:routes", "rollback-restore:acls", "rollback-restore:qos", "rollback-restore:nat44", "rollback-restore:port-maps",
 	}
 	if !reflect.DeepEqual(trace, want) {
 		t.Fatalf("later rollback trace = %#v, want %#v", trace, want)

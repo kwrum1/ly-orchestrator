@@ -94,10 +94,12 @@ func proveDesiredGatewayResource(evidence apply.GatewayResourceEvidence, desired
 		// VPP lists static mappings in its own order. Port-map identity is its
 		// fields, not database insertion order, so a reorder is not degradation.
 		matched = equalGatewaySliceUnordered(evidence.After.NAT.PortMappings, desired.NAT.PortMappings)
+	case "service-networks":
+		matched = len(desired.DNSServiceNetworks) > 0 || len(desired.Proxy.VPPSteering) > 0
 	}
 	if matched {
 		owner := vpp.SupplementalOwner(evidence.Resource)
-		if owner == vpp.SupplementalInterfaces || owner == vpp.SupplementalRoutes || owner == vpp.SupplementalQoS {
+		if owner == vpp.SupplementalInterfaces || owner == vpp.SupplementalRoutes || owner == vpp.SupplementalQoS || owner == vpp.SupplementalServiceNetworks {
 			evidencePlan := desired
 			// A committed gateway transaction has already completed the privileged
 			// DPDK bind/restart/readback phase. Reconstruct supplemental operations
@@ -227,6 +229,9 @@ func gatewayPlanResources(plan vpp.Plan) map[string]struct{} {
 	}
 	if len(plan.NAT.PortMappings) > 0 {
 		resources["port-maps"] = struct{}{}
+	}
+	if len(plan.DNSServiceNetworks) > 0 || len(plan.Proxy.VPPSteering) > 0 || hasSupplemental(vpp.SupplementalServiceNetworks) {
+		resources["service-networks"] = struct{}{}
 	}
 	return resources
 }

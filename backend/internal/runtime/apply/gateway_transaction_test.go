@@ -50,7 +50,7 @@ func TestGatewayMultiResourceTransaction_rollsBackEarlierResourcesWhenMiddleAppl
 	if err == nil || !errors.Is(err, ErrGatewayTransactionFailed) {
 		t.Fatalf("error = %v, want gateway transaction failure", err)
 	}
-	wantTrace := []string{"interfaces", "bonds", "wan-groups", "routes", "rollback:wan-groups", "rollback:bonds", "rollback:interfaces"}
+	wantTrace := []string{"interfaces", "bonds", "wan-groups", "routes", "rollback:routes", "rollback:wan-groups", "rollback:bonds", "rollback:interfaces"}
 	if !reflect.DeepEqual(trace, wantTrace) {
 		t.Fatalf("trace = %#v, want %#v", trace, wantTrace)
 	}
@@ -168,7 +168,7 @@ func TestGatewayMultiResourceTransaction_preservesPriorGenerationBytesAfterReadb
 			if err == nil {
 				t.Fatal("transaction succeeded after simulated failure")
 			}
-			wantTrace := []string{"interfaces", "bonds", "wan-groups", "routes", "acls", "qos", "rollback:acls", "rollback:routes", "rollback:wan-groups", "rollback:bonds", "rollback:interfaces"}
+			wantTrace := []string{"interfaces", "bonds", "wan-groups", "routes", "acls", "qos", "rollback:qos", "rollback:acls", "rollback:routes", "rollback:wan-groups", "rollback:bonds", "rollback:interfaces"}
 			if !reflect.DeepEqual(trace, wantTrace) {
 				t.Fatalf("trace = %#v, want exact readback rollback %v", trace, wantTrace)
 			}

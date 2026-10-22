@@ -190,9 +190,9 @@ func TestRuntimeApply_failed_PPPoE_preserves_unrelated_service_receipt(t *testin
 	}
 	// PPPoE must establish the selected WAN before dependent DNS source routes
 	// are applied; an authentication failure does not discard SmartDNS evidence.
-	// The first PPPoE attempt is the pre-gateway status bootstrap, the second is
-	// the authoritative post-gateway evidence pass.
-	if got, want := strings.Join(controller.applied, ","), "pppoe,pppoe,smartdns"; got != want {
+	// The PPPoE helper is one graph/bootstrap node; it is not re-applied in the
+	// independent service node.
+	if got, want := strings.Join(controller.applied, ","), "pppoe,smartdns"; got != want {
 		t.Fatalf("attempted services = %s, want %s", got, want)
 	}
 	if len(controller.receiptArtifacts) != 2 || controller.receiptArtifacts[0].Service != serviceRuntime.SmartDNS || controller.receiptArtifacts[1].Service != serviceRuntime.SmartDNS || controller.receiptArtifacts[1].Path != "/etc/ly-route/dns-source-routes.conf" {

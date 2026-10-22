@@ -14,9 +14,14 @@ type SupplementalOwner string
 
 const (
 	SupplementalInterfaces SupplementalOwner = "interfaces"
-	SupplementalRoutes     SupplementalOwner = "routes"
-	SupplementalSecurity   SupplementalOwner = "security"
-	SupplementalQoS        SupplementalOwner = "qos"
+	// SupplementalServiceNetworks owns DNS/proxy service handoffs. They depend
+	// on the native underlay, LCP and PPPoE helper, but are independent of the
+	// user route/ABF graph; keeping them separate lets the apply graph order
+	// and heal their NAT44 role explicitly.
+	SupplementalServiceNetworks SupplementalOwner = "service-networks"
+	SupplementalRoutes          SupplementalOwner = "routes"
+	SupplementalSecurity        SupplementalOwner = "security"
+	SupplementalQoS             SupplementalOwner = "qos"
 )
 
 type SupplementalOperationReadback struct {
@@ -105,6 +110,26 @@ func (a Adapter) ApplySupplemental(ctx context.Context, plan Plan, owner Supplem
 		if len(readback.Shows) == 0 {
 			return nil, fmt.Errorf("%w: supplemental operation %q has no typed show readback", ErrSnapshotIncomplete, operation.Name)
 		}
+		if network, ok := operation.Payload.(DNSServiceNetwork); ok {
+			if err := ensureDNSServiceNetworkNAT(ctx, channel, network, plan.NAT.Behavior); err != nil {
+				return nil, err
+			}
+			// The role may have been repaired after the operation's first show;
+			// append a fresh observation so evidence reflects the committed state.
+			show := dnsNATShowCommand(plan.NAT.Behavior)
+			verifyReply, verifyErr := doOperation(ctx, channel, Operation{Name: "vpp.dns-service.network.nat44-readback", RequestID: operation.RequestID, VPPCtlCommands: []string{show}})
+			if verifyErr != nil {
+				return nil, verifyErr
+			}
+			if verifyEnvelope, ok := verifyReply.Payload.(VPPCTLReplyPayload); ok {
+				envelope.CommandResults = append(envelope.CommandResults, verifyEnvelope.CommandResults...)
+				for _, result := range verifyEnvelope.CommandResults {
+					if strings.HasPrefix(result.Command, "show ") {
+						readback.Shows = append(readback.Shows, result)
+					}
+				}
+			}
+		}
 		if err := verifySupplementalOperation(operation, envelope.CommandResults); err != nil {
 			return nil, err
 		}
@@ -113,6 +138,53 @@ func (a Adapter) ApplySupplemental(ctx context.Context, plan Plan, owner Supplem
 			return nil, err
 		}
 		readbacks = append(readbacks, readback)
+	}
+	return readbacks, nil
+}
+
+// ReadbackSupplemental proves an unchanged supplemental owner from live show
+// commands only. Repeat applies use it to avoid re-creating TAPs/NAT roles.
+func (a Adapter) ReadbackSupplemental(ctx context.Context, plan Plan, owner SupplementalOwner) ([]SupplementalOperationReadback, error) {
+	operations, err := supplementalOperations(plan, owner)
+	if err != nil || len(operations) == 0 {
+		return nil, err
+	}
+	if a.Client == nil {
+		return nil, fmt.Errorf("%w: vpp client is not configured", ErrVPPUnavailable)
+	}
+	channel, err := a.Client.OpenChannel(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: open supplemental readback channel: %v", ErrVPPUnavailable, err)
+	}
+	defer channel.Close()
+	readbacks := make([]SupplementalOperationReadback, 0, len(operations))
+	for _, operation := range operations {
+		shows := make([]string, 0, len(operation.VPPCtlCommands))
+		for _, command := range operation.VPPCtlCommands {
+			command = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(command), "?"))
+			if strings.HasPrefix(command, "show ") {
+				shows = append(shows, command)
+			}
+		}
+		if len(shows) == 0 {
+			return nil, fmt.Errorf("%w: supplemental operation %q has no show commands", ErrSnapshotIncomplete, operation.Name)
+		}
+		reply, err := doOperation(ctx, channel, Operation{Name: operation.Name + ".readback", RequestID: operation.RequestID, Resource: operation.Resource, VPPCtlCommands: shows})
+		if err != nil {
+			return nil, err
+		}
+		envelope, ok := reply.Payload.(VPPCTLReplyPayload)
+		if !ok {
+			return nil, fmt.Errorf("%w: supplemental readback %q returned untyped payload", ErrSnapshotIncomplete, operation.Name)
+		}
+		if err := verifySupplementalOperation(operation, envelope.CommandResults); err != nil {
+			return nil, err
+		}
+		hash, err := supplementalOperationHash(operation)
+		if err != nil {
+			return nil, err
+		}
+		readbacks = append(readbacks, SupplementalOperationReadback{Name: operation.Name, Resource: operation.Resource, PayloadHash: hash, Shows: envelope.CommandResults})
 	}
 	return readbacks, nil
 }
@@ -204,7 +276,9 @@ func supplementalOperationOwner(operation Operation) SupplementalOwner {
 	switch operation.Name {
 	case "vpp.dataplane.attach", "vpp.lan-control-lcp", "vpp.management-lcp":
 		return SupplementalInterfaces
-	case "vpp.abf.policy", "vpp.pbr.policy", "vpp.service-chain.egress-binding", "vpp.proxy-service.network", "vpp.dns-service.network", "vpp.dns-transparent-interception":
+	case "vpp.proxy-service.network", "vpp.dns-service.network":
+		return SupplementalServiceNetworks
+	case "vpp.abf.policy", "vpp.pbr.policy", "vpp.service-chain.egress-binding", "vpp.dns-transparent-interception":
 		return SupplementalRoutes
 	case "vpp.smart-qos":
 		return SupplementalQoS
@@ -306,7 +380,7 @@ func SupplementalReconciliationCleanupOperations(prior, desired Plan, owner Supp
 }
 
 func supplementalServiceNetworkOperations(plan Plan, owner SupplementalOwner) ([]Operation, error) {
-	if owner != SupplementalRoutes {
+	if owner != SupplementalServiceNetworks {
 		return nil, nil
 	}
 	operations := make([]Operation, 0, len(plan.DNSServiceNetworks)+len(plan.Proxy.VPPSteering))

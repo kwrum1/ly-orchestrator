@@ -78,7 +78,7 @@ func TestSupplementalReconciliationCleanupDeletesRemovedDNSServiceNetwork(t *tes
 	desired.RequestID = "txn-supplemental-cleanup"
 	desired.DNSServiceNetworks = nil
 
-	cleanup, err := SupplementalReconciliationCleanupOperations(prior, desired, SupplementalRoutes)
+	cleanup, err := SupplementalReconciliationCleanupOperations(prior, desired, SupplementalServiceNetworks)
 	if err != nil {
 		t.Fatal(err)
 	}
