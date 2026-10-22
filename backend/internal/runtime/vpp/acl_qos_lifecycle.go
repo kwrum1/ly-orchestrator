@@ -11,15 +11,25 @@ import (
 	"ly-route/backend/internal/runtime/trafficpolicy"
 )
 
+func nonEmptyQoSGroups(groups []flow.VPPObjectGroup) []flow.VPPObjectGroup {
+	nonEmpty := make([]flow.VPPObjectGroup, 0, len(groups))
+	for _, group := range groups {
+		if len(group.Objects) > 0 {
+			nonEmpty = append(nonEmpty, group)
+		}
+	}
+	return nonEmpty
+}
+
 type ACLQoSPlan struct {
-	TransactionID          string
-	IngressVPPInterface    string
-	ACLs                   []trafficpolicy.SecurityACL
-	QoS                    []flow.VPPObjectGroup
-	DeleteACLs             []string
-	DeleteQoS              []string
-	DeleteACLState         []trafficpolicy.SecurityACL
-	DeleteQoSState         []flow.VPPObjectGroup
+	TransactionID       string
+	IngressVPPInterface string
+	ACLs                []trafficpolicy.SecurityACL
+	QoS                 []flow.VPPObjectGroup
+	DeleteACLs          []string
+	DeleteQoS           []string
+	DeleteACLState      []trafficpolicy.SecurityACL
+	DeleteQoSState      []flow.VPPObjectGroup
 }
 
 type ACLQoSLifecycleError struct {
@@ -116,6 +126,10 @@ func BuildACLQoSOperations(plan ACLQoSPlan) ([]Operation, error) {
 		operations = append(operations, Operation{Name: "vpp.security-acl", RequestID: transactionID, Resource: acl.ID, Payload: acl, VPPCtlCommands: securityACLCommands(acl)})
 	}
 	for _, group := range plan.QoS {
+		// Keep the operation identity for empty groups so rollback and evidence
+		// ordering remain stable, but do not emit an invalid CLI command. The
+		// snapshot request filters these groups out instead of treating them as
+		// incomplete live objects.
 		operations = append(operations, Operation{Name: "vpp.qos", RequestID: transactionID, Resource: group.Kind, Payload: group, VPPCtlCommands: flowGroupCommands(group)})
 	}
 	return operations, nil
@@ -179,9 +193,12 @@ func aclQoSSnapshotRequest(transactionID string, snapshot Snapshot) SnapshotRequ
 	}
 	request.Candidates.ACLs = append(request.Candidates.ACLs, snapshot.ACLs...)
 	for _, group := range snapshot.QoS {
+		if len(group.Objects) == 0 {
+			continue
+		}
 		request.QoS = append(request.QoS, group.Kind)
+		request.Candidates.QoS = append(request.Candidates.QoS, group)
 	}
-	request.Candidates.QoS = append(request.Candidates.QoS, snapshot.QoS...)
 	return request
 }
 
@@ -194,11 +211,18 @@ func aclQoSSnapshotRequestForPlan(plan ACLQoSPlan) SnapshotRequest {
 	request.AbsentACLs = append([]string(nil), plan.DeleteACLs...)
 	request.Candidates.ACLs = appendACLsByID(request.Candidates.ACLs, plan.DeleteACLs, plan.DeleteACLState)
 	for _, group := range plan.QoS {
+		if len(group.Objects) == 0 {
+			continue
+		}
 		request.QoS = append(request.QoS, group.Kind)
+		request.Candidates.QoS = append(request.Candidates.QoS, group)
 	}
-	request.Candidates.QoS = append(request.Candidates.QoS, plan.QoS...)
-	request.AbsentQoS = append([]string(nil), plan.DeleteQoS...)
 	request.Candidates.QoS = appendQoSByID(request.Candidates.QoS, plan.DeleteQoS, plan.DeleteQoSState)
+	for _, id := range plan.DeleteQoS {
+		if group, found := qosGroupByKind(request.Candidates.QoS, id); found && len(group.Objects) > 0 {
+			request.AbsentQoS = append(request.AbsentQoS, id)
+		}
+	}
 	return request
 }
 
@@ -231,7 +255,20 @@ func deleteACLCommands(acl trafficpolicy.SecurityACL) []string {
 }
 
 func deleteQoSCommands(id string) []string {
-	return []string{fmt.Sprintf("?qos delete %s", id), fmt.Sprintf("show qos %s", id)}
+	// VPP has no generic `qos delete <group-kind>` command. Known groups must
+	// use the same feature-specific disable/delete sequence as a normal object
+	// group. An unknown legacy ID has no live object to remove; keep a
+	// best-effort ignored command so the transaction still records a delete
+	// operation without sending a valid-looking destructive command for a real
+	// group kind.
+	switch id {
+	case "vpp.qos.classify", "vpp.qos.record", "vpp.qos.store",
+		"vpp.qos.egress-map", "vpp.qos.mark", "vpp.policer",
+		"vpp.acl.drop", "vpp.behavior.rate":
+		return flowTargetDeleteCommands(flow.Target{Kind: id, RuleID: id})
+	default:
+		return []string{fmt.Sprintf("?qos delete %s", id), fmt.Sprintf("?show qos %s", id)}
+	}
 }
 
 func aclByID(acls []trafficpolicy.SecurityACL, id string) (trafficpolicy.SecurityACL, bool) {

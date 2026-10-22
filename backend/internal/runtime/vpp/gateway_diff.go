@@ -68,6 +68,10 @@ func ReconcileGatewayPlan(input GatewayReconciliationInput) (GatewayDiff, error)
 		// LAN before allowing route deletion to emit an unresolved ABF attach.
 		routeIngressVPPInterface = gatewayLANVPPInterface(prior)
 	}
+	routeIngressLANPrefix := gatewayLANPrefix(desired)
+	if routeIngressLANPrefix == "" {
+		routeIngressLANPrefix = gatewayLANPrefix(prior)
+	}
 	interfaces, err := diffResources(resourceStates[InterfaceState]{prior: prior.Interfaces, desired: desired.Interfaces, live: live.Interfaces}, interfaceContract(), input.RepairVerifiedDrift)
 	if err != nil {
 		return GatewayDiff{}, err
@@ -109,7 +113,12 @@ func ReconcileGatewayPlan(input GatewayReconciliationInput) (GatewayDiff, error)
 	if err != nil {
 		return GatewayDiff{}, err
 	}
-	qos, err := diffResources(resourceStates[flow.VPPObjectGroup]{prior: prior.Flow.VPPGroups, desired: desired.Flow.VPPGroups, live: live.QoS}, qosContract(), input.RepairVerifiedDrift)
+	// Empty QoS groups are desired-state deletion markers, not live objects.
+	// Comparing them with non-empty groups would either create an unusable
+	// operation (no VPP command) or make the strict snapshot decoder report an
+	// incomplete object. Drop them from all three sides; an empty desired group
+	// still removes the corresponding prior non-empty group.
+	qos, err := diffResources(resourceStates[flow.VPPObjectGroup]{prior: nonEmptyQoSGroups(prior.Flow.VPPGroups), desired: nonEmptyQoSGroups(desired.Flow.VPPGroups), live: nonEmptyQoSGroups(live.QoS)}, qosContract(), input.RepairVerifiedDrift)
 	if err != nil {
 		return GatewayDiff{}, err
 	}
@@ -136,8 +145,8 @@ func ReconcileGatewayPlan(input GatewayReconciliationInput) (GatewayDiff, error)
 		},
 		ACLs:     ACLQoSPlan{TransactionID: transactionID, IngressVPPInterface: routeIngressVPPInterface, ACLs: acls.apply, DeleteACLs: acls.delete},
 		QoS:      ACLQoSPlan{TransactionID: transactionID, IngressVPPInterface: routeIngressVPPInterface, QoS: qos.apply, DeleteQoS: qos.delete},
-		NAT44:    NAT44Plan{TransactionID: transactionID, Behavior: desired.NAT.Behavior, IngressVPPInterface: routeIngressVPPInterface, StaticMappings: staticMappings.apply, DeleteStaticMappings: staticMappings.delete},
-		PortMaps: NAT44Plan{TransactionID: transactionID, Behavior: desired.NAT.Behavior, IngressVPPInterface: routeIngressVPPInterface, PortMappings: portMappings.apply, DeletePortMappings: portMappings.delete},
+		NAT44:    NAT44Plan{TransactionID: transactionID, Behavior: desired.NAT.Behavior, IngressVPPInterface: routeIngressVPPInterface, IngressLANPrefix: routeIngressLANPrefix, StaticMappings: staticMappings.apply, DeleteStaticMappings: staticMappings.delete},
+		PortMaps: NAT44Plan{TransactionID: transactionID, Behavior: desired.NAT.Behavior, IngressVPPInterface: routeIngressVPPInterface, IngressLANPrefix: routeIngressLANPrefix, PortMappings: portMappings.apply, DeletePortMappings: portMappings.delete},
 	}, nil
 }
 

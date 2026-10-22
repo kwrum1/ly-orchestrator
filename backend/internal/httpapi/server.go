@@ -5761,13 +5761,35 @@ func (server *Server) buildApplyHooks(
 		RollbackPPPoE: func(ctx context.Context, _ apply.Plan) error {
 			return server.services.Rollback(ctx, pppoeArtifacts)
 		},
-		ApplyServices: func(ctx context.Context, _ apply.Plan) error {
+		ApplyServices: func(ctx context.Context, plan apply.Plan) error {
 			report := server.services.ApplyCapabilitiesForTransaction(ctx, transactionID, otherArtifacts)
 			*appliedArtifacts = append(*appliedArtifacts, report.AppliedArtifacts...)
 			*capabilityFailures = append(*capabilityFailures, serviceFailureEvidence(report.Failures)...)
 			evidenceRequest.Artifacts = *appliedArtifacts
-			// Service capability failures are evidence/degraded state, not a
-			// reason to discard an otherwise committed VPP graph.
+			if len(plan.GatewayPlan.NAT.PortMappings) > 0 {
+				// A port mapping is not committed until the standalone replay
+				// operations have been persisted. Otherwise VPP can contain the
+				// mapping while a reboot has no durable way to recreate it. This
+				// is the one service failure that must fail the transaction and
+				// trigger rollback instead of being reported as degraded.
+				for _, failure := range report.Failures {
+					if failure.Service == serviceRuntime.VPP {
+						return fmt.Errorf("persist VPP replay operations for port mappings: %w", failure)
+					}
+				}
+				persisted := false
+				for _, artifact := range report.AppliedArtifacts {
+					if artifact.Service == serviceRuntime.VPP && artifact.Path == "/var/lib/ly-route/vpp/operations.json" {
+						persisted = true
+						break
+					}
+				}
+				if !persisted {
+					return fmt.Errorf("persist VPP replay operations for port mappings: operations artifact was not applied")
+				}
+			}
+			// Other service capability failures remain evidence/degraded state;
+			// they do not discard an otherwise committed VPP graph.
 			return nil
 		},
 		RollbackServices: func(ctx context.Context, _ apply.Plan) error {

@@ -369,12 +369,22 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 		operations = append(operations, Operation{Name: target.Kind, RequestID: plan.RequestID, Resource: resource, Payload: target, VPPCtlCommands: flowTargetCommands(target)})
 	}
 	if planRequiresNAT(plan) {
+		initializeCommands := natInitializeCommands(plan.NAT.Behavior)
+		// NAT44-ED needs the LAN interface on the inside of the NAT domain.
+		// Without it, return traffic and LAN-to-public-address hairpin traffic
+		// never enter the NAT44 input feature.  The WAN side is configured by
+		// the per-mapping commands below.
+		if plan.NAT.Behavior != nat.BehaviorFullCone {
+			if lan := gatewayLANVPPInterface(plan); lan != "" {
+				initializeCommands = append(initializeCommands, "set interface nat44 in "+lan)
+			}
+		}
 		operations = append(operations, Operation{
 			Name:           "vpp.nat44.initialize",
 			RequestID:      plan.RequestID,
 			Resource:       string(plan.NAT.Behavior),
 			Payload:        plan.NAT.Behavior,
-			VPPCtlCommands: natInitializeCommands(plan.NAT.Behavior),
+			VPPCtlCommands: initializeCommands,
 		})
 	}
 	// VPPGroups are the executable, deduplicated representation of Targets.
@@ -387,6 +397,13 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 	for _, mapping := range plan.NAT.PortMappings {
 		operation := Operation{Name: "vpp.nat44-ed.static-mapping", RequestID: plan.RequestID, Resource: mapping.ID, Payload: mapping}
 		operation.VPPCtlCommands = natPortMappingCommandsForBehavior(plan.NAT.Behavior, mapping)
+		// The durable operations file is replayed after a cold VPP start.  A
+		// plain NAT44 static mapping is not sufficient: the return-path ACL,
+		// ABF policy/attachment, and pre-NAT bypass are separate VPP objects and
+		// are normally created by the live ApplyNAT44 adapter.  Persist them here
+		// with stable identities so the standalone replay service can rebuild
+		// the complete forwarding contract before status is read.
+		operation.VPPCtlCommands = append(operation.VPPCtlCommands, natReturnGuardPersistentCommands(mapping, gatewayLANPrefix(plan))...)
 		operations = append(operations, operation)
 	}
 	for _, group := range plan.Policy.WANGroups {
@@ -1143,10 +1160,14 @@ func natStaticMappingCommandsForBehavior(behavior nat.Behavior, mapping nat.Stat
 	}
 	commands := []string{}
 	if mapping.WANInterface != "" {
+		// NAT44-ED has one inside interface (LAN) and one outside interface
+		// (WAN). Marking the WAN as an input/inside interface as well is wrong
+		// and prevents hairpin traffic from being routed back out the LAN.
 		commands = append(commands,
 			fmt.Sprintf("?set interface nat44 in %s output-feature del", mapping.WANInterface),
-			fmt.Sprintf("?set interface nat44 in %s output-feature", mapping.WANInterface),
 			fmt.Sprintf("?set interface nat44 out %s output-feature del", mapping.WANInterface),
+			fmt.Sprintf("?set interface nat44 in lyroute-$LY_ROUTE_LAN_INTERFACE out %s output-feature del", mapping.WANInterface),
+			fmt.Sprintf("set interface nat44 in lyroute-$LY_ROUTE_LAN_INTERFACE out %s output-feature", mapping.WANInterface),
 			fmt.Sprintf("?set interface nat44 out %s output-feature", mapping.WANInterface),
 		)
 	}
@@ -1186,12 +1207,16 @@ func natPortMappingCommandsForBehavior(behavior nat.Behavior, mapping nat.PortMa
 	if mapping.WANInterface != "" {
 		commands = append(commands,
 			fmt.Sprintf("?set interface nat44 in %s output-feature del", mapping.WANInterface),
-			fmt.Sprintf("?set interface nat44 in %s output-feature", mapping.WANInterface),
 			fmt.Sprintf("?set interface nat44 out %s output-feature del", mapping.WANInterface),
+			fmt.Sprintf("?set interface nat44 in lyroute-$LY_ROUTE_LAN_INTERFACE out %s output-feature del", mapping.WANInterface),
+			fmt.Sprintf("set interface nat44 in lyroute-$LY_ROUTE_LAN_INTERFACE out %s output-feature", mapping.WANInterface),
 			fmt.Sprintf("?set interface nat44 out %s output-feature", mapping.WANInterface),
 		)
 	}
 	if mapping.Hairpin {
+		// The LAN-to-WAN inside/outside binding is installed above for every
+		// mapping. Hairpin additionally needs the external address in the NAT44
+		// pool so the translated packet can be sent back through the LAN.
 		commands = append(commands, fmt.Sprintf("?nat44 add address %s", mapping.ExternalAddress), "show nat44 addresses")
 	}
 	mappingCommand := fmt.Sprintf("nat44 add static mapping %s local %s %d external %s %d", mapping.Protocol, mapping.InternalHost, mapping.InternalPort, mapping.ExternalAddress, mapping.ExternalPort)
@@ -1796,6 +1821,28 @@ func routeNextHop(policy trafficpolicy.RoutePolicy) string {
 // the resolved LAN interface in RouteWANGroupPlan. The explicit VPP variable
 // lets an appliance remove a stale ABF attachment safely during an upgrade
 // without guessing from an arbitrary physical port.
+// gatewayLANPrefix returns the LAN network prefix used by the pre-NAT
+// classifier.  It is derived from the same address assignments used to build
+// the VPP plan rather than from the process environment so a replay and a live
+// apply use the same state.
+func gatewayLANPrefix(plan Plan) string {
+	for _, assignment := range plan.AddressAssignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		cidr := strings.TrimSpace(assignment.CIDR)
+		if cidr == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			continue
+		}
+		return prefix.Masked().String()
+	}
+	return ""
+}
+
 func configuredLANVPPInterface() string {
 	for _, key := range []string{"LY_ROUTE_LAN_VPP_INTERFACE", "LY_ROUTE_LAN_INTERFACE"} {
 		value := strings.TrimSpace(os.Getenv(key))

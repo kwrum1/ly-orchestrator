@@ -196,7 +196,7 @@ func TestLANControlPlaneHostInterfaceIsStableAndLinuxSafe(t *testing.T) {
 }
 
 func TestBuildOperationsIncludesNAT44Mappings(t *testing.T) {
-	operations := mustBuildOperations(t, provenPlan(Plan{RequestID: "req-nat", NAT: nat.CompiledConfig{
+	operations := mustBuildOperations(t, provenPlan(Plan{RequestID: "req-nat", AddressAssignments: []AddressAssignment{{ID: "lan", LinuxInterface: "eth1", VPPInterface: "lyroute-eth1", CIDR: "192.168.10.1/24", Role: "lan"}}, NAT: nat.CompiledConfig{
 		StaticMappings: []nat.StaticMapping{{ID: "static-main", ExternalAddress: "203.0.113.10", InternalAddress: "192.168.88.10", WANInterface: "wan0"}},
 		PortMappings: []nat.PortMapping{
 			{ID: "web", Protocol: "tcp", ExternalAddress: "203.0.113.10", ExternalPort: 8443, InternalHost: "192.168.88.20", InternalPort: 8443, WANInterface: "wan0", Hairpin: true},
@@ -206,18 +206,23 @@ func TestBuildOperationsIncludesNAT44Mappings(t *testing.T) {
 	if !hasOperation(operations, "vpp.nat44-ed.static-mapping") {
 		t.Fatalf("operations missing nat44 mapping: %#v", operations)
 	}
-	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "set interface nat44 in wan0 output-feature del")
-	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "set interface nat44 in wan0 output-feature")
+	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "set interface nat44 in lyroute-eth1 out wan0 output-feature del")
+	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "set interface nat44 in lyroute-eth1 out wan0 output-feature")
 	var mappingCommands []string
 	for _, operation := range operations {
 		if operation.Name == "vpp.nat44-ed.static-mapping" {
 			mappingCommands = append(mappingCommands, operation.VPPCtlCommands...)
 		}
 	}
-	if strings.Contains(strings.Join(mappingCommands, "\n"), "lyroute-eth1 out wan0") {
-		t.Fatal("multi-WAN NAT mapping must not re-enable LAN input NAT")
+	if !strings.Contains(strings.Join(mappingCommands, "\n"), "set interface nat44 in lyroute-eth1 out wan0 output-feature") {
+		t.Fatal("hairpin port map must bind LAN input to the WAN output interface")
 	}
 	assertOperationCommand(t, operations, "vpp.nat44.initialize", "nat44 plugin enable")
+	assertOperationCommand(t, operations, "vpp.nat44.initialize", "set interface nat44 in lyroute-eth1")
+	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "set ly-route pre-nat-route interface lyroute-eth1 lan-prefix 192.168.10.0/24")
+	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "set acl-plugin acl index ")
+	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "abf attach ip4 policy ")
+	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "set ly-route pre-nat-route add ")
 	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "nat44 add address 203.0.113.10")
 	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "nat44 add static mapping local 192.168.88.10 external 203.0.113.10")
 	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "nat44 add static mapping tcp local 192.168.88.20 8443 external 203.0.113.10 8443 del")

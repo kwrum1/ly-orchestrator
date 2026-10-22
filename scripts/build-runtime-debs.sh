@@ -973,6 +973,25 @@ def install_pre_nat_routes(vppctl, operations, receipt):
     ingress = operation_lan_interface(operations)
     if not ingress:
         return
+    # Port mappings persist their return-path guard as a pre-NAT bypass rule.
+    # The classifier rebuild below clears the whole pre-NAT table, so capture
+    # those rules first and re-add them after the route-policy rules.  Without
+    # this the NAT mapping survives a reboot but its return path does not.
+    guard_rules = []
+    for operation in operations:
+        for raw in commands_from_operation(operation):
+            command = str(raw).strip()
+            if command.startswith("?"):
+                command = command[1:].strip()
+            if not (command.startswith("set ly-route pre-nat-route add ")
+                    and command.rstrip().endswith(" bypass")):
+                continue
+            try:
+                command = expand_command(command)
+            except ValueError as err:
+                fail_with_receipt(f"failed to expand persisted NAT return bypass: {err}")
+            if command not in guard_rules:
+                guard_rules.append(command)
     rules = []
     for operation in operations:
         if operation_name(operation) != "vpp.route-policy":
@@ -1011,7 +1030,7 @@ def install_pre_nat_routes(vppctl, operations, receipt):
     clear = run_vppctl(vppctl, "set ly-route pre-nat-route clear")
     if clear.returncode != 0:
         fail_with_receipt(f"failed to clear VPP pre-NAT routes: {clear.stderr.strip()}")
-    if not rules:
+    if not rules and not guard_rules:
         return
     address = run_vppctl(vppctl, f"show interface address {ingress}")
     if address.returncode != 0:
@@ -1027,11 +1046,11 @@ def install_pre_nat_routes(vppctl, operations, receipt):
     configured = run_vppctl(vppctl, f"set ly-route pre-nat-route interface {ingress} lan-prefix {lan_prefix}")
     if configured.returncode != 0:
         fail_with_receipt(f"failed to configure VPP pre-NAT interface: {configured.stderr.strip()}")
-    for command in rules:
+    for command in rules + guard_rules:
         result = run_vppctl(vppctl, command)
         if vpp_cli_failed(result):
             fail_with_receipt(f"failed to install VPP pre-NAT route: {result.stderr.strip()}")
-    receipt["pre_nat_routes"] = len(rules)
+    receipt["pre_nat_routes"] = len(rules) + len(guard_rules)
 
 if len(sys.argv) < 2 or len(sys.argv) > 4:
     fail("usage: vpp-apply [--dry-run] [--underlay-only] /path/to/operations.json")

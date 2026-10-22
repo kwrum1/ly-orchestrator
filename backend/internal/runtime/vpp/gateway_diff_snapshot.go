@@ -41,8 +41,10 @@ func GatewayDiffSnapshotRequest(transactionID string, prior, desired Plan) Snaps
 		request.ACLs = aclIDs(prior.Policy.SecurityACLs)
 		request.Candidates.ACLs = unionCandidates(prior.Policy.SecurityACLs, desired.Policy.SecurityACLs, aclContract())
 	}
-	request.QoS = qosIDs(prior.Flow.VPPGroups)
-	request.Candidates.QoS = unionCandidates(prior.Flow.VPPGroups, desired.Flow.VPPGroups, qosContract())
+	priorQoS := nonEmptyQoSGroups(prior.Flow.VPPGroups)
+	desiredQoS := nonEmptyQoSGroups(desired.Flow.VPPGroups)
+	request.QoS = qosIDs(priorQoS)
+	request.Candidates.QoS = unionCandidates(priorQoS, desiredQoS, qosContract())
 	request.NATStaticMappings = natStaticIDs(prior.NAT.StaticMappings)
 	request.Candidates.NATStaticMappings = unionCandidates(prior.NAT.StaticMappings, desired.NAT.StaticMappings, natStaticContract())
 	request.NATPortMappings = portMapIDs(prior.NAT.PortMappings)

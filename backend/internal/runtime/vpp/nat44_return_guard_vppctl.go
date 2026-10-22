@@ -56,12 +56,57 @@ func natReturnGuardForStaticMapping(mapping nat.StaticMapping) natReturnGuard {
 	}
 }
 
+// natReturnGuardPersistentCommands is the durable replay representation of a
+// port mapping's return path.  The real adapter creates the ACL dynamically,
+// but a cold VPP restart has no dynamic ACL left.  These commands use the
+// stable ACL index, which vpp-apply remaps by tag when the live ACL already
+// exists, and recreate the ABF policy, attachment, and pre-NAT bypass in one
+// idempotent sequence.
+func natReturnGuardPersistentCommands(mapping nat.PortMapping, lanPrefix string) []string {
+	guard := natReturnGuardForPortMapping(mapping)
+	prefix, err := guard.sourcePrefix()
+	if err != nil {
+		return nil
+	}
+	bypass, err := guard.preNATBypassCommand()
+	if err != nil {
+		return nil
+	}
+	ingress := "lyroute-$LY_ROUTE_LAN_INTERFACE"
+	commands := make([]string, 0, 10)
+	if lanPrefix = strings.TrimSpace(lanPrefix); lanPrefix != "" {
+		commands = append(commands, fmt.Sprintf("set ly-route pre-nat-route interface %s lan-prefix %s", ingress, lanPrefix))
+	}
+	commands = append(commands,
+		fmt.Sprintf("?abf attach ip4 del policy %d %s", guard.policyID(), ingress),
+		fmt.Sprintf("?abf policy del id %d", guard.policyID()),
+		fmt.Sprintf("?delete acl-plugin acl index %d", guard.aclID()),
+		fmt.Sprintf("set acl-plugin acl index %d permit src %s dst 0.0.0.0/0 proto 0 sport 0-65535 dport 0-65535 tag %s", guard.aclID(), prefix, guard.tag()),
+		fmt.Sprintf("abf policy add id %d acl %d via %s", guard.policyID(), guard.aclID(), guard.via()),
+		fmt.Sprintf("abf attach ip4 policy %d priority %d %s", guard.policyID(), natReturnGuardPriority, ingress),
+		bypass,
+		"show acl-plugin acl",
+		fmt.Sprintf("show abf policy %d", guard.policyID()),
+		"show abf attach "+ingress,
+		"show ly-route pre-nat-route",
+	)
+	return commands
+}
+
 func (guard natReturnGuard) identity() string {
 	return "nat-return-" + strings.TrimSpace(guard.resource)
 }
 
 func (guard natReturnGuard) policyID() int {
 	return stableID("nat-return-abf:"+guard.resource, 20000, 8999)
+}
+
+// aclID is the durable identity used by the standalone operations replay.
+// Live application allocates an ACL index dynamically, but the persisted
+// operations use this stable index and vpp-apply maps it to the live index when
+// the tag already exists.
+func (guard natReturnGuard) aclID() int {
+	return stableID("nat-return-acl:"+guard.resource, 30000, 9999)
 }
 
 func (guard natReturnGuard) tag() string {
@@ -237,7 +282,11 @@ func (channel vppctlChannel) replaceNATReturnGuard(ctx context.Context, operatio
 	if err != nil {
 		return append(removed, created...), err
 	}
-	applied, err := channel.runServiceChainCommands(ctx, operation,
+	commands := make([]string, 0, 9)
+	if prefix := strings.TrimSpace(channel.natReturnLANPrefix); prefix != "" {
+		commands = append(commands, fmt.Sprintf("set ly-route pre-nat-route interface %s lan-prefix %s", ingress, prefix))
+	}
+	commands = append(commands,
 		guard.preNATBypassDeleteCommand(),
 		bypass,
 		fmt.Sprintf("abf policy add id %d acl %d via %s", guard.policyID(), aclID, guard.via()),
@@ -246,6 +295,7 @@ func (channel vppctlChannel) replaceNATReturnGuard(ctx context.Context, operatio
 		fmt.Sprintf("show abf policy %d", guard.policyID()),
 		"show abf attach "+ingress,
 		"show ly-route pre-nat-route")
+	applied, err := channel.runServiceChainCommands(ctx, operation, commands...)
 	results := append(append(removed, created...), applied...)
 	if err != nil {
 		return results, err

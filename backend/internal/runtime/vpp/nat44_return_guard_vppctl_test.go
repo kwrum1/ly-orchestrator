@@ -75,6 +75,32 @@ func TestNATReturnGuardBypassesProxyPolicyBeforeNAT(t *testing.T) {
 	}
 }
 
+func TestNATReturnGuardPersistentCommandsRecreateACLAndPreNATBypass(t *testing.T) {
+	mapping := nat.PortMapping{
+		ID:              "public-web",
+		ExternalAddress: "10.67.0.11",
+		ExternalPort:    8443,
+		InternalHost:    "192.168.88.20",
+		InternalPort:    443,
+		Protocol:        "tcp",
+		WANInterface:    "pppoe_session0",
+		WANNextHop:      "10.67.0.1",
+	}
+	guard := natReturnGuardForPortMapping(mapping)
+	commands := strings.Join(natReturnGuardPersistentCommands(mapping, "192.168.88.0/24"), "\n")
+	for _, want := range []string{
+		"set ly-route pre-nat-route interface lyroute-$LY_ROUTE_LAN_INTERFACE lan-prefix 192.168.88.0/24",
+		fmt.Sprintf("set acl-plugin acl index %d permit src 10.67.0.11/32", guard.aclID()),
+		fmt.Sprintf("abf policy add id %d acl %d via 10.67.0.1 pppoe_session0", guard.policyID(), guard.aclID()),
+		fmt.Sprintf("abf attach ip4 policy %d priority %d lyroute-$LY_ROUTE_LAN_INTERFACE", guard.policyID(), natReturnGuardPriority),
+		"source 192.168.88.20/32 destination 0.0.0.0/0 protocol tcp sport 443-443 dport 0-65535 bypass",
+	} {
+		if !strings.Contains(commands, want) {
+			t.Fatalf("persistent NAT guard commands missing %q:\n%s", want, commands)
+		}
+	}
+}
+
 func TestNATSnapshotPreservesMappingAndMarksMissingReturnGuardAsDrift(t *testing.T) {
 	t.Setenv("LY_ROUTE_LAN_VPP_INTERFACE", "lyroute-ens192")
 	mapping := nat.PortMapping{ID: "public-web", Protocol: "tcp", ExternalAddress: "10.67.0.11", ExternalPort: 18080, InternalHost: "192.168.88.100", InternalPort: 18080, WANInterface: "pppoe_session0"}

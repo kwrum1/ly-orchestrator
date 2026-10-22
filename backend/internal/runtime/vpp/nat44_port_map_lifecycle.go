@@ -20,6 +20,7 @@ type NAT44Plan struct {
 	TransactionID          string
 	Behavior               nat.Behavior
 	IngressVPPInterface    string
+	IngressLANPrefix       string
 	StaticMappings         []nat.StaticMapping
 	PortMappings           []nat.PortMapping
 	ReadbackStaticMappings []nat.StaticMapping
@@ -70,6 +71,23 @@ func (a Adapter) ApplyNAT44(ctx context.Context, plan NAT44Plan, prior Snapshot,
 	defer channel.Close()
 	if ingress, ok := channel.(interface{ setNATReturnGuardIngress(string) }); ok {
 		ingress.setNATReturnGuardIngress(plan.IngressVPPInterface)
+	}
+	if prefix, ok := channel.(interface{ setNATReturnGuardLANPrefix(string) }); ok {
+		prefix.setNATReturnGuardLANPrefix(plan.IngressLANPrefix)
+	}
+	if len(plan.StaticMappings)+len(plan.PortMappings) > 0 && strings.TrimSpace(plan.IngressVPPInterface) != "" {
+		// The gateway graph applies NAT mappings directly, before the separate
+		// VPP operations artifact is replayed. Ensure the plugin and LAN inside
+		// interface exist here as well; otherwise a clean boot can add a static
+		// mapping while NAT44 has no input interface. Synthetic adapter tests
+		// without an ingress interface intentionally skip this step.
+		initialize := natInitializeCommands(plan.Behavior)
+		if plan.Behavior != nat.BehaviorFullCone {
+			initialize = append(initialize, "set interface nat44 in "+strings.TrimSpace(plan.IngressVPPInterface))
+		}
+		if _, err := doOperation(ctx, channel, Operation{Name: "vpp.nat44.initialize", RequestID: plan.TransactionID, Resource: string(plan.Behavior), VPPCtlCommands: initialize}); err != nil {
+			return NAT44ApplyResult{}, a.nat44Failure(ctx, channel, plan.TransactionID, "initialize", err, prior, rollbackPlan)
+		}
 	}
 	for _, operation := range operations {
 		if _, err := doOperation(ctx, channel, operation); err != nil {

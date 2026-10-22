@@ -43,12 +43,17 @@ type vppctlChannel struct {
 	dynamicACL            bool
 	cache                 *vppctlCache
 	natReturnGuardIngress string
+	natReturnLANPrefix    string
 	lanVPPInterface       string
 	pppoeResolved         map[string]string
 }
 
 func (channel *vppctlChannel) setNATReturnGuardIngress(ingress string) {
 	channel.natReturnGuardIngress = strings.TrimSpace(ingress)
+}
+
+func (channel *vppctlChannel) setNATReturnGuardLANPrefix(prefix string) {
+	channel.natReturnLANPrefix = strings.TrimSpace(prefix)
 }
 
 func (channel *vppctlChannel) setLANVPPInterface(ingress string) {
