@@ -46,3 +46,8 @@ PanabitOEM_TANGr7p8_20260414_Linux3.tar.gz
 # Dependencies and OS/editor noise
 node_modules/
 .DS_Store
+
+# Gateway UI build dependencies and output
+frontend/gateway/node_modules/
+frontend/gateway/dist/
+frontend/gateway/tsconfig.tsbuildinfo
