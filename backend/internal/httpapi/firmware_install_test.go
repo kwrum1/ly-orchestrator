@@ -12,7 +12,7 @@ func TestFirmwareUpgradeInstallerHasBackupRollbackAndDataplaneCheck(t *testing.T
 		"restore_backup",
 		"includes_dataplane",
 		"pppoeclient_plugin.so",
-		"curl -fsS --max-time 2 http://127.0.0.1:8080/api/v1/health",
+		"curl -fsS --max-time 10 http://127.0.0.1:8080/api/v1/health",
 		"systemctl reboot",
 	} {
 		if !strings.Contains(script, required) {
