@@ -392,6 +392,7 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 	for _, mapping := range plan.NAT.StaticMappings {
 		operation := Operation{Name: "vpp.nat44-ed.static-mapping", RequestID: plan.RequestID, Resource: mapping.ID, Payload: mapping}
 		operation.VPPCtlCommands = natStaticMappingCommandsForBehavior(plan.NAT.Behavior, mapping)
+		operation.VPPCtlCommands = tokenizePersistedWANAddress(operation.VPPCtlCommands, mapping.WANInterface, mapping.ExternalAddress)
 		operations = append(operations, operation)
 	}
 	for _, mapping := range plan.NAT.PortMappings {
@@ -404,6 +405,7 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 		// with stable identities so the standalone replay service can rebuild
 		// the complete forwarding contract before status is read.
 		operation.VPPCtlCommands = append(operation.VPPCtlCommands, natReturnGuardPersistentCommands(mapping, gatewayLANPrefix(plan))...)
+		operation.VPPCtlCommands = tokenizePersistedWANAddress(operation.VPPCtlCommands, mapping.WANInterface, mapping.ExternalAddress)
 		operations = append(operations, operation)
 	}
 	for _, group := range plan.Policy.WANGroups {
@@ -1225,12 +1227,16 @@ func natPortMappingCommandsForBehavior(behavior nat.Behavior, mapping nat.PortMa
 		fmt.Sprintf("?%s del", mappingCommand),
 		fmt.Sprintf("?%s", mappingCommand),
 		"show nat44 static mappings",
-		fmt.Sprintf("show nat44 static mappings | include %s", mapping.ExternalAddress),
-		fmt.Sprintf("show nat44 static mappings | include %s", safeTag(mapping.ID)),
+		// The bounded replay executor passes commands as argv, so a shell-style
+		// pipe is not guaranteed to be available. These are diagnostic filters,
+		// not the authoritative readback (the typed snapshot does that); never
+		// fail a whole boot replay merely because the filter produced no row.
+		fmt.Sprintf("?show nat44 static mappings | include %s", mapping.ExternalAddress),
+		fmt.Sprintf("?show nat44 static mappings | include %s", safeTag(mapping.ID)),
 		"show nat44 sessions",
 	)
 	if mapping.Hairpin {
-		commands = append(commands, "show nat44 sessions | include hairpin")
+		commands = append(commands, "?show nat44 sessions | include hairpin")
 	}
 	return commands
 }
@@ -1841,6 +1847,24 @@ func gatewayLANPrefix(plan Plan) string {
 		return prefix.Masked().String()
 	}
 	return ""
+}
+
+// tokenizePersistedWANAddress replaces a dynamic PPPoE address in durable
+// replay commands with a token resolved from the current session status.  A
+// lease can change while the box is down; persisting the old public address
+// makes the boot replay fail its own readback and leaves NAT without a mapping.
+func tokenizePersistedWANAddress(commands []string, wanInterface, externalAddress string) []string {
+	wanInterface = strings.TrimSpace(wanInterface)
+	externalAddress = strings.TrimSpace(externalAddress)
+	if wanInterface == "" || externalAddress == "" || !isRuntimePPPoEInterface(wanInterface) {
+		return commands
+	}
+	token := "ly-route-wan-ip:" + wanInterface
+	result := make([]string, len(commands))
+	for index, command := range commands {
+		result[index] = strings.ReplaceAll(command, externalAddress, token)
+	}
+	return result
 }
 
 func configuredLANVPPInterface() string {

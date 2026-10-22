@@ -445,7 +445,7 @@ def bounded_vppctl(argv):
 
 def run_vppctl(vppctl, command):
     try:
-        command = resolve_runtime_pppoe(command)
+        command = resolve_runtime_wan_addresses(resolve_runtime_pppoe(command))
     except (OSError, ValueError, json.JSONDecodeError) as err:
         return subprocess.CompletedProcess([vppctl], 2, "", f"PPPoE runtime peer is not ready: {err}")
     argv = shlex.split(command)
@@ -651,6 +651,43 @@ def resolve_runtime_pppoe(command):
         else:
             resolved.append(field)
     return " ".join(resolved)
+
+WAN_ADDRESS_PREFIX = "ly-route-wan-ip:"
+
+def read_runtime_wan_address(interface):
+    """Resolve a PPPoE interface token to the current session's local address."""
+    import ipaddress
+    if not interface or not PPPOE_RUNTIME_PEER.fullmatch(interface):
+        raise ValueError(f"invalid WAN interface token {interface!r}")
+    status_dir = os.environ.get("LY_ROUTE_PPPOE_RUNTIME_STATUS_DIR", "/run/ly-route/pppoe")
+    candidates = []
+    try:
+        candidates = sorted(os.listdir(status_dir))
+    except OSError as err:
+        raise ValueError(f"PPPoE runtime status directory is unavailable: {err}")
+    for name in candidates:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(status_dir, name), "r", encoding="utf-8") as handle:
+                status = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(status.get("interface") or "").strip() != interface:
+            continue
+        address = str((status.get("session") or {}).get("local_address") or "").strip()
+        try:
+            ipaddress.IPv4Address(address)
+        except ValueError:
+            continue
+        return address
+    raise ValueError(f"WAN interface {interface!r} has no current PPPoE IPv4 address")
+
+def resolve_runtime_wan_addresses(command):
+    """Replace persisted ly-route-wan-ip:<interface> tokens with live addresses."""
+    for match in list(re.finditer(r"ly-route-wan-ip:([A-Za-z0-9_.@-]+)", str(command))):
+        command = str(command).replace(match.group(0), read_runtime_wan_address(match.group(1)))
+    return command
 
 def runtime_interface_present(vppctl, interface):
     result = bounded_vppctl([vppctl, "show", "interface"])
@@ -987,9 +1024,9 @@ def install_pre_nat_routes(vppctl, operations, receipt):
                     and command.rstrip().endswith(" bypass")):
                 continue
             try:
-                command = expand_command(command)
-            except ValueError as err:
-                fail_with_receipt(f"failed to expand persisted NAT return bypass: {err}")
+                command = resolve_runtime_wan_addresses(resolve_runtime_pppoe(expand_command(command)))
+            except (OSError, ValueError, json.JSONDecodeError) as err:
+                fail_with_receipt(f"failed to resolve persisted NAT return bypass: {err}")
             if command not in guard_rules:
                 guard_rules.append(command)
     rules = []
@@ -1216,7 +1253,7 @@ for index, operation in enumerate(operations):
         if command == VPP_ROUTE_BATCH_BEGIN:
             try:
                 route_batch, batch_end = collect_route_batch(commands, command_index)
-                expanded_batch = [resolve_runtime_pppoe(expand_command(route_command)) for route_command in route_batch]
+                expanded_batch = [resolve_runtime_wan_addresses(resolve_runtime_pppoe(expand_command(route_command))) for route_command in route_batch]
             except ValueError as err:
                 entry["results"].append({"command": receipt_command, "status": "failed", "stderr": receipt_text(str(err))})
                 receipt["operations"].append(entry)
@@ -1244,7 +1281,7 @@ for index, operation in enumerate(operations):
             receipt["operations"].append(entry)
             fail_with_receipt(f"unexpected VPP route command batch terminator for operation {name}")
         try:
-            command = resolve_runtime_pppoe(expand_command(command))
+            command = resolve_runtime_wan_addresses(resolve_runtime_pppoe(expand_command(command)))
         except (ValueError, OSError, json.JSONDecodeError) as err:
             entry["results"].append({"command": receipt_command, "status": "failed", "stderr": receipt_text(str(err))})
             receipt["operations"].append(entry)

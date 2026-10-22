@@ -2,8 +2,10 @@ package httpapi
 
 import (
 	"context"
+	"time"
 
 	"ly-route/backend/internal/runtime/apply"
+	"ly-route/backend/internal/runtime/vpp"
 )
 
 // decoratePortMapRuntimeStates keeps the port-map list consistent with the
@@ -26,6 +28,18 @@ func (server *Server) decoratePortMapRuntimeStates(ctx context.Context, items []
 }
 
 func (server *Server) appliedNATPortMapIDs(ctx context.Context) map[string]struct{} {
+	if applied := server.evidenceNATPortMapIDs(ctx); applied != nil {
+		return applied
+	}
+	// A cold boot replays the durable VPP operations before the next control
+	// transaction. The persisted evidence still describes the previous
+	// transaction (and may contain the previous PPPoE address), so status must
+	// verify the live VPP mapping rather than reporting desired_not_applied for
+	// a mapping that is actually forwarding.
+	return server.liveNATPortMapIDs(ctx)
+}
+
+func (server *Server) evidenceNATPortMapIDs(ctx context.Context) map[string]struct{} {
 	result := server.runtimeEvidence()
 	if result.Status != RuntimeStatusCommitted || result.RuntimeState != RuntimeStateRunning || result.GatewayPlan == nil {
 		return nil
@@ -51,6 +65,51 @@ func (server *Server) appliedNATPortMapIDs(ctx context.Context) map[string]struc
 	}
 	current, err := server.currentNATConfig(ctx)
 	if err != nil || !equalGatewaySliceUnordered(current.PortMappings, result.GatewayPlan.NAT.PortMappings) {
+		return nil
+	}
+	applied := make(map[string]struct{}, len(current.PortMappings))
+	for _, mapping := range current.PortMappings {
+		applied[mapping.ID] = struct{}{}
+	}
+	return applied
+}
+
+func (server *Server) liveNATPortMapIDs(ctx context.Context) map[string]struct{} {
+	current, err := server.currentNATConfig(ctx)
+	if err != nil || len(current.PortMappings) == 0 {
+		return nil
+	}
+	assignments, err := server.runtimeAddressAssignments(ctx)
+	if err != nil {
+		return nil
+	}
+	lanInterface := ""
+	for _, assignment := range assignments {
+		if assignment.Role == "lan" {
+			lanInterface = assignment.VPPInterface
+			break
+		}
+	}
+	if lanInterface == "" {
+		return nil
+	}
+	ids := make([]string, 0, len(current.PortMappings))
+	for _, mapping := range current.PortMappings {
+		ids = append(ids, mapping.ID)
+	}
+	request := vpp.SnapshotRequest{
+		TransactionID:          "status-port-maps",
+		Capabilities:           []vpp.SnapshotCapability{vpp.SnapshotCapabilityNAT44},
+		NATBehavior:            current.Behavior,
+		NATIngressVPPInterface: lanInterface,
+		NATPortMappings:        ids,
+		Candidates:             vpp.SnapshotCandidates{NATPortMappings: current.PortMappings},
+		VerifyNATReturnGuards:  true,
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	snapshot, err := (vpp.Adapter{Client: vpp.NewProductionVPPCTLClient(liveVPPBinary())}).Snapshot(readCtx, request)
+	if err != nil || !equalGatewaySliceUnordered(snapshot.NAT.PortMappings, current.PortMappings) {
 		return nil
 	}
 	applied := make(map[string]struct{}, len(current.PortMappings))
