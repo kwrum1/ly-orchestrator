@@ -1611,6 +1611,9 @@ func (server *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
 	dependencies := server.capabilities(ctx)
+	if capability := server.orchestratorRuntimeCapability(ctx); capability != nil {
+		dependencies = append(dependencies, *capability)
+	}
 	status := "ok"
 	degraded := false
 	for _, dependency := range dependencies {
@@ -1625,7 +1628,7 @@ func (server *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func requiredCapability(name string) bool {
 	switch name {
-	case "vpp", "smartdns", "kea", "xray", "nftables", "linux_routing", "persistence":
+	case "vpp", "smartdns", "kea", "xray", "nftables", "linux_routing", "persistence", "orchestrator_runtime":
 		return true
 	default:
 		return false

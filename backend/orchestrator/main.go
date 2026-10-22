@@ -69,6 +69,9 @@ func run() error {
 		}),
 		httpapi.WithSmartQoSRuntime(productionSmartQoSObserver{transaction: dataplaneController}, false),
 	}
+	var recoveryRepository *orchestrator.Repository
+	var recoveryRuntime *productionOrchestratorRuntime
+	var reconcileInterval time.Duration
 	if profile.ID() == product.Orchestrator().ID() {
 		repository, repositoryErr := orchestrator.NewRepository(store, orchestrator.RepositoryOptions{Now: time.Now})
 		if repositoryErr != nil {
@@ -101,12 +104,15 @@ func run() error {
 		if err := orchestratorRuntime.CommitTransparentTransaction(context.Background()); err != nil {
 			return fmt.Errorf("commit recovered orchestrator transaction: %w", err)
 		}
+		reconcileInterval = envDuration("LY_ROUTE_ORCHESTRATOR_RECONCILE_INTERVAL", 2*time.Second)
 		options = append(options,
 			httpapi.WithOrchestratorRepository(repository),
 			httpapi.WithOrchestratorTelemetry(newOrchestratorTelemetryRuntime(repository, env("LY_ROUTE_VPPCTL", "vppctl"), time.Now)),
-			httpapi.WithOrchestratorReconcileInterval(envDuration("LY_ROUTE_ORCHESTRATOR_RECONCILE_INTERVAL", 2*time.Second)),
+			httpapi.WithOrchestratorReconcileInterval(reconcileInterval),
 			httpapi.WithOrchestratorRuntime(orchestratorRuntime),
 		)
+		recoveryRepository = repository
+		recoveryRuntime = orchestratorRuntime
 	}
 	if envBool("LY_ROUTE_ENABLE_SERVICE_RUNTIME", false) {
 		options = append(options, httpapi.WithServiceRuntime(serviceRuntime.Runtime{Controller: serviceRuntime.FilesystemController{RootDir: env("LY_ROUTE_SERVICE_ROOT", ""), Runner: serviceRuntime.SystemctlRunner{}, XrayAPIAddress: env("LY_ROUTE_XRAY_API_ADDRESS", serviceRuntime.DefaultXrayRoutingAPIAddress)}}))
@@ -120,6 +126,11 @@ func run() error {
 	server, err := httpapi.NewServer(selection, options...)
 	if err != nil {
 		return fmt.Errorf("initialize control API: %w", err)
+	}
+	recoveryCtx, stopRecovery := context.WithCancel(context.Background())
+	defer stopRecovery()
+	if recoveryRepository != nil && recoveryRuntime != nil {
+		go runTransparentRecovery(recoveryCtx, recoveryRepository, recoveryRuntime, reconcileInterval)
 	}
 	log.Printf("ly-route %s control API listening on %s database=%s config=%s", profile.ID(), addr, databasePath, configPath)
 	if err := httpapi.ListenAndServe(addr, server); err != nil {
@@ -195,6 +206,10 @@ type productionOrchestratorRuntime struct {
 func (runtime *productionOrchestratorRuntime) ApplyTransparent(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) error {
 	runtime.transparentMu.Lock()
 	defer runtime.transparentMu.Unlock()
+	return runtime.applyTransparentLocked(ctx, requestID, topology, policy)
+}
+
+func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) error {
 	interfaces := transparentTopologyInterfaces(topology.View())
 	path, err := runtime.selectAndPrepare(ctx, requestID, interfaces, topology.View().ManagementShared)
 	if err != nil {
@@ -250,6 +265,78 @@ func (runtime *productionOrchestratorRuntime) ApplyTransparent(ctx context.Conte
 	runtime.transparentGeneration = generation
 	runtime.transparentAppliedAt = time.Now().UTC()
 	return nil
+}
+
+// RecoverTransparent restores the persisted topology/policy when VPP restarts
+// and reloads the plugin in the locked state.  It holds the transparent mutex
+// across the readback and replay so a user apply cannot interleave with the
+// recovery generation.  No topology means orchestration is intentionally
+// disabled, so recovery is a no-op.
+func (runtime *productionOrchestratorRuntime) RecoverTransparent(ctx context.Context, repository *orchestrator.Repository) error {
+	runtime.transparentMu.Lock()
+	defer runtime.transparentMu.Unlock()
+	topology, _, err := repository.Snapshot(ctx)
+	if errors.Is(err, orchestrator.ErrTopologyNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read orchestrator topology for recovery: %w", err)
+	}
+	var policy *orchestrator.Policy
+	current, _, policyErr := repository.PolicySnapshot(ctx)
+	switch {
+	case policyErr == nil:
+		policy = &current
+	case errors.Is(policyErr, orchestrator.ErrPolicyNotFound):
+	default:
+		return fmt.Errorf("read orchestrator policy for recovery: %w", policyErr)
+	}
+	observed, observeErr := runtime.adapter.ObserveTransparentOrchestrator(ctx, "orchestrator-recovery")
+	if !transparentRecoveryRequired(observed, observeErr, runtime.transparentGeneration) {
+		if runtime.transparentJournalPending {
+			return runtime.clearTransparentTransactionLocked()
+		}
+		return nil
+	}
+	if err := runtime.applyTransparentLocked(ctx, "orchestrator-recovery", topology, policy); err != nil {
+		return err
+	}
+	return runtime.clearTransparentTransactionLocked()
+}
+
+func transparentRecoveryRequired(observed vpp.TransparentOrchestratorReadback, observeErr error, committedGeneration string) bool {
+	if observeErr != nil || strings.TrimSpace(committedGeneration) == "" {
+		return true
+	}
+	return observed.State != "running" || observed.Generation != committedGeneration
+}
+
+func runTransparentRecovery(ctx context.Context, repository *orchestrator.Repository, runtime *productionOrchestratorRuntime, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	lastError := ""
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := runtime.RecoverTransparent(ctx, repository); err != nil {
+				message := err.Error()
+				if message != lastError {
+					log.Printf("transparent orchestrator recovery failed: %v", err)
+					lastError = message
+				}
+				continue
+			}
+			if lastError != "" {
+				log.Printf("transparent orchestrator recovery succeeded")
+				lastError = ""
+			}
+		}
+	}
 }
 
 func (runtime *productionOrchestratorRuntime) DisableTransparent(ctx context.Context, requestID string) error {
@@ -385,7 +472,9 @@ func syncDirectory(path string) error {
 }
 
 func (runtime *productionOrchestratorRuntime) TransparentRuntimeEvidence(ctx context.Context) (orchestratorapi.TransparentRuntimeEvidence, error) {
-	runtime.transparentMu.Lock()
+	if !runtime.transparentMu.TryLock() {
+		return orchestratorapi.TransparentRuntimeEvidence{}, errors.New("transparent orchestrator runtime is applying or recovering")
+	}
 	defer runtime.transparentMu.Unlock()
 	if strings.TrimSpace(runtime.transparentRequest) == "" || strings.TrimSpace(runtime.transparentGeneration) == "" || runtime.transparentAppliedAt.IsZero() {
 		return orchestratorapi.TransparentRuntimeEvidence{}, errors.New("transparent orchestrator has no committed runtime generation")

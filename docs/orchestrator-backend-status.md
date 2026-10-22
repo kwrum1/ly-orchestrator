@@ -105,6 +105,14 @@ SmartDNS/Kea/Xray 进入 Orchestrator 运行时，先按上述原则评估 VPP �
 
 评估记录模板：`模块 / 失败现象 / 根因 / 自研成本 / 候选与版本 / 许可证 / 适配层 / 回退开关 / 测试证据 / 决策`。
 
+## 透明策略方向与 VPP 重启恢复（P0/P1）
+
+- 策略匹配统一使用 **client → server** 方向。LAN 入向保持原 tuple；WAN 入向在匹配前交换源/目的地址和端口，因此 `destination_ports` 规则会同时命中请求与返回流。`via`、`drop`、端口范围、`source_ports` 和非端口规则共用同一归一化路径。
+- 回归必须同时检查 VPP `policy ... packets > 0`、flow `groups inline-a`、API `policy_hits > 0` 和真实 TCP 200/超时，不能只检查 apply committed。
+- VPP 重启后插件处于 `state locked` 时，control 的透明恢复循环按 `LY_ROUTE_ORCHESTRATOR_RECONCILE_INTERVAL`（默认 2s）读取持久化 topology/policy 并重放；恢复失败会保留错误并继续重试。
+- `/api/v1/health` 在存在 topology 时必须包含 `orchestrator_runtime` 依赖；插件 locked、generation 漂移或回读失败时返回 `degraded=true`，不再只依据 `vpp.service` 报假绿。无 topology 时不要求该依赖。
+- 相关证据：`.sisyphus/full-acceptance/evidence/orchestrator-p0p1/`。
+
 ## 验证命令
 
 ```sh
