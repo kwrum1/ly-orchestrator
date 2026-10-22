@@ -86,6 +86,27 @@ start. That service owns the Linux ingress/outbound fwmark rules and policy
 tables (including the proxy egress table); without it a reboot leaves Xray
 and capture healthy but every marked upstream unrouteable.
 
+### Live fail-open / reboot evidence (P0-1 lab, before the shared lab reset)
+
+- `systemctl stop xray`: helper logged `capture removed and proxy steering
+  bypassed`; VPP gained `rule id 9001 priority 9 ... bypass 1`; client curl
+  returned `200` in `0.035s` (previously 15s timeout).
+- `systemctl start xray`: helper logged `capture installed and proxy steering
+  enabled`; reserved bypass removed; `nft` showed both TCP/UDP TPROXY rules;
+  client curl returned `200`.
+- Cold reboot: `xray` and `vpp` active with `nftables.service` still disabled;
+  `ly_route_proxy_capture proxy_prerouting` was present with both TPROXY
+  rules without any manual apply; helper journal showed the ExecStartPost
+  install.
+- Direct LAN (`192.168.88.50:8080`) returned `200` while capture was active.
+
+The shared lab VM was later reset to a pre-configuration disk state (PPPoE
+session and the deployed helper/drop-ins disappeared). The reboot acceptance
+above is from the verified run before that reset; the final acceptance must be
+repeated on a freshly built image that contains these overlay files. The
+reboot retry and DNS-only exemption in the policy-routing drop-in are covered
+by `policy_routing_ready_test.go` and the helper fixture test.
+
 ## Verification
 
 Unit/regression (all pass on the independent worktree):

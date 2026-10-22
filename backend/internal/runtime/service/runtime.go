@@ -1626,8 +1626,13 @@ func renderProxyServiceNetwork(plan proxy.LinuxPolicyRoutingPlan, natBehavior na
 	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" show interface address %s | grep -F %s >/dev/null\n", network.IngressVPPInterface, network.IngressVPPAddress))
 	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" show interface address %s | grep -F %s >/dev/null\n", network.EgressVPPInterface, network.EgressVPPAddress))
 	builder.WriteString(fmt.Sprintf("ip route show table %d | grep -F %s >/dev/null\n", network.OutboundTableID, network.EgressVPPAddress))
+	// Marker consumed by the systemd unit's ExecStartPost. A boot-time apply
+	// can run before PPPoE has an address; the unit must retry instead of
+	// reporting success with no TPROXY policy rules installed.
+	builder.WriteString("mkdir -p /run/ly-route\n")
+	builder.WriteString("printf 'ready\\n' > /run/ly-route/proxy-policy-ready\n")
 
-	builder.WriteString("else\n  echo \"proxy service bypassed because its WAN underlay is unavailable\" >&2\nfi\n")
+	builder.WriteString("else\n  rm -f /run/ly-route/proxy-policy-ready\n  echo \"proxy service bypassed because its WAN underlay is unavailable\" >&2\nfi\n")
 	return []RenderedArtifact{NewArtifact(LinuxRouting, "/var/lib/ly-route/policy-routing/apply.sh", builder.String(), "restart")}, nil
 }
 
