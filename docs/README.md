@@ -9,6 +9,7 @@
 - [架构 / Architecture](architecture.md)
 - [实现与验收状态 / Status](implementation-status.md)
 - [验收契约 / Verification](product-functional-qa.md)
+- [Kea 重启生命周期 / Kea restart lifecycle](kea-restart-lifecycle.md)
 - [发布和安装 / Release and installation](release-and-installation.md)
 - [后续工作计划 / Work plan](work-plan.md)
 
@@ -22,5 +23,6 @@ removed. Git history remains available for historical investigation.
 - [Architecture](architecture.md)
 - [Implementation and validation status](implementation-status.md)
 - [Verification contract](product-functional-qa.md)
+- [Kea restart lifecycle](kea-restart-lifecycle.md)
 - [Release and installation](release-and-installation.md)
 - [Work plan](work-plan.md)
