@@ -125,8 +125,15 @@ func parseKeaDHCP4Leases(ctx context.Context, content []byte) (map[netip.Addr]ke
 	if err != nil {
 		return nil, err
 	}
+	// Kea creates the memfile before the first lease is written. A zero-byte
+	// file, a file containing only a newline, and a header-only file are all
+	// valid empty lease databases: they must read back as zero leases instead
+	// of surfacing a 500 from the API during first boot.
 	if len(records) == 0 {
-		return nil, fmt.Errorf("lease database is empty and has no header")
+		return map[netip.Addr]keaLeaseCandidate{}, nil
+	}
+	if len(records) == 1 && len(records[0]) == 1 && strings.TrimSpace(records[0][0]) == "" {
+		return map[netip.Addr]keaLeaseCandidate{}, nil
 	}
 	header := map[string]int{}
 	for index, name := range records[0] {

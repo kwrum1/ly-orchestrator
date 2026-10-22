@@ -16,6 +16,12 @@ func TestKeaLeaseHTTPIntegration(t *testing.T) {
 	}
 	server := New(WithDHCPLeases(serviceRuntime.KeaMemfileLeaseCollector{Path: path}))
 	response := request(t, server, http.MethodGet, "/api/v1/dhcp/leases")
+	if os.Getenv("LY_ROUTE_KEA_LEASE_EXPECT_EMPTY") == "1" {
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"total":0`) || !strings.Contains(response.Body.String(), `"items":[]`) {
+			t.Fatalf("empty Kea database did not read back as an empty list: %d %s", response.Code, response.Body.String())
+		}
+		return
+	}
 	if os.Getenv("LY_ROUTE_KEA_LEASE_EXPECT_UNAVAILABLE") == "1" {
 		if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "dhcp_leases_failed") || strings.Contains(response.Body.String(), "192.0.2.50") {
 			t.Fatalf("missing Kea database did not fail explicitly without stale leases: %d %s", response.Code, response.Body.String())

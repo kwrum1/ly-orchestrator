@@ -60,6 +60,30 @@ func TestKeaMemfileLeaseCollectorSortsAddresses(t *testing.T) {
 	}
 }
 
+func TestKeaMemfileLeaseCollectorAcceptsEmptyLeaseDatabase(t *testing.T) {
+	tests := map[string]string{
+		"zero byte":   "",
+		"blank line":  "\n",
+		"header only": "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context\n",
+		"crlf header": "address,hwaddr,valid_lifetime,expire,subnet_id,hostname,state\r\n",
+	}
+	for name, content := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "kea-leases4.csv")
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			leases, err := (KeaMemfileLeaseCollector{Path: path}).Leases(context.Background())
+			if err != nil {
+				t.Fatalf("empty lease database must not fail: %v", err)
+			}
+			if len(leases) != 0 {
+				t.Fatalf("expected no leases, got %#v", leases)
+			}
+		})
+	}
+}
+
 func TestKeaMemfileLeaseCollectorFailsClosedOnMalformedInput(t *testing.T) {
 	tests := map[string]string{
 		"missing header": "address,hwaddr,valid_lifetime,expire,subnet_id,hostname\n",

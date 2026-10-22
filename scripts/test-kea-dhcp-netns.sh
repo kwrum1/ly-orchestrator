@@ -98,6 +98,17 @@ grep -F '192.0.2.50' "$tmpdir/kea.log" >/dev/null
 kill "$kea_pid" 2>/dev/null || true
 wait "$kea_pid" 2>/dev/null || true
 
+# A freshly created memfile is empty. The API must return an empty list, not
+# a 500, while the daemon is down during the restart window.
+mv "$tmpdir/kea-leases4.csv" "$tmpdir/kea-leases4.csv.leases"
+: > "$tmpdir/kea-leases4.csv"
+(
+  cd "$repo_root/backend"
+  LY_ROUTE_KEA_LEASE_INTEGRATION_FILE="$tmpdir/kea-leases4.csv" LY_ROUTE_KEA_LEASE_EXPECT_EMPTY=1 go test ./internal/httpapi -run '^TestKeaLeaseHTTPIntegration$' -count=1
+)
+rm -f "$tmpdir/kea-leases4.csv"
+mv "$tmpdir/kea-leases4.csv.leases" "$tmpdir/kea-leases4.csv"
+
 # Kea must recover the persisted memfile lease after a daemon restart.
 ip netns exec "$server_ns" env KEA_LOCKFILE_DIR="$tmpdir/run" KEA_PIDFILE_DIR="$tmpdir/run" LD_LIBRARY_PATH="$tmpdir/rootfs/usr/lib/x86_64-linux-gnu" "$tmpdir/rootfs/usr/sbin/kea-dhcp4" -c "$tmpdir/kea-dhcp4.conf" > "$tmpdir/kea-restart.log" 2>&1 &
 kea_pid=$!
