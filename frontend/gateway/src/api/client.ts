@@ -100,6 +100,15 @@ export function patchJson<T>(path: string, body: unknown, timeoutMs = DEFAULT_TI
   });
 }
 
+export function putJson<T>(path: string, body: unknown, timeoutMs = DEFAULT_TIMEOUT) {
+  return apiFetch<T>(path, {
+    method: "PUT",
+    timeoutMs,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 export function deleteJson<T>(path: string, timeoutMs = DEFAULT_TIMEOUT) {
   return apiFetch<T>(path, { method: "DELETE", timeoutMs });
 }

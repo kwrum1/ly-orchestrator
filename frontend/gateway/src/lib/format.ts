@@ -36,6 +36,7 @@ export function formatDateTime(value: unknown): string {
   if (!value) return "--";
   const date = new Date(String(value));
   if (Number.isNaN(date.valueOf())) return String(value);
+  if (date.getUTCFullYear() <= 1) return "--";
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
@@ -127,6 +128,19 @@ export function stateLabel(value: unknown): string {
     ok: "正常",
     healthy: "正常",
     degraded: "降级",
+    reconciled_degraded: "降级",
+    reconciled: "已对齐",
+    idle: "空闲",
+    staged: "已暂存",
+    installing: "安装中",
+    installed: "已安装",
+    rolling_back: "回滚中",
+    rolled_back: "已回滚",
+    rollback_failed: "回滚失败",
+    validated: "已校验",
+    ready: "已准备",
+    applying: "应用中",
+    rolledback: "已回滚",
     unavailable: "不可用",
     failed: "失败",
     apply_failed: "应用失败",

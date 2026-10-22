@@ -18,7 +18,10 @@ function ProductMark({ size = 54 }: { size?: number }) {
   );
 }
 
-export function LoginPage({ onLoggedIn, forceChange = false, initialUsername = "" }: { onLoggedIn?: () => void; forceChange?: boolean; initialUsername?: string }) {
+export function LoginPage({ onLoggedIn, forceChange = false, initialUsername = "", product = "gateway" }: { onLoggedIn?: () => void; forceChange?: boolean; initialUsername?: string; product?: "gateway" | "orchestrator" }) {
+  const config = product === "orchestrator"
+    ? { brand: "流量编排控制台", title: "登录编排控制台", subtitle: "单机 VPP 流量编排：本地拓扑、策略、服务链与遥测。", footer: "Ly Route Orchestrator", hint: "单机本地编排，不是多站点控制器" }
+    : { brand: "出口网关控制台", title: "登录管理界面", subtitle: "使用设备管理员账号访问路由、策略与运行态。", footer: "Ly Route Gateway", hint: "仅通过 HTTPS 访问管理界面" };
   const { login } = useAuth();
   const [username, setUsername] = useState(initialUsername);
   const [password, setPassword] = useState("");
@@ -87,12 +90,12 @@ export function LoginPage({ onLoggedIn, forceChange = false, initialUsername = "
           <ProductMark />
           <div>
             <strong>Ly Route</strong>
-            <span>出口网关控制台</span>
+            <span>{config.brand}</span>
           </div>
         </div>
         <div className="login-intro">
-          <h1>登录管理界面</h1>
-          <p>使用设备管理员账号访问路由、策略与运行态。</p>
+          <h1>{config.title}</h1>
+          <p>{config.subtitle}</p>
         </div>
         {!needsChange ? (
           <form onSubmit={submit} className="login-form">
@@ -124,7 +127,7 @@ export function LoginPage({ onLoggedIn, forceChange = false, initialUsername = "
               登录
             </Button>
             <div className="login-hint">
-              <ShieldCheck size={14} /> 仅通过 HTTPS 访问管理界面
+              <ShieldCheck size={14} /> {config.hint}
             </div>
           </form>
         ) : (
@@ -153,12 +156,12 @@ export function LoginPage({ onLoggedIn, forceChange = false, initialUsername = "
         )}
         <footer className="login-footer">
           <span><Wifi size={13} /> 管理口：当前访问地址</span>
-          <span>Ly Route Gateway</span>
+          <span>{config.footer}</span>
         </footer>
       </section>
       <div className="login-side-note">
         <ProductMark size={30} />
-        <span>路由 · 策略 · 可观测</span>
+        <span>{product === "orchestrator" ? "拓扑 · 策略 · 服务链" : "路由 · 策略 · 可观测"}</span>
       </div>
       {busy && <div className="login-busy"><Loader2 className="spin" size={16} /> 正在验证…</div>}
     </main>

@@ -51,3 +51,5 @@ node_modules/
 frontend/gateway/node_modules/
 frontend/gateway/dist/
 frontend/gateway/tsconfig.tsbuildinfo
+
+frontend/gateway/dist-*/

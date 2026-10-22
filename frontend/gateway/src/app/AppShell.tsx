@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import {
   Activity,
@@ -15,14 +15,29 @@ import {
   ShieldCheck,
   UserRound,
 } from "lucide-react";
-import { ALL_PAGES, COMMAND_ACTIONS, NAV_GROUPS } from "./nav";
+import { ALL_PAGES, COMMAND_ACTIONS, NAV_GROUPS, type NavGroup, type NavPage } from "./nav";
+import { CURRENT_PRODUCT } from "../product";
 import { useAuth, useApply, useConfirm } from "../state/providers";
 import { useHealth, useRuntime } from "../api/hooks";
 import { Badge, Button, Drawer, Field, IconButton, Input, Modal, useToast } from "../components/ui";
 import { ApplyBanner } from "../state/providers";
 import { classNames, formatDateTime, stateLabel } from "../lib/format";
 
-export function AppShell() {
+interface AppShellProps {
+  navGroups?: NavGroup[];
+  allPages?: NavPage[];
+  commandActions?: { key: string; label: string; description: string; icon: ReactNode }[];
+  productSubtitle?: string;
+  productBadge?: string;
+}
+
+export function AppShell({
+  navGroups = NAV_GROUPS,
+  allPages = ALL_PAGES,
+  commandActions = COMMAND_ACTIONS,
+  productSubtitle = CURRENT_PRODUCT.subtitle,
+  productBadge = CURRENT_PRODUCT.badge,
+}: AppShellProps) {
   const location = useLocation();
   const navigate = useNavigate();
   const { session, logout, changePassword } = useAuth();
@@ -46,25 +61,25 @@ export function AppShell() {
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
 
-  const currentPage = ALL_PAGES.find((page) => page.path === location.pathname);
-  const currentGroup = NAV_GROUPS.find((group) => group.pages.some((page) => page.path === location.pathname));
+  const currentPage = allPages.find((page) => page.path === location.pathname);
+  const currentGroup = navGroups.find((group) => group.pages.some((page) => page.path === location.pathname));
 
   const filteredGroups = useMemo(() => {
     const value = query.trim().toLowerCase();
-    if (!value) return NAV_GROUPS;
-    return NAV_GROUPS
+    if (!value) return navGroups;
+    return navGroups
       .map((group) => ({
         ...group,
         pages: group.pages.filter((page) => `${group.label} ${page.label} ${page.description}`.toLowerCase().includes(value)),
       }))
       .filter((group) => group.pages.length > 0);
-  }, [query]);
+  }, [query, navGroups]);
 
   const commands = useMemo(() => {
     const value = commandQuery.trim().toLowerCase();
-    const pages = ALL_PAGES.filter((page) => !value || `${page.label} ${page.description} ${page.path}`.toLowerCase().includes(value));
-    return { pages, actions: COMMAND_ACTIONS.filter((action) => !value || action.label.toLowerCase().includes(value)) };
-  }, [commandQuery]);
+    const pages = allPages.filter((page) => !value || `${page.label} ${page.description} ${page.path}`.toLowerCase().includes(value));
+    return { pages, actions: commandActions.filter((action) => !value || action.label.toLowerCase().includes(value)) };
+  }, [commandQuery, allPages, commandActions]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -150,8 +165,9 @@ export function AppShell() {
             <span className="brand-mark">LR</span>
             <span className="brand-copy">
               <strong>Ly Route</strong>
-              <small>出口网关</small>
+              <small>{productSubtitle}</small>
             </span>
+            {productBadge && <span className="brand-badge">{productBadge}</span>}
           </button>
           <div className="breadcrumb">
             <span>{currentGroup?.label || "概览"}</span>

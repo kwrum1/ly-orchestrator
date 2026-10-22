@@ -10,7 +10,8 @@
 - 保留并重做现有全部页面；新增“安全策略”“代理线路”“静态 NAT”使用后端已有 API。
 - 首页重新设计；其余页面保留功能，重做视觉/交互。
 - 设计文档：`docs/ui-redesign/01..07`。
-- 构建集成：`scripts/build-gateway-ui.sh`、`scripts/build-controller-shell.sh`、`scripts/validate-rootfs-scaffold.sh`。
+- 构建集成：`scripts/build-product-ui.sh`、`scripts/build-gateway-ui.sh`、`scripts/build-controller-shell.sh`、`scripts/validate-rootfs-scaffold.sh`。
+- 双产品：同一源码支持 `LY_ROUTE_PRODUCT=gateway|orchestrator`；Orchestrator 页面/API/缺口见 `09-orchestrator-product.md`，验收闸门见 `07-acceptance-and-gate.md`。
 - 未修改 `frontend/orchestrator`、`backend/`、`packaging/nginx/ly-route-admin.conf`、Pingora 配置。
 
 ## 2. 页面清单（旧 → 新）
@@ -104,7 +105,18 @@ LY_ROUTE_UI_DIST=$PWD/frontend/gateway/dist \
 ./scripts/build-controller-shell.sh --product gateway --out /tmp/gw-ui-controller
 ```
 
-`build-controller-shell.sh` 的 gateway 分支现在调用 `build-gateway-ui.sh`，不再拼接旧 `app.js`。输出保留 `app.js/styles.css/shell.js/commercial.css/capabilities.json`，以兼容现有升级包 checksum/rootfs 校验；`shell.js` 与 `commercial.css` 为兼容占位文件，不加载业务逻辑。
+`build-controller-shell.sh` 的 gateway 分支现在调用 `build-product-ui.sh`，不再拼接旧 `app.js`。输出保留 `app.js/styles.css/shell.js/commercial.css/capabilities.json`，以兼容现有升级包 checksum/rootfs 校验；`shell.js` 与 `commercial.css` 为兼容占位文件，不加载业务逻辑。
+
+双产品构建：
+
+```sh
+./scripts/build-product-ui.sh --product gateway --out /tmp/gw-ui-final
+./scripts/build-product-ui.sh --product orchestrator --out /tmp/orch-ui-final
+./scripts/build-controller-shell.sh --product gateway --out /tmp/gw-ui-controller
+./scripts/build-controller-shell.sh --product orchestrator --out /tmp/orch-ui-controller
+```
+
+Gateway 页面集合仍为 21 页；因共享产品层重构，bundle hash 已更新，新 hash 记录在 `09-orchestrator-product.md`。Orchestrator 使用 `dist-orchestrator/`，产物文件名保持一致。
 
 > 未改 `build-upgrade-package.sh` 的 checksum 列表，因为新构建继续产出同名文件；如后续切换为多 chunk/多 CSS，需要改为遍历 `ui-manifest.json`。
 
@@ -129,7 +141,7 @@ LY_ROUTE_UI_DIST=$PWD/frontend/gateway/dist \
 | 会话策略/出口归属 | 会话 API 无字段 | 不显示推断列 |
 | VPP 遥测 | 沙箱无 VPP，图表为空/降级 | 真实 router 上应显示采样；空态/降级已覆盖 |
 | `runtime/status` 慢 | 后端约 10s | 25s 超时 + 骨架 + 不阻塞首屏 |
-| 配置导入确认 | 后端需 dry-run + confirm token；当前 UI 未暴露完整流程 | 保留导出/快照/初始化；导入待产品确认 |
+| 配置导入确认 | 后端需 dry-run + confirm token；已在配置页暴露预检/确认流程 | 预检展示 package/diff hash 与有效期；确认后触发 apply |
 | PPPoE 连接/断开 | 当前旧 UI 也仅状态；未加按钮 | 保持状态/peer 展示 |
 | Xray 重启 | 旧 UI 未暴露；未加按钮 | 只读状态/日志 |
 | 安全 ACL 默认规则 | 默认 WAN inbound deny 可能存在 | 删除按钮禁用默认规则 |

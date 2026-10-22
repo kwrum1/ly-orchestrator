@@ -23,6 +23,7 @@
 | [06-panabit-lab-plan.md](./06-panabit-lab-plan.md) | Panabit 安装、学习场景、证据模板、清理与风险 | 测试 / 设计 |
 | [07-acceptance-and-gate.md](./07-acceptance-and-gate.md) | UI 验收标准、证据包、门禁条件、上线与回退 | 产品 / 测试 / 发布 |
 | [08-implementation-report.md](./08-implementation-report.md) | 实际实现、构建命令、页面映射、未实现/后端缺口、证据 | 产品 / 测试 / 前端 |
+| [09-orchestrator-product.md](./09-orchestrator-product.md) | Orchestrator 单机产品边界、11 页路由、API 映射、双产品构建、验收证据 | 产品 / 测试 / 前端 |
 
 ## 2. 基线（本次阅读与核对）
 
@@ -51,7 +52,7 @@
 | 门禁 | 状态 | 说明 |
 | --- | --- | --- |
 | 后端功能冻结 | **已满足（用户确认）** | Gateway P0 清零，HEAD 约 `fa3abd68`，API 契约冻结 |
-| UI 实现 | **已完成，待验收** | `feat/ui-redesign` 已实现全部页面/功能；见 08 报告 |
+| UI 实现 | **已完成，待验收** | `feat/ui-redesign` 已实现 Gateway 21 页 + Orchestrator 11 页；见 08/09 报告 |
 | 测试专家全栈验收 | **待启动** | 真实 router + 真实 VPP 遥测/会话回归 |
 | Pingora 合并 | **暂缓** | 前端验收通过后再合并；nginx 保持默认 |
 | 发布门禁 | 独立管理 | 仍以测试/发布团队结论为准 |

@@ -6,6 +6,9 @@ const target = process.env.LY_ROUTE_UI_API || "http://127.0.0.1:18090";
 export default defineConfig({
   base: "/",
   plugins: [react()],
+  define: {
+    __LY_PRODUCT__: JSON.stringify(process.env.LY_ROUTE_PRODUCT || "gateway"),
+  },
   server: {
     host: "0.0.0.0",
     port: 5173,

@@ -484,3 +484,201 @@ export interface AuthUser {
   role: string;
   enabled?: boolean;
 }
+
+export interface TopologyPort {
+  interface?: string;
+  direction?: "lan_facing" | "wan_facing" | string;
+  bond?: { name: string; members: string[] } | null;
+}
+
+export interface TopologyInterface {
+  name: string;
+  role: "lan" | "wan" | string;
+  port?: string;
+  bond?: { name: string; members: string[] } | null;
+}
+
+export interface OrchestrationGroup {
+  name: string;
+  ports: TopologyPort[];
+}
+
+export interface Topology {
+  schema_version: number;
+  management_interface: string;
+  management_shared?: boolean;
+  interfaces: TopologyInterface[];
+  orchestration_groups: OrchestrationGroup[];
+}
+
+export interface TopologyEnvelope {
+  item: Topology;
+  checksum?: string;
+}
+
+export interface OrchestrationGroupEnvelope {
+  item: OrchestrationGroup;
+  checksum?: string;
+}
+
+export interface PolicyPortRange {
+  start: number;
+  end: number;
+}
+
+export interface PolicyMatch {
+  sources: string[];
+  destinations: string[];
+  protocol: "any" | "tcp" | "udp" | "icmp" | "icmpv6" | string;
+  source_ports?: PolicyPortRange[];
+  destination_ports?: PolicyPortRange[];
+}
+
+export interface PolicyAction {
+  kind: "via" | "direct" | "drop" | string;
+  group?: string;
+}
+
+export interface PolicyRule {
+  id: string;
+  sequence: number;
+  match: PolicyMatch;
+  action: PolicyAction;
+}
+
+export interface PolicyGroup {
+  id: string;
+  position: number;
+  rules: PolicyRule[];
+}
+
+export interface PolicyIPObject {
+  id: string;
+  prefixes: string[];
+}
+
+export interface OrchestratorPolicy {
+  schema_version: number;
+  ip_objects: PolicyIPObject[];
+  policy_groups: PolicyGroup[];
+  default: PolicyAction;
+}
+
+export interface PolicyEnvelope {
+  item: OrchestratorPolicy;
+  checksum?: string;
+}
+
+export interface OrchestratorOperation {
+  name?: string;
+  resource?: string;
+  state?: string;
+  started_at?: string;
+  ended_at?: string;
+}
+
+export interface UpgradeVersion {
+  product?: string;
+  version?: string;
+  commit?: string;
+  suite?: string;
+  arch?: string;
+  upgrade_supported?: boolean;
+}
+
+export interface UpgradeTask {
+  id: string;
+  product?: string;
+  from_version?: string;
+  to_version?: string;
+  state: string;
+  package_name?: string;
+  package_sha256?: string;
+  package_size?: number;
+  services?: string[];
+  actor?: string;
+  reason?: string;
+  backup_id?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface UpgradeList {
+  version?: UpgradeVersion;
+  items: UpgradeTask[];
+}
+
+export interface ConversionPlanStep {
+  id?: string;
+  description?: string;
+  reversible?: boolean;
+}
+
+export interface ConversionPlan {
+  from_product?: string;
+  to_product?: string;
+  from_version?: string;
+  to_version?: string;
+  base_version?: string;
+  dataplane_mode?: string;
+  verify_packages?: string[];
+  required_plugin?: string;
+  config_migration?: string;
+  preserve_database?: boolean;
+  snapshot_required?: boolean;
+  rollback_supported?: boolean;
+  backup_required?: boolean;
+  preserve_service_state?: boolean;
+  service_units?: string[];
+  steps?: ConversionPlanStep[];
+  warnings?: string[];
+}
+
+export interface ConversionValidation {
+  valid: boolean;
+  issues?: string[];
+  plan?: ConversionPlan;
+}
+
+export interface ConversionTask {
+  id: string;
+  state: string;
+  from_product?: string;
+  to_product?: string;
+  from_version?: string;
+  to_version?: string;
+  base_version?: string;
+  plan?: ConversionPlan;
+  issues?: string[];
+  snapshot_id?: string;
+  service_state?: Record<string, string>;
+  actor?: string;
+  reason?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface ConversionList {
+  items: ConversionTask[];
+}
+
+export interface ServiceChainBinding {
+  group: string;
+  wan_facing_next_hop: string;
+  lan_facing_next_hop: string;
+}
+
+export interface ServiceChainFlow {
+  source_ip: string;
+  destination_ip: string;
+  protocol: string;
+  source_port?: number;
+  destination_port?: number;
+}
+
+export interface ServiceChainCompileResult {
+  path?: AnyRecord;
+  chain?: AnyRecord;
+  topology_checksum?: string;
+  policy_checksum?: string;
+}

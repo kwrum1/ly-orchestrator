@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Clock3, Download, HardDrive, RotateCcw, Save, ServerCog, ShieldAlert, Trash2 } from "lucide-react";
+import { Clock3, Download, HardDrive, RotateCcw, Save, ServerCog, ShieldAlert, Trash2, Upload } from "lucide-react";
 import { API } from "../api/endpoints";
 import { getJson, postJson } from "../api/client";
 import { useHealth, useInterfacesResource, useManagementNetwork, useSummary } from "../api/hooks";
@@ -24,6 +24,12 @@ export function ConfigPage() {
   const [snapshotName, setSnapshotName] = useState("");
   const [resetOpen, setResetOpen] = useState(false);
   const [resetText, setResetText] = useState("");
+  const [importOpen, setImportOpen] = useState(false);
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importPackage, setImportPackage] = useState<any>(null);
+  const [importPreflight, setImportPreflight] = useState<any>(null);
+  const [importError, setImportError] = useState("");
+  const [importBusy, setImportBusy] = useState(false);
 
   useEffect(() => {
     const item = management.data?.item || management.data || {};
@@ -126,6 +132,56 @@ export function ConfigPage() {
     }
   };
 
+  const preflightImport = async () => {
+    if (!importFile) { setImportError("请选择配置包 JSON"); return; }
+    if (importFile.size > 10 * 1024 * 1024) { setImportError("配置包不能超过 10 MiB"); return; }
+    setImportBusy(true);
+    setImportError("");
+    setImportPreflight(null);
+    try {
+      const rawPackage = JSON.parse(await importFile.text());
+      if (!rawPackage.package_manifest || !rawPackage.payload) throw new Error("配置包缺少 package_manifest 或 payload");
+      const { request_id: _requestId, ...packageData } = rawPackage;
+      const result = await postJson<any>(API.config.import, { ...packageData, confirm: false, dry_run: true }, 30_000);
+      setImportPackage(packageData);
+      setImportPreflight(result);
+      toast("预检通过，请确认导入", "success");
+    } catch (error: any) {
+      setImportError(error?.message || "配置预检失败");
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  const confirmImport = async () => {
+    if (!importPackage || !importPreflight) return;
+    setImportBusy(true);
+    setImportError("");
+    try {
+      await postJson(API.config.import, {
+        ...importPackage,
+        confirm: true,
+        dry_run: false,
+        confirmation_token: importPreflight.confirmation_token,
+        confirmation_actor: importPreflight.confirmation_actor,
+        confirmation_expires_at: importPreflight.confirmation_expires_at,
+        package_hash: importPreflight.package_hash,
+        diff_hash: importPreflight.diff_hash,
+      }, 60_000);
+      toast("配置已导入，正在应用", "success");
+      setImportOpen(false);
+      setImportFile(null);
+      setImportPackage(null);
+      setImportPreflight(null);
+      await loadSnapshots();
+      void apply.apply();
+    } catch (error: any) {
+      setImportError(error?.message || "配置导入失败");
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
   const system = summary.data?.system || {};
   const candidates = (interfaces.data?.items || []).filter((item) => (item.gateway_role || item.role) !== "wan");
   const managementOptions = form.interfaceId && !candidates.some((item) => item.id === form.interfaceId)
@@ -162,9 +218,10 @@ export function ConfigPage() {
           <div className="inline-warning">系统时间当前仅支持读取；后端没有提供时间写入 API，因此不提供“同步时间”假按钮。</div>
         </Card>
 
-        <Card title="配置备份" subtitle="导出期望配置 JSON；导入/快照恢复需产品确认后开放">
+        <Card title="配置备份" subtitle="导出/导入期望配置 JSON；导入先预检，再确认替换">
           <div className="button-row">
             <Button icon={<Download size={14} />} onClick={exportConfig}>导出配置</Button>
+            <Button icon={<Upload size={14} />} onClick={() => { setImportOpen(true); setImportError(""); setImportPreflight(null); setImportPackage(null); }} disabled={session?.role === "readonly"}>导入配置</Button>
             <Button icon={<Save size={14} />} onClick={() => navigate("/system/runtime")}>查看运行态</Button>
           </div>
           <div className="snapshot-create">
@@ -191,6 +248,37 @@ export function ConfigPage() {
           </div>
         </Card>
       </div>
+
+      <Modal
+        open={importOpen}
+        onClose={() => !importBusy && setImportOpen(false)}
+        title="导入配置"
+        subtitle="先预检，再确认替换；不兼容/密钥材料会被拒绝"
+        size="md"
+        busy={importBusy}
+        footer={
+          <>
+            <Button onClick={() => setImportOpen(false)} disabled={importBusy}>取消</Button>
+            <Button onClick={preflightImport} loading={importBusy && !importPreflight} disabled={!importFile}>预检</Button>
+            <Button variant="danger" onClick={confirmImport} loading={importBusy && Boolean(importPreflight)} disabled={!importPreflight}>确认导入</Button>
+          </>
+        }
+      >
+        <div className="form-stack">
+          <Field label="配置包 JSON"><input type="file" accept="application/json,.json" onChange={(event) => { setImportFile(event.target.files?.[0] || null); setImportPreflight(null); setImportPackage(null); setImportError(""); }} /></Field>
+          {importError && <div className="error-state"><strong>导入失败</strong><p>{importError}</p></div>}
+          {importPreflight && (
+            <div className="notice-block">
+              <strong>预检通过</strong>
+              <span>状态：{text(importPreflight.status, "dry_run")} · 安全应用：{importPreflight.safe_to_apply ? "是" : "否"}</span>
+              <span>包哈希：<code>{text(importPreflight.package_hash)}</code></span>
+              <span>差异哈希：<code>{text(importPreflight.diff_hash)}</code></span>
+              <span>确认有效期至：{formatDateTime(importPreflight.confirmation_expires_at)}</span>
+            </div>
+          )}
+          <div className="inline-warning">导入会替换当前期望配置；成功后会触发运行态应用。仅接受当前产品导出的包，密钥材料会被后端拒绝。</div>
+        </div>
+      </Modal>
 
       <Modal
         open={resetOpen}

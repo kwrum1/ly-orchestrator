@@ -58,8 +58,8 @@ if (manifestPath !== canonicalPath && readFileSync(manifestPath, "utf8") !== rea
 NODE
 
 source_dir="$repo_root/frontend/$product"
-if [ "$product" = gateway ] && [ -f "$source_dir/package.json" ] && [ -f "$source_dir/vite.config.ts" ]; then
-  "$repo_root/scripts/build-gateway-ui.sh" --out "$out_dir" --manifest "$manifest"
+if [ -f "$repo_root/frontend/gateway/package.json" ] && [ -f "$repo_root/frontend/gateway/vite.config.ts" ]; then
+  "$repo_root/scripts/build-product-ui.sh" --product "$product" --out "$out_dir" --manifest "$manifest"
   exit 0
 fi
 if [ ! -f "$source_dir/shell.js" ] || [ ! -f "$source_dir/index.html" ] || [ ! -f "$source_dir/styles.css" ]; then
