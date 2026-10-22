@@ -311,6 +311,8 @@ EOF
       "$target/etc/systemd/system/ly-route-pppoe@.service" \
       "$target/etc/systemd/system/ly-route-policy-routing.service"
     rm -rf "$target/etc/systemd/system/kea-dhcp4-server.service.d"
+    rm -f "$target/usr/lib/ly-route/kea-wait-lan.sh" \
+      "$target/etc/udev/rules.d/90-ly-route-kea-lan.rules"
     sed -i '/kea-dhcp4-server\.service/d; s/ with DHCP enabled//' "$target/usr/lib/ly-route/firstboot.sh"
   fi
 }

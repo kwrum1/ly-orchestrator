@@ -221,10 +221,9 @@ EOF
     chmod 0644 "$runtime_env_tmp"
     mv -f "$runtime_env_tmp" "$runtime_env"
   fi
+  # Kea is ordered after this unit and waits for the VPP LAN tap itself.
+  # Restarting it here would race with the dataplane and abort a valid wait.
   systemctl reset-failed kea-dhcp4-server.service 2>/dev/null || true
-  # Kea may wait for network-online.target, while firstboot is ordered before
-  # that target. Do not hold the complete dataplane boot transaction here.
-  systemctl restart --no-block kea-dhcp4-server.service 2>/dev/null || true
 
   if [ "${LY_ROUTE_VMXNET3_TAP_BRIDGE_ACCEPTANCE:-false}" = true ]; then
     python3 - "$installed_network" <<'PY' | while IFS='|' read -r name bridge host; do

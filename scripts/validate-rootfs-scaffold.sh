@@ -53,6 +53,9 @@ $repo_root/packaging/rootfs-overlay/etc/ly-route/default-config.json
 $repo_root/packaging/rootfs-overlay/etc/ly-route/runtime.env
 $repo_root/packaging/rootfs-overlay/etc/kea/kea-dhcp4.conf
 $repo_root/packaging/rootfs-overlay/etc/systemd/system/kea-dhcp4-server.service.d/ly-route-firstboot.conf
+$repo_root/packaging/rootfs-overlay/etc/systemd/system/kea-dhcp4-server.service.d/20-ly-route-lan-retry.conf
+$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/kea-wait-lan.sh
+$repo_root/packaging/rootfs-overlay/etc/udev/rules.d/90-ly-route-kea-lan.rules
 $repo_root/packaging/nginx/ly-route-admin.conf
 $repo_root/backend/cmd/gateway-control/main.go
 $repo_root/backend/cmd/orchestrator-control/main.go
@@ -141,13 +144,33 @@ if ! grep -q '"active_path": "dataplane_locked"' "$repo_root/packaging/rootfs-ov
   exit 1
 fi
 
-if ! grep -q '"interfaces": \["eth0"\]' "$repo_root/packaging/rootfs-overlay/etc/kea/kea-dhcp4.conf"; then
-  echo "factory Kea config does not bind DHCP to eth0" >&2
+if ! grep -q '"interfaces": \["lylan-' "$repo_root/packaging/rootfs-overlay/etc/kea/kea-dhcp4.conf"; then
+  echo "factory Kea config does not bind DHCP to a VPP LAN control interface" >&2
+  exit 1
+fi
+
+if grep -q '10\.0\.2\.' "$repo_root/packaging/rootfs-overlay/etc/kea/kea-dhcp4.conf"; then
+  echo "factory Kea config must not serve the management network" >&2
   exit 1
 fi
 
 if ! grep -q '192.168.88.100 - 192.168.88.199' "$repo_root/packaging/rootfs-overlay/etc/kea/kea-dhcp4.conf"; then
   echo "factory Kea config does not expose the default LAN DHCP pool" >&2
+  exit 1
+fi
+
+if [ ! -x "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/kea-wait-lan.sh" ]; then
+  echo "Kea LAN readiness helper is missing or not executable" >&2
+  exit 1
+fi
+
+if ! grep -q '^ExecStartPre=/usr/lib/ly-route/kea-wait-lan.sh$' "$repo_root/packaging/rootfs-overlay/etc/systemd/system/kea-dhcp4-server.service.d/20-ly-route-lan-retry.conf"; then
+  echo "Kea service does not wait for the exact configured LAN interface" >&2
+  exit 1
+fi
+
+if ! grep -q 'KERNEL=="lylan-\*"' "$repo_root/packaging/rootfs-overlay/etc/udev/rules.d/90-ly-route-kea-lan.rules"; then
+  echo "Kea udev rule does not react to late VPP LAN taps" >&2
   exit 1
 fi
 

@@ -65,6 +65,7 @@ copy_path() {
 }
 for path in \
   etc/ly-route etc/vpp etc/kea \
+  etc/udev/rules.d/90-ly-route-kea-lan.rules \
   etc/nginx/conf.d/ly-route-admin.conf \
   etc/systemd/network/10-ethernet-dhcp.network \
   opt/ly-route usr/lib/ly-route usr/share/ly-route; do
@@ -119,6 +120,7 @@ apt-get install -y ca-certificates nginx-light openssh-server sudo openssl zstd 
 apt-get install -y "$bundle_dir"/packages/*.deb
 zstd -dc "$bundle_dir/overlay.tar.zst" | tar -xpf - -C /
 systemctl daemon-reload
+udevadm control --reload-rules 2>/dev/null || true
 systemctl enable systemd-networkd.service systemd-resolved.service nginx.service \
   ly-route-firstboot.service ly-route-runtime-check.service ly-route-vpp-tune.service \
   ly-route-vpp-apply.service ly-route-control-api.service ly-route-recovery.service \
