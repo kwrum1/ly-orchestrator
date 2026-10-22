@@ -98,22 +98,48 @@ func TestRenderGatewayNftablesCaptureRejectsUnsafeLANInterface(t *testing.T) {
 }
 
 func TestRenderGatewayNftablesCaptureDropsOnlyLinuxLCPDNSCopies(t *testing.T) {
-	artifacts, err := RenderGatewayNftablesCapture(proxy.NftablesCapturePlan{}, DNSInterceptionPlan{LCPGuardAddresses: []string{"192.168.50.1", "2001:db8:50::1", "192.168.50.1"}})
+	artifacts, err := RenderGatewayNftablesCapture(proxy.NftablesCapturePlan{}, DNSInterceptionPlan{
+		LCPGuardAddresses:  []string{"192.168.50.1", "2001:db8:50::1", "192.168.50.1"},
+		LCPGuardInterfaces: []string{"lylan-eth2", "lylan-eth2"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(artifacts) != 1 {
 		t.Fatalf("LCP guard artifacts = %d", len(artifacts))
 	}
+	content := artifacts[0].Content
 	for _, required := range []string{
 		"type filter hook input priority -300; policy accept;",
-		"ip daddr 192.168.50.1 udp dport 53 counter drop",
-		"ip daddr 192.168.50.1 tcp dport 53 counter drop",
-		"ip6 daddr 2001:db8:50::1 udp dport 53 counter drop",
+		`iifname "lylan-eth2" ip daddr 192.168.50.1 udp dport 53 counter drop`,
+		`iifname "lylan-eth2" ip daddr 192.168.50.1 tcp dport 53 counter drop`,
+		`iifname "lylan-eth2" ip6 daddr 2001:db8:50::1 udp dport 53 counter drop`,
 	} {
-		if !strings.Contains(artifacts[0].Content, required) {
-			t.Fatalf("LCP guard missing %q:\n%s", required, artifacts[0].Content)
+		if !strings.Contains(content, required) {
+			t.Fatalf("LCP guard missing %q:\n%s", required, content)
 		}
+	}
+	// An unscoped drop would also discard legitimate SmartDNS input on the
+	// LAN or DNS service TAP.
+	for _, forbidden := range []string{
+		"\n    ip daddr 192.168.50.1 udp dport 53 counter drop",
+		"\n    ip daddr 192.168.50.1 tcp dport 53 counter drop",
+	} {
+		if strings.Contains(content, forbidden) {
+			t.Fatalf("LCP guard contains an unscoped DNS drop %q:\n%s", forbidden, content)
+		}
+	}
+}
+
+func TestRenderGatewayNftablesCaptureKeepsLANDPOpenWithoutLCPInterface(t *testing.T) {
+	artifacts, err := RenderGatewayNftablesCapture(proxy.NftablesCapturePlan{}, DNSInterceptionPlan{
+		LCPGuardAddresses: []string{"192.168.50.1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifacts) != 0 {
+		t.Fatalf("guard without an LCP interface must not render a drop: %#v", artifacts)
 	}
 }
 

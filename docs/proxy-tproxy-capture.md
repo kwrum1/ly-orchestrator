@@ -43,6 +43,29 @@ artifact instead of leaving the previous TPROXY generation installed. The
 nftables readback accepts this generation only via the explicit
 `ly-route-proxy-fail-open` marker and only for the managed table.
 
+### DNS LCP guard (`runtime/service`, `httpapi`)
+
+The P0-2 regression showed the `dns_lcp_guard` input chain dropping every
+packet to the LAN gateway's port 53, including legitimate SmartDNS input:
+
+```text
+ip daddr 192.168.88.1 udp dport 53 drop
+ip daddr 192.168.88.1 tcp dport 53 drop
+```
+
+The guard now requires `LCPGuardInterfaces` and renders an `iifname` match:
+
+```text
+iifname "lylan-eth2" ip daddr 192.168.88.1 udp dport 53 counter drop
+```
+
+`dnsLCPGuardPlan` derives the interface with
+`vpp.LANControlPlaneHostInterface(assignment.LinuxInterface)` (falling back to
+the `lyroute-*` VPP name). Only the duplicate copy seen on the VPP LCP is
+dropped; normal LAN input and DNS service TAP input to the same gateway
+address stay deliverable to SmartDNS. If no interface is supplied, the
+renderer emits no drop (fail-open) instead of reintroducing the broad rule.
+
 ### Xray (`runtime/proxy`, `httpapi`)
 
 `EnsureDirectFallback`:
@@ -128,7 +151,17 @@ Independent netns acceptance (no lab, own namespaces):
 ```
 bash scripts/test-proxy-tproxy-netns.sh
 PASS: selected=TPROXY, lan/dns=direct, flush=fail-open, reapply=idempotent
+
+bash scripts/test-lan-dns-lcp-guard-netns.sh
+lan-udp -> DNS-OK
+lan-tcp -> DNS-OK
+lcp-udp -> TIMEOUT
+lcp-tcp -> TIMEOUT
+PASS: LAN 53 udp/tcp delivered; LCP duplicate udp/tcp dropped by scoped guard
 ```
+
+The second script renders the real guard through `testdata/render`, so it
+fails if an unscoped gateway-port-53 drop reappears.
 
 It renders the real plan with `testdata/render`, applies it with `nft -f`,
 and proves: selected -> TPROXY listener, LAN/DNS -> forwarded direct,

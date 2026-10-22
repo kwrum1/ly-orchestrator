@@ -5612,6 +5612,7 @@ func hasLANAddressAssignment(assignments []vpp.AddressAssignment) bool {
 
 func dnsLCPGuardPlan(assignments []vpp.AddressAssignment) serviceRuntime.DNSInterceptionPlan {
 	addresses := make([]string, 0, len(assignments))
+	interfaces := make([]string, 0, len(assignments))
 	for _, assignment := range assignments {
 		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
 			continue
@@ -5620,8 +5621,18 @@ func dnsLCPGuardPlan(assignments []vpp.AddressAssignment) serviceRuntime.DNSInte
 		if err == nil {
 			addresses = append(addresses, prefix.Addr().String())
 		}
+		// The guard exists only for the duplicate LCP copy. Scoping it to the
+		// VPP LCP host interface keeps normal LAN DNS and the DNS service TAP
+		// deliverable to SmartDNS on the same gateway address.
+		linuxInterface := strings.TrimSpace(assignment.LinuxInterface)
+		if linuxInterface == "" {
+			linuxInterface = strings.TrimPrefix(strings.TrimSpace(assignment.VPPInterface), "lyroute-")
+		}
+		if linuxInterface != "" {
+			interfaces = append(interfaces, vpp.LANControlPlaneHostInterface(linuxInterface))
+		}
 	}
-	return serviceRuntime.DNSInterceptionPlan{LCPGuardAddresses: addresses}
+	return serviceRuntime.DNSInterceptionPlan{LCPGuardAddresses: addresses, LCPGuardInterfaces: interfaces}
 }
 
 func dataplaneLockedReason(proof []vpp.PrerequisiteResult, warnings []string) string {

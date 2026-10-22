@@ -1086,15 +1086,22 @@ func RenderNftablesCapture(plan proxy.NftablesCapturePlan) ([]RenderedArtifact, 
 }
 
 type DNSInterceptionPlan struct {
-	LANInterfaces     []string `json:"lan_interfaces"`
-	LCPGuardAddresses []string `json:"lcp_guard_addresses,omitempty"`
-	ListenPort        int      `json:"listen_port"`
+	LANInterfaces []string `json:"lan_interfaces"`
+	// LCPGuardAddresses are LAN gateway addresses whose Linux LCP copy must be
+	// dropped. The drop is scoped to LCPGuardInterfaces; a normal LAN or DNS
+	// service TAP input to the same address must stay deliverable to SmartDNS.
+	LCPGuardAddresses  []string `json:"lcp_guard_addresses,omitempty"`
+	LCPGuardInterfaces []string `json:"lcp_guard_interfaces,omitempty"`
+	ListenPort         int      `json:"listen_port"`
 }
 
 func RenderGatewayNftablesCapture(plan proxy.NftablesCapturePlan, dns DNSInterceptionPlan) ([]RenderedArtifact, error) {
 	hasProxy := strings.TrimSpace(plan.Family) != "" || strings.TrimSpace(plan.Table) != ""
 	hasDNS := len(dns.LANInterfaces) > 0
-	hasLCPGuard := len(dns.LCPGuardAddresses) > 0
+	// A guard address without an ingress interface would drop legitimate DNS
+	// delivered on the LAN or DNS service TAP, so it is deliberately ignored
+	// (fail-open) until the caller supplies the Linux LCP interface.
+	hasLCPGuard := len(dns.LCPGuardAddresses) > 0 && len(dns.LCPGuardInterfaces) > 0
 	if !hasProxy && !hasDNS && !hasLCPGuard {
 		return nil, nil
 	}
@@ -1138,6 +1145,22 @@ func RenderGatewayNftablesCapture(plan proxy.NftablesCapturePlan, dns DNSInterce
 		}
 	}
 	slices.SortFunc(guardAddresses, func(left, right netip.Addr) int { return left.Compare(right) })
+	seenGuardInterfaces := map[string]bool{}
+	guardInterfaces := make([]string, 0, len(dns.LCPGuardInterfaces))
+	for _, name := range dns.LCPGuardInterfaces {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !serviceTokenSafe(name) {
+			return nil, fmt.Errorf("DNS LCP guard interface %q is unsafe", name)
+		}
+		if !seenGuardInterfaces[name] {
+			seenGuardInterfaces[name] = true
+			guardInterfaces = append(guardInterfaces, name)
+		}
+	}
+	slices.Sort(guardInterfaces)
 	var builder strings.Builder
 	builder.WriteString("#!/usr/sbin/nft -f\n\n")
 	if plan.FailOpen {
@@ -1168,16 +1191,21 @@ func RenderGatewayNftablesCapture(plan proxy.NftablesCapturePlan, dns DNSInterce
 		}
 		builder.WriteString("  }\n")
 	}
-	if len(guardAddresses) > 0 {
+	if len(guardAddresses) > 0 && len(guardInterfaces) > 0 {
 		builder.WriteString("  chain dns_lcp_guard {\n")
 		builder.WriteString("    type filter hook input priority -300; policy accept;\n")
-		for _, address := range guardAddresses {
-			family := "ip"
-			if address.Is6() {
-				family = "ip6"
+		for _, interfaceName := range guardInterfaces {
+			for _, address := range guardAddresses {
+				family := "ip"
+				if address.Is6() {
+					family = "ip6"
+				}
+				// Only the LCP copy is a duplicate. SmartDNS listens on this
+				// same gateway address, and its LAN / DNS service TAP input
+				// must not match this rule.
+				builder.WriteString(fmt.Sprintf("    iifname %q %s daddr %s udp dport 53 counter drop\n", interfaceName, family, address))
+				builder.WriteString(fmt.Sprintf("    iifname %q %s daddr %s tcp dport 53 counter drop\n", interfaceName, family, address))
 			}
-			builder.WriteString(fmt.Sprintf("    %s daddr %s udp dport 53 counter drop\n", family, address))
-			builder.WriteString(fmt.Sprintf("    %s daddr %s tcp dport 53 counter drop\n", family, address))
 		}
 		builder.WriteString("  }\n")
 	}

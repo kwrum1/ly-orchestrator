@@ -17,6 +17,8 @@ func main() {
 	mode := flag.String("mode", "json", "json, nft, or xray")
 	lan := flag.String("lan", "10.200.1.0/24", "LAN return prefix that must bypass capture")
 	underlay := flag.String("underlay", "203.0.113.1 veth-up", "resolved VPP underlay for the policy route plan")
+	guardAddress := flag.String("guard-address", "192.168.88.1", "LAN gateway address for the LCP DNS guard")
+	guardInterface := flag.String("guard-interface", "lylan-eth2", "Linux LCP host interface for the DNS guard")
 	flag.Parse()
 
 	egress := proxy.NewProxyEgress("proxy-netns", "xray-vpp-service")
@@ -42,6 +44,15 @@ func main() {
 		}
 	case "nft":
 		artifacts, err := service.RenderNftablesCapture(compiled.NftablesCapture)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Print(artifacts[0].Content)
+	case "guard":
+		artifacts, err := service.RenderGatewayNftablesCapture(proxy.NftablesCapturePlan{}, service.DNSInterceptionPlan{
+			LCPGuardAddresses:  []string{*guardAddress},
+			LCPGuardInterfaces: []string{*guardInterface},
+		})
 		if err != nil {
 			fail(err)
 		}

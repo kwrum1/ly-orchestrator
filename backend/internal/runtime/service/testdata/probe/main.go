@@ -27,6 +27,8 @@ func main() {
 		serve(*listen, *reply, false)
 	case "tproxy":
 		serve(*listen, *reply, true)
+	case "dns":
+		serveDNS(*listen)
 	case "client":
 		client(*address, *attempts)
 	default:
@@ -53,6 +55,47 @@ func serve(listen, reply string, transparent bool) {
 			_, _ = connection.Read(buffer)
 			local := connection.LocalAddr().String()
 			_, _ = fmt.Fprintf(connection, "%s %s\n", reply, local)
+		}(connection)
+	}
+}
+
+// serveDNS is a deliberately format-agnostic DNS endpoint: the guard test only
+// needs to prove that UDP/TCP port 53 input is delivered or dropped.
+func serveDNS(listen string) {
+	udpAddress, err := net.ResolveUDPAddr("udp4", listen)
+	if err != nil {
+		fail(err)
+	}
+	udp, err := net.ListenUDP("udp4", udpAddress)
+	if err != nil {
+		fail(err)
+	}
+	tcp, err := net.Listen("tcp4", listen)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Fprintln(os.Stderr, "dns listening", listen)
+	go func() {
+		buffer := make([]byte, 512)
+		for {
+			_, peer, err := udp.ReadFromUDP(buffer)
+			if err != nil {
+				return
+			}
+			_, _ = udp.WriteToUDP([]byte("DNS-OK"), peer)
+		}
+	}()
+	for {
+		connection, err := tcp.Accept()
+		if err != nil {
+			fail(err)
+		}
+		go func(connection net.Conn) {
+			defer connection.Close()
+			_ = connection.SetReadDeadline(time.Now().Add(3 * time.Second))
+			buffer := make([]byte, 512)
+			_, _ = connection.Read(buffer)
+			_, _ = connection.Write([]byte("DNS-OK"))
 		}(connection)
 	}
 }
