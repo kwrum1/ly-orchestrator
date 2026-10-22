@@ -1,0 +1,196 @@
+#!/bin/sh
+# Keep the proxy dataplane fail-open across Xray stop, crash and reboot.
+#
+# on  (ExecStartPost): wait for the TPROXY listener, then re-apply the
+#     persisted nftables generation and remove the VPP fail-open bypasses.
+# off (ExecStopPost):  install VPP pre-NAT bypass rules for every skip-nat
+#     proxy policy *before* removing host capture, so VPP stops steering
+#     selected traffic into the proxy TAP as soon as Xray goes away.
+#
+# The VPP plugin keeps pre-NAT state; the bypass rules mirror each proxy
+# policy at priority-1 and use reserved ids 9000..9063. They are idempotent
+# and are removed again on a healthy start.
+set -u
+
+MODE=${1:-}
+NFT=${LY_ROUTE_NFT:-/usr/sbin/nft}
+VPPCTL=${LY_ROUTE_VPPCTL:-vppctl}
+CONF=${LY_ROUTE_NFT_CONF:-/etc/nftables.conf}
+XRAY_CONFIG=${LY_ROUTE_XRAY_CONFIG:-/etc/xray/config.json}
+PRE_NAT_SHOW=${LY_ROUTE_PRE_NAT_SHOW:-}
+CAPTURE_FAMILY=inet
+CAPTURE_TABLE=ly_route_proxy_capture
+CAPTURE_CHAIN=proxy_prerouting
+BYPASS_BASE=9000
+BYPASS_MAX=64
+
+log() { printf 'ly-route-proxy-failopen: %s\n' "$*" >&2; }
+
+show_rules() {
+    if [ -n "$PRE_NAT_SHOW" ]; then
+        cat "$PRE_NAT_SHOW" 2>/dev/null || true
+        return
+    fi
+    "$VPPCTL" show ly-route pre-nat-route detail 2>/dev/null || true
+}
+
+vpp_set() {
+    if [ -n "$PRE_NAT_SHOW" ]; then
+        # Test/fixture mode records commands instead of touching VPP.
+        [ -n "${LY_ROUTE_VPP_LOG:-}" ] && printf '%s\n' "$*" >>"$LY_ROUTE_VPP_LOG"
+        return 0
+    fi
+    "$VPPCTL" "$@" >/dev/null 2>&1
+}
+
+flush_capture() {
+    "$NFT" flush chain "$CAPTURE_FAMILY" "$CAPTURE_TABLE" "$CAPTURE_CHAIN" 2>/dev/null || true
+}
+
+install_capture() {
+    [ -f "$CONF" ] || {
+        log "no $CONF, leaving capture fail-open"
+        return 1
+    }
+    "$NFT" -f "$CONF" || {
+        log "failed to apply $CONF, leaving capture fail-open"
+        return 1
+    }
+}
+
+tproxy_ports() {
+    [ -f "$XRAY_CONFIG" ] || return 0
+    python3 - "$XRAY_CONFIG" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+for inbound in data.get("inbounds", []):
+    sockopt = (inbound.get("streamSettings") or {}).get("sockopt") or {}
+    if inbound.get("protocol") != "dokodemo-door" or sockopt.get("tproxy") != "tproxy":
+        continue
+    try:
+        port = int(inbound.get("port"))
+    except (TypeError, ValueError):
+        continue
+    if 0 < port < 65536:
+        print(port)
+PY
+}
+
+listening_port() {
+    port=$1
+    ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$port\$"
+}
+
+wait_listener() {
+    ports=$(tproxy_ports)
+    [ -n "$ports" ] || return 0
+    attempt=0
+    while [ "$attempt" -lt "${LY_ROUTE_LISTENER_WAIT_ATTEMPTS:-100}" ]; do
+        ready=1
+        for port in $ports; do
+            listening_port "$port" || ready=0
+        done
+        [ "$ready" = 1 ] && return 0
+        attempt=$((attempt + 1))
+        sleep 0.2
+    done
+    return 1
+}
+
+delete_bypass() {
+    show_rules | awk '
+        $1 == "rule" {
+            id = bypass = "";
+            for (i = 1; i <= NF; i++) {
+                if ($i == "id") id = $(i + 1);
+                else if ($i == "bypass") bypass = $(i + 1);
+            }
+            if ((bypass + 0) == 1 && (id + 0) >= '"$BYPASS_BASE"' && (id + 0) < '"$((BYPASS_BASE + BYPASS_MAX))"')
+                print id;
+        }' | while read -r id; do
+        [ -n "$id" ] || continue
+        vpp_set set ly-route pre-nat-route del id "$id" || log "delete bypass $id failed"
+    done
+}
+
+add_bypass() {
+    # Replace any previous reservation so repeated stop/crash events cannot
+    # accumulate duplicate rules with our reserved ids.
+    delete_bypass
+    tmp=$(mktemp 2>/dev/null) || return 1
+    show_rules | awk '
+        $1 == "rule" {
+            id = prio = src = dst = proto = sport = dport = skip = bypass = "";
+            for (i = 1; i <= NF; i++) {
+                if ($i == "id") id = $(i + 1);
+                else if ($i == "priority") prio = $(i + 1);
+                else if ($i == "source") src = $(i + 1);
+                else if ($i == "destination") dst = $(i + 1);
+                else if ($i == "protocol") proto = $(i + 1);
+                else if ($i == "sport") sport = $(i + 1);
+                else if ($i == "dport") dport = $(i + 1);
+                else if ($i == "skip-nat") skip = $(i + 1);
+                else if ($i == "bypass") bypass = $(i + 1);
+            }
+            if ((skip + 0) == 1 && (bypass + 0) == 0)
+                print id, prio, src, dst, proto, sport, dport;
+        }' >"$tmp"
+
+    index=0
+    while read -r id prio src dst proto sport dport; do
+        [ -n "${id:-}" ] || continue
+        index=$((index + 1))
+        [ "$index" -le "$BYPASS_MAX" ] || break
+        case "$proto" in
+            0) protocol=any ;;
+            6) protocol=tcp ;;
+            17) protocol=udp ;;
+            1) protocol=icmp ;;
+            *) log "skip proxy rule $id with protocol $proto"; continue ;;
+        esac
+        bypass_priority=$prio
+        if [ "$bypass_priority" -gt 0 ] 2>/dev/null; then
+            bypass_priority=$((bypass_priority - 1))
+        fi
+        bypass_id=$((BYPASS_BASE + index))
+        # Same selector as the proxy rule, one step earlier in priority (and
+        # a lower id as the tie-break).  The plugin then keeps the packet on
+        # the normal NAT path instead of the proxy skip-nat FIB.
+        vpp_set set ly-route pre-nat-route add id "$bypass_id" priority "$bypass_priority" \
+            source "$src" destination "$dst" protocol "$protocol" \
+            sport "$sport" dport "$dport" bypass || log "add bypass for rule $id failed"
+    done <"$tmp"
+    rm -f "$tmp"
+}
+
+case "$MODE" in
+    on)
+        if wait_listener; then
+            if install_capture; then
+                delete_bypass
+                log "capture installed and proxy steering enabled"
+                exit 0
+            fi
+        else
+            log "TPROXY listener did not become ready"
+        fi
+        # Never leave a live VPP steering path pointing at a listener that is
+        # not ready. Install the direct bypass and keep host capture empty.
+        add_bypass
+        flush_capture
+        exit 0
+        ;;
+    off)
+        add_bypass
+        flush_capture
+        log "capture removed and proxy steering bypassed"
+        exit 0
+        ;;
+    *)
+        printf 'usage: %s on|off\n' "$0" >&2
+        exit 2
+        ;;
+esac

@@ -9,8 +9,9 @@ import (
 // Every rule that selected a proxy outbound is routed through a single-node
 // balancer whose fallbackTag is the "direct" freedom outbound. The Xray
 // observatory marks an unreachable node dead, after which the balancer
-// selects the direct outbound. The direct outbound deliberately has no proxy
-// socket mark, so it uses the ordinary WAN route.
+// selects the direct outbound. The direct outbound carries the same proxy
+// egress socket mark as the node: VPP owns the WAN interface, so the marked
+// policy route is the only working path to the WAN.
 func EnsureDirectFallback(config *XrayConfigPayload, probeURL string) error {
 	if config == nil {
 		return fmt.Errorf("%w: xray config is required for direct fallback", ErrInvalidEgress)

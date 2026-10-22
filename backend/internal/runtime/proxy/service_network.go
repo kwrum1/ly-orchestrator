@@ -170,13 +170,10 @@ func ApplyOutboundSocketMark(config *XrayConfigPayload, mark uint32) {
 		return
 	}
 	for index := range config.Outbounds {
-		// The direct fail-open outbound must use the ordinary WAN route. Giving
-		// it the proxy mark would send a failed proxy connection back through
-		// the proxy underlay, which is exactly the blackhole this fallback is
-		// meant to avoid.
-		if strings.TrimSpace(config.Outbounds[index].Tag) == ProxyDirectOutboundTag {
-			continue
-		}
+		// Every Xray outbound, including the direct fail-open outbound, must
+		// use the proxy egress policy route. That route is the host's only
+		// path to the WAN (VPP owns the WAN interface); an unmarked direct
+		// socket would fall back to the management/default table and fail.
 		stream := cloneMap(config.Outbounds[index].StreamSettings)
 		sockopt := cloneMap(anyMap(stream["sockopt"]))
 		sockopt["mark"] = mark

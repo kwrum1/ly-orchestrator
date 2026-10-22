@@ -54,16 +54,37 @@ nftables readback accepts this generation only via the explicit
 - enables the observatory so an unreachable node is marked dead and the
   balancer actually falls back.
 
-`ApplyOutboundSocketMark` skips the `direct` tag: a failed proxy uses the
-ordinary WAN route instead of re-entering the proxy underlay.
+`ApplyOutboundSocketMark` marks **every** Xray outbound, including `direct`.
+VPP owns the WAN interface, so the proxy egress mark is the only Linux path
+to the WAN; an unmarked direct socket would use the management/default table
+and fail. The node and the direct fallback both leave through the same VPP
+egress TAP/NAT role.
 
-### systemd fail-open guard
+### systemd fail-open guard and boot restore
 
-`packaging/rootfs-overlay/etc/systemd/system/xray.service.d/10-ly-route-proxy-fail-open.conf`
-flushes only `inet ly_route_proxy_capture` in `ExecStartPre` and `ExecStopPost`.
-An Xray restart/crash therefore removes capture before the listener can be
-unavailable; the next verified apply reinstalls it (service order is Xray then
-Nftables).
+`packaging/rootfs-overlay/usr/lib/ly-route/proxy-failopen` is called by
+`xray.service`:
+
+- `ExecStartPre`: flush only the `proxy_prerouting` chain (never the DNS
+  chains in the same table).
+- `ExecStartPost (on)`: wait until every TPROXY inbound port is listening,
+  re-apply `/etc/nftables.conf` (so a reboot needs no manual apply), then
+  remove the VPP bypass rules.
+- `ExecStopPost (off)`: add VPP pre-NAT rules for every `skip-nat` proxy
+  policy at `priority - 1` with reserved ids `9000..9063`, then flush host
+  capture. VPP immediately stops steering selected traffic into the proxy
+  TAP and the normal LAN -> WAN NAT path takes over.
+
+The bypass mirrors each proxy policy's source/destination/protocol/ports and
+is idempotent. It is added before capture is flushed and removed only after a
+healthy capture install, so a listener that never becomes ready installs the
+bypass instead of a black hole.
+
+`packaging/rootfs-overlay/etc/systemd/system/vpp.service.d/40-ly-route-policy-routing.conf`
+pulls in the otherwise-static `ly-route-policy-routing.service` on every VPP
+start. That service owns the Linux ingress/outbound fwmark rules and policy
+tables (including the proxy egress table); without it a reboot leaves Xray
+and capture healthy but every marked upstream unrouteable.
 
 ## Verification
 

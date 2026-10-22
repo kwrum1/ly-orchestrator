@@ -117,7 +117,7 @@ func TestFailOpenNftablesCaptureHasNoTPROXYRules(t *testing.T) {
 	}
 }
 
-func TestEnsureDirectFallbackIsIdempotentAndUnmarked(t *testing.T) {
+func TestEnsureDirectFallbackIsIdempotentAndMarked(t *testing.T) {
 	config := XrayConfigPayload{
 		Inbounds:  []XrayInbound{{Tag: "proxy-in", Protocol: "dokodemo-door", Settings: XrayDokodemoSettings{Network: "tcp,udp"}}},
 		Outbounds: []XrayOutbound{{Tag: "node-a", Protocol: "vless"}},
@@ -158,13 +158,13 @@ func TestEnsureDirectFallbackIsIdempotentAndUnmarked(t *testing.T) {
 	}
 
 	ApplyOutboundSocketMark(&config, 0x200001)
-	nodeMark, _ := config.Outbounds[0].StreamSettings["sockopt"].(map[string]any)
-	if nodeMark["mark"] != uint32(0x200001) {
-		t.Fatalf("proxy node lost the egress mark: %#v", nodeMark)
-	}
-	if config.Outbounds[1].StreamSettings != nil {
-		if sockopt, ok := config.Outbounds[1].StreamSettings["sockopt"]; ok {
-			t.Fatalf("direct fallback must not carry a proxy mark: %#v", sockopt)
+	for _, index := range []int{0, 1} {
+		stream := config.Outbounds[index].StreamSettings
+		sockopt, _ := stream["sockopt"].(map[string]any)
+		if sockopt["mark"] != uint32(0x200001) {
+			// VPP owns the WAN interface. Without the proxy egress mark the
+			// direct fallback would use the management/default table and fail.
+			t.Fatalf("outbound %q lost the egress mark: %#v", config.Outbounds[index].Tag, sockopt)
 		}
 	}
 
