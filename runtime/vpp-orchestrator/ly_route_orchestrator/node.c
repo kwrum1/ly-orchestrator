@@ -450,7 +450,12 @@ VLIB_NODE_FN (ly_orch_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       if (direction == LY_ORCH_DIRECTION_INVALID || !config->valid)
         drop = 1;
-      if (direction == LY_ORCH_DIRECTION_REVERSE && tuple.valid)
+      /* Policy rules are written in the client-to-server orientation.  WAN
+       * ingress is the return direction, so reverse it before matching; LAN
+       * ingress is already the request orientation.  Reversing the other
+       * direction made every port rule evaluate sport=service-port and never
+       * match the API's destination_ports condition. */
+      if (direction == LY_ORCH_DIRECTION_FORWARD && tuple.valid)
         ly_orch_reverse_tuple (&tuple);
       if (!drop && tuple.valid)
         path_count = ly_orch_build_path (config, &tuple, path,
