@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
 )
@@ -97,15 +98,24 @@ type VPPSteeringInstruction struct {
 }
 
 type NftablesCapturePlan struct {
-	EgressID         string          `json:"egress_id"`
-	Family           string          `json:"family"`
-	Table            string          `json:"table"`
-	TargetPort       int             `json:"target_port"`
-	Mark             string          `json:"mark"`
-	InboundMark      string          `json:"inbound_mark,omitempty"`
-	IngressInterface string          `json:"ingress_interface,omitempty"`
-	Chains           []NftablesChain `json:"chains"`
-	Rules            []NftablesRule  `json:"rules"`
+	EgressID         string `json:"egress_id"`
+	Family           string `json:"family"`
+	Table            string `json:"table"`
+	TargetPort       int    `json:"target_port"`
+	Mark             string `json:"mark"`
+	InboundMark      string `json:"inbound_mark,omitempty"`
+	IngressInterface string `json:"ingress_interface,omitempty"`
+	// BypassDestinations are IPv4 prefixes that must never enter the proxy
+	// socket. VPP-selected traffic can still include LAN, link-local or the
+	// proxy service networks themselves; capturing those would blackhole
+	// same-source LAN upstreams or loop the proxy handoff.
+	BypassDestinations []string `json:"bypass_destinations,omitempty"`
+	// FailOpen marks a deliberately empty capture generation. The table is
+	// flushed and left with policy accept so traffic continues on the direct
+	// path while the proxy runtime is degraded or unhealthy.
+	FailOpen bool            `json:"fail_open,omitempty"`
+	Chains   []NftablesChain `json:"chains"`
+	Rules    []NftablesRule  `json:"rules"`
 }
 
 type NftablesChain struct {
@@ -226,7 +236,8 @@ type XrayRouting struct {
 
 type XrayRoutingRule struct {
 	Type        string   `json:"type"`
-	InboundTags []string `json:"inboundTag"`
+	InboundTags []string `json:"inboundTag,omitempty"`
+	Network     string   `json:"network,omitempty"`
 	BalancerTag string   `json:"balancerTag,omitempty"`
 	OutboundTag string   `json:"outboundTag,omitempty"`
 }
@@ -237,9 +248,10 @@ type XrayAPI struct {
 }
 
 type XrayBalancer struct {
-	Tag      string               `json:"tag"`
-	Selector []string             `json:"selector"`
-	Strategy XrayBalancerStrategy `json:"strategy"`
+	Tag         string               `json:"tag"`
+	Selector    []string             `json:"selector"`
+	FallbackTag string               `json:"fallbackTag,omitempty"`
+	Strategy    XrayBalancerStrategy `json:"strategy"`
 }
 
 type XrayBalancerStrategy struct {
@@ -631,31 +643,182 @@ func compileNftablesCapture(egress Egress) NftablesCapturePlan {
 	return compileNftablesCaptureForNetwork(egress, ServiceNetworkForEgressID(egress.ID))
 }
 
-func compileNftablesCaptureForNetwork(egress Egress, network ProxyServiceNetwork) NftablesCapturePlan {
-	const (
-		family = "inet"
-		table  = "ly_route_proxy_capture"
-		chain  = "proxy_prerouting"
-	)
-	mark := fmt.Sprintf("0x%x", network.IngressMark)
+// Proxy capture identities. The table is owned exclusively by Ly Route, so a
+// reload can flush only this table and never touch host firewall or other
+// container rules.
+const (
+	ProxyCaptureFamily = "inet"
+	ProxyCaptureTable  = "ly_route_proxy_capture"
+	ProxyCaptureChain  = "proxy_prerouting"
 
+	// ProxyDirectOutboundTag is the freedom outbound used as the explicit
+	// fail-open path when no proxy node is healthy. It must never carry the
+	// proxy egress fwmark, otherwise a failed proxy still disappears into the
+	// proxy underlay instead of using the normal WAN route.
+	ProxyDirectOutboundTag = "direct"
+	ProxyDirectProbeURL    = "https://www.gstatic.com/generate_204"
+)
+
+// NftablesBypassDestinations returns the IPv4 prefixes that must stay on the
+// direct path. The proxy service /30 peers are always included, as are the
+// reserved ranges that can never legitimately terminate in a proxy socket.
+func NftablesBypassDestinations(network ProxyServiceNetwork, lanRoutes []string) []string {
+	candidates := []string{
+		"0.0.0.0/8",
+		"127.0.0.0/8",
+		"169.254.0.0/16",
+		"224.0.0.0/4",
+		"240.0.0.0/4",
+		"255.255.255.255/32",
+		network.IngressCIDR,
+		network.EgressCIDR,
+	}
+	candidates = append(candidates, lanRoutes...)
+	seen := map[string]struct{}{}
+	destinations := make([]string, 0, len(candidates))
+	for _, raw := range candidates {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil || !prefix.Addr().Is4() {
+			continue
+		}
+		canonical := prefix.Masked().String()
+		if _, exists := seen[canonical]; exists {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		destinations = append(destinations, canonical)
+	}
+	return destinations
+}
+
+// CaptureGuardRules builds the non-TPROXY prefix of the capture chain:
+// already-marked packets and everything that must stay direct return before
+// the terminal tproxy statements. Because the base chain policy is accept, an
+// empty guard/chain is fail-open by construction.
+func CaptureGuardRules(plan NftablesCapturePlan) []NftablesRule {
+	ingress := strings.TrimSpace(plan.IngressInterface)
+	chain := CaptureChainName(plan)
+	mark := strings.TrimSpace(plan.InboundMark)
+	if mark == "" {
+		mark = strings.TrimSpace(plan.Mark)
+	}
+	if ingress == "" || chain == "" {
+		return nil
+	}
+	ipv4 := fmt.Sprintf("iifname %q meta nfproto ipv4", ingress)
+	rules := make([]NftablesRule, 0, 4+len(plan.BypassDestinations))
+	add := func(expression, action string) {
+		rules = append(rules, NftablesRule{
+			Order:      len(rules) + 1,
+			EgressID:   plan.EgressID,
+			Chain:      chain,
+			Expression: expression,
+			Action:     action,
+		})
+	}
+	if mark != "" {
+		add(fmt.Sprintf("iifname %q meta mark %s", ingress, mark), "counter return")
+	}
+	add(fmt.Sprintf("iifname != %q", ingress), "counter return")
+	for _, protocol := range []string{"tcp", "udp"} {
+		// Keep the transport keyword explicit: `meta l4proto tcp dport` has no
+		// symbol type information and is rejected by nft.
+		add(ipv4+" "+protocol+" dport 53", "counter return")
+	}
+	for _, destination := range plan.BypassDestinations {
+		add(ipv4+" ip daddr "+destination, "counter return")
+	}
+	return rules
+}
+
+// CaptureChainName returns the managed capture chain for a plan.
+func CaptureChainName(plan NftablesCapturePlan) string {
+	if len(plan.Chains) > 0 && strings.TrimSpace(plan.Chains[0].Name) != "" {
+		return strings.TrimSpace(plan.Chains[0].Name)
+	}
+	return ProxyCaptureChain
+}
+
+// FailOpenNftablesCapture returns a valid capture generation that flushes the
+// managed table and installs no TPROXY statement. It is used when a proxy
+// egress exists but its runtime could not be compiled or verified: selected
+// traffic then falls through the accept policy and stays on the direct path.
+func FailOpenNftablesCapture(egressID string) NftablesCapturePlan {
 	return NftablesCapturePlan{
-		EgressID:         egress.ID,
-		Family:           family,
-		Table:            table,
-		TargetPort:       network.ListenerPort,
-		Mark:             fmt.Sprintf("0x%x", network.IngressMark),
-		InboundMark:      fmt.Sprintf("0x%x", network.IngressMark),
-		IngressInterface: network.IngressHostInterface,
+		EgressID: strings.TrimSpace(egressID),
+		Family:   ProxyCaptureFamily,
+		Table:    ProxyCaptureTable,
+		FailOpen: true,
+	}
+}
+
+func compileNftablesCaptureForNetwork(egress Egress, network ProxyServiceNetwork) NftablesCapturePlan {
+	return buildNftablesCapturePlan(egress.ID, network, network.LANRoutes)
+}
+
+func buildNftablesCapturePlan(egressID string, network ProxyServiceNetwork, lanRoutes []string) NftablesCapturePlan {
+	mark := fmt.Sprintf("0x%x", network.IngressMark)
+	plan := NftablesCapturePlan{
+		EgressID:           egressID,
+		Family:             ProxyCaptureFamily,
+		Table:              ProxyCaptureTable,
+		TargetPort:         network.ListenerPort,
+		Mark:               mark,
+		InboundMark:        mark,
+		IngressInterface:   network.IngressHostInterface,
+		BypassDestinations: NftablesBypassDestinations(network, lanRoutes),
 		Chains: []NftablesChain{
-			{Name: chain, Type: "filter", Hook: "prerouting", Priority: -150, Policy: "accept"},
-		},
-		Rules: []NftablesRule{
-			{Order: 1, EgressID: egress.ID, Chain: chain, Expression: fmt.Sprintf("iifname %q meta mark %s", network.IngressHostInterface, fmt.Sprintf("0x%x", network.IngressMark)), Action: "return"},
-			{Order: 2, EgressID: egress.ID, Chain: chain, Expression: fmt.Sprintf("iifname %q meta l4proto tcp", network.IngressHostInterface), Action: fmt.Sprintf("meta mark set %s tproxy to :%d accept", mark, network.ListenerPort)},
-			{Order: 3, EgressID: egress.ID, Chain: chain, Expression: fmt.Sprintf("iifname %q meta l4proto udp", network.IngressHostInterface), Action: fmt.Sprintf("meta mark set %s tproxy to :%d accept", mark, network.ListenerPort)},
+			{Name: ProxyCaptureChain, Type: "filter", Hook: "prerouting", Priority: -150, Policy: "accept"},
 		},
 	}
+	rules := CaptureGuardRules(plan)
+	ipv4 := fmt.Sprintf("iifname %q meta nfproto ipv4", network.IngressHostInterface)
+	for _, protocol := range []string{"tcp", "udp"} {
+		rules = append(rules, NftablesRule{
+			Order:      len(rules) + 1,
+			EgressID:   egressID,
+			Chain:      ProxyCaptureChain,
+			Expression: ipv4 + " meta l4proto " + protocol,
+			Action:     fmt.Sprintf("counter meta mark set %s tproxy ip to :%d accept", mark, network.ListenerPort),
+		})
+	}
+	plan.Rules = rules
+	return plan
+}
+
+// refreshCaptureRules regenerates the guard prefix while preserving any
+// per-lane terminal TPROXY rules produced by adaptive subscription routing.
+func refreshCaptureRules(plan NftablesCapturePlan, network ProxyServiceNetwork, lanRoutes []string) NftablesCapturePlan {
+	plan.EgressID = network.EgressID
+	plan.Family = ProxyCaptureFamily
+	plan.Table = ProxyCaptureTable
+	plan.TargetPort = network.ListenerPort
+	plan.Mark = fmt.Sprintf("0x%x", network.IngressMark)
+	plan.InboundMark = plan.Mark
+	plan.IngressInterface = network.IngressHostInterface
+	plan.BypassDestinations = NftablesBypassDestinations(network, lanRoutes)
+	if len(plan.Chains) == 0 {
+		plan.Chains = []NftablesChain{{Name: ProxyCaptureChain, Type: "filter", Hook: "prerouting", Priority: -150, Policy: "accept"}}
+	}
+	terminal := make([]NftablesRule, 0, len(plan.Rules))
+	for _, rule := range plan.Rules {
+		if strings.TrimSpace(rule.Action) == "counter return" || strings.TrimSpace(rule.Action) == "return" {
+			continue
+		}
+		terminal = append(terminal, rule)
+	}
+	chain := CaptureChainName(plan)
+	plan.Rules = make([]NftablesRule, 0, len(terminal)+8)
+	for index := range terminal {
+		terminal[index].Chain = chain
+		terminal[index].EgressID = plan.EgressID
+	}
+	guard := CaptureGuardRules(plan)
+	plan.Rules = append(guard, terminal...)
+	for index := range plan.Rules {
+		plan.Rules[index].Order = index + 1
+	}
+	return plan
 }
 
 func compileLinuxPolicyRouting(egress Egress, capture NftablesCapturePlan) (LinuxPolicyRoutingPlan, error) {

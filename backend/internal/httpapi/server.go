@@ -5448,8 +5448,16 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		artifacts = append(artifacts, routingArtifacts...)
 	}
 	dnsInterception := dnsLCPGuardPlan(addressAssignments)
-	if strings.TrimSpace(compiledProxy.NftablesCapture.Table) != "" {
-		nftablesArtifacts, renderErr := serviceRuntime.RenderGatewayNftablesCapture(compiledProxy.NftablesCapture, dnsInterception)
+	capturePlan := compiledProxy.NftablesCapture
+	if hasProxyEgress && strings.TrimSpace(capturePlan.Table) == "" {
+		// The proxy egress still exists but its runtime could not be compiled
+		// or verified. Flush the managed capture table so selected traffic
+		// falls through to the direct path instead of being black-holed by a
+		// stale TPROXY generation.
+		capturePlan = proxy.FailOpenNftablesCapture(proxyEgress.ID)
+	}
+	if strings.TrimSpace(capturePlan.Table) != "" {
+		nftablesArtifacts, renderErr := serviceRuntime.RenderGatewayNftablesCapture(capturePlan, dnsInterception)
 		if renderErr != nil {
 			return RuntimePlan{}, renderErr
 		}

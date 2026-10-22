@@ -38,17 +38,40 @@ func TestBuildAdaptiveCapturePlanUsesWeightedFiveTupleRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.TargetPort != 21001 || len(plan.Rules) != 5 {
+	if plan.TargetPort != 21001 {
 		t.Fatalf("capture plan = %#v", plan)
 	}
-	if !strings.Contains(plan.Rules[1].Expression, "jhash ip saddr . ip daddr . meta l4proto . tcp sport . tcp dport mod 3 seed 0x9e3779b9 < 2") {
-		t.Fatalf("missing TCP five-tuple hash: %#v", plan.Rules[1])
+	// The guard prefix (mark return, DNS direct, LAN direct) must precede the
+	// lane rules so unproxied destinations never enter the hash buckets.
+	firstLane := -1
+	for index, rule := range plan.Rules {
+		if strings.Contains(rule.Action, "tproxy") {
+			firstLane = index
+			break
+		}
 	}
-	if !strings.Contains(plan.Rules[2].Expression, "meta l4proto . udp sport . udp dport mod 3 seed 0x9e3779b9 < 2") {
-		t.Fatalf("missing UDP five-tuple hash: %#v", plan.Rules[2])
+	if firstLane <= 0 {
+		t.Fatalf("capture plan has no lane rules: %#v", plan)
 	}
-	if strings.Contains(plan.Rules[3].Expression, "jhash") || plan.Rules[3].Expression != `iifname "proxy-in" meta l4proto tcp` {
-		t.Fatalf("second lane does not cover the remaining hash range: %#v", plan.Rules[3])
+	for _, guard := range plan.Rules[:firstLane] {
+		if strings.Contains(guard.Action, "tproxy") || !strings.Contains(guard.Action, "return") {
+			t.Fatalf("rule before the first lane is not a bypass guard: %#v", guard)
+		}
+	}
+	var tcpHash, udpHash, secondLaneTCP *NftablesRule
+	for index := range plan.Rules {
+		rule := &plan.Rules[index]
+		switch {
+		case strings.Contains(rule.Expression, "tcp sport . tcp dport mod 3 seed 0x9e3779b9 < 2"):
+			tcpHash = rule
+		case strings.Contains(rule.Expression, "udp sport . udp dport mod 3 seed 0x9e3779b9 < 2"):
+			udpHash = rule
+		case !strings.Contains(rule.Expression, "jhash") && strings.Contains(rule.Expression, "meta nfproto ipv4 meta l4proto tcp") && strings.Contains(rule.Action, "tproxy ip to :21002"):
+			secondLaneTCP = rule
+		}
+	}
+	if tcpHash == nil || udpHash == nil || secondLaneTCP == nil {
+		t.Fatalf("adaptive capture buckets are incomplete: %#v", plan.Rules)
 	}
 	if !strings.Contains(plan.Rules[len(plan.Rules)-1].Action, "counter meta mark") || !strings.Contains(plan.Rules[len(plan.Rules)-1].Action, "tproxy ip to :21002") {
 		t.Fatalf("last bucket does not select node b: %#v", plan.Rules[len(plan.Rules)-1])

@@ -1139,6 +1139,9 @@ func RenderGatewayNftablesCapture(plan proxy.NftablesCapturePlan, dns DNSInterce
 	slices.SortFunc(guardAddresses, func(left, right netip.Addr) int { return left.Compare(right) })
 	var builder strings.Builder
 	builder.WriteString("#!/usr/sbin/nft -f\n\n")
+	if plan.FailOpen {
+		builder.WriteString("# ly-route-proxy-fail-open: capture table is intentionally empty; selected traffic stays on the direct path\n")
+	}
 	// This artifact owns only its dedicated table. `add table` is idempotent on
 	// Debian 12's nftables, then `flush table` clears only Ly Route's prior
 	// generation. Host firewall, container, and management rules remain intact.

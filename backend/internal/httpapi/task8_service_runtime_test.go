@@ -133,16 +133,28 @@ func TestRuntimePlan_bad_subscription_degrades_only_proxy_runtime(t *testing.T) 
 		t.Fatalf("runtime warnings = %#v", plan.Warnings)
 	}
 	hasSmartDNS := false
+	hasFailOpenCapture := false
 	for _, artifact := range plan.RuntimeArtifacts {
 		switch artifact.Service {
 		case serviceRuntime.SmartDNS:
 			hasSmartDNS = true
-		case serviceRuntime.Xray, serviceRuntime.Nftables, serviceRuntime.LinuxRouting:
-			t.Fatalf("bad subscription emitted proxy artifact: %#v", artifact)
+		case serviceRuntime.Xray, serviceRuntime.LinuxRouting:
+			t.Fatalf("bad subscription emitted proxy runtime artifact: %#v", artifact)
+		case serviceRuntime.Nftables:
+			// A degraded proxy must still flush its capture table. Without
+			// this fail-open artifact a stale TPROXY generation would keep
+			// pointing at a listener that was never configured.
+			if !strings.Contains(artifact.Content, "ly-route-proxy-fail-open") || strings.Contains(artifact.Content, "tproxy") {
+				t.Fatalf("bad subscription did not emit a fail-open capture: %#v", artifact)
+			}
+			hasFailOpenCapture = true
 		}
 	}
 	if !hasSmartDNS {
 		t.Fatal("bad subscription removed unrelated SmartDNS artifact")
+	}
+	if !hasFailOpenCapture {
+		t.Fatal("bad subscription did not flush the stale proxy capture table")
 	}
 	xrayComponents := 0
 	for _, component := range plan.Components {

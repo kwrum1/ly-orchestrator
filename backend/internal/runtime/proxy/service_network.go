@@ -147,9 +147,10 @@ func BindServiceNetwork(compiled *CompiledEgress, underlayRoute string, lanRoute
 	network.UnderlayRoute = underlayRoute
 	network.LANRoutes = cleanRoutes
 	compiled.ServiceNetwork = network
-	compiled.NftablesCapture.IngressInterface = network.IngressHostInterface
-	compiled.NftablesCapture.Mark = fmt.Sprintf("0x%x", network.IngressMark)
-	compiled.NftablesCapture.InboundMark = compiled.NftablesCapture.Mark
+	// Refresh the whole capture plan, not only its interface: the guard rules
+	// depend on the resolved LAN return routes and on the proxy service /30
+	// peers, and the terminal rules may come from an adaptive lane plan.
+	compiled.NftablesCapture = refreshCaptureRules(compiled.NftablesCapture, network, cleanRoutes)
 	compiled.LinuxPolicyRouting.Network = network
 	compiled.LinuxPolicyRouting.LANRoutes = cleanRoutes
 	compiled.LinuxPolicyRouting.UnderlayRoute = underlayRoute
@@ -169,6 +170,13 @@ func ApplyOutboundSocketMark(config *XrayConfigPayload, mark uint32) {
 		return
 	}
 	for index := range config.Outbounds {
+		// The direct fail-open outbound must use the ordinary WAN route. Giving
+		// it the proxy mark would send a failed proxy connection back through
+		// the proxy underlay, which is exactly the blackhole this fallback is
+		// meant to avoid.
+		if strings.TrimSpace(config.Outbounds[index].Tag) == ProxyDirectOutboundTag {
+			continue
+		}
 		stream := cloneMap(config.Outbounds[index].StreamSettings)
 		sockopt := cloneMap(anyMap(stream["sockopt"]))
 		sockopt["mark"] = mark

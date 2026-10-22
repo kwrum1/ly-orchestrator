@@ -42,20 +42,17 @@ func BuildAdaptiveCapturePlan(plan NftablesCapturePlan, lanes []AdaptiveNodeLane
 	if total < 1 || total > 256 {
 		return NftablesCapturePlan{}, fmt.Errorf("%w: adaptive hash bucket count %d is unsupported", ErrInvalidSubscription, total)
 	}
-	chain := "proxy_prerouting"
-	if len(plan.Chains) > 0 && strings.TrimSpace(plan.Chains[0].Name) != "" {
-		chain = plan.Chains[0].Name
-	}
-	rules := []NftablesRule{{
-		Order: 1, EgressID: plan.EgressID, Chain: chain,
-		Expression: fmt.Sprintf("iifname %q meta mark %s", plan.IngressInterface, plan.InboundMark), Action: "return",
-	}}
-	order := 2
+	chain := CaptureChainName(plan)
+	// Keep the DNS / LAN / service-network fail-open guards in front of the
+	// adaptive lanes. Without them a selected LAN upstream would be hashed
+	// into a proxy lane and blackholed instead of staying direct.
+	rules := CaptureGuardRules(plan)
+	order := len(rules) + 1
 	cumulative := 0
 	for _, lane := range lanes {
 		cumulative += lane.Weight
 		for _, protocol := range []string{"tcp", "udp"} {
-			expression := fmt.Sprintf("iifname %q meta l4proto %s", plan.IngressInterface, protocol)
+			expression := fmt.Sprintf("iifname %q meta nfproto ipv4 meta l4proto %s", plan.IngressInterface, protocol)
 			if cumulative < total {
 				ports := protocol + " sport . " + protocol + " dport"
 				expression += fmt.Sprintf(" jhash ip saddr . ip daddr . meta l4proto . %s mod %d seed %s < %d", ports, total, adaptiveHashSeed, cumulative)

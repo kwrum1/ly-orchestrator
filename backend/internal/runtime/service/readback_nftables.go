@@ -89,7 +89,14 @@ func expectedNftablesRules(content string) (string, string, []string, error) {
 	if family == "" || table == "" {
 		return "", "", nil, fmt.Errorf("rendered nftables plan lacks a table declaration")
 	}
-	if dnsRules == 0 && tproxyRules == 0 {
+	// A degraded proxy runtime knowingly renders an empty, policy-accept
+	// capture table. That is fail-open, not a truncated plan, and is only
+	// accepted for the managed proxy table.
+	failOpen := strings.Contains(content, "ly-route-proxy-fail-open")
+	if failOpen && (family != "inet" || table != "ly_route_proxy_capture") {
+		return "", "", nil, fmt.Errorf("nftables fail-open marker is only valid for inet ly_route_proxy_capture")
+	}
+	if dnsRules == 0 && tproxyRules == 0 && !failOpen {
 		return "", "", nil, fmt.Errorf("rendered nftables plan lacks capture rules")
 	}
 	if dnsRules > 0 && dnsRules < 2 {

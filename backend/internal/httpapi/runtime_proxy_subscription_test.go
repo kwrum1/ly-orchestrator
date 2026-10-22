@@ -106,8 +106,8 @@ func TestCompileProxySubscriptionUsesConfiguredDirectNode(t *testing.T) {
 	if warning := server.compileProxySubscription(ctx, egress, &compiled); warning != "" {
 		t.Fatalf("direct node compilation warning: %s", warning)
 	}
-	if len(compiled.XrayRuntime.ConfigPayload.Outbounds) != 1 {
-		t.Fatalf("outbounds = %#v, want one direct node outbound", compiled.XrayRuntime.ConfigPayload.Outbounds)
+	if len(compiled.XrayRuntime.ConfigPayload.Outbounds) != 2 {
+		t.Fatalf("outbounds = %#v, want configured node plus direct fail-open outbound", compiled.XrayRuntime.ConfigPayload.Outbounds)
 	}
 	outbound := compiled.XrayRuntime.ConfigPayload.Outbounds[0]
 	if outbound.Protocol != "vless" || outbound.Tag != "node-node-direct" {
@@ -118,6 +118,14 @@ func TestCompileProxySubscriptionUsesConfiguredDirectNode(t *testing.T) {
 	}
 	if outbound.StreamSettings["realitySettings"] == nil {
 		t.Fatalf("Reality settings missing from direct node outbound: %#v", outbound.StreamSettings)
+	}
+	fallback := compiled.XrayRuntime.ConfigPayload.Outbounds[1]
+	if fallback.Tag != proxy.ProxyDirectOutboundTag || fallback.Protocol != "freedom" {
+		t.Fatalf("direct fail-open outbound = %#v", fallback)
+	}
+	routing := compiled.XrayRuntime.ConfigPayload.Routing
+	if routing == nil || len(routing.Balancers) != 1 || routing.Balancers[0].FallbackTag != proxy.ProxyDirectOutboundTag {
+		t.Fatalf("routing fallback = %#v", routing)
 	}
 }
 

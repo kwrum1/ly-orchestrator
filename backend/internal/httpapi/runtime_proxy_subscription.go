@@ -67,6 +67,9 @@ func (server *Server) compileProxySubscription(ctx context.Context, egress proxy
 			compiled.XrayRuntime.ConfigPayload.Routing = nil
 			compiled.XrayRuntime.ConfigPayload.Observatory = nil
 			compiled.XrayRuntime.ConfigPayload.API = nil
+			if err := proxy.EnsureDirectFallback(&compiled.XrayRuntime.ConfigPayload, proxy.ProxyDirectProbeURL); err != nil {
+				return err.Error()
+			}
 			compiled.XrayRuntime.OutboundTag = outbound.Tag
 			return ""
 		}
@@ -148,6 +151,9 @@ func (server *Server) compileProxySubscription(ctx context.Context, egress proxy
 			compiled.XrayRuntime.ConfigPayload.Observatory = &runtime.Observatory
 			compiled.XrayRuntime.ConfigPayload.Metrics = runtime.Metrics
 			compiled.XrayRuntime.ConfigPayload.API = nil
+			if err := proxy.EnsureDirectFallback(&compiled.XrayRuntime.ConfigPayload, proxy.ProxyDirectProbeURL); err != nil {
+				return err.Error()
+			}
 			compiled.XrayRuntime.OutboundTag = "subscription-" + subscription.ID + "-adaptive"
 			return ""
 		}
@@ -159,6 +165,9 @@ func (server *Server) compileProxySubscription(ctx context.Context, egress proxy
 			return err.Error()
 		}
 		compiled.XrayRuntime.ConfigPayload.Outbounds = []proxy.XrayOutbound{outbound}
+		if err := proxy.EnsureDirectFallback(&compiled.XrayRuntime.ConfigPayload, proxy.ProxyDirectProbeURL); err != nil {
+			return err.Error()
+		}
 		return ""
 	}
 	return "proxy egress requires a usable proxy node or subscription"
