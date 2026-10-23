@@ -66,7 +66,7 @@ func (server *Server) appliedWANGroupIDs(ctx context.Context) map[string]struct{
 
 func (server *Server) appliedRoutePolicyIDs(ctx context.Context) map[string]struct{} {
 	result := server.runtimeEvidence()
-	if result.Status != RuntimeStatusCommitted || result.RuntimeState != RuntimeStateRunning || result.GatewayPlan == nil {
+	if result.Status != RuntimeStatusCommitted || result.RuntimeState != RuntimeStateRunning {
 		return nil
 	}
 	if result.TransactionID == "" || result.Receipt.Status != apply.ReceiptApplied || result.Receipt.TransactionID != result.TransactionID {
@@ -94,9 +94,12 @@ func (server *Server) appliedRoutePolicyIDs(ctx context.Context) map[string]stru
 	}
 	applied := make(map[string]struct{}, len(current.RoutePolicies))
 	for _, currentPolicy := range current.RoutePolicies {
-		plannedPolicy, planned := routePolicyWithID(result.GatewayPlan.Policy.RoutePolicies, currentPolicy.ID)
+		// The persisted gateway plan is not guaranteed to survive an upgrade
+		// rollback/restart. The typed After snapshot is durable commit evidence;
+		// compare the live desired policy to that snapshot instead of requiring
+		// the in-memory plan pointer.
 		observedPolicy, observed := routePolicyWithID(appliedSnapshot, currentPolicy.ID)
-		if planned && observed && equalGatewaySlice([]trafficpolicy.RoutePolicy{currentPolicy}, []trafficpolicy.RoutePolicy{plannedPolicy}) && equalGatewaySlice([]trafficpolicy.RoutePolicy{currentPolicy}, []trafficpolicy.RoutePolicy{observedPolicy}) {
+		if observed && equalGatewaySlice([]trafficpolicy.RoutePolicy{currentPolicy}, []trafficpolicy.RoutePolicy{observedPolicy}) {
 			applied[currentPolicy.ID] = struct{}{}
 		}
 	}
