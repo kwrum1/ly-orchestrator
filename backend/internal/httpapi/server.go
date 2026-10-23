@@ -543,10 +543,26 @@ func (access orchestratorSessionAccess) Authorize(request *http.Request, permiss
 	if !ok {
 		return orchestratorapi.ErrAuthenticationRequired
 	}
-	if permission == orchestratorapi.PermissionAdminWrite && (session.Role != "admin" || session.PasswordChangeRequired) {
-		return orchestratorapi.ErrAdminRequired
+	if permission == orchestratorapi.PermissionAdminWrite {
+		if session.PasswordChangeRequired {
+			return orchestratorapi.ErrPasswordChangeRequired
+		}
+		if session.Role != "admin" {
+			return orchestratorapi.ErrAdminRequired
+		}
 	}
 	return nil
+}
+
+func (access orchestratorSessionAccess) RecordAudit(request *http.Request, resource, action, status, detail string) {
+	if access.server == nil {
+		return
+	}
+	actor, role, ok := access.Actor(request)
+	if !ok {
+		actor, role = "anonymous", "system"
+	}
+	access.server.recordAuditWithTransaction(actor, role, resource, action, status, detail, requestID(request))
 }
 
 func (access orchestratorSessionAccess) Actor(request *http.Request) (string, string, bool) {
@@ -8751,6 +8767,13 @@ func (server *Server) telemetryPayload(ctx context.Context, kind string) (any, [
 		}
 	}
 	server.runtimeMu.Unlock()
+	if server.profile.ID() == product.Orchestrator().ID() && kind == "dashboard" {
+		if freshComponents, handled := server.orchestratorTransparentRuntimeComponents(ctx); handled {
+			components = freshComponents
+			runtimeStateValue = runtimeState(components)
+			lastApply = server.lastRuntimeApply()
+		}
+	}
 	capabilities := []controlapi.CapabilityState{{Name: "local_telemetry", Available: true, State: controlapi.CapabilityAvailable}}
 	if payload, capability, handled := server.orchestratorTelemetryPayload(ctx, kind, runtimeStateValue, components, lastApply); handled {
 		return payload, append(capabilities, capability)

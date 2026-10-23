@@ -73,6 +73,8 @@ func codeForError(err error) string {
 		return "interface_already_owned"
 	case errors.Is(err, orchestrator.ErrDuplicateGroup):
 		return "duplicate_group"
+	case errors.Is(err, orchestrator.ErrGroupInUse):
+		return "group_in_use"
 	case errors.Is(err, orchestrator.ErrTopologyNotFound):
 		return "topology_not_found"
 	case errors.Is(err, orchestrator.ErrTopologyConflict):
@@ -81,6 +83,8 @@ func codeForError(err error) string {
 		return "group_not_found"
 	case errors.Is(err, ErrAuthenticationRequired):
 		return "unauthorized"
+	case errors.Is(err, ErrPasswordChangeRequired):
+		return "password_change_required"
 	case errors.Is(err, ErrAdminRequired):
 		return "forbidden"
 	case errors.Is(err, orchestrator.ErrInvalidName), errors.Is(err, orchestrator.ErrInvalidInterface), errors.Is(err, orchestrator.ErrInvalidBond):

@@ -196,6 +196,7 @@ func (handler *Handler) handleTopology(writer http.ResponseWriter, request *http
 			writeAPIError(writer, http.StatusInternalServerError, err)
 			return
 		}
+		handler.recordAudit(request, TopologyPath, "update", "success", "")
 		handler.writeTopology(writer, request)
 	case http.MethodDelete:
 		if !handler.authorize(writer, request, PermissionAdminWrite) {
@@ -231,6 +232,7 @@ func (handler *Handler) handleTopology(writer http.ResponseWriter, request *http
 			writeAPIError(writer, http.StatusInternalServerError, err)
 			return
 		}
+		handler.recordAudit(request, TopologyPath, "delete", "success", "")
 		writer.WriteHeader(http.StatusNoContent)
 	default:
 		writeAPIError(writer, http.StatusMethodNotAllowed, errors.New("method is not allowed"))
@@ -288,6 +290,7 @@ func (handler *Handler) handleGroups(writer http.ResponseWriter, request *http.R
 			writeAPIError(writer, http.StatusInternalServerError, err)
 			return
 		}
+		handler.recordAudit(request, OrchestrationGroupsPath+"/"+group.Name(), "create", "success", "")
 		handler.writeGroup(writer, request, group.Name(), http.StatusCreated)
 	default:
 		writeAPIError(writer, http.StatusMethodNotAllowed, errors.New("method is not allowed"))
@@ -356,6 +359,7 @@ func (handler *Handler) handleGroup(writer http.ResponseWriter, request *http.Re
 			writeAPIError(writer, http.StatusInternalServerError, err)
 			return
 		}
+		handler.recordAudit(request, OrchestrationGroupsPath+"/"+name, "update", "success", "")
 		handler.writeGroup(writer, request, name, http.StatusOK)
 	case http.MethodDelete:
 		current, _, snapshotErr := handler.repository.Snapshot(request.Context())
@@ -363,14 +367,19 @@ func (handler *Handler) handleGroup(writer http.ResponseWriter, request *http.Re
 			writeMutationError(writer, snapshotErr)
 			return
 		}
-		candidate, candidateErr := orchestrator.RemoveTopologyGroup(current, name)
-		if candidateErr != nil {
-			writeMutationError(writer, candidateErr)
-			return
-		}
 		policy, policyErr := handler.currentPolicy(request.Context())
 		if policyErr != nil {
 			writePolicyRepositoryError(writer, policyErr)
+			return
+		}
+		if policy != nil && policyReferencesGroup(policy, name) {
+			handler.recordAudit(request, OrchestrationGroupsPath+"/"+name, "delete", "failure", "orchestration group is referenced by policy")
+			writeAPIError(writer, http.StatusUnprocessableEntity, fmt.Errorf("%w: group %q is referenced by policy; update or delete the referencing rules first", orchestrator.ErrGroupInUse, name))
+			return
+		}
+		candidate, candidateErr := orchestrator.RemoveTopologyGroup(current, name)
+		if candidateErr != nil {
+			writeMutationError(writer, candidateErr)
 			return
 		}
 		if err := handler.applyTransparent(request.Context(), candidate, policy); err != nil {
@@ -389,8 +398,31 @@ func (handler *Handler) handleGroup(writer http.ResponseWriter, request *http.Re
 			writeAPIError(writer, http.StatusInternalServerError, err)
 			return
 		}
+		handler.recordAudit(request, OrchestrationGroupsPath+"/"+name, "delete", "success", "")
 		writer.WriteHeader(http.StatusNoContent)
 	}
+}
+
+func (handler *Handler) recordAudit(request *http.Request, resource, action, status, detail string) {
+	recorder, ok := handler.access.(AuditRecorder)
+	if !ok {
+		return
+	}
+	recorder.RecordAudit(request, resource, action, status, detail)
+}
+
+func policyReferencesGroup(policy *orchestrator.Policy, name string) bool {
+	if policy == nil {
+		return false
+	}
+	for _, group := range policy.View().Groups {
+		for _, rule := range group.Rules {
+			if rule.Action.Kind == orchestrator.ActionVia && rule.Action.Group == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (handler *Handler) currentPolicy(ctx context.Context) (*orchestrator.Policy, error) {

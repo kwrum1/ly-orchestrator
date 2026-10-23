@@ -29,6 +29,12 @@ Install and rollback are **accepted before execution**:
   cut the already-accepted HTTP response;
 - clients poll `GET /api/v1/orchestrator/upgrades/{id}` until
   `installed/failed/rolled_back/rollback_failed`.
+- during the control API restart window nginx may return `502/503/504` for
+  roughly 20–30 seconds. These are retryable transport failures, **not** task
+  failures: retry with backoff, re-authenticate when the control API returns,
+  and continue polling the same task ID. Do not assume success until the task
+  reaches a terminal state. The 202 response already includes `Retry-After: 2`
+  and `Location` for this reason.
 - If the control process exits after acceptance but before the unit starts, the
   next GET marks the task `failed`/`rollback_failed` after 30 seconds instead of
   leaving it stuck in `installing`.
@@ -92,6 +98,8 @@ own dataplane/PPPoE check.
 |---|---|---|
 | Orchestration group/topology needs an unavailable dataplane tier | 422 | `prerequisite_unmet` (clean message, no internal prerequisite list) |
 | Invalid upgrade payload/checksum/archive | 422 | `invalid_upgrade_package`; process signals such as `signal: killed` are sanitized |
+| Delete an orchestration group still referenced by a via rule | 422 | `group_in_use`; readable message, no rule identity leaked |
+| Write before the forced initial password change | 403 | `password_change_required`; message asks the user to change password first |
 | Unknown JSON field | 400 | `unknown_field` with the field name in the message |
 | Malformed JSON | 400 | `invalid_json` |
 | Config import confirmation | 200 | accepts both `package_hash`/`diff_hash` and `confirmation_package_hash`/`confirmation_diff_hash`; dry-run returns both names |
@@ -118,7 +126,18 @@ operation endpoint lets clients show progress while the request is in flight.
 Both task types use the additive `product_tasks` table
 (`product_id`, `task_type`, `state`, `payload_json`, timestamps). Tasks survive
 control restarts; `GET` reconciles installer result files. All stage/install/
-rollback/prepare/apply actions write the normal audit events.
+rollback/prepare/apply actions write the normal audit events. Direct
+`PUT/DELETE /api/v1/orchestrator/topology` and
+`PUT/DELETE /api/v1/orchestrator/policy` also write independent `update`/`delete`
+audit rows with the session actor and request ID; orchestration-group mutations
+write `create`/`update`/`delete` rows.
+
+Dashboard telemetry derives `runtime_state` from the fresh transparent runtime
+readback, not from a previous apply result. During an apply the telemetry
+components may briefly be unavailable, but `/runtime/status` remains the
+authoritative runtime view and `/health` reflects the committed orchestration
+runtime. Clients should not use a single dashboard sample to override those
+signals.
 
 ## Known limitations
 
