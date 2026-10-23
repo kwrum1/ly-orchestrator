@@ -31,11 +31,20 @@ func Run() {
 	}
 }
 
+// buildVersion is stamped by release builds. It is authoritative for a
+// hot-deployed control binary even when the on-disk artifact manifest belongs
+// to the previous package.
+var buildVersion string
+
 // Version is the release identity reported by /health and the installer
-// preflight. Prefer an explicit environment value, then the immutable build
-// provenance shipped in the rootfs/upgrade package.
+// preflight. Prefer an explicit environment value, then the release stamp
+// embedded in the running control binary, then the immutable package
+// provenance on disk.
 func Version() string {
 	if value := strings.TrimSpace(os.Getenv("LY_ROUTE_VERSION")); value != "" && !strings.EqualFold(value, "dev") {
+		return value
+	}
+	if value := strings.TrimSpace(buildVersion); value != "" && !strings.EqualFold(value, "dev") {
 		return value
 	}
 	path := strings.TrimSpace(os.Getenv("LY_ROUTE_ARTIFACT_MANIFEST"))
