@@ -95,18 +95,20 @@ const { readFileSync, readdirSync } = require("node:fs");
 const [bundlePath, canonicalPath, product] = process.argv.slice(2);
 const bundleManifestPath = `${bundlePath}/capabilities.json`;
 const appPath = `${bundlePath}/app.js`;
+const shellPath = `${bundlePath}/shell.js`;
 let bundle;
 try { bundle = JSON.parse(readFileSync(bundleManifestPath, "utf8")); }
 catch { console.error("Frontend bundle capabilities must be valid JSON"); process.exit(1); }
 const canonical = JSON.parse(readFileSync(canonicalPath, "utf8"));
 const marker = `window.LY_ROUTE_PRODUCT_ENTRYPOINT = "${product}";`;
-const expectedFiles = ["app.js", "capabilities.json", "index.html", "shell.js", "styles.css"];
+const expectedFiles = ["app.js", "capabilities.json", "commercial.css", "index.html", "shell.js", "styles.css"];
 if (product === "orchestrator") expectedFiles.push("product.css");
 expectedFiles.sort();
 const actualFiles = readdirSync(bundlePath, { withFileTypes: true })
   .filter((entry) => entry.isFile()).map((entry) => entry.name).sort();
 if (bundle.product !== product || JSON.stringify(bundle) !== JSON.stringify(canonical) ||
-    !readFileSync(appPath, "utf8").includes(marker) || JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
+    (!readFileSync(appPath, "utf8").includes(marker) && !readFileSync(shellPath, "utf8").includes(marker)) ||
+    JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
   console.error(`Frontend bundle product mismatch: expected ${product}`);
   process.exit(1);
 }
