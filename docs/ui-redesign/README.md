@@ -26,6 +26,7 @@
 | [09-orchestrator-product.md](./09-orchestrator-product.md) | Orchestrator 单机产品边界、11 页路由、API 映射、双产品构建、验收证据 | 产品 / 测试 / 前端 |
 | [10-gateway-p1-fixes.md](./10-gateway-p1-fixes.md) | Gateway 全栈 P1 修复：WAN/PPPoE、固件、代理、Any→Any apply、DHCP 状态 | 产品 / 测试 / 前端 |
 | [11-orchestrator-p2-groups.md](./11-orchestrator-p2-groups.md) | Orchestrator 编排组 P2：系统接口名、编辑预选、POST/PUT/DELETE 真实 API CRUD | 产品 / 测试 / 前端 |
+| [12-final-ui-closeout.md](./12-final-ui-closeout.md) | 最终 Gateway/Orchestrator 产物路径、hash、capabilities/title、证据与重建命令 | 发布 / 主开发 / 测试 |
 
 ## 2. 基线（本次阅读与核对）
 
