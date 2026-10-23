@@ -107,7 +107,7 @@ func TestFirmwareUpgradeHasBoundedFailureAndFastRestore(t *testing.T) {
 	if !strings.Contains(firmwareUpgradeInstallScript, "restart_base=$(timeout 3s systemctl show ly-route-control-api.service -p NRestarts") {
 		t.Fatal("installer does not detect a control crash loop")
 	}
-	if !strings.Contains(firmwareUpgradeInstallScript, "timeout 20s systemctl stop ly-route-control-api.service") {
+	if !strings.Contains(firmwareUpgradeInstallScript, "timeout 5s systemctl stop --no-block ly-route-control-api.service") {
 		t.Fatal("restore does not stop the candidate before restoring files")
 	}
 	if !strings.Contains(firmwareUpgradeInstallScript, "printf '[Service]\\nRestart=no\\n'") {
@@ -122,7 +122,7 @@ func TestFirmwareUpgradeHasBoundedFailureAndFastRestore(t *testing.T) {
 func TestFirmwareUpgradeHealthWindowAllowsColdControlStart(t *testing.T) {
 	// final3 failed on a TCG lab because control needed 15-17s while the old
 	// health loop only waited ~10s. Keep a bounded but realistic window.
-	if !strings.Contains(firmwareUpgradeInstallScript, "restart_timeout=90") {
+	if !strings.Contains(firmwareUpgradeInstallScript, "restart_timeout=60") {
 		t.Fatal("control restart timeout is too short for cold start")
 	}
 	if !strings.Contains(firmwareUpgradeInstallScript, "health_deadline=$((health_started + 60))") {

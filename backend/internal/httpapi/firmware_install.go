@@ -23,7 +23,7 @@ upgrade_dropin=/run/systemd/system/ly-route-control-api.service.d/90-upgrade.con
 remove_upgrade_dropin() {
   rm -f "$upgrade_dropin"
   rmdir /run/systemd/system/ly-route-control-api.service.d 2>/dev/null || true
-  timeout 15s systemctl daemon-reload || true
+  timeout 5s systemctl daemon-reload || true
 }
 trap remove_upgrade_dropin EXIT
 actual=$(sha256sum -- "$package_path" | cut -d' ' -f1)
@@ -105,8 +105,21 @@ fi
 restore_backup() {
   echo "upgrade failed; restoring $backup" >&2
   if [ -e "$backup/target" ]; then
-    rm -rf "$target_dir"
-    cp -al "$backup/target" "$target_dir" 2>/dev/null || cp -a "$backup/target" "$target_dir"
+    # Swap the restored tree into place by rename. Removing and copying a
+    # 32MB /usr/lib/ly-route tree takes minutes on a loaded TCG lab; the
+    # backup is already hardlinked, so this keeps rollback fast.
+    restore_tmp="${target_dir}.restore-$$"
+    failed_tmp="${target_dir}.failed-$$"
+    rm -rf "$restore_tmp"
+    if cp -al "$backup/target" "$restore_tmp" 2>/dev/null || cp -a "$backup/target" "$restore_tmp"; then
+      if mv "$target_dir" "$failed_tmp" 2>/dev/null; then
+        mv "$restore_tmp" "$target_dir"
+        (rm -rf "$failed_tmp" >/dev/null 2>&1 &)
+      else
+        rm -rf "$target_dir"
+        mv "$restore_tmp" "$target_dir"
+      fi
+    fi
   fi
   if [ -e "$backup/admin" ]; then
     rm -rf /opt/ly-route/admin
@@ -133,10 +146,10 @@ restore_backup() {
   # Stop the candidate before restoring files. If it is crash-looping, a
   # plain restart can hold the install open for minutes and keep spawning
   # failures. Bound the stop/start as well so restore itself stays fast.
-  timeout 20s systemctl stop ly-route-control-api.service || true
-  timeout 5s systemctl kill -s KILL ly-route-control-api.service || true
+  timeout 5s systemctl stop --no-block ly-route-control-api.service || true
+  timeout 2s systemctl kill -s KILL ly-route-control-api.service || true
   remove_upgrade_dropin
-  timeout 10s systemctl reset-failed ly-route-control-api.service || true
+  timeout 5s systemctl reset-failed ly-route-control-api.service || true
   # The control process is stopped here, so the audit row cannot race the
   # service's database writers. Then start the restored control.
   mkdir -p /var/lib/ly-route/firmware-update
@@ -144,8 +157,8 @@ restore_backup() {
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$backup" \
     >> /var/lib/ly-route/firmware-update/rollback-audit.jsonl
   record_firmware_audit failure "upgrade health check failed" "$backup"
-  timeout 15s systemctl start --no-block ly-route-control-api.service || true
-  timeout 15s systemctl reload nginx.service || timeout 15s systemctl restart nginx.service || true
+  timeout 8s systemctl start --no-block ly-route-control-api.service || true
+  timeout 5s systemctl reload nginx.service || timeout 5s systemctl restart nginx.service || true
 }
 
 install -d -m 0755 "$target_dir"
@@ -177,7 +190,7 @@ fi
 if [ -f "$tmp/etc/nginx/conf.d/ly-route-admin.conf" ]; then
   install -D -m 0644 "$tmp/etc/nginx/conf.d/ly-route-admin.conf" /etc/nginx/conf.d/ly-route-admin.conf
 fi
-timeout 15s systemctl daemon-reload || true
+timeout 5s systemctl daemon-reload || true
 restart_base=$(timeout 3s systemctl show ly-route-control-api.service -p NRestarts --value 2>/dev/null || echo 0)
 case "$restart_base" in ''|*[!0-9]*) restart_base=0;; esac
 # During candidate validation do not let systemd respawn a broken control
@@ -185,24 +198,24 @@ case "$restart_base" in ''|*[!0-9]*) restart_base=0;; esac
 # restoring the normal Restart=on-failure policy.
 mkdir -p "$(dirname "$upgrade_dropin")"
 printf '[Service]\nRestart=no\n' > "$upgrade_dropin"
-timeout 15s systemctl daemon-reload || true
+timeout 5s systemctl daemon-reload || true
 restart_timeout=$((install_deadline - $(date +%s)))
 if [ "$restart_timeout" -lt 15 ]; then
   restore_backup
   echo "upgrade deadline reached before candidate restart" >&2
   exit 1
 fi
-if [ "$restart_timeout" -gt 90 ]; then restart_timeout=90; fi
+if [ "$restart_timeout" -gt 60 ]; then restart_timeout=60; fi
 # A graceful restart is normally enough, but a stuck control stop job must not
 # consume the whole deadline. Stop, force-kill if necessary, then start the
 # candidate with a bounded job.
-timeout 10s systemctl stop --no-block ly-route-control-api.service || true
+timeout 5s systemctl stop --no-block ly-route-control-api.service || true
 pkill -9 -f "^/usr/lib/ly-route/ly-route-control$" 2>/dev/null || true
-timeout 10s systemctl reset-failed ly-route-control-api.service || true
+timeout 5s systemctl reset-failed ly-route-control-api.service || true
 # systemd may queue the start behind other jobs; --no-block plus a short
 # command timeout lets the health deadline, not a stuck D-Bus call, decide.
-timeout 15s systemctl start --no-block ly-route-control-api.service || true
-timeout 15s systemctl reload nginx.service || timeout 15s systemctl restart nginx.service || true
+timeout 8s systemctl start --no-block ly-route-control-api.service || true
+timeout 5s systemctl reload nginx.service || timeout 5s systemctl restart nginx.service || true
 
 healthy=0
 inactive_probes=0
