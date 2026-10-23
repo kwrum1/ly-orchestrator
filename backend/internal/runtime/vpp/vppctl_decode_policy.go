@@ -57,8 +57,8 @@ func verifyRoutePolicyAbsence(results []VPPCTLCommandResult, id string) error {
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(fibOutput) != "" {
-		return snapshotDecodeError("deleted route policy %q private FIB remains", id)
+	if fibTableHasForwardingDefault(fibOutput) {
+		return snapshotDecodeError("deleted route policy %q private FIB still forwards", id)
 	}
 	return nil
 }
@@ -167,7 +167,7 @@ func resolveRuntimePPPoEWANGroup(candidate trafficpolicy.WANGroup) (trafficpolic
 
 func wanGroupFIBIsAbsent(results []VPPCTLCommandResult, id string) bool {
 	output, err := commandOutputAllowEmpty(results, fmt.Sprintf("show ip fib table %d", wanGroupTableID(id)))
-	return err == nil && strings.TrimSpace(output) == ""
+	return err == nil && !fibTableHasForwardingDefault(output)
 }
 
 func activeWANPathMatches(path fibPath, expected trafficpolicy.WANPath, member string) bool {

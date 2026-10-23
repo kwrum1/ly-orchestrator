@@ -1578,12 +1578,12 @@ func routePolicyRadixCommands(policy trafficpolicy.RoutePolicy, wanGroups map[st
 		fmt.Sprintf("?set ip flow-hash table %d src dst sport dport proto", tableID),
 	}
 	commands = append(commands, fmt.Sprintf("?ip route add table %d 0.0.0.0/0 via %s", tableID, plan.routeTarget))
-	// A destination catch-all must not steal traffic addressed to the local
-	// LAN.  The native radix path is a FIB lookup, so install the LAN prefixes
-	// into the same private table before the catch-all entry.
-	for _, prefix := range options.localDestinations {
-		commands = append(commands, fmt.Sprintf("ip route add table %d %s via lyroute-$LY_ROUTE_LAN_INTERFACE", tableID, prefix))
-	}
+	// The pre-NAT classifier below installs a higher-priority LAN-to-LAN
+	// bypass (lanLocalPreNATRuleID). Do not duplicate that bypass as a local
+	// FIB route: VPP 26.06 crashes in fib_attached_export_import when a
+	// connected/interface path is added to a private table immediately after
+	// its lookup-DPO default route. The bypass is still enforced before the
+	// policy table is consulted.
 	classifier, applied, err := buildPreNATRoutePolicyCommandsForTable(
 		policy, policyID, tableID, "lyroute-$LY_ROUTE_LAN_INTERFACE", plan.lanPrefix, plan.skipNAT,
 	)

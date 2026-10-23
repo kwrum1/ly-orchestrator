@@ -373,7 +373,7 @@ func TestDecodeRoutesReadsBackRadixPolicyWithoutACLOrABF(t *testing.T) {
 		Candidates:        SnapshotCandidates{RoutePolicies: []trafficpolicy.RoutePolicy{route}},
 	}
 	commands := routeSnapshotCommands(request)
-	if !slices.Contains(commands, "show ly-route pre-nat-route") {
+	if !slices.Contains(commands, "?show ly-route pre-nat-route") {
 		t.Fatalf("snapshot commands = %#v, want radix inventory", commands)
 	}
 	readback, err := decodeVPPCTLRoutes(request, []VPPCTLCommandResult{

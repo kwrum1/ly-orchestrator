@@ -117,10 +117,13 @@ func TestProductionGatewayHTTPFailurePreservesExactPriorAndNeverRuns(t *testing.
 		t.Fatal(err)
 	}
 	trace := string(traceBytes)
-	for _, required := range []string{"delete acl-plugin", "abf policy del", "ip table del", "delete bond", "set interface state"} {
+	for _, required := range []string{"delete acl-plugin", "abf policy del", "ip route del", "delete bond", "set interface state"} {
 		if !strings.Contains(trace, required) {
 			t.Fatalf("rollback trace lacks %q:\n%s", required, trace)
 		}
+	}
+	if strings.Contains(trace, "ip table del") {
+		t.Fatalf("rollback sent an unsafe destructive table delete:\n%s", trace)
 	}
 	t.Logf("failure_vppctl_trace:\n%s", trace)
 }

@@ -388,8 +388,8 @@ func (channel vppctlChannel) removeRoutePolicyState(ctx context.Context, operati
 	if routePolicyAttached(resultStdoutLast(results, "show abf attach "+spec.ingress), spec.policyID) {
 		return nil, snapshotDecodeError("route policy %q remains attached after deletion", operation.Resource)
 	}
-	if strings.TrimSpace(resultStdoutLast(results, fmt.Sprintf("show ip fib table %d", spec.tableID))) != "" {
-		return nil, snapshotDecodeError("route policy %q private FIB remains after deletion", operation.Resource)
+	if fibTableHasForwardingDefault(resultStdoutLast(results, fmt.Sprintf("show ip fib table %d", spec.tableID))) {
+		return nil, snapshotDecodeError("route policy %q private FIB still forwards after deletion", operation.Resource)
 	}
 	return results, nil
 }

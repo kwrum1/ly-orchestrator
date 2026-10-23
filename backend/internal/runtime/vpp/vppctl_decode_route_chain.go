@@ -8,6 +8,21 @@ import (
 	"ly-route/backend/internal/runtime/trafficpolicy"
 )
 
+func routePolicyPreNATReadbackUnavailable(results []VPPCTLCommandResult) bool {
+	const command = "show ly-route pre-nat-route"
+	for _, result := range results {
+		if result.Command != command {
+			continue
+		}
+		if result.Retval == 0 {
+			return false
+		}
+		message := strings.ToLower(result.Stdout + " " + result.Stderr)
+		return strings.Contains(message, "unsupported") || strings.Contains(message, "unknown input") || strings.Contains(message, "not found")
+	}
+	return true
+}
+
 func decodeVPPCTLRoutes(request SnapshotRequest, results []VPPCTLCommandResult) (RoutePolicyReadback, error) {
 	candidates, err := routeCandidates(request)
 	if err != nil {
@@ -33,6 +48,7 @@ func decodeVPPCTLRoutes(request SnapshotRequest, results []VPPCTLCommandResult) 
 	}
 	routeOptions := buildRoutePolicyCommandOptions(resolvedPolicies, groups)
 	addRoutePolicyLocalDestinationPrefixes(routeOptions, resolvedPolicies, request.LocalDestinations)
+	preNATUnavailable := routePolicyPreNATReadbackUnavailable(results)
 	policies := make([]trafficpolicy.RoutePolicy, 0, len(request.RoutePolicies))
 	for _, id := range request.RoutePolicies {
 		desiredCandidate := candidates[strings.TrimSpace(id)]
@@ -40,13 +56,24 @@ func decodeVPPCTLRoutes(request SnapshotRequest, results []VPPCTLCommandResult) 
 		policyID := stableID("route-abf:"+candidate.ID, 10000, 8999)
 		tableID := stableID("route-table:"+candidate.ID, 50000, 49999)
 		radixPlan, radix := compileRoutePolicyRadixPlan(candidate, groups, routeOptions[candidate.ID])
-		if radix && routePolicyNeedsLocalACLDeny(candidate, routeOptions[candidate.ID]) {
-			// A source-scoped catch-all policy keeps the ACL/ABF representation
-			// because it must deny the LAN prefix before its permit rule. The
-			// compiler deliberately skips the native pre-NAT classifier for
-			// that shape, so requiring it during readback would report a policy
-			// the transaction just installed as missing.
+		if radix && (preNATUnavailable || routePolicyNeedsLocalACLDeny(candidate, routeOptions[candidate.ID])) {
+			// A source-scoped catch-all usually keeps the ACL/ABF
+			// representation because it must deny the LAN prefix before its
+			// permit rule. The compiler deliberately skips the native pre-NAT
+			// classifier for that shape. However, a policy created by an older
+			// generation may already be live through pre-NAT; in that case the
+			// live classifier is authoritative and readback must not demand an
+			// ACL that the native path never created.
 			radix = false
+			if !preNATUnavailable {
+				if !hasVPPCTLCommand(results, "show ly-route pre-nat-route") {
+					radix = false
+				} else if preNATOutput, preNATErr := commandOutput(results, "show ly-route pre-nat-route"); preNATErr != nil {
+					radix = false
+				} else if _, found, summaryErr := preNATRoutePolicySummaryForID(preNATOutput, policyID); summaryErr == nil && found {
+					radix = true
+				}
+			}
 		}
 		if radix {
 			preNATOutput, preNATErr := commandOutput(results, "show ly-route pre-nat-route")
@@ -80,6 +107,19 @@ func decodeVPPCTLRoutes(request SnapshotRequest, results []VPPCTLCommandResult) 
 			}
 			policies = append(policies, desiredCandidate)
 			continue
+		}
+		if !preNATUnavailable && hasVPPCTLCommand(results, "show ly-route pre-nat-route") {
+			if preNATOutput, preNATErr := commandOutput(results, "show ly-route pre-nat-route"); preNATErr == nil {
+				if _, found, summaryErr := preNATRoutePolicySummaryForID(preNATOutput, policyID); summaryErr == nil && found {
+					// The live policy is installed through the native pre-NAT
+					// classifier. Older or partially restored plans may not carry
+					// the WANPath needed to rebuild the radix plan during readback;
+					// the live classifier is still authoritative and must not be
+					// rejected for a missing legacy ACL.
+					policies = append(policies, desiredCandidate)
+					continue
+				}
+			}
 		}
 		policyOutput, policyErr := vppctlOutputAllowEmpty(results, fmt.Sprintf("show abf policy %d", policyID))
 		if policyErr != nil {

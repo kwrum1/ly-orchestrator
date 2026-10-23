@@ -73,7 +73,7 @@ func TestRoutePolicyLocalBypassAlsoCoversNonOptimizedPolicy(t *testing.T) {
 	}
 }
 
-func TestRoutePolicyOptimizedCatchAllInstallsLocalLANRoute(t *testing.T) {
+func TestRoutePolicyOptimizedCatchAllUsesPreNATLocalBypass(t *testing.T) {
 	policy := trafficpolicy.RoutePolicy{
 		ID:       "default-proxy",
 		Priority: 100,
@@ -84,11 +84,14 @@ func TestRoutePolicyOptimizedCatchAllInstallsLocalLANRoute(t *testing.T) {
 		},
 	}
 	commands := routePolicyCommandsWithOptions(policy, nil, routePolicyCommandOptions{
-		optimizedIPv4:    true,
+		optimizedIPv4:     true,
 		localDestinations: []string{"192.168.50.0/24"},
 	})
 	joined := strings.Join(commands, "\n")
-	if !strings.Contains(joined, "ip route add table ") || !strings.Contains(joined, "192.168.50.0/24 via lyroute-$LY_ROUTE_LAN_INTERFACE") {
-		t.Fatalf("optimized catch-all policy does not install local LAN route: %s", joined)
+	if strings.Contains(joined, "192.168.50.0/24 via lyroute-$LY_ROUTE_LAN_INTERFACE") {
+		t.Fatalf("optimized policy duplicated the LAN bypass in the private FIB: %s", joined)
+	}
+	if !strings.Contains(joined, "set ly-route pre-nat-route add id 64999 priority 1 source 192.168.50.0/24 destination 192.168.50.0/24") {
+		t.Fatalf("optimized policy lost the pre-NAT LAN bypass: %s", joined)
 	}
 }

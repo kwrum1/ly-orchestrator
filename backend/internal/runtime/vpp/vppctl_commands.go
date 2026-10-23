@@ -243,6 +243,13 @@ func (channel *vppctlChannel) doCommands(ctx context.Context, operation Operatio
 		if lanInterface := strings.TrimSpace(os.Getenv("LY_ROUTE_LAN_INTERFACE")); lanInterface != "" {
 			command = strings.ReplaceAll(command, "$LY_ROUTE_LAN_INTERFACE", lanInterface)
 		}
+		// VPP 26.06 aborts on unsafe FIB table lifecycle operations. Route and
+		// table commands are made idempotent here so cleanup/replay cannot
+		// delete a non-empty table or touch a table that no longer exists.
+		if skip, reason := channel.skipDeletedTableCommand(ctx, command); skip {
+			results = append(results, VPPCTLCommandResult{Command: logicalCommand, Stderr: reason, Retval: 0})
+			continue
+		}
 		resolvedCommand, resolveErr := channel.resolveRuntimePPPoECommandReady(ctx, command)
 		if resolveErr != nil {
 			if ignoreFailure {
@@ -338,6 +345,167 @@ func collectVPPRouteBatch(commands []string, begin int) ([]string, int, error) {
 // practical exec-file limits while making full GeoIP replay fast enough for a
 // control-plane transaction.
 const vppRouteBatchChunkSize = 512
+
+type tableCommandKind int
+
+const (
+	tableCommandNone tableCommandKind = iota
+	tableCommandRouteDelete
+	tableCommandAdd
+	tableCommandDelete
+)
+
+// skipDeletedTableCommand keeps VPP table lifecycle commands idempotent.
+//
+// VPP 26.06 has two fatal failure modes around private FIB tables:
+//   - `ip table del` aborts the process when the table still owns a route;
+//   - deleting and immediately recreating an otherwise empty table can leave
+//     stale attached-export state, so the next `ip route add` crashes in
+//     fib_attached_export_import.
+//
+// Tables are therefore retained for the lifetime of the VPP instance. Their
+// IDs are stable hashes of the owning resource, so this is bounded and a
+// re-apply reuses the same table instead of destroying it. Routes are still
+// removed by the normal cleanup commands, and route/table commands aimed at a
+// table that does not exist are skipped rather than asking VPP to operate on
+// an invalid FIB.
+func (channel *vppctlChannel) skipDeletedTableCommand(ctx context.Context, command string) (bool, string) {
+	tableID, kind, ok := tableCommandIdentity(command)
+	if !ok {
+		return false, ""
+	}
+	exists, err := channel.vppTableExists(ctx, tableID)
+	if kind == tableCommandDelete {
+		// Destructive table deletion is never sent to VPP. If the inventory
+		// query works, remove every owned route first so the retained table is
+		// empty; if it does not, leaving the table untouched is still safer than
+		// a blind delete.
+		if err == nil {
+			routes, routeErr := channel.fibTableRoutes(ctx, tableID)
+			if routeErr == nil {
+				for _, prefix := range routes {
+					commandCtx, cancel, _ := vppctlTimeout(ctx, false)
+					_ = exec.CommandContext(commandCtx, channel.binary, "ip", "route", "del", "table", tableID, prefix).Run()
+					cancel()
+				}
+			}
+		}
+		return true, fmt.Sprintf("retained: destructive deletion of IPv4 table %s is disabled", tableID)
+	}
+	if err != nil {
+		// A fake or older vppctl may not implement `show ip table`; preserve the
+		// legacy command path rather than silently dropping lifecycle commands.
+		return false, ""
+	}
+	switch kind {
+	case tableCommandAdd:
+		if exists {
+			return true, fmt.Sprintf("skipped: IPv4 table %s already exists", tableID)
+		}
+	case tableCommandRouteDelete:
+		if !exists {
+			return true, fmt.Sprintf("skipped: IPv4 table %s does not exist", tableID)
+		}
+	}
+	return false, ""
+}
+
+func (channel *vppctlChannel) fibTableRoutes(ctx context.Context, tableID string) ([]string, error) {
+	commandCtx, cancel, _ := vppctlTimeout(ctx, false)
+	defer cancel()
+	output, err := exec.CommandContext(commandCtx, channel.binary, "show", "ip", "fib", "table", tableID).Output()
+	if err != nil {
+		return nil, err
+	}
+	return fibTablePrefixes(string(output)), nil
+}
+
+func fibTablePrefixes(output string) []string {
+	prefixes := make([]string, 0, 8)
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		prefix := fields[0]
+		if strings.HasPrefix(prefix, "ipv4") || strings.HasPrefix(prefix, "ipv6") || !strings.Contains(prefix, "/") {
+			continue
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes
+}
+
+// fibTableHasForwardingDefault reports whether the table still has a usable
+// default route. VPP keeps a special drop entry for a removed default path, so
+// an empty prefix inventory is not sufficient to prove that a route policy is
+// gone. The default entry is the only path that can forward unmatched traffic
+// through the private FIB.
+func fibTableHasForwardingDefault(output string) bool {
+	lines := strings.Split(output, "\n")
+	inDefault := false
+	defaultBlock := make([]string, 0, 16)
+	flush := func() bool {
+		if !inDefault {
+			return false
+		}
+		block := strings.Join(defaultBlock, "\n")
+		if strings.Contains(block, "ipv4 via ") || strings.Contains(block, "ip4-lookup-in-table ") || strings.Contains(block, "lookup in ipv4-VRF:") {
+			return true
+		}
+		return false
+	}
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && strings.Contains(fields[0], "/") && !strings.HasPrefix(fields[0], "ipv4") && !strings.HasPrefix(fields[0], "ipv6") {
+			if flush() {
+				return true
+			}
+			inDefault = fields[0] == "0.0.0.0/0"
+			defaultBlock = defaultBlock[:0]
+			if inDefault {
+				defaultBlock = append(defaultBlock, line)
+			}
+			continue
+		}
+		if inDefault {
+			defaultBlock = append(defaultBlock, line)
+		}
+	}
+	return flush()
+}
+
+func tableCommandIdentity(command string) (string, tableCommandKind, bool) {
+	fields := strings.Fields(strings.TrimSpace(command))
+	if len(fields) >= 4 && fields[0] == "ip" && fields[1] == "table" && fields[2] == "del" {
+		return fields[3], tableCommandDelete, true
+	}
+	if len(fields) >= 4 && fields[0] == "ip" && fields[1] == "table" && fields[2] == "add" {
+		return fields[3], tableCommandAdd, true
+	}
+	if len(fields) >= 5 && fields[0] == "ip" && fields[1] == "route" && fields[2] == "del" && fields[3] == "table" {
+		return fields[4], tableCommandRouteDelete, true
+	}
+	return "", tableCommandNone, false
+}
+
+func (channel *vppctlChannel) vppTableExists(ctx context.Context, tableID string) (bool, error) {
+	commandCtx, cancel, _ := vppctlTimeout(ctx, false)
+	defer cancel()
+	output, err := exec.CommandContext(commandCtx, channel.binary, "show", "ip", "table").Output()
+	if err != nil {
+		return false, err
+	}
+	token := "table_id:" + tableID
+	for _, line := range strings.Split(string(output), "\n") {
+		for _, field := range strings.Fields(line) {
+			if field == token {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
 
 func (channel *vppctlChannel) doVPPRouteBatch(ctx context.Context, commands []string) ([]VPPCTLCommandResult, error) {
 	results := make([]VPPCTLCommandResult, 0, (len(commands)+vppRouteBatchChunkSize-1)/vppRouteBatchChunkSize)

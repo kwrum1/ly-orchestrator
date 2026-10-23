@@ -3,8 +3,6 @@ package vpp
 import (
 	"fmt"
 	"strings"
-
-	"ly-route/backend/internal/runtime/trafficpolicy"
 )
 
 func decodeVPPCTLReadback(operation Operation, results []VPPCTLCommandResult) (any, error) {
@@ -99,20 +97,13 @@ func routeSnapshotCommands(request SnapshotRequest) []string {
 	ids := append(append([]string(nil), request.RoutePolicies...), request.AbsentRoutePolicies...)
 	commands := make([]string, 0, 1+len(ids)*2)
 	commands = append(commands, "show acl-plugin acl")
-	groups := make(map[string]trafficpolicy.WANGroup, len(request.Candidates.WANGroups))
-	for _, group := range request.Candidates.WANGroups {
-		groups[group.ID] = group
-	}
-	routeOptions := buildRoutePolicyCommandOptions(request.Candidates.RoutePolicies, groups)
-	addRoutePolicyLocalDestinationPrefixes(routeOptions, request.Candidates.RoutePolicies, request.LocalDestinations)
-	for _, candidate := range request.Candidates.RoutePolicies {
-		if _, ok := compileRoutePolicyRadixPlan(candidate, groups, routeOptions[candidate.ID]); ok {
-			commands = appendUnique(commands, "show ly-route pre-nat-route")
-			break
-		}
-	}
-	if len(request.AbsentRoutePolicies) > 0 {
-		commands = appendUnique(commands, "show ly-route pre-nat-route")
+	// Route policies may be live through the native pre-NAT classifier even
+	// when the current readback plan cannot rebuild the radix plan (for
+	// example during rollback of a policy created by an older generation).
+	// Always read the classifier inventory so readback can accept the native
+	// representation instead of demanding a legacy ACL.
+	if len(ids) > 0 {
+		commands = appendUnique(commands, "?show ly-route pre-nat-route")
 	}
 	for _, id := range ids {
 		id = strings.TrimSpace(id)

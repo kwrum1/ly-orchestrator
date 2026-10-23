@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -142,6 +143,55 @@ func TestExecutorEmitsRollbackAuditEvidenceAfterHealthCheckFailure(t *testing.T)
 		t.Fatal(err)
 	}
 	assertEvents(t, storedEvents, []Phase{PhaseValidate, PhaseCompile, PhaseSnapshot, PhaseApply, PhaseHealthCheck, PhaseRollback}, []string{StatusSuccess, StatusSuccess, StatusSuccess, StatusSuccess, StatusFailure, StatusRollback}, "txn-health-failure")
+}
+
+func TestExecutorFailedApplyRollbackReplayIsRepeatable(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t, ctx)
+	seedSnapshot(t, ctx, store, "snapshot-previous", "txn-previous")
+	clock := deterministicClock(time.Date(2026, 6, 5, 20, 0, 0, 0, time.UTC))
+	rollbacks := 0
+	for attempt := 1; attempt <= 3; attempt++ {
+		request := validRequest(fmt.Sprintf("txn-replay-%d", attempt))
+		request.PreviousSnapshotID = "snapshot-previous"
+		executor := Executor{
+			Store: store,
+			Now:   clock,
+			Receipt: func(_ context.Context, plan Plan) (ApplyReceipt, error) {
+				return ApplyReceipt{TransactionID: plan.Request.TransactionID, Status: ReceiptApplied, Capability: plan.Request.Resource, AppliedAt: clock()}, nil
+			},
+			Readback: func(_ context.Context, plan Plan) (Readback, error) {
+				return Readback{TransactionID: plan.Request.TransactionID, Capability: plan.Request.Resource, Timestamp: clock(), Fresh: true}, nil
+			},
+			HealthCheck: func(context.Context, Plan) error {
+				return errors.New("simulated repeated apply failure")
+			},
+			Rollback: func(_ context.Context, plan Plan) error {
+				if !plan.Previous.Available || plan.Previous.SnapshotHash == "" {
+					return errors.New("rollback lost the prior generation")
+				}
+				rollbacks++
+				return nil
+			},
+		}
+		result, err := executor.Run(ctx, request)
+		if err == nil {
+			t.Fatalf("attempt %d: Run succeeded after injected failure", attempt)
+		}
+		if result.Rollback.Status != "succeeded" || result.Rollback.TargetSnapshotID != "snapshot-previous" {
+			t.Fatalf("attempt %d: rollback = %#v", attempt, result.Rollback)
+		}
+	}
+	if rollbacks != 3 {
+		t.Fatalf("rollback calls = %d, want 3", rollbacks)
+	}
+	snapshot, err := store.RuntimeSnapshot(ctx, "snapshot-previous")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.PayloadHash == "" {
+		t.Fatal("prior generation was lost across repeated rollbacks")
+	}
 }
 
 func TestExecutorRejectsMissingReceiptAndPreservesCommittedSnapshot(t *testing.T) {
