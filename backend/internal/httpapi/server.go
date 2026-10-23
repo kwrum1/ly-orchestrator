@@ -2679,6 +2679,9 @@ func (server *Server) handleDesiredCollection(resourceType string) http.HandlerF
 			if resourceType == "port_map" {
 				items = server.decoratePortMapRuntimeStates(r.Context(), items)
 			}
+			if resourceType == "dhcp_server" {
+				items = server.decorateDHCPRuntimeStates(r.Context(), items)
+			}
 			if resourceType == "route_policy" {
 				items = server.decorateRoutePolicyRuntimeStates(r.Context(), items)
 			}
@@ -2783,6 +2786,9 @@ func (server *Server) handleDesiredItem(resourceType string) http.HandlerFunc {
 			}
 			if resourceType == "port_map" {
 				item = server.decoratePortMapRuntimeStates(r.Context(), []map[string]any{item})[0]
+			}
+			if resourceType == "dhcp_server" {
+				item = server.decorateDHCPRuntimeStates(r.Context(), []map[string]any{item})[0]
 			}
 			if resourceType == "traffic_control" {
 				item = server.decorateTrafficControlRuntimeState(r.Context(), item)
