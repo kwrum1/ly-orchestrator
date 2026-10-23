@@ -100,13 +100,32 @@ func unsafeUpgradePackage(t *testing.T, header tar.Header) string {
 	return packagePath
 }
 
+func TestFirmwareUpgradeHasBoundedFailureAndFastRestore(t *testing.T) {
+	if !strings.Contains(firmwareUpgradeInstallScript, "install_deadline=$((install_started + 180))") {
+		t.Fatal("installer has no overall deadline")
+	}
+	if !strings.Contains(firmwareUpgradeInstallScript, "restart_base=$(timeout 3s systemctl show ly-route-control-api.service -p NRestarts") {
+		t.Fatal("installer does not detect a control crash loop")
+	}
+	if !strings.Contains(firmwareUpgradeInstallScript, "timeout 20s systemctl stop ly-route-control-api.service") {
+		t.Fatal("restore does not stop the candidate before restoring files")
+	}
+	if !strings.Contains(firmwareUpgradeInstallScript, "printf '[Service]\\nRestart=no\\n'") {
+		t.Fatal("candidate validation does not suppress crash-loop restarts")
+	}
+	if !strings.Contains(firmwareUpgradeInstallScript, "while :; do") ||
+		!strings.Contains(firmwareUpgradeInstallScript, "health_deadline=$((health_started + 60))") {
+		t.Fatal("health window is not bounded to 60s")
+	}
+}
+
 func TestFirmwareUpgradeHealthWindowAllowsColdControlStart(t *testing.T) {
 	// final3 failed on a TCG lab because control needed 15-17s while the old
 	// health loop only waited ~10s. Keep a bounded but realistic window.
-	if !strings.Contains(firmwareUpgradeInstallScript, "timeout 30s systemctl restart ly-route-control-api.service") {
+	if !strings.Contains(firmwareUpgradeInstallScript, "restart_timeout=90") {
 		t.Fatal("control restart timeout is too short for cold start")
 	}
-	if !strings.Contains(firmwareUpgradeInstallScript, `while [ "$i" -lt 60 ]`) {
+	if !strings.Contains(firmwareUpgradeInstallScript, "health_deadline=$((health_started + 60))") {
 		t.Fatal("health check window is too short for cold start")
 	}
 	if !strings.Contains(firmwareUpgradeInstallScript, "curl -fsS --max-time 10 http://127.0.0.1:8080/api/v1/health") {

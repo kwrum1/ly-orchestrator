@@ -14,6 +14,18 @@ package_path=$1
 package_hash=$2
 target_dir=$3
 reboot_requested=$4
+install_started=$(date +%s)
+# Bound the complete install+health+restore decision. The normal health
+# window stays 60s below; this deadline prevents a crashing control binary
+# from extending a failed install into an eight-minute crash loop.
+install_deadline=$((install_started + 180))
+upgrade_dropin=/run/systemd/system/ly-route-control-api.service.d/90-upgrade.conf
+remove_upgrade_dropin() {
+  rm -f "$upgrade_dropin"
+  rmdir /run/systemd/system/ly-route-control-api.service.d 2>/dev/null || true
+  timeout 15s systemctl daemon-reload || true
+}
+trap remove_upgrade_dropin EXIT
 actual=$(sha256sum -- "$package_path" | cut -d' ' -f1)
 test "$actual" = "$package_hash"
 tmp=$(mktemp -d /var/lib/ly-route/firmware-update/install.XXXXXX)
@@ -52,7 +64,7 @@ from datetime import datetime, timezone
 status, reason, backup = sys.argv[1:4]
 now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 try:
-    db = sqlite3.connect("/var/lib/ly-route/gateway/ly-route.db", timeout=5)
+    db = sqlite3.connect("/var/lib/ly-route/gateway/ly-route.db", timeout=30)
     db.execute(
         "insert or replace into audit_events "
         "(id,timestamp,actor,role,resource,action,status,error,transaction_id) "
@@ -71,7 +83,9 @@ AUDIT_PY
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 backup=/var/lib/ly-route/firmware-update/backup-$stamp
 mkdir -p "$backup"
-if [ -e "$target_dir" ]; then cp -a "$target_dir" "$backup/target"; fi
+if [ -e "$target_dir" ]; then
+  cp -al "$target_dir" "$backup/target" 2>/dev/null || cp -a "$target_dir" "$backup/target"
+fi
 if [ -e /opt/ly-route/admin ]; then cp -a /opt/ly-route/admin "$backup/admin"; fi
 if [ -e /etc/nginx/conf.d/ly-route-admin.conf ]; then cp -a /etc/nginx/conf.d/ly-route-admin.conf "$backup/ly-route-admin.conf"; fi
 if [ -e /etc/systemd/system/ly-route-firstboot.service ]; then cp -a /etc/systemd/system/ly-route-firstboot.service "$backup/ly-route-firstboot.service"; fi
@@ -92,7 +106,7 @@ restore_backup() {
   echo "upgrade failed; restoring $backup" >&2
   if [ -e "$backup/target" ]; then
     rm -rf "$target_dir"
-    cp -a "$backup/target" "$target_dir"
+    cp -al "$backup/target" "$target_dir" 2>/dev/null || cp -a "$backup/target" "$target_dir"
   fi
   if [ -e "$backup/admin" ]; then
     rm -rf /opt/ly-route/admin
@@ -116,14 +130,22 @@ restore_backup() {
   if [ -e "$backup/artifact-manifest.json" ]; then
     install -D -m 0644 "$backup/artifact-manifest.json" /usr/share/ly-route/artifact-manifest.json
   fi
-  systemctl daemon-reload || true
-  systemctl restart ly-route-control-api.service || true
-  systemctl reload nginx.service || systemctl restart nginx.service || true
+  # Stop the candidate before restoring files. If it is crash-looping, a
+  # plain restart can hold the install open for minutes and keep spawning
+  # failures. Bound the stop/start as well so restore itself stays fast.
+  timeout 20s systemctl stop ly-route-control-api.service || true
+  timeout 5s systemctl kill -s KILL ly-route-control-api.service || true
+  remove_upgrade_dropin
+  timeout 10s systemctl reset-failed ly-route-control-api.service || true
+  # The control process is stopped here, so the audit row cannot race the
+  # service's database writers. Then start the restored control.
   mkdir -p /var/lib/ly-route/firmware-update
   printf '{"timestamp":"%s","backup":"%s","reason":"upgrade health check failed"}\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$backup" \
     >> /var/lib/ly-route/firmware-update/rollback-audit.jsonl
   record_firmware_audit failure "upgrade health check failed" "$backup"
+  timeout 15s systemctl start --no-block ly-route-control-api.service || true
+  timeout 15s systemctl reload nginx.service || timeout 15s systemctl restart nginx.service || true
 }
 
 install -d -m 0755 "$target_dir"
@@ -155,29 +177,75 @@ fi
 if [ -f "$tmp/etc/nginx/conf.d/ly-route-admin.conf" ]; then
   install -D -m 0644 "$tmp/etc/nginx/conf.d/ly-route-admin.conf" /etc/nginx/conf.d/ly-route-admin.conf
 fi
-systemctl daemon-reload || true
-if ! timeout 30s systemctl restart ly-route-control-api.service; then
+timeout 15s systemctl daemon-reload || true
+restart_base=$(timeout 3s systemctl show ly-route-control-api.service -p NRestarts --value 2>/dev/null || echo 0)
+case "$restart_base" in ''|*[!0-9]*) restart_base=0;; esac
+# During candidate validation do not let systemd respawn a broken control
+# indefinitely. This runtime-only drop-in is removed on success or rollback,
+# restoring the normal Restart=on-failure policy.
+mkdir -p "$(dirname "$upgrade_dropin")"
+printf '[Service]\nRestart=no\n' > "$upgrade_dropin"
+timeout 15s systemctl daemon-reload || true
+restart_timeout=$((install_deadline - $(date +%s)))
+if [ "$restart_timeout" -lt 15 ]; then
   restore_backup
+  echo "upgrade deadline reached before candidate restart" >&2
   exit 1
 fi
-systemctl reload nginx.service || systemctl restart nginx.service || true
+if [ "$restart_timeout" -gt 90 ]; then restart_timeout=90; fi
+# A graceful restart is normally enough, but a stuck control stop job must not
+# consume the whole deadline. Stop, force-kill if necessary, then start the
+# candidate with a bounded job.
+timeout 10s systemctl stop --no-block ly-route-control-api.service || true
+pkill -9 -f "^/usr/lib/ly-route/ly-route-control$" 2>/dev/null || true
+timeout 10s systemctl reset-failed ly-route-control-api.service || true
+# systemd may queue the start behind other jobs; --no-block plus a short
+# command timeout lets the health deadline, not a stuck D-Bus call, decide.
+timeout 15s systemctl start --no-block ly-route-control-api.service || true
+timeout 15s systemctl reload nginx.service || timeout 15s systemctl restart nginx.service || true
 
 healthy=0
-i=0
-while [ "$i" -lt 60 ]; do
+inactive_probes=0
+health_started=$(date +%s)
+health_deadline=$((health_started + 60))
+while :; do
+  now=$(date +%s)
+  if [ "$now" -ge "$install_deadline" ] || [ "$now" -ge "$health_deadline" ]; then
+    break
+  fi
   if timeout 3s systemctl is-active --quiet ly-route-control-api.service &&
      timeout 12s curl -fsS --max-time 10 http://127.0.0.1:8080/api/v1/health >/dev/null 2>&1; then
     healthy=1
     break
   fi
-  i=$((i + 1))
+  restarts=$(timeout 3s systemctl show ly-route-control-api.service -p NRestarts --value 2>/dev/null || echo 0)
+  case "$restarts" in ''|*[!0-9]*) restarts=0;; esac
+  if [ "$restarts" -ge $((restart_base + 3)) ]; then
+    echo "candidate control crash-loop detected: NRestarts $restart_base->$restarts" >&2
+    break
+  fi
+  active_state=$(timeout 3s systemctl show ly-route-control-api.service -p ActiveState --value 2>/dev/null || true)
+  if [ "$active_state" = "failed" ] || [ "$active_state" = "inactive" ]; then
+    inactive_probes=$((inactive_probes + 1))
+    if [ "$inactive_probes" -ge 3 ]; then
+      echo "candidate control stayed inactive for 3 probes" >&2
+      break
+    fi
+  else
+    inactive_probes=0
+  fi
   sleep 1
 done
 if [ "$healthy" != 1 ]; then
   restore_backup
-  echo "upgrade health check failed" >&2
+  if [ "$(date +%s)" -ge "$install_deadline" ]; then
+    echo "upgrade health check failed (total deadline)" >&2
+  else
+    echo "upgrade health check failed" >&2
+  fi
   exit 1
 fi
+remove_upgrade_dropin
 record_firmware_audit success "upgrade installed" "$backup"
 
 if [ "$reboot_requested" = true ]; then
