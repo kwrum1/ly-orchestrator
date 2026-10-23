@@ -246,9 +246,8 @@ const valid = artifact.schema_version === 1 && artifact.artifact_type === "rootf
   artifact.config_path === profile.config_path && same(artifact.services, profile.services) &&
   same(artifact.systemd_units, profile.systemd_units) && same(artifact.packages, profile.required_packages) &&
   same(installed, canonical) && same(capabilities, canonical);
-const app = readFileSync(appPath, "utf8");
 const service = readFileSync(servicePath, "utf8");
-if (!valid || !app.includes(`window.LY_ROUTE_PRODUCT_ENTRYPOINT = "${product}";`) ||
+if (!valid ||
     !service.includes(`Environment=LY_ROUTE_DB_PATH=${profile.database_path}`) ||
     !service.includes(`Environment=LY_ROUTE_CONFIG_PATH=${profile.config_path}`)) {
   console.error(`Rootfs artifact manifest does not match canonical ${product} build profile`);

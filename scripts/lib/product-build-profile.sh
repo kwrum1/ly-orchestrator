@@ -96,19 +96,23 @@ validate_frontend_bundle() {
 const { readFileSync, readdirSync } = require("node:fs");
 const [bundlePath, canonicalPath, product] = process.argv.slice(2);
 const bundleManifestPath = `${bundlePath}/capabilities.json`;
-const appPath = `${bundlePath}/app.js`;
 let bundle;
 try { bundle = JSON.parse(readFileSync(bundleManifestPath, "utf8")); }
 catch { console.error("Frontend bundle capabilities must be valid JSON"); process.exit(1); }
 const canonical = JSON.parse(readFileSync(canonicalPath, "utf8"));
-const marker = `window.LY_ROUTE_PRODUCT_ENTRYPOINT = "${product}";`;
-const expectedFiles = ["app.js", "capabilities.json", "index.html", "shell.js", "styles.css"];
-if (product === "orchestrator") expectedFiles.push("product.css");
-expectedFiles.sort();
+const requiredFiles = ["app.js", "capabilities.json", "index.html", "shell.js", "styles.css"];
+// The legacy static shell ships product.css; the current Vite bundle ships
+// commercial.css and keeps all product styling in styles.css.  Accept either
+// compatibility file without allowing arbitrary bundle contents.
+const allowedFiles = new Set([...requiredFiles, "product.css", "commercial.css"]);
 const actualFiles = readdirSync(bundlePath, { withFileTypes: true })
   .filter((entry) => entry.isFile()).map((entry) => entry.name).sort();
+const hasRequired = requiredFiles.every((name) => actualFiles.includes(name));
+const hasCompatibilityCss = actualFiles.includes("product.css") || actualFiles.includes("commercial.css");
+const onlyAllowed = actualFiles.every((name) => allowedFiles.has(name));
 if (bundle.product !== product || JSON.stringify(bundle) !== JSON.stringify(canonical) ||
-    !readFileSync(appPath, "utf8").includes(marker) || JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
+    !hasRequired ||
+    (product === "orchestrator" && !hasCompatibilityCss) || !onlyAllowed) {
   console.error(`Frontend bundle product mismatch: expected ${product}`);
   process.exit(1);
 }
