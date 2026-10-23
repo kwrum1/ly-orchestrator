@@ -32,7 +32,7 @@ export function ProxyPage() {
   const [busy, setBusy] = useState(false);
 
   const underlays = links.data?.items || [];
-  const egressItems = (egresses.data?.items || []).filter((item) => item.id !== "proxy-egress-default");
+  const egressItems = egresses.data?.items || [];
   const nodeItems = nodes.data?.items || [];
   const subscriptionItems = subscriptions.data?.items || [];
 
@@ -119,7 +119,7 @@ export function ProxyPage() {
 
   const columns = useMemo<ColumnDef<any, any>[]>(() => {
     if (tab === "egress") return [
-      { id: "name", header: "出口名称", accessorFn: (row) => row.name, cell: ({ row }) => <span className="interface-name"><CloudCog size={14} /><strong>{text(row.original.name || row.original.id)}</strong></span>, meta: { width: 190 } },
+      { id: "name", header: "出口名称", accessorFn: (row) => row.name, cell: ({ row }) => <span className="interface-name"><CloudCog size={14} /><strong>{text(row.original.name || row.original.id)}</strong>{row.original.id === "proxy-egress-default" && <Badge tone="neutral">默认</Badge>}</span>, meta: { width: 190 } },
       { id: "underlay", header: "承载 WAN", accessorFn: (row) => row.underlay_wan_id, cell: ({ getValue }) => <span>{underlays.find((item) => item.id === getValue())?.name || text(getValue(), "--")}</span>, meta: { width: 150 } },
       { id: "node", header: "节点/订阅", accessorFn: (row) => row.node_id || row.subscription_id, cell: ({ getValue }) => <span className="mono">{text(getValue(), "--")}</span>, meta: { width: 180 } },
       { id: "desc", header: "备注", accessorFn: (row) => row.description, cell: ({ getValue }) => <span className="muted">{text(getValue(), "")}</span> },

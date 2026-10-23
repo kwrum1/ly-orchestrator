@@ -24,6 +24,7 @@
 | [07-acceptance-and-gate.md](./07-acceptance-and-gate.md) | UI 验收标准、证据包、门禁条件、上线与回退 | 产品 / 测试 / 发布 |
 | [08-implementation-report.md](./08-implementation-report.md) | 实际实现、构建命令、页面映射、未实现/后端缺口、证据 | 产品 / 测试 / 前端 |
 | [09-orchestrator-product.md](./09-orchestrator-product.md) | Orchestrator 单机产品边界、11 页路由、API 映射、双产品构建、验收证据 | 产品 / 测试 / 前端 |
+| [10-gateway-p1-fixes.md](./10-gateway-p1-fixes.md) | Gateway 全栈 P1 修复：WAN/PPPoE、固件、代理、Any→Any apply、DHCP 状态 | 产品 / 测试 / 前端 |
 
 ## 2. 基线（本次阅读与核对）
 

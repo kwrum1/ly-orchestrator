@@ -4,7 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { ArrowRight, Pencil, Plus, RefreshCw, Route, Trash2 } from "lucide-react";
 import { API } from "../api/endpoints";
 import { deleteJson, patchJson, postJson } from "../api/client";
-import { useObjectGroups, useProxyEgresses, useRoutes, useWanGroups, useWanLinks } from "../api/hooks";
+import { useObjectGroups, useProxyEgresses, useRoutes, useRuntime, useWanGroups, useWanLinks } from "../api/hooks";
 import type { RoutePolicy } from "../api/types";
 import { AddressListEditor } from "../components/AddressListEditor";
 import { DataTable } from "../components/DataTable";
@@ -22,6 +22,16 @@ function summary(list: string[]) {
   return list.length ? list.join(", ") : "任意";
 }
 
+function routeRuntimeState(item: any, runtime: any, applying: boolean, failed: boolean) {
+  const raw = item?.enabled === false ? "disabled" : item?.runtime_state || "unknown";
+  if (raw !== "desired_not_applied" || applying || failed) return raw;
+  const last = runtime?.last_apply;
+  if (String(last?.status || "").toLowerCase() !== "committed") return raw;
+  const evidence = (last?.gateway_evidence || []).find((entry: any) => entry?.resource === "routes" && String(entry?.apply_receipt?.status || "").toLowerCase() === "applied");
+  const applied = (evidence?.after?.route_policies || []).some((route: any) => route?.id === item?.id);
+  return applied ? "applied" : raw;
+}
+
 export function RoutingPage() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -33,6 +43,7 @@ export function RoutingPage() {
   const groups = useWanGroups();
   const proxies = useProxyEgresses();
   const objects = useObjectGroups();
+  const runtime = useRuntime();
   const [editor, setEditor] = useState<RoutePolicy | null | undefined>(undefined);
   const [form, setForm] = useState<any>({});
   const [busy, setBusy] = useState(false);
@@ -130,10 +141,10 @@ export function RoutingPage() {
     { id: "destinations", header: "目的地址", accessorFn: (row) => matchList(row.match?.destinations || row.match?.dst_ip), cell: ({ row }) => <span className="mono truncate" title={summary(matchList(row.original.match?.destinations || row.original.match?.dst_ip))}>{summary(matchList(row.original.match?.destinations || row.original.match?.dst_ip))}</span>, meta: { width: 170, mono: true } },
     { id: "ports", header: "端口", accessorFn: (row) => `${row.match?.src_port || "任意"} / ${row.match?.dst_port || "任意"}`, cell: ({ getValue }) => <span className="mono">{text(getValue())}</span>, meta: { width: 130 } },
     { id: "egress", header: "目标线路", accessorFn: (row) => row.egress, cell: ({ getValue }) => <span>{egressOptions.find((item) => item.id === getValue())?.label || text(getValue(), "--")}</span>, meta: { width: 150 } },
-    { id: "state", header: "状态", accessorFn: (row) => row.enabled === false ? "disabled" : row.runtime_state, cell: ({ row }) => <Badge tone={row.original.enabled === false ? "neutral" : row.original.runtime_state === "applied" ? "success" : "warning"} dot>{row.original.enabled === false ? "已停用" : stateLabel(row.original.runtime_state)}</Badge>, meta: { width: 95 } },
+    { id: "state", header: "状态", accessorFn: (row) => routeRuntimeState(row, runtime.data, apply.running, apply.phase === "failed"), cell: ({ getValue }) => <Badge tone={getValue() === "applied" ? "success" : getValue() === "disabled" ? "neutral" : "warning"} dot>{stateLabel(getValue())}</Badge>, meta: { width: 95 } },
     { id: "name", header: "备注", accessorFn: (row) => row.name, cell: ({ getValue }) => <span className="muted">{text(getValue(), "")}</span>, meta: { width: 130 } },
     { id: "actions", header: "操作", cell: ({ row }) => <div className="row-actions"><Button size="sm" variant="text" icon={<Pencil size={13} />} onClick={() => open(row.original)} disabled={session?.role === "readonly"}>编辑</Button><Button size="sm" variant="text" icon={<Trash2 size={13} />} onClick={() => remove(row.original)} disabled={session?.role === "readonly"}>删除</Button></div>, meta: { width: 120, align: "right", hideable: false } },
-  ], [egressOptions, session?.role]);
+  ], [egressOptions, session?.role, runtime.data, apply.running, apply.phase]);
 
   return (
     <div className="page">

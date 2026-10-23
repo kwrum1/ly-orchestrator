@@ -199,6 +199,16 @@ export function ApplyProvider({ children }: { children: ReactNode }) {
   const [startedAt, setStartedAt] = useState(0);
   const [result, setResult] = useState<RuntimeApply | null>(null);
   const runningRef = useRef(false);
+  const pendingRef = useRef(false);
+  const applyRef = useRef<(() => Promise<RuntimeApply | null>) | null>(null);
+
+  const triggerPending = useCallback(() => {
+    if (!pendingRef.current || runningRef.current) return;
+    pendingRef.current = false;
+    window.setTimeout(() => {
+      void applyRef.current?.();
+    }, 0);
+  }, []);
 
   const finish = useCallback((next: RuntimeApply) => {
     setResult(next);
@@ -221,7 +231,8 @@ export function ApplyProvider({ children }: { children: ReactNode }) {
     queryClient.invalidateQueries({ queryKey: ["runtime"] });
     queryClient.invalidateQueries({ queryKey: ["resources"] });
     queryClient.invalidateQueries({ queryKey: ["telemetry"] });
-  }, [queryClient, toast]);
+    triggerPending();
+  }, [queryClient, toast, triggerPending]);
 
   const poll = useCallback(async (initial?: RuntimeApply) => {
     const deadline = Date.now() + 12 * 60_000;
@@ -250,11 +261,17 @@ export function ApplyProvider({ children }: { children: ReactNode }) {
     setPhase("failed");
     setMessage("应用状态确认超时，请到运行态页面查看结果");
     runningRef.current = false;
+    triggerPending();
     return latest || null;
-  }, [finish, transactionId]);
+  }, [finish, transactionId, triggerPending]);
 
   const apply = useCallback(async () => {
-    if (runningRef.current) return null;
+    if (runningRef.current) {
+      pendingRef.current = true;
+      setPhase("applying");
+      setMessage("已保存，等待当前应用结束后自动应用");
+      return null;
+    }
     runningRef.current = true;
     setPhase("applying");
     setMessage("正在应用运行态，请勿关闭页面");
@@ -282,9 +299,11 @@ export function ApplyProvider({ children }: { children: ReactNode }) {
       setMessage(apiError.message || "应用请求失败");
       runningRef.current = false;
       toast(apiError.message || "应用请求失败", "error", apiError.requestId);
+      triggerPending();
       return null;
     }
-  }, [finish, poll, toast]);
+  }, [finish, poll, toast, triggerPending]);
+  applyRef.current = apply;
 
   const dismiss = useCallback(() => {
     if (runningRef.current) return;

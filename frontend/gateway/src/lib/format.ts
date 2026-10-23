@@ -122,9 +122,13 @@ export function stateLabel(value: unknown): string {
   const raw = String(value || "").toLowerCase();
   return ({
     running: "运行中",
+    connected: "已连接",
+    disconnected: "未连接",
+    connecting: "连接中",
     committed: "已应用",
     applied: "已应用",
     available: "可用",
+    active: "活动",
     ok: "正常",
     healthy: "正常",
     degraded: "降级",

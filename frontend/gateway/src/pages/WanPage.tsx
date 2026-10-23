@@ -33,7 +33,33 @@ function wanAddress(item: any) {
 }
 
 function wanState(item: any) {
-  return item?.status || item?.state || item?.runtime_state || (item?.enabled === false ? "disabled" : "unknown");
+  if (item?.pppoe_state) return item.pppoe_state;
+  if (item?.status || item?.state) return item.status || item.state;
+  if (item?.runtime_state) return item.runtime_state;
+  if (item?.kind === "egress") return item.enabled === false ? "disabled" : "available";
+  return item?.enabled === false ? "disabled" : "unknown";
+}
+
+function wanHealth(item: any) {
+  const state = String(wanState(item)).toLowerCase();
+  if (item?.route_ready === true && state === "connected") return "healthy";
+  if (["connected", "running", "up", "healthy", "available", "ok"].includes(state)) return "healthy";
+  if (["failed", "down", "unavailable"].includes(state)) return "failed";
+  return state || "unknown";
+}
+
+function pppoePeersOf(data: any) {
+  if (Array.isArray(data?.items)) return data.items;
+  if (Array.isArray(data?.peers)) return data.peers;
+  return [];
+}
+
+function handoffLabel(peer: any) {
+  const value = peer?.vpp_route_handoff ?? peer?.route_handoff;
+  if (typeof value === "string") return value;
+  if (value?.state) return value.state;
+  if (value?.ready === true || peer?.route_ready === true) return "ready";
+  return peer?.route_ready === false ? "pending" : "--";
 }
 
 export function WanPage() {
@@ -57,7 +83,10 @@ export function WanPage() {
   const allInterfaces = interfaces.data?.items || [];
   const lanItems = allInterfaces.filter((item) => (item.gateway_role || item.role) === "lan");
   const wanItems = wanLinks.data?.items || [];
-  const proxyItems = (proxyEgresses.data?.items || []).filter((item) => item.id !== "proxy-egress-default");
+  const proxyItems = proxyEgresses.data?.items || [];
+  const pppoePeers = pppoePeersOf(pppoe.data);
+  const pppoeConnected = pppoePeers.filter((peer: any) => String(peer.state || peer.status || "").toLowerCase() === "connected").length;
+  const pppoeSummary = pppoePeers.length ? `${pppoeConnected}/${pppoePeers.length} 已连接` : "未配置";
   const logs = useMemo(() => {
     const payload = audit.data;
     const items = payload?.data?.items || payload?.items || (Array.isArray(payload) ? payload : []);
@@ -293,14 +322,14 @@ export function WanPage() {
   ], [session?.role]);
 
   const wanColumns = useMemo<ColumnDef<any, any>[]>(() => [
-    { id: "name", header: "接口名称", accessorFn: (row) => row.name, cell: ({ row }) => <span className="interface-name"><Router size={14} /><strong>{text(row.original.name || row.original.id)}</strong>{row.original.isProxy && <Badge tone="violet">代理</Badge>}</span>, meta: { width: 190 } },
+    { id: "name", header: "接口名称", accessorFn: (row) => row.name, cell: ({ row }) => <span className="interface-name"><Router size={14} /><strong>{text(row.original.name || row.original.id)}</strong>{row.original.isProxy && <Badge tone="violet">代理</Badge>}{row.original.id === "proxy-egress-default" && <Badge tone="neutral">默认</Badge>}</span>, meta: { width: 190 } },
     { id: "address", header: "当前地址", accessorFn: (row) => wanAddress(row), cell: ({ getValue }) => <span className="mono">{text(getValue(), "--")}</span>, meta: { width: 150 } },
-    { id: "state", header: "状态", accessorFn: (row) => wanState(row), cell: ({ row }) => <Badge tone={String(wanState(row.original)).toLowerCase().includes("up") || String(wanState(row.original)).toLowerCase().includes("running") ? "success" : "warning"} dot>{stateLabel(wanState(row.original))}</Badge>, meta: { width: 95 } },
+    { id: "state", header: "状态", accessorFn: (row) => wanState(row), cell: ({ row }) => <Badge tone={wanHealth(row.original) === "healthy" ? "success" : wanHealth(row.original) === "failed" ? "danger" : "warning"} dot>{stateLabel(wanState(row.original))}</Badge>, meta: { width: 95 } },
     { id: "type", header: "线路类型", accessorFn: (row) => wanType(row), cell: ({ row }) => <Badge tone="info">{row.original.isProxy ? "代理线路" : wanTypeLabel(wanType(row.original))}</Badge>, meta: { width: 105 } },
     { id: "mtu", header: "MTU", accessorFn: (row) => row.mtu, cell: ({ getValue }) => text(getValue()), meta: { width: 65, align: "right" } },
     { id: "bandwidth", header: "带宽", accessorFn: (row) => row.bandwidth, cell: ({ getValue }) => text(getValue(), "--"), meta: { width: 100 } },
     { id: "desc", header: "备注", accessorFn: (row) => row.description, cell: ({ getValue }) => <span className="muted">{text(getValue(), "")}</span>, meta: { width: 120 } },
-    { id: "actions", header: "操作", cell: ({ row }) => <div className="row-actions"><Button size="sm" variant="text" icon={<Pencil size={13} />} onClick={() => row.original.isProxy ? navigate("/proxy") : openWan(row.original)} disabled={session?.role === "readonly"}>编辑</Button><Button size="sm" variant="text" icon={<Trash2 size={13} />} onClick={() => remove(row.original.isProxy ? "proxy" : "wan", row.original)} disabled={session?.role === "readonly"}>删除</Button></div>, meta: { width: 120, align: "right", hideable: false } },
+    { id: "actions", header: "操作", cell: ({ row }) => <div className="row-actions"><Button size="sm" variant="text" icon={<Pencil size={13} />} onClick={() => row.original.isProxy ? navigate("/proxy") : openWan(row.original)} disabled={session?.role === "readonly"}>编辑</Button>{row.original.id !== "proxy-egress-default" && <Button size="sm" variant="text" icon={<Trash2 size={13} />} onClick={() => remove(row.original.isProxy ? "proxy" : "wan", row.original)} disabled={session?.role === "readonly"}>删除</Button>}</div>, meta: { width: 120, align: "right", hideable: false } },
   ], [session?.role, navigate]);
 
   const wanRows = [
@@ -325,7 +354,7 @@ export function WanPage() {
       />
 
       <div className="status-strip">
-        <span><Wifi size={14} /> PPPoE <b>{text(pppoe.data?.status || pppoe.data?.state, "未知")}</b></span>
+        <span><Wifi size={14} /> PPPoE <b>{pppoeSummary}</b></span>
         <span>LAN <b>{lanItems.length}</b></span>
         <span>WAN <b>{wanItems.length}</b></span>
         <span>代理 <b>{proxyItems.length}</b></span>
@@ -345,19 +374,20 @@ export function WanPage() {
       <Card
         title="PPPoE 生产路径"
         subtitle={text(pppoe.data?.reason || pppoe.data?.error, "来自 /gateway/pppoe/status")}
-        actions={<Badge tone={pppoe.data?.status === "running" ? "success" : "warning"} dot>{stateLabel(pppoe.data?.status || pppoe.data?.state || "unknown")}</Badge>}
+        actions={<Badge tone={pppoePeers.length && pppoeConnected === pppoePeers.length ? "success" : "warning"} dot>{pppoePeers.length ? `${pppoeSummary}` : "未配置"}</Badge>}
       >
-        {(pppoe.data?.peers || []).length ? (
+        {pppoePeers.length ? (
           <div className="mini-table-wrap">
             <table className="data-table">
-              <thead><tr><th>Peer</th><th>接口</th><th>状态</th><th>VPP 路由交接</th></tr></thead>
+              <thead><tr><th>Peer</th><th>接口</th><th>地址</th><th>状态</th><th>VPP 路由交接</th></tr></thead>
               <tbody>
-                {(pppoe.data?.peers || []).map((peer: any, index: number) => (
-                  <tr key={peer.id || index}>
-                    <td>{text(peer.id || peer.name)}</td>
+                {pppoePeers.map((peer: any, index: number) => (
+                  <tr key={peer.peer_id || peer.id || index}>
+                    <td>{text(peer.peer_id || peer.id || peer.name)}</td>
                     <td className="mono">{text(peer.interface || peer.iface)}</td>
-                    <td><Badge tone={String(peer.state || peer.status).includes("connected") ? "success" : "warning"}>{text(peer.state || peer.status)}</Badge></td>
-                    <td>{text(peer.route_handoff?.state || peer.vpp_route_handoff?.state)}</td>
+                    <td className="mono">{text(peer.assigned_ipv4 || peer.address, "--")}</td>
+                    <td><Badge tone={String(peer.state || peer.status).toLowerCase() === "connected" ? "success" : "warning"}>{stateLabel(peer.state || peer.status)}</Badge></td>
+                    <td><span className="mono">{stateLabel(handoffLabel(peer))}</span>{peer.route_ready === true && <span className="muted"> · ready</span>}</td>
                   </tr>
                 ))}
               </tbody>

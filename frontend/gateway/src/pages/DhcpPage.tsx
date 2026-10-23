@@ -4,7 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2, Wifi } from "lucide-react";
 import { API } from "../api/endpoints";
 import { deleteJson, patchJson, postJson } from "../api/client";
-import { useDhcpBindings, useDhcpServers, useInterfacesResource } from "../api/hooks";
+import { useDhcpBindings, useDhcpServers, useInterfacesResource, useRuntime } from "../api/hooks";
 import type { DhcpBinding, DhcpServer } from "../api/types";
 import { DataTable } from "../components/DataTable";
 import { Badge, Button, Field, Input, Modal, PageHeader, Select, Tabs, Textarea, useToast } from "../components/ui";
@@ -18,6 +18,15 @@ function leaseLabel(seconds: unknown) {
   return `${Math.round(value / 60)} 分钟`;
 }
 
+function dhcpRuntimeState(item: any, runtime: any, applying: boolean, failed: boolean) {
+  const raw = item?.runtime_state || (item?.enabled === false ? "disabled" : "enabled");
+  if (raw !== "desired_not_applied" || applying || failed) return raw;
+  const last = runtime?.last_apply;
+  const kea = (runtime?.components || []).find((component: any) => component.name === "kea");
+  if (String(last?.status || "").toLowerCase() === "committed" && (kea?.state === "running" || kea?.available === true)) return "applied";
+  return raw;
+}
+
 export function DhcpPage() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -27,6 +36,7 @@ export function DhcpPage() {
   const servers = useDhcpServers();
   const bindings = useDhcpBindings();
   const interfaces = useInterfacesResource();
+  const runtime = useRuntime();
   const [tab, setTab] = useState<"servers" | "bindings">("servers");
   const [editor, setEditor] = useState<DhcpServer | DhcpBinding | null | undefined>(undefined);
   const [form, setForm] = useState<any>({});
@@ -129,9 +139,9 @@ export function DhcpPage() {
     { id: "pools", header: "地址池", accessorFn: (row) => row.pools, cell: ({ getValue }) => <span className="mono">{(getValue() || []).join(", ") || "--"}</span>, meta: { width: 190 } },
     { id: "gateway", header: "网关", accessorFn: (row) => row.routers?.[0], cell: ({ getValue }) => <span className="mono">{text(getValue())}</span>, meta: { width: 130 } },
     { id: "lease", header: "租约", accessorFn: (row) => row.lease_time_seconds, cell: ({ getValue }) => leaseLabel(getValue()), meta: { width: 90 } },
-    { id: "state", header: "状态", accessorFn: (row) => row.runtime_state || (row.enabled === false ? "disabled" : "enabled"), cell: ({ getValue }) => <Badge tone={getValue() === "applied" ? "success" : "warning"} dot>{stateLabel(getValue())}</Badge>, meta: { width: 90 } },
+    { id: "state", header: "状态", accessorFn: (row) => dhcpRuntimeState(row, runtime.data, apply.running, apply.phase === "failed"), cell: ({ getValue }) => <Badge tone={getValue() === "applied" ? "success" : getValue() === "disabled" ? "neutral" : "warning"} dot>{stateLabel(getValue())}</Badge>, meta: { width: 90 } },
     { id: "actions", header: "操作", cell: ({ row }) => <div className="row-actions"><Button size="sm" variant="text" icon={<Pencil size={13} />} onClick={() => openServer(row.original)} disabled={session?.role === "readonly"}>编辑</Button><Button size="sm" variant="text" icon={<Trash2 size={13} />} onClick={() => remove("server", row.original)} disabled={session?.role === "readonly"}>删除</Button></div>, meta: { width: 120, align: "right", hideable: false } },
-  ], [session?.role]);
+  ], [session?.role, runtime.data, apply.running, apply.phase]);
 
   const bindingColumns = useMemo<ColumnDef<DhcpBinding, any>[]>(() => [
     { id: "mac", header: "MAC", accessorFn: (row) => row.mac, cell: ({ getValue }) => <span className="mono">{text(getValue())}</span>, meta: { width: 170, mono: true } },

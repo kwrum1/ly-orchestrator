@@ -63,9 +63,19 @@ function trendValues(item: LogicalEgressSeries) {
 
 function healthTone(value?: string) {
   const state = String(value || "").toLowerCase();
-  if (["healthy", "ok", "up", "available"].includes(state)) return "success";
+  if (["healthy", "ok", "up", "available", "running", "connected", "active"].includes(state)) return "success";
   if (["degraded", "stale", "warning"].includes(state)) return "warning";
+  if (["failed", "down", "unavailable"].includes(state)) return "danger";
   return "neutral";
+}
+
+function configuredHealth(item: any) {
+  const state = String(item?.pppoe_state || item?.state || item?.status || item?.runtime_state || "").toLowerCase();
+  if (state === "connected" || (item?.route_ready === true && (state === "running" || state === "connected"))) return "healthy";
+  if (["running", "up", "available", "ok"].includes(state)) return "healthy";
+  if (["failed", "down", "unavailable"].includes(state)) return "failed";
+  if (item?.kind === "egress") return item.enabled === false ? "disabled" : "available";
+  return state || "unknown";
 }
 
 export function OverviewPage() {
@@ -92,13 +102,16 @@ export function OverviewPage() {
 
   const series = trend.data?.series?.logical_egresses || [];
   const configuredEgresses = useMemo(() => [
-    ...(wanLinks.data?.items || []).map((item) => ({ id: item.id, name: item.name || item.id, kind: "WAN", health: item.state || item.status || item.runtime_state, up: null as number | null, down: null as number | null })),
-    ...(wanGroups.data?.items || []).map((item) => ({ id: item.id, name: item.name || item.id, kind: "WAN 群组", health: item.runtime_state, up: null as number | null, down: null as number | null })),
-    ...(proxyEgresses.data?.items || []).filter((item) => item.id !== "proxy-egress-default").map((item) => ({ id: item.id, name: item.name || item.id, kind: "代理 WAN", health: item.runtime_state, up: null as number | null, down: null as number | null })),
+    ...(wanLinks.data?.items || []).map((item) => ({ id: item.id, name: item.name || item.id, kind: "WAN", health: configuredHealth(item), up: null as number | null, down: null as number | null })),
+    ...(wanGroups.data?.items || []).map((item) => ({ id: item.id, name: item.name || item.id, kind: "WAN 群组", health: configuredHealth(item), up: null as number | null, down: null as number | null })),
+    ...(proxyEgresses.data?.items || []).map((item) => ({ id: item.id, name: item.name || item.id, kind: "代理 WAN", health: configuredHealth(item), up: null as number | null, down: null as number | null })),
   ], [wanLinks.data, wanGroups.data, proxyEgresses.data]);
+  const configuredById = useMemo(() => new Map(configuredEgresses.map((item) => [item.id, item])), [configuredEgresses]);
+  const configuredByName = useMemo(() => new Map(configuredEgresses.map((item) => [String(item.name).toLowerCase(), item])), [configuredEgresses]);
   const displayEgresses = series.length ? series.map((item) => {
     const latest = seriesLatest(item);
-    return { id: item.id, name: item.name || item.id, kind: item.kind === "wan_group" ? "WAN 群组" : item.kind === "proxy" ? "代理 WAN" : "直连 WAN", health: item.health || item.state, up: latest.up, down: latest.down };
+    const configured = configuredById.get(item.id) || configuredByName.get(String(item.name || "").toLowerCase());
+    return { id: item.id, name: configured?.name || item.name || item.id, kind: configured?.kind || (item.kind === "wan_group" ? "WAN 群组" : item.kind === "proxy" ? "代理 WAN" : "直连 WAN"), health: configured?.health || item.health || item.state, up: latest.up, down: latest.down };
   }) : configuredEgresses;
 
   const visibleSeries = series.filter((item) => !hidden.has(item.id));
