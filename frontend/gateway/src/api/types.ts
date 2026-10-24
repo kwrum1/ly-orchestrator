@@ -279,6 +279,17 @@ export interface DhcpBinding {
   [key: string]: any;
 }
 
+export interface DhcpLease {
+  id: string;
+  ip_address?: string;
+  mac?: string;
+  hostname?: string;
+  lease_end?: string;
+  infinite?: boolean;
+  state?: string;
+  [key: string]: any;
+}
+
 export interface ObjectGroup {
   id: string;
   name?: string;

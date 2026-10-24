@@ -7,6 +7,7 @@ import type {
   Collection,
   DashboardSummary,
   DataEnvelope,
+  DhcpLease,
   DhcpServer,
   DnsPolicy,
   DnsUpstream,
@@ -197,6 +198,10 @@ export function useDhcpServers() {
 
 export function useDhcpBindings() {
   return useResource<any>("dhcp-bindings", API.resources.dhcpBindings);
+}
+
+export function useDhcpLeases() {
+  return useResource<DhcpLease>("dhcp-leases", API.resources.dhcpLeases, { refetchInterval: 15_000, staleTime: 10_000 });
 }
 
 export function useObjectGroups() {

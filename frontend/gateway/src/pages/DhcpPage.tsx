@@ -4,12 +4,12 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2, Wifi } from "lucide-react";
 import { API } from "../api/endpoints";
 import { deleteJson, patchJson, postJson } from "../api/client";
-import { useDhcpBindings, useDhcpServers, useInterfacesResource, useRuntime } from "../api/hooks";
-import type { DhcpBinding, DhcpServer } from "../api/types";
+import { useDhcpBindings, useDhcpLeases, useDhcpServers, useInterfacesResource, useRuntime } from "../api/hooks";
+import type { DhcpBinding, DhcpLease, DhcpServer } from "../api/types";
 import { DataTable } from "../components/DataTable";
 import { Badge, Button, Field, Input, Modal, PageHeader, Select, Tabs, Textarea, useToast } from "../components/ui";
 import { useApply, useAuth, useConfirm } from "../state/providers";
-import { splitLines, stateLabel, text } from "../lib/format";
+import { formatDateTime, splitLines, stateLabel, text } from "../lib/format";
 
 function leaseLabel(seconds: unknown) {
   const value = Number(seconds);
@@ -22,7 +22,7 @@ function dhcpRuntimeState(item: any, runtime: any, applying: boolean, failed: bo
   const raw = item?.runtime_state || (item?.enabled === false ? "disabled" : "enabled");
   if (raw !== "desired_not_applied" || applying || failed) return raw;
   const last = runtime?.last_apply;
-  const kea = (runtime?.components || []).find((component: any) => component.name === "kea");
+  const kea = (runtime?.components || []).find((component: any) => component.name === "dnsmasq");
   if (String(last?.status || "").toLowerCase() === "committed" && (kea?.state === "running" || kea?.available === true)) return "applied";
   return raw;
 }
@@ -35,9 +35,10 @@ export function DhcpPage() {
   const { session } = useAuth();
   const servers = useDhcpServers();
   const bindings = useDhcpBindings();
+  const leases = useDhcpLeases();
   const interfaces = useInterfacesResource();
   const runtime = useRuntime();
-  const [tab, setTab] = useState<"servers" | "bindings">("servers");
+  const [tab, setTab] = useState<"servers" | "bindings" | "leases">("servers");
   const [editor, setEditor] = useState<DhcpServer | DhcpBinding | null | undefined>(undefined);
   const [form, setForm] = useState<any>({});
   const [busy, setBusy] = useState(false);
@@ -78,7 +79,7 @@ export function DhcpPage() {
           id,
           name: form.name.trim(),
           description: form.description || "",
-          engine: "kea",
+          engine: "dnsmasq",
           enabled: true,
           interface_id: form.interfaceId,
           subnet: form.subnet || "",
@@ -151,18 +152,28 @@ export function DhcpPage() {
     { id: "actions", header: "操作", cell: ({ row }) => <div className="row-actions"><Button size="sm" variant="text" icon={<Pencil size={13} />} onClick={() => openBinding(row.original)} disabled={session?.role === "readonly"}>编辑</Button><Button size="sm" variant="text" icon={<Trash2 size={13} />} onClick={() => remove("binding", row.original)} disabled={session?.role === "readonly"}>删除</Button></div>, meta: { width: 120, align: "right", hideable: false } },
   ], [session?.role]);
 
+  const leaseColumns = useMemo<ColumnDef<DhcpLease, any>[]>(() => [
+    { id: "ip", header: "IP 地址", accessorFn: (row) => row.ip_address, cell: ({ getValue }) => <span className="mono">{text(getValue())}</span>, meta: { width: 150, mono: true } },
+    { id: "mac", header: "MAC", accessorFn: (row) => row.mac, cell: ({ getValue }) => <span className="mono">{text(getValue(), "--")}</span>, meta: { width: 170, mono: true } },
+    { id: "hostname", header: "主机名", accessorFn: (row) => row.hostname, cell: ({ getValue }) => text(getValue(), "--"), meta: { width: 160 } },
+    { id: "expires", header: "到期", accessorFn: (row) => row.infinite ? "永久" : formatDateTime(row.lease_end), cell: ({ getValue }) => text(getValue(), "--"), meta: { width: 180 } },
+    { id: "state", header: "状态", accessorFn: (row) => row.state, cell: ({ getValue }) => <Badge tone={getValue() === "active" ? "success" : "warning"} dot>{stateLabel(getValue())}</Badge>, meta: { width: 90 } },
+  ], []);
+
   return (
     <div className="page">
       <PageHeader
         title="DHCP 服务"
         subtitle="动态地址池、静态分配与租约；服务依赖 LAN 接口"
-        actions={<><Button size="sm" icon={<RefreshCw size={14} />} onClick={() => { servers.refetch(); bindings.refetch(); interfaces.refetch(); }}>刷新</Button><Button size="sm" variant="primary" icon={<Plus size={14} />} onClick={() => tab === "servers" ? openServer() : openBinding()} disabled={session?.role === "readonly"}>{tab === "servers" ? "新增服务" : "新增静态分配"}</Button></>}
+        actions={<><Button size="sm" icon={<RefreshCw size={14} />} onClick={() => { servers.refetch(); bindings.refetch(); leases.refetch(); interfaces.refetch(); }}>刷新</Button>{tab !== "leases" && <Button size="sm" variant="primary" icon={<Plus size={14} />} onClick={() => tab === "servers" ? openServer() : openBinding()} disabled={session?.role === "readonly"}>{tab === "servers" ? "新增服务" : "新增静态分配"}</Button>}</>}
       />
-      <Tabs value={tab} onChange={(value) => setTab(value as any)} items={[{ key: "servers", label: "服务列表", count: servers.data?.items?.length }, { key: "bindings", label: "静态分配", count: bindings.data?.items?.length }]} />
+      <Tabs value={tab} onChange={(value) => setTab(value as any)} items={[{ key: "servers", label: "服务列表", count: servers.data?.items?.length }, { key: "bindings", label: "静态分配", count: bindings.data?.items?.length }, { key: "leases", label: "租约", count: leases.data?.items?.length }]} />
       {tab === "servers" ? (
         <DataTable data={servers.data?.items || []} columns={serverColumns} loading={servers.isLoading} error={servers.isError ? servers.error : null} onRetry={() => servers.refetch()} emptyTitle="暂无 DHCP 服务" emptyDescription={candidates.length ? "为 LAN 接口创建 DHCP 服务。" : "请先创建 LAN 接口。"} emptyAction={<Button size="sm" variant="primary" onClick={() => openServer()} disabled={session?.role === "readonly" || !candidates.length}>新增服务</Button>} getRowId={(row) => row.id} />
-      ) : (
+      ) : tab === "bindings" ? (
         <DataTable data={bindings.data?.items || []} columns={bindingColumns} loading={bindings.isLoading} error={bindings.isError ? bindings.error : null} onRetry={() => bindings.refetch()} emptyTitle="暂无静态分配" emptyDescription="将 MAC 固定到指定 IP。" emptyAction={<Button size="sm" variant="primary" onClick={() => openBinding()} disabled={session?.role === "readonly"}>新增静态分配</Button>} getRowId={(row) => row.id} />
+      ) : (
+        <DataTable data={leases.data?.items || []} columns={leaseColumns} loading={leases.isLoading} error={leases.isError ? leases.error : null} onRetry={() => leases.refetch()} emptyTitle="暂无租约" emptyDescription="终端从本机取得地址后会显示在这里。" getRowId={(row) => row.id} />
       )}
 
       <Modal open={editor !== undefined} onClose={() => !busy && setEditor(undefined)} title={tab === "servers" ? (editor ? "编辑 DHCP 服务" : "新增 DHCP 服务") : (editor ? "编辑静态分配" : "新增静态分配")} size="md" busy={busy} footer={<><Button onClick={() => setEditor(undefined)} disabled={busy}>取消</Button><Button variant="primary" loading={busy} onClick={save}>保存并应用</Button></>}>
