@@ -2765,6 +2765,17 @@ func (server *Server) handleDesiredItem(resourceType string) http.HandlerFunc {
 					return
 				}
 				if !ok {
+					// Logical LAN/WAN assignments are desired-state resources
+					// with their own id; they are not physical runtime NICs.
+					// Read them back through the desired-state store so the
+					// item API is symmetric with POST /api/v1/interfaces.
+					item, ok, err = server.desiredItem(r.Context(), resourceType, id)
+					if err != nil {
+						writeError(w, r, http.StatusInternalServerError, "desired_state_read_failed", err.Error())
+						return
+					}
+				}
+				if !ok {
 					writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
 					return
 				}
