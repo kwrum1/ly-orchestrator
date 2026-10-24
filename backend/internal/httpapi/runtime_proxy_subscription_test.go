@@ -107,7 +107,7 @@ func TestCompileProxySubscriptionUsesConfiguredDirectNode(t *testing.T) {
 		t.Fatalf("direct node compilation warning: %s", warning)
 	}
 	if len(compiled.XrayRuntime.ConfigPayload.Outbounds) != 2 {
-		t.Fatalf("outbounds = %#v, want configured node plus direct fail-open outbound", compiled.XrayRuntime.ConfigPayload.Outbounds)
+		t.Fatalf("outbounds = %#v, want configured node plus failure blackhole outbound", compiled.XrayRuntime.ConfigPayload.Outbounds)
 	}
 	outbound := compiled.XrayRuntime.ConfigPayload.Outbounds[0]
 	if outbound.Protocol != "vless" || outbound.Tag != "node-node-direct" {
@@ -120,12 +120,20 @@ func TestCompileProxySubscriptionUsesConfiguredDirectNode(t *testing.T) {
 		t.Fatalf("Reality settings missing from direct node outbound: %#v", outbound.StreamSettings)
 	}
 	fallback := compiled.XrayRuntime.ConfigPayload.Outbounds[1]
-	if fallback.Tag != proxy.ProxyDirectOutboundTag || fallback.Protocol != "freedom" {
-		t.Fatalf("direct fail-open outbound = %#v", fallback)
+	if fallback.Tag != proxy.ProxyFailureOutboundTag || fallback.Protocol != "blackhole" {
+		t.Fatalf("failure blackhole outbound = %#v", fallback)
+	}
+	for _, outbound := range compiled.XrayRuntime.ConfigPayload.Outbounds {
+		if outbound.Tag == proxy.ProxyDirectOutboundTag || strings.EqualFold(outbound.Protocol, "freedom") {
+			t.Fatalf("captured traffic can still reach direct: %#v", outbound)
+		}
 	}
 	routing := compiled.XrayRuntime.ConfigPayload.Routing
-	if routing == nil || len(routing.Balancers) != 1 || routing.Balancers[0].FallbackTag != proxy.ProxyDirectOutboundTag {
+	if routing == nil || len(routing.Balancers) != 1 || routing.Balancers[0].FallbackTag != proxy.ProxyFailureOutboundTag {
 		t.Fatalf("routing fallback = %#v", routing)
+	}
+	if compiled.XrayRuntime.ConfigPayload.Metrics == nil {
+		t.Fatal("fixed node config did not enable observatory metrics")
 	}
 }
 

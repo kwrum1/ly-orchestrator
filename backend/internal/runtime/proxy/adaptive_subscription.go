@@ -137,7 +137,7 @@ func CompileAdaptiveSubscriptionLanes(subscription Subscription, nodes []Node, p
 		Inbounds: inbounds, Outbounds: outbounds,
 		Routing:     XrayRouting{Rules: rules},
 		Observatory: XrayObservatory{SubjectSelector: []string{prefix}, ProbeURL: "https://www.gstatic.com/generate_204", ProbeInterval: "10s", EnableConcurrency: true},
-		Metrics:     &XrayMetrics{Listen: "127.0.0.1:11111"},
+		Metrics:     &XrayMetrics{Listen: DefaultXrayMetricsListen},
 		Lanes:       lanes,
 		Candidates:  candidateLanes,
 	}, nil
