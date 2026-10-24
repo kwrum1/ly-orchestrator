@@ -19,7 +19,8 @@ function memberCount(group: ObjectGroup) {
   return membersOf(group).length || Number(group.source_entry_count || 0);
 }
 
-function ObjectGroupPage({ kind }: { kind: "domain" | "ip" }) {
+function ObjectGroupPage({ kind: initialKind, combined = false }: { kind: "domain" | "ip"; combined?: boolean }) {
+  const [kind, setKind] = useState<"domain" | "ip">(initialKind);
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const confirm = useConfirm();
@@ -35,6 +36,8 @@ function ObjectGroupPage({ kind }: { kind: "domain" | "ip" }) {
   const [busy, setBusy] = useState(false);
 
   const kindItems = (groups.data?.items || []).filter((item) => item.kind === kind);
+  const domainCount = (groups.data?.items || []).filter((item) => item.kind === "domain").length;
+  const ipCount = (groups.data?.items || []).filter((item) => item.kind === "ip").length;
   const label = kind === "domain" ? "域名" : "IP";
 
   const open = (group?: ObjectGroup) => {
@@ -122,10 +125,11 @@ function ObjectGroupPage({ kind }: { kind: "domain" | "ip" }) {
   return (
     <div className="page">
       <PageHeader
-        title={kind === "domain" ? "域名管理" : "IP 管理"}
-        subtitle={kind === "domain" ? "域名组、成员与文件导入" : "IP 组、成员与文件导入"}
+        title={combined ? "对象管理" : (kind === "domain" ? "域名管理" : "IP 管理")}
+        subtitle={combined ? "域名组与 IP 组，供策略、DNS 和代理分流引用" : (kind === "domain" ? "域名组、成员与文件导入" : "IP 组、成员与文件导入")}
         actions={<><Button size="sm" icon={<RefreshCw size={14} />} onClick={() => groups.refetch()}>刷新</Button><Button size="sm" variant="primary" icon={<Plus size={14} />} onClick={() => open()} disabled={session?.role === "readonly"}>新增{label}组</Button></>}
       />
+      {combined && <Tabs value={kind} onChange={(value) => { setKind(value as "domain" | "ip"); setTab("groups"); setViewing(null); }} items={[{ key: "domain", label: "域名组", count: domainCount }, { key: "ip", label: "IP 组", count: ipCount }]} />}
       <Tabs value={tab} onChange={(value) => setTab(value as any)} items={[{ key: "groups", label: `${label}群组`, count: kindItems.length }, { key: "members", label: `${label}展示` }]} />
       {tab === "groups" ? (
         <DataTable data={kindItems} columns={columns} loading={groups.isLoading} error={groups.isError ? groups.error : null} onRetry={() => groups.refetch()} emptyTitle={`暂无${label}组`} emptyDescription={`创建${label}组后，可在策略中作为条件引用。`} emptyAction={<Button size="sm" variant="primary" onClick={() => open()} disabled={session?.role === "readonly"}>新增{label}组</Button>} getRowId={(row) => row.id} />
@@ -168,6 +172,10 @@ function ObjectGroupPage({ kind }: { kind: "domain" | "ip" }) {
       </Drawer>
     </div>
   );
+}
+
+export function ObjectsPage() {
+  return <ObjectGroupPage kind="domain" combined />;
 }
 
 export function DomainsObjectPage() {

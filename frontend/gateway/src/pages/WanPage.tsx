@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type { ColumnDef } from "@tanstack/react-table";
 import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
@@ -62,7 +62,7 @@ function handoffLabel(peer: any) {
   return peer?.route_ready === false ? "pending" : "--";
 }
 
-export function WanPage() {
+export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -74,7 +74,8 @@ export function WanPage() {
   const proxyEgresses = useProxyEgresses();
   const pppoe = usePPPoEStatus();
   const audit = useAudit();
-  const [tab, setTab] = useState<"lan" | "wan" | "logs">("lan");
+  const [tab, setTab] = useState<"lan" | "wan" | "logs">(mode);
+  useEffect(() => { setTab(mode); }, [mode]);
   const [editor, setEditor] = useState<EditorState>(null);
   const [busy, setBusy] = useState(false);
   const [form, setForm] = useState<any>({});
@@ -341,8 +342,8 @@ export function WanPage() {
   return (
     <div className="page">
       <PageHeader
-        title="LAN/WAN"
-        subtitle="LAN 接口、WAN 线路、PPPoE 与线路日志"
+        title={mode === "wan" ? "WAN 线路" : "LAN 线路"}
+        subtitle={mode === "wan" ? "WAN、PPPoE 与代理 WAN" : "LAN 接口、IPv4、IPv6、RA 与 DHCPv6"}
         actions={
           <>
             <Button size="sm" icon={<RefreshCw size={14} />} onClick={() => { interfaces.refetch(); wanLinks.refetch(); proxyEgresses.refetch(); pppoe.refetch(); audit.refetch(); }}>刷新</Button>
@@ -365,8 +366,8 @@ export function WanPage() {
         value={tab}
         onChange={(value) => setTab(value as any)}
         items={[
-          { key: "lan", label: "LAN 接口", count: lanItems.length },
-          { key: "wan", label: "WAN 接口", count: wanRows.length },
+          { key: "lan", label: "LAN 线路", count: lanItems.length },
+          { key: "wan", label: "WAN 线路", count: wanRows.length },
           { key: "logs", label: "线路日志" },
         ]}
       />

@@ -650,3 +650,5 @@ input[type="file"]::file-selector-button:hover { border-color: var(--accent); co
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+.diagnostic-output { margin-top: 12px; min-height: 180px; background: #0f172a; color: #cbd5e1; border-radius: 8px; padding: 14px; font: 12px/1.8 ui-monospace, Consolas, monospace; white-space: pre-wrap; }
