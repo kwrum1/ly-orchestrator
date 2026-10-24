@@ -10,7 +10,7 @@ set -eu
 : "${LY_ROUTE_RECOVERY_ATTEMPTS:=3}"
 : "${LY_ROUTE_RECOVERY_RETRY_SECONDS:=5}"
 # A complete runtime transaction can restart VPP-side DNS adapters, Xray,
-# SmartDNS, and Kea.  Bound each attempt so the unit cannot run for 19 minutes
+# SmartDNS, and dnsmasq. Bound each attempt so the unit cannot run for 19 minutes
 # and block boot; the timer/next boot can retry after this pass.
 : "${LY_ROUTE_RECOVERY_APPLY_TIMEOUT:=60}"
 

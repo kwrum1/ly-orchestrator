@@ -161,7 +161,7 @@ func TestOrchestratorSharedStatusExcludesGatewayOnlyServices(t *testing.T) {
 			if response.Code != http.StatusOK {
 				t.Fatalf("GET %s status = %d, want 200: %s", path, response.Code, response.Body.String())
 			}
-			for _, forbidden := range []string{"smartdns", "kea", "xray", "pppoe", "pppd", "linux_routing"} {
+			for _, forbidden := range []string{"smartdns", "dnsmasq", "xray", "pppoe", "pppd", "linux_routing"} {
 				if strings.Contains(response.Body.String(), `"name":"`+forbidden+`"`) {
 					t.Fatalf("GET %s exposed Gateway-only service %q: %s", path, forbidden, response.Body.String())
 				}

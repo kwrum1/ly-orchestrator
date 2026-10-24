@@ -19,7 +19,7 @@ func TestOrchestratorRuntimePlanNeverReadsOrBuildsGatewayResources(t *testing.T)
 	}
 	for _, artifact := range plan.RuntimeArtifacts {
 		switch string(artifact.Service) {
-		case "smartdns", "kea", "xray", "pppoe", "pppd", "nftables", "linux-routing":
+		case "smartdns", "dnsmasq", "xray", "pppoe", "pppd", "nftables", "linux-routing":
 			t.Fatalf("Orchestrator runtime plan contains Gateway artifact %q", artifact.Service)
 		}
 	}

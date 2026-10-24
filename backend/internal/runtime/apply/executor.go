@@ -167,7 +167,7 @@ func (e Executor) Run(ctx context.Context, request Request) (Result, error) {
 		return e.fail(ctx, plan, events, snapshotHash, PhaseApply, err)
 	}
 	// VPP owns production data interfaces. Apply the gateway graph first so
-	// Linux control-plane peers (Kea, SmartDNS, PPPoE and Xray) can bind to
+	// Linux control-plane peers (Dnsmasq, SmartDNS, PPPoE and Xray) can bind to
 	// their committed LCP/TAP handoff instead of racing a nonexistent netdev.
 	if err := e.apply(ctx, plan); err != nil {
 		return e.fail(ctx, plan, events, snapshotHash, PhaseApply, err)

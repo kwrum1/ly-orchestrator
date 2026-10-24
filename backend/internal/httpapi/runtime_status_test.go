@@ -16,7 +16,7 @@ import (
 func TestRuntimeStateIgnoresOptionalComponentsThatAreNotConfigured(t *testing.T) {
 	components := []RuntimeComponentState{
 		{Name: "smartdns", State: "running", Available: true},
-		{Name: "kea", State: "not_configured"},
+		{Name: "dnsmasq", State: "not_configured"},
 		{Name: "xray", State: "not_configured"},
 		{Name: "pppd", State: "running", Available: true},
 		{Name: "vpp", State: "running", Available: true},

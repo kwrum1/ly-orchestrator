@@ -185,7 +185,7 @@ func (controller *fakeDataplaneKeaRebinder) Rollback(context.Context, string) (d
 	return dataplane.Receipt{}, nil
 }
 
-func (controller *fakeDataplaneKeaRebinder) RebindKea(context.Context) error {
+func (controller *fakeDataplaneKeaRebinder) RebindDHCPService(context.Context) error {
 	*controller.trace = append(*controller.trace, "kea-rebind")
 	return nil
 }

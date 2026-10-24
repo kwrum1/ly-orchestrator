@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -313,7 +312,7 @@ func TestRuntimeAppliesArtifactsInServiceOrder(t *testing.T) {
 	err := runtime.Apply(context.Background(), []RenderedArtifact{
 		NewArtifact(Xray, "/etc/xray/config.json", "{}", "restart"),
 		NewArtifact(SmartDNS, "/etc/smartdns/domain.conf", "server 1.1.1.1", "reload"),
-		NewArtifact(Kea, "/etc/kea/kea-dhcp4.json", "{}", "restart"),
+		NewArtifact(Dnsmasq, "/etc/kea/dnsmasq.json", "{}", "restart"),
 		NewArtifact(Nftables, "/etc/nftables.conf", "flush ruleset", "reload"),
 		NewArtifact(LinuxRouting, "/var/lib/ly-route/policy-routing/apply.sh", "#!/bin/sh\n", "restart"),
 		NewArtifact(VPP, "/var/lib/ly-route/vpp/operations.json", `{"operations":[]}`, "restart"),
@@ -321,7 +320,7 @@ func TestRuntimeAppliesArtifactsInServiceOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "vpp,linux-routing,smartdns,kea,xray,nftables"
+	want := "vpp,linux-routing,smartdns,dnsmasq,xray,nftables"
 	if got := strings.Join(controller.applied, ","); got != want {
 		t.Fatalf("apply order = %s, want %s", got, want)
 	}
@@ -369,7 +368,7 @@ func TestRuntimeRollbackContinuesAndJoinsFailures(t *testing.T) {
 
 func TestRuntimeReturnsControllerFailures(t *testing.T) {
 	runtime := Runtime{Controller: &fakeController{applyErr: errors.New("reload failed")}}
-	err := runtime.Apply(context.Background(), []RenderedArtifact{NewArtifact(Kea, "/etc/kea/kea-dhcp4.json", "{}", "restart")})
+	err := runtime.Apply(context.Background(), []RenderedArtifact{NewArtifact(Dnsmasq, "/etc/kea/dnsmasq.json", "{}", "restart")})
 	if err == nil || !strings.Contains(err.Error(), "reload failed") {
 		t.Fatalf("apply error = %v, want reload failure", err)
 	}
@@ -407,12 +406,17 @@ func TestRenderServiceArtifactsForRuntimeTargets(t *testing.T) {
 		t.Fatalf("smartdns artifacts = %#v", smartdnsArtifacts)
 	}
 
-	keaArtifacts, err := RenderKeaDHCP4(KeaDHCP4Plan{ID: "lan", InterfaceID: "eth1", Subnet: "192.168.88.0/24", Pools: []string{"192.168.88.100-192.168.88.199"}, Routers: []string{"192.168.88.1"}, NameServers: []string{"192.168.88.1"}})
+	keaArtifacts, err := RenderDnsmasq(DnsmasqPlan{ID: "lan", InterfaceID: "eth1", Subnet: "192.168.88.0/24", Pools: []string{"192.168.88.100-192.168.88.199"}, Routers: []string{"192.168.88.1"}, NameServers: []string{"192.168.88.1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(keaArtifacts) != 1 || keaArtifacts[0].Service != Kea || keaArtifacts[0].Path != "/etc/kea/kea-dhcp4.conf" || !strings.Contains(keaArtifacts[0].Content, "Dhcp4") || !strings.Contains(keaArtifacts[0].Content, "eth1") || !strings.Contains(keaArtifacts[0].Content, "option-data") || !strings.Contains(keaArtifacts[0].Content, "domain-name-servers") || strings.Contains(keaArtifacts[0].Content, "loggers") {
-		t.Fatalf("kea artifacts = %#v", keaArtifacts)
+	if len(keaArtifacts) != 1 || keaArtifacts[0].Service != Dnsmasq || keaArtifacts[0].Path != "/etc/dnsmasq.d/ly-route-dhcp.conf" ||
+		!strings.Contains(keaArtifacts[0].Content, "port=0") ||
+		!strings.Contains(keaArtifacts[0].Content, "interface=eth1") ||
+		!strings.Contains(keaArtifacts[0].Content, "dhcp-range=set:lyroute-lan,192.168.88.100,192.168.88.199,255.255.255.0,12h") ||
+		!strings.Contains(keaArtifacts[0].Content, "dhcp-option=tag:lyroute-lan,3,192.168.88.1") ||
+		!strings.Contains(keaArtifacts[0].Content, "dhcp-option=tag:lyroute-lan,6,192.168.88.1") {
+		t.Fatalf("dnsmasq artifacts = %#v", keaArtifacts)
 	}
 
 	compiledProxy, err := proxy.CompileEgress(proxy.NewProxyEgress("proxy-media", "xray-tproxy-outbound"))
@@ -641,43 +645,55 @@ func TestRenderSmartDNSBundleRejectsMissingPinnedUpstream(t *testing.T) {
 	}
 }
 
-func TestRenderKeaDHCP4IncludesLifetimeAndHostReservationsOnlyInDhcp4(t *testing.T) {
-	artifacts, err := RenderKeaDHCP4(KeaDHCP4Plan{ID: "lan", InterfaceID: "eth1", Subnet: "192.168.88.0/24", Pools: []string{"192.168.88.100-192.168.88.199"}, Routers: []string{"192.168.88.1"}, NameServers: []string{"192.168.88.1"}, LeaseTime: 43200, Reservations: []KeaReservation{{HWAddress: "00:11:22:33:44:66", IPAddress: "192.168.88.101", Hostname: "workstation"}}})
+func TestRenderDnsmasqIncludesLifetimeAndHostReservations(t *testing.T) {
+	artifacts, err := RenderDnsmasq(DnsmasqPlan{ID: "lan", InterfaceID: "eth1", Subnet: "192.168.88.0/24", Pools: []string{"192.168.88.100-192.168.88.199"}, Routers: []string{"192.168.88.1"}, NameServers: []string{"192.168.88.1"}, LeaseTime: 43200, Reservations: []DnsmasqReservation{{HWAddress: "00:11:22:33:44:66", IPAddress: "192.168.88.101", Hostname: "workstation"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	content := artifacts[0].Content
-	for _, required := range []string{"valid-lifetime", "43200", "reservations", "hw-address", "00:11:22:33:44:66", "ip-address", "192.168.88.101", "workstation", "domain-name-servers", "routers"} {
+	for _, required := range []string{
+		"dhcp-range=set:lyroute-lan,192.168.88.100,192.168.88.199,255.255.255.0,43200s",
+		"dhcp-host=00:11:22:33:44:66,set:lyroute-lan,192.168.88.101,workstation",
+		"dhcp-option=tag:lyroute-lan,3,192.168.88.1",
+		"dhcp-option=tag:lyroute-lan,6,192.168.88.1",
+	} {
 		if !strings.Contains(content, required) {
-			t.Fatalf("kea content missing %q: %s", required, content)
+			t.Fatalf("dnsmasq content missing %q: %s", required, content)
 		}
 	}
-	for _, forbidden := range []string{"Dhcp6", "subnet6", "router-advertisement", "RA"} {
+	for _, forbidden := range []string{"Dhcp4", "Dhcp6", "subnet6", "router-advertisement", "kea"} {
 		if strings.Contains(content, forbidden) {
-			t.Fatalf("kea content should not contain %q: %s", forbidden, content)
+			t.Fatalf("dnsmasq content should not contain %q: %s", forbidden, content)
 		}
 	}
 }
 
-func TestRenderKeaDHCP4ConfigMergesMultipleSubnets(t *testing.T) {
-	artifacts, err := RenderKeaDHCP4Config([]KeaDHCP4Plan{
+func TestRenderDnsmasqConfigMergesMultipleSubnets(t *testing.T) {
+	artifacts, err := RenderDnsmasqConfig([]DnsmasqPlan{
 		{ID: "lan", InterfaceID: "eth1", Subnet: "192.168.88.0/24", Pools: []string{"192.168.88.100-192.168.88.199"}, Routers: []string{"192.168.88.1"}, NameServers: []string{"192.168.88.1"}},
 		{ID: "guest", InterfaceID: "eth2", Subnet: "192.168.20.0/24", Pools: []string{"192.168.20.100-192.168.20.199"}, Routers: []string{"192.168.20.1"}, NameServers: []string{"192.168.20.1"}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts) != 1 || artifacts[0].Service != Kea || artifacts[0].Path != "/etc/kea/kea-dhcp4.conf" {
-		t.Fatalf("kea artifacts = %#v", artifacts)
+	if len(artifacts) != 1 || artifacts[0].Service != Dnsmasq || artifacts[0].Path != "/etc/dnsmasq.d/ly-route-dhcp.conf" {
+		t.Fatalf("dnsmasq artifacts = %#v", artifacts)
 	}
 	content := artifacts[0].Content
-	for _, required := range []string{"eth1", "eth2", "192.168.88.0/24", "192.168.20.0/24", `"id": 1`, `"id": 2`} {
+	for _, required := range []string{
+		"interface=eth1",
+		"interface=eth2",
+		"dhcp-range=set:lyroute-lan,192.168.88.100,192.168.88.199,255.255.255.0,12h",
+		"dhcp-range=set:lyroute-guest,192.168.20.100,192.168.20.199,255.255.255.0,12h",
+		"dhcp-option=tag:lyroute-lan,3,192.168.88.1",
+		"dhcp-option=tag:lyroute-guest,3,192.168.20.1",
+	} {
 		if !strings.Contains(content, required) {
-			t.Fatalf("kea merged config missing %q: %s", required, content)
+			t.Fatalf("dnsmasq merged config missing %q: %s", required, content)
 		}
 	}
-	if strings.Count(content, `"Dhcp4"`) != 1 || strings.Count(content, `"subnet4"`) != 1 {
-		t.Fatalf("kea config should be one native Dhcp4 document: %s", content)
+	if strings.Count(content, "port=0") != 1 || strings.Count(content, "dhcp-leasefile=") != 1 {
+		t.Fatalf("dnsmasq config must have one global header: %s", content)
 	}
 }
 
@@ -860,29 +876,6 @@ func TestFilesystemControllerSkipsUnchangedHealthyServiceRestart(t *testing.T) {
 	}
 }
 
-func TestFilesystemControllerKeaRestartRemovesStaleLeaseCleanupLock(t *testing.T) {
-	root := t.TempDir()
-	pidPath := filepath.Join(root, "var/lib/kea/kea-leases4.csv.pid")
-	if err := os.MkdirAll(filepath.Dir(pidPath), 0o750); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(pidPath, nil, 0o640); err != nil {
-		t.Fatal(err)
-	}
-	runner := &fakeRunner{}
-	controller := FilesystemController{RootDir: root, Runner: runner}
-
-	if err := controller.runApplyCommand(context.Background(), Kea, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(pidPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("stale Kea lease cleanup lock error = %v, want not exist", err)
-	}
-	if got, want := strings.Join(runner.commands, ","), "systemctl stop kea-dhcp4-server.service,systemctl start kea-dhcp4-server.service"; got != want {
-		t.Fatalf("Kea restart commands = %q, want %q", got, want)
-	}
-}
-
 func TestFilesystemControllerProtectsPPPoESecrets(t *testing.T) {
 	controller := FilesystemController{RootDir: t.TempDir()}
 	artifacts := []RenderedArtifact{
@@ -996,9 +989,9 @@ func TestFilesystemControllerSmartDNSRollbackRestoresRemovedDomainSet(t *testing
 }
 
 func TestFilesystemControllerHealthAndRollback(t *testing.T) {
-	runner := &fakeRunner{health: map[ServiceName]Health{Kea: {Service: Kea, Available: false, Reason: "kea inactive"}}}
+	runner := &fakeRunner{health: map[ServiceName]Health{Dnsmasq: {Service: Dnsmasq, Available: false, Reason: "kea inactive"}}}
 	controller := FilesystemController{RootDir: t.TempDir(), Runner: runner}
-	health, err := controller.Status(context.Background(), Kea)
+	health, err := controller.Status(context.Background(), Dnsmasq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1013,39 +1006,20 @@ func TestFilesystemControllerHealthAndRollback(t *testing.T) {
 	}
 }
 
-func TestRenderedArtifactsAreValidJSONWhereExpected(t *testing.T) {
-	artifacts, err := RenderKeaDHCP4(KeaDHCP4Plan{ID: "lan", InterfaceID: "eth1", Subnet: "192.168.88.0/24", Pools: []string{"192.168.88.100-192.168.88.199"}, Routers: []string{"192.168.88.1"}, NameServers: []string{"192.168.88.1"}})
+func TestRenderedDNSMasqArtifactIsNativeConfig(t *testing.T) {
+	artifacts, err := RenderDnsmasq(DnsmasqPlan{ID: "lan", InterfaceID: "eth1", Subnet: "192.168.88.0/24", Pools: []string{"192.168.88.100-192.168.88.199"}, Routers: []string{"192.168.88.1"}, NameServers: []string{"192.168.88.1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var payload map[string]any
-	if err := json.Unmarshal([]byte(artifacts[0].Content), &payload); err != nil {
-		t.Fatalf("kea content is not json: %v", err)
+	content := artifacts[0].Content
+	if strings.Contains(content, "interface_id") || strings.Contains(content, "name_servers") || strings.Contains(content, `"routers":`) {
+		t.Fatalf("dnsmasq content leaked internal desired-state fields: %s", content)
 	}
-	if strings.Contains(artifacts[0].Content, "interface_id") || strings.Contains(artifacts[0].Content, "name_servers") || strings.Contains(artifacts[0].Content, "\"routers\":") {
-		t.Fatalf("kea content leaked internal desired-state fields: %s", artifacts[0].Content)
+	for _, required := range []string{"port=0", "dhcp-authoritative", "dhcp-leasefile=/var/lib/misc/dnsmasq.leases", "interface=eth1", "dhcp-range=set:lyroute-lan"} {
+		if !strings.Contains(content, required) {
+			t.Fatalf("dnsmasq content missing %q: %s", required, content)
+		}
 	}
-	if !strings.Contains(artifacts[0].Content, "option-data") || !strings.Contains(artifacts[0].Content, "domain-name-servers") {
-		t.Fatalf("kea content missing native DHCP options: %s", artifacts[0].Content)
-	}
-}
-
-type fakeController struct {
-	applied      []string
-	rolledBack   []string
-	applyErr     error
-	applyErrs    map[ServiceName]error
-	rollbackErrs map[ServiceName]error
-	health       map[ServiceName]Health
-}
-
-type fakeRunner struct {
-	commands     []string
-	health       map[ServiceName]Health
-	outputs      map[string]string
-	readErrs     map[ServiceName]error
-	runErrs      map[string]error
-	runErrCounts map[string]int
 }
 
 func (runner *fakeRunner) Run(_ context.Context, name string, args ...string) error {
@@ -1075,6 +1049,24 @@ func (runner *fakeRunner) Status(_ context.Context, service ServiceName) (Health
 
 func (runner *fakeRunner) Readback(_ context.Context, service ServiceName, _ []RenderedArtifact) error {
 	return runner.readErrs[service]
+}
+
+type fakeController struct {
+	applied      []string
+	rolledBack   []string
+	applyErr     error
+	applyErrs    map[ServiceName]error
+	rollbackErrs map[ServiceName]error
+	health       map[ServiceName]Health
+}
+
+type fakeRunner struct {
+	commands     []string
+	health       map[ServiceName]Health
+	outputs      map[string]string
+	readErrs     map[ServiceName]error
+	runErrs      map[string]error
+	runErrCounts map[string]int
 }
 
 func (controller *fakeController) ReloadOrRestart(_ context.Context, service ServiceName, _ []RenderedArtifact) error {

@@ -11,7 +11,7 @@ tests=(
   "gateway-negative|scripts/test-gateway-negative-contract.sh"
   "security-contract|scripts/test-gateway-security-contract.sh"
   "operations|scripts/test-gateway-operations-acceptance.sh"
-  "kea-dhcp|scripts/test-kea-dhcp-netns.sh"
+  "dnsmasq-dhcp|scripts/test-dnsmasq-dhcp-netns.sh"
   "nat44|scripts/test-nat44-vpp-netns.sh"
   "smartdns|scripts/test-smartdns-netns.sh"
   "wan-group|scripts/test-wan-group-vpp-netns.sh"

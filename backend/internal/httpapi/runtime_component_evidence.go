@@ -19,7 +19,7 @@ func (server *Server) attachServiceEvidence(ctx context.Context, components []Ru
 	evidenceCtx := context.WithoutCancel(ctx)
 	services := map[string]serviceRuntime.ServiceName{
 		"smartdns":        serviceRuntime.SmartDNS,
-		"kea":             serviceRuntime.Kea,
+		"dnsmasq":         serviceRuntime.Dnsmasq,
 		"xray":            serviceRuntime.Xray,
 		"pppoe":           serviceRuntime.PPPoE,
 		"vpp":             serviceRuntime.VPP,

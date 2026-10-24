@@ -107,24 +107,26 @@ validate_product_payload() {
   if [ "$product" = gateway ]; then
     # Runtime command ordering is not a product contract: DNS VPP helpers may
     # be inserted between these services. Verify each required Gateway command.
-    for command_name in smartdns kea-dhcp4 xray ipset; do
+    for command_name in smartdns xray ipset; do
       grep -Eq "^LY_ROUTE_REQUIRED_COMMANDS=.*(^|,)${command_name}(,|$)" \
         "$extract_dir/etc/ly-route/runtime.env" || fail "Gateway runtime env misses command: $command_name"
     done
-    test -f "$extract_dir/etc/kea/kea-dhcp4.conf"
+    grep -Eq "^LY_ROUTE_OPTIONAL_COMMANDS=.*(^|,)dnsmasq(,|$)" \
+      "$extract_dir/etc/ly-route/runtime.env" || fail "Gateway runtime env misses optional dnsmasq"
+    test -f "$extract_dir/etc/dnsmasq.d/ly-route-dhcp.conf"
     test -x "$extract_dir/usr/lib/ly-route/ly-route-pppoe-client"
     test -f "$extract_dir/etc/systemd/system/ly-route-pppoe.target"
     test -f "$extract_dir/etc/systemd/system/ly-route-pppoe@.service"
     test -f "$extract_dir/etc/systemd/system/ly-route-policy-routing.service"
   else
-    for forbidden in smartdns kea-dhcp4 xray pppd; do
+    for forbidden in smartdns dnsmasq xray pppd; do
       if grep -R -F -- "$forbidden" \
         "$extract_dir/etc/ly-route/runtime.env" \
         "$extract_dir/usr/share/ly-route/artifact-manifest.json" >/dev/null 2>&1; then
         fail "Orchestrator payload contains forbidden service/package: $forbidden"
       fi
     done
-    test ! -e "$extract_dir/etc/kea"
+    test ! -e "$extract_dir/etc/dnsmasq.d"
     test ! -e "$extract_dir/usr/lib/ly-route/ly-route-pppoe-client"
     test ! -e "$extract_dir/etc/systemd/system/ly-route-pppoe.target"
     test ! -e "$extract_dir/etc/systemd/system/ly-route-pppoe@.service"

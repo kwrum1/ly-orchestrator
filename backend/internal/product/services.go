@@ -7,7 +7,7 @@ const (
 	ServiceVPP          Service = "vpp"
 	ServiceSmartDNS     Service = "smartdns"
 	ServiceDNSVPPProxy  Service = "dns-vpp-proxy"
-	ServiceKea          Service = "kea"
+	ServiceDnsmasq      Service = "dnsmasq"
 	ServiceXray         Service = "xray"
 	ServicePPPoE        Service = "pppoe"
 	ServiceNftables     Service = "nftables"
@@ -20,7 +20,7 @@ var allServices = [serviceCount]Service{
 	ServiceVPP,
 	ServiceSmartDNS,
 	ServiceDNSVPPProxy,
-	ServiceKea,
+	ServiceDnsmasq,
 	ServiceXray,
 	ServicePPPoE,
 	ServiceNftables,
@@ -37,7 +37,7 @@ func lookupServiceIndex(service Service) (int, bool) {
 		return 2, true
 	case ServiceDNSVPPProxy:
 		return 3, true
-	case ServiceKea:
+	case ServiceDnsmasq:
 		return 4, true
 	case ServiceXray:
 		return 5, true

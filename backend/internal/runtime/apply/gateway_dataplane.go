@@ -146,10 +146,10 @@ func (transaction *productionGatewayWithDataplane) Run(ctx context.Context, plan
 		return result, applyErr
 	}
 	if dataplaneReceipt.Changed {
-		if rebinder, ok := transaction.dataplane.(dataplane.KeaRebinder); ok {
-			if err := rebinder.RebindKea(ctx); err != nil {
+		if rebinder, ok := transaction.dataplane.(dataplane.DHCPServiceRebinder); ok {
+			if err := rebinder.RebindDHCPService(ctx); err != nil {
 				_, rollbackErr := transaction.dataplane.Rollback(ctx, request.TransactionID)
-				return result, errors.Join(fmt.Errorf("rebind Kea after VPP restart: %w", err), rollbackErr)
+				return result, errors.Join(fmt.Errorf("rebind Dnsmasq after VPP restart: %w", err), rollbackErr)
 			}
 		}
 		transaction.mu.Lock()

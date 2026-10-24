@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestKeaRuntimeIdentityTracksInterfaceRecreation(t *testing.T) {
+func TestDnsmasqRuntimeIdentityTracksInterfaceRecreation(t *testing.T) {
 	root := t.TempDir()
 	controller := FilesystemController{RootDir: root}
 	interfacePath := filepath.Join(root, "sys", "class", "net", "lylan-ens34")
@@ -16,17 +16,17 @@ func TestKeaRuntimeIdentityTracksInterfaceRecreation(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(interfacePath, "ifindex"), []byte("17\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	artifacts := []RenderedArtifact{NewArtifact(Kea, "/etc/kea/kea-dhcp4.conf", `{"Dhcp4":{"interfaces-config":{"interfaces":["lylan-ens34"]}}}`, "restart")}
-	if err := controller.saveApplyRecord(Kea, artifacts, "runtime-a"); err != nil {
+	artifacts := []RenderedArtifact{NewArtifact(Dnsmasq, "/etc/dnsmasq.d/ly-route-dhcp.conf", "port=0\ninterface=lylan-ens34\n", "restart")}
+	if err := controller.saveApplyRecord(Dnsmasq, artifacts, "runtime-a"); err != nil {
 		t.Fatal(err)
 	}
-	if !controller.serviceRuntimeIdentityMatches(Kea, artifacts) {
-		t.Fatal("unchanged Kea interface identity did not match")
+	if !controller.serviceRuntimeIdentityMatches(Dnsmasq, artifacts) {
+		t.Fatal("unchanged Dnsmasq interface identity did not match")
 	}
 	if err := os.WriteFile(filepath.Join(interfacePath, "ifindex"), []byte("46\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if controller.serviceRuntimeIdentityMatches(Kea, artifacts) {
-		t.Fatal("recreated Kea interface retained a stale runtime identity")
+	if controller.serviceRuntimeIdentityMatches(Dnsmasq, artifacts) {
+		t.Fatal("recreated Dnsmasq interface retained a stale runtime identity")
 	}
 }

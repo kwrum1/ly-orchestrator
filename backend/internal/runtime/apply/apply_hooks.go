@@ -13,7 +13,7 @@ type ApplyHooks struct {
 	VerifyPPPoE func(context.Context, Plan) error
 	// RollbackPPPoE stops/restores the helper when the generation rolls back.
 	RollbackPPPoE func(context.Context, Plan) error
-	// ApplyServices applies Kea/Linux routing/SmartDNS/Xray/Nftables/IPv6RA.
+	// ApplyServices applies Dnsmasq/Linux routing/SmartDNS/Xray/Nftables/IPv6RA.
 	ApplyServices func(context.Context, Plan) error
 	// RollbackServices restores the prior service artifacts and daemons.
 	RollbackServices func(context.Context, Plan) error

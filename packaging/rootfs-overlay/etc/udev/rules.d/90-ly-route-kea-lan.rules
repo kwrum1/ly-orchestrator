@@ -1,4 +1,0 @@
-# Start Kea as soon as the VPP LAN tap exists. This covers the race where the
-# tap is created after kea-dhcp4-server.service already started (or timed out)
-# and the case where vpp.service was restarted and recreated the tap.
-ACTION=="add", SUBSYSTEM=="net", KERNEL=="lylan-*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="kea-dhcp4-server.service"

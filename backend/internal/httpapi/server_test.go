@@ -89,7 +89,7 @@ func TestHealthReturnsDependencyStatesAndRequestID(t *testing.T) {
 	if body.Version != "test-version" || body.Status != "degraded" || !body.Degraded || body.RequestID != "req-test" {
 		t.Fatalf("health body = %#v", body)
 	}
-	want := map[string]string{"vpp": "degraded", "smartdns": "degraded", "kea": "degraded", "xray": "degraded", "pppoe": "available", "persistence": "degraded"}
+	want := map[string]string{"vpp": "degraded", "smartdns": "degraded", "dnsmasq": "degraded", "xray": "degraded", "pppoe": "available", "persistence": "degraded"}
 	for _, dep := range body.Dependencies {
 		if dep.State != want[dep.Name] || (dep.State == controlapi.CapabilityDegraded && dep.Reason == "") {
 			t.Fatalf("dependency = %#v, want explicit degraded capability", dep)
@@ -194,7 +194,7 @@ func TestHealthIgnoresOptionalUnavailableCapabilities(t *testing.T) {
 	controller := &httpServiceController{health: map[serviceRuntime.ServiceName]serviceRuntime.Health{
 		serviceRuntime.VPP:          {Service: serviceRuntime.VPP, Available: true},
 		serviceRuntime.SmartDNS:     {Service: serviceRuntime.SmartDNS, Available: true},
-		serviceRuntime.Kea:          {Service: serviceRuntime.Kea, Available: true},
+		serviceRuntime.Dnsmasq:      {Service: serviceRuntime.Dnsmasq, Available: true},
 		serviceRuntime.Xray:         {Service: serviceRuntime.Xray, Available: true},
 		serviceRuntime.PPPd:         {Service: serviceRuntime.PPPd, Available: false, Reason: "pppoe not configured"},
 		serviceRuntime.Nftables:     {Service: serviceRuntime.Nftables, Available: true},
@@ -264,7 +264,7 @@ func (collector fakeTrafficTrend) TrafficTrend(context.Context, TrafficTrendQuer
 func TestHealthUsesServiceRuntimeStatusWithoutClaimingVPPOrNftables(t *testing.T) {
 	controller := &httpServiceController{health: map[serviceRuntime.ServiceName]serviceRuntime.Health{
 		serviceRuntime.SmartDNS: {Service: serviceRuntime.SmartDNS, Available: true},
-		serviceRuntime.Kea:      {Service: serviceRuntime.Kea, Available: true},
+		serviceRuntime.Dnsmasq:  {Service: serviceRuntime.Dnsmasq, Available: true},
 		serviceRuntime.Xray:     {Service: serviceRuntime.Xray, Available: true},
 		serviceRuntime.PPPd:     {Service: serviceRuntime.PPPd, Available: false, Reason: "pppd inactive"},
 	}}
@@ -282,7 +282,7 @@ func TestHealthUsesServiceRuntimeStatusWithoutClaimingVPPOrNftables(t *testing.T
 	for _, dependency := range body.Dependencies {
 		states[dependency.Name] = dependency
 	}
-	for _, name := range []string{"smartdns", "kea", "xray"} {
+	for _, name := range []string{"smartdns", "dnsmasq", "xray"} {
 		if !states[name].Available || states[name].State != controlapi.CapabilityAvailable {
 			t.Fatalf("%s capability = %#v, want available", name, states[name])
 		}
@@ -876,14 +876,21 @@ func TestRuntimePlanRendersSingleKeaArtifactForMultipleDHCPServers(t *testing.T)
 	}
 	var keaArtifacts []serviceRuntime.RenderedArtifact
 	for _, artifact := range plan.RuntimeArtifacts {
-		if artifact.Service == serviceRuntime.Kea {
+		if artifact.Service == serviceRuntime.Dnsmasq {
 			keaArtifacts = append(keaArtifacts, artifact)
 		}
 	}
 	if len(keaArtifacts) != 1 {
 		t.Fatalf("kea artifact count = %d, want 1: %#v", len(keaArtifacts), keaArtifacts)
 	}
-	for _, required := range []string{"lylan-ens33", "lylan-ens35", "192.168.88.0/24", "192.168.20.0/24"} {
+	for _, required := range []string{
+		"interface=lylan-ens33",
+		"interface=lylan-ens35",
+		"dhcp-range=set:lyroute-lan,192.168.88.100,192.168.88.199,255.255.255.0",
+		"dhcp-range=set:lyroute-guest,192.168.20.100,192.168.20.199,255.255.255.0",
+		"dhcp-option=tag:lyroute-lan,3,192.168.88.1",
+		"dhcp-option=tag:lyroute-guest,3,192.168.20.1",
+	} {
 		if !strings.Contains(keaArtifacts[0].Content, required) {
 			t.Fatalf("kea artifact missing %q: %s", required, keaArtifacts[0].Content)
 		}
@@ -2203,7 +2210,7 @@ func TestDHCPLeaseCollectorBacksLeasesAndOnlineUsers(t *testing.T) {
 		t.Fatalf("login status = %d, want 200: %s", login.Code, login.Body.String())
 	}
 	online := authenticatedJSONRequest(t, server, http.MethodGet, "/api/v1/telemetry/online-users", "", login.Result().Cookies()[0])
-	for _, required := range []string{"client-a", "kea_leases", "vpp_user_traffic", `"available":true`, `"online_status":"online"`, `"lease_start":"2026-06-11T08:00:00Z"`, `"lease_end":"2026-06-11T20:00:00Z"`, `"last_traffic_time":"2026-06-11T08:10:00Z"`, `"rx_bps":1234`, `"tx_bps":5678`, `"rx_bytes":100000`, `"tx_bytes":200000`} {
+	for _, required := range []string{"client-a", "dnsmasq_leases", "vpp_user_traffic", `"available":true`, `"online_status":"online"`, `"lease_start":"2026-06-11T08:00:00Z"`, `"lease_end":"2026-06-11T20:00:00Z"`, `"last_traffic_time":"2026-06-11T08:10:00Z"`, `"rx_bps":1234`, `"tx_bps":5678`, `"rx_bytes":100000`, `"tx_bytes":200000`} {
 		if online.Code != http.StatusOK || !strings.Contains(online.Body.String(), required) {
 			t.Fatalf("online users response missing %q: %d %s", required, online.Code, online.Body.String())
 		}
@@ -2213,7 +2220,7 @@ func TestDHCPLeaseCollectorBacksLeasesAndOnlineUsers(t *testing.T) {
 func TestDHCPLeasesFallbackIsExplicitlyDegraded(t *testing.T) {
 	server := New()
 	res := request(t, server, http.MethodGet, "/api/v1/dhcp/leases")
-	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), "Kea lease collector is not configured") || !strings.Contains(res.Body.String(), `"available":false`) {
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), "Dnsmasq lease collector is not configured") || !strings.Contains(res.Body.String(), `"available":false`) {
 		t.Fatalf("dhcp fallback response = %d %s", res.Code, res.Body.String())
 	}
 }
@@ -2445,7 +2452,7 @@ func TestRuntimeApplyUsesConfiguredServiceRuntimeAndStatusExposesLastApply(t *te
 	saveTestProxyNode(t, store)
 	controller := &httpServiceController{health: map[serviceRuntime.ServiceName]serviceRuntime.Health{
 		serviceRuntime.SmartDNS: {Service: serviceRuntime.SmartDNS, Available: true},
-		serviceRuntime.Kea:      {Service: serviceRuntime.Kea, Available: true},
+		serviceRuntime.Dnsmasq:  {Service: serviceRuntime.Dnsmasq, Available: true},
 		serviceRuntime.Xray:     {Service: serviceRuntime.Xray, Available: true},
 		serviceRuntime.PPPd:     {Service: serviceRuntime.PPPd, Available: true},
 		serviceRuntime.VPP:      {Service: serviceRuntime.VPP, Available: true},
@@ -2626,7 +2633,7 @@ func TestRuntimeApplyProofRefreshCarriesSharedManagementAssignment(t *testing.T)
 func TestRuntimeStatusReportsVPPUnavailableWhileDataplaneLocked(t *testing.T) {
 	controller := &httpServiceController{health: map[serviceRuntime.ServiceName]serviceRuntime.Health{
 		serviceRuntime.SmartDNS: {Service: serviceRuntime.SmartDNS, Available: true},
-		serviceRuntime.Kea:      {Service: serviceRuntime.Kea, Available: true},
+		serviceRuntime.Dnsmasq:  {Service: serviceRuntime.Dnsmasq, Available: true},
 		serviceRuntime.Xray:     {Service: serviceRuntime.Xray, Available: true},
 		serviceRuntime.PPPd:     {Service: serviceRuntime.PPPd, Available: true},
 		serviceRuntime.VPP:      {Service: serviceRuntime.VPP, Available: true},
@@ -2971,7 +2978,7 @@ func TestCapabilitiesRouteReportsExplicitRuntimeDegradation(t *testing.T) {
 		t.Fatalf("capabilities status = %d, want 200: %s", res.Code, res.Body.String())
 	}
 	payload := res.Body.String()
-	for _, required := range []string{"vpp", "smartdns", "kea", "xray", "pppoe", "persistence", "available", "degraded"} {
+	for _, required := range []string{"vpp", "smartdns", "dnsmasq", "xray", "pppoe", "persistence", "available", "degraded"} {
 		if !strings.Contains(payload, required) {
 			t.Fatalf("capabilities response missing %q: %s", required, payload)
 		}

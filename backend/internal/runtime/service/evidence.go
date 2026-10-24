@@ -147,23 +147,22 @@ func (controller FilesystemController) serviceRuntimeIdentityMatches(service Ser
 }
 
 func (controller FilesystemController) serviceRuntimeIdentity(service ServiceName, artifacts []RenderedArtifact) string {
-	if service != Kea {
+	if service != Dnsmasq {
 		return ""
 	}
 	var interfaces []string
 	for _, artifact := range artifacts {
-		if artifact.Service != Kea || !strings.HasSuffix(artifact.Path, "kea-dhcp4.conf") {
+		if artifact.Service != Dnsmasq || !strings.HasPrefix(artifact.Path, "/etc/dnsmasq.d/") {
 			continue
 		}
-		var config struct {
-			DHCP4 struct {
-				Interfaces struct {
-					Names []string `json:"interfaces"`
-				} `json:"interfaces-config"`
-			} `json:"Dhcp4"`
-		}
-		if json.Unmarshal([]byte(artifact.Content), &config) == nil {
-			interfaces = append(interfaces, config.DHCP4.Interfaces.Names...)
+		for _, line := range strings.Split(artifact.Content, "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "interface=") {
+				continue
+			}
+			if name := strings.TrimSpace(strings.TrimPrefix(line, "interface=")); name != "" {
+				interfaces = append(interfaces, name)
+			}
 		}
 	}
 	sort.Strings(interfaces)

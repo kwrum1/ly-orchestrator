@@ -24,8 +24,8 @@ func liveReadback(ctx context.Context, runner CommandRunner, service ServiceName
 	switch service {
 	case SmartDNS:
 		_, err = requiredOutput(ctx, runner, "systemctl", "show", applyUnit(service), "--property=ActiveEnterTimestampMonotonic", "--value")
-	case Kea:
-		_, err = requiredOutput(ctx, runner, "kea-dhcp4", "-t", "/etc/kea/kea-dhcp4.conf")
+	case Dnsmasq:
+		_, err = requiredOutput(ctx, runner, "dnsmasq", "-t", "/etc/dnsmasq.d/ly-route-dhcp.conf")
 	case Xray:
 		_, err = requiredOutput(ctx, runner, "xray", "run", "-test", "-config", "/etc/xray/config.json")
 	case PPPoE:
@@ -59,8 +59,8 @@ func serviceReadbackCommands(service ServiceName) ([][]string, error) {
 	switch service {
 	case SmartDNS:
 		return [][]string{{"systemctl", "show", applyUnit(service), "--property=ActiveEnterTimestampMonotonic", "--value"}}, nil
-	case Kea:
-		return [][]string{{"kea-dhcp4", "-t", "/etc/kea/kea-dhcp4.conf"}}, nil
+	case Dnsmasq:
+		return [][]string{{"dnsmasq", "-t", "/etc/dnsmasq.d/ly-route-dhcp.conf"}}, nil
 	case Xray:
 		return [][]string{{"xray", "run", "-test", "-config", "/etc/xray/config.json"}}, nil
 	case PPPoE:

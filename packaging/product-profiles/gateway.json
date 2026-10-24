@@ -6,7 +6,7 @@
     "vpp",
     "smartdns",
     "dns-vpp-proxy",
-    "kea",
+    "dnsmasq",
     "xray",
     "pppoe"
   ],

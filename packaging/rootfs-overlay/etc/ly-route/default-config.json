@@ -39,7 +39,7 @@
     "policies": []
   },
   "dhcp": {
-    "engine": "kea",
+    "engine": "dnsmasq",
     "servers": [],
     "static_bindings": []
   },
@@ -80,7 +80,7 @@
   "runtime_services": {
     "vpp": { "available": false, "state": "requires-runtime-check" },
     "smartdns": { "available": false, "state": "requires-runtime-check" },
-    "kea": { "available": false, "state": "requires-runtime-check" },
+    "dnsmasq": { "available": false, "state": "requires-runtime-check" },
     "xray": { "available": false, "state": "requires-runtime-check" },
     "pppoe": { "available": false, "state": "requires-runtime-check" },
     "nftables": { "available": false, "state": "requires-runtime-check" }

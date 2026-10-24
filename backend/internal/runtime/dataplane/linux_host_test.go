@@ -77,30 +77,30 @@ func TestLinuxHostRebindsOnlyActiveKea(t *testing.T) {
 		host := &LinuxHost{Runner: runner}
 
 		// When
-		err := host.RebindKea(context.Background())
+		err := host.RebindDHCPService(context.Background())
 
 		// Then
 		if err != nil {
 			t.Fatal(err)
 		}
-		if want := []string{"systemctl is-active --quiet kea-dhcp4-server.service", "systemctl restart kea-dhcp4-server.service"}; !reflect.DeepEqual(runner.commands, want) {
+		if want := []string{"systemctl is-active --quiet dnsmasq.service", "systemctl restart dnsmasq.service"}; !reflect.DeepEqual(runner.commands, want) {
 			t.Fatalf("commands=%v, want=%v", runner.commands, want)
 		}
 	})
 
 	t.Run("inactive", func(t *testing.T) {
 		// Given
-		runner := &recordingRunner{failures: map[string]error{"systemctl is-active --quiet kea-dhcp4-server.service": errors.New("inactive")}}
+		runner := &recordingRunner{failures: map[string]error{"systemctl is-active --quiet dnsmasq.service": errors.New("inactive")}}
 		host := &LinuxHost{Runner: runner}
 
 		// When
-		err := host.RebindKea(context.Background())
+		err := host.RebindDHCPService(context.Background())
 
 		// Then
 		if err != nil {
 			t.Fatal(err)
 		}
-		if want := []string{"systemctl is-active --quiet kea-dhcp4-server.service"}; !reflect.DeepEqual(runner.commands, want) {
+		if want := []string{"systemctl is-active --quiet dnsmasq.service"}; !reflect.DeepEqual(runner.commands, want) {
 			t.Fatalf("commands=%v, want=%v", runner.commands, want)
 		}
 	})

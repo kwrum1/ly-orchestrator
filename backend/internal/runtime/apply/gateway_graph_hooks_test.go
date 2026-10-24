@@ -59,7 +59,7 @@ func TestGatewayGraphRollsBackServicesPPPoEAndNetworksInReverse(t *testing.T) {
 		RollbackPPPoE: func(context.Context, Plan) error { trace = append(trace, "rollback:pppoe"); return nil },
 		ApplyServices: func(context.Context, Plan) error {
 			trace = append(trace, "hook:services")
-			return errors.New("Kea handoff failed")
+			return errors.New("Dnsmasq handoff failed")
 		},
 		RollbackServices: func(context.Context, Plan) error {
 			trace = append(trace, "rollback:services")

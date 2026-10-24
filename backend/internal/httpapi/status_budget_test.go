@@ -66,7 +66,7 @@ func TestRuntimeStatusRepliesWithinBudgetFromCachedComponents(t *testing.T) {
 		AppliedAt:     now,
 		Components: []RuntimeComponentState{
 			{Name: string(serviceRuntime.SmartDNS), State: "running", Available: true},
-			{Name: string(serviceRuntime.Kea), State: "running", Available: true},
+			{Name: string(serviceRuntime.Dnsmasq), State: "running", Available: true},
 			{Name: string(serviceRuntime.Xray), State: "running", Available: true},
 			{Name: string(serviceRuntime.PPPoE), State: "running", Available: true},
 		},

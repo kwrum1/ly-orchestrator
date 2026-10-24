@@ -98,7 +98,7 @@ func (cache *runtimeHealthCache) check(ctx context.Context, service ServiceName,
 	}
 	if health.TimedOut {
 		// Preserve a recent successful observation. A slow PID1 probe is not
-		// evidence that an already-active Kea/Xray process failed.
+		// evidence that an already-active Dnsmasq/Xray process failed.
 		if previous, ok := cache.entries[service]; ok && previous.health.Available {
 			health = previous.health
 			health.Reason = "health probe timed out; using last known running state"

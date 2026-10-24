@@ -65,7 +65,7 @@ func (controller FilesystemController) applyWithRecovery(ctx context.Context, se
 	// dedicated path below because it must also repair target enablement without
 	// tearing down a connected native session.
 	if service != PPPoE && !persistOnly && artifactsMatchSnapshot(controller, snapshot, artifacts) &&
-		(service != Kea || controller.serviceRuntimeIdentityMatches(service, artifacts)) {
+		(service != Dnsmasq || controller.serviceRuntimeIdentityMatches(service, artifacts)) {
 		if readbackErr := liveReadback(ctx, controller.Runner, service, artifacts); readbackErr == nil {
 			return controller.saveApplyRecord(service, artifacts, transactionIDFromContext(ctx))
 		}
@@ -194,20 +194,10 @@ func (controller FilesystemController) runApplyCommand(ctx context.Context, serv
 	if helper := directApplyHelper(service); helper != "" {
 		return controller.Runner.Run(ctx, helper)
 	}
-	if service == Kea {
+	if service == Dnsmasq {
 		unit := applyUnit(service)
 		if err := controller.Runner.Run(ctx, "systemctl", "stop", unit); err != nil {
 			return err
-		}
-		// Kea's lease-file cleanup can leave this lock behind when the daemon is
-		// interrupted. With the service stopped, the lock is necessarily stale;
-		// preserving the lease database while removing it makes restart idempotent.
-		pidPath, err := controller.resolvePath("/var/lib/kea/kea-leases4.csv.pid")
-		if err != nil {
-			return err
-		}
-		if err := os.Remove(pidPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove stale Kea lease cleanup lock: %w", err)
 		}
 		return controller.Runner.Run(ctx, "systemctl", "start", unit)
 	}

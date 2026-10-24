@@ -116,7 +116,7 @@ func Gateway() Profile {
 		ServiceVPP,
 		ServiceSmartDNS,
 		ServiceDNSVPPProxy,
-		ServiceKea,
+		ServiceDnsmasq,
 		ServiceXray,
 		ServicePPPoE,
 	} {

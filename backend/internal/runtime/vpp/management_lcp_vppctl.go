@@ -95,7 +95,7 @@ const lanDHCPBroadcastBypassPolicyID = 65000
 // lanDHCPBroadcastBypassPolicy is a reserved, receive-only ABF policy.  A
 // DHCP client sends its initial discover to 255.255.255.255 before it has an
 // address or a route.  User route policies must never capture that packet;
-// the local ABF path hands it to the Linux LCP where Kea can answer it.
+// the local ABF path hands it to the Linux LCP where Dnsmasq can answer it.
 func lanDHCPBroadcastBypassPolicy(ingress string) ServiceChainPolicy {
 	return ServiceChainPolicy{
 		ChainID:          "lan-dhcp-broadcast",

@@ -11,14 +11,14 @@
     "vpp",
     "smartdns",
     "dns-vpp-proxy",
-    "kea",
+    "dnsmasq",
     "xray",
     "pppoe"
   ],
   "systemd_units": [
     "systemd-networkd.service",
     "systemd-resolved.service",
-    "kea-dhcp4-server.service",
+    "dnsmasq.service",
     "ly-route-runtime-check.service",
     "ly-route-vpp-apply.service",
     "ly-route-policy-routing.service",
@@ -50,7 +50,7 @@
     "ly-route-vpp-pre-nat-route",
     "smartdns",
     "ly-route-dns-vpp-proxy",
-    "kea-dhcp4-server",
+    "dnsmasq",
     "xray",
     "ipset"
   ],
@@ -67,13 +67,13 @@
   ],
   "optional_commands": [
     "smartdns",
-    "kea-dhcp4",
+    "dnsmasq",
     "xray",
     "/usr/lib/ly-route/ly-route-dns-vpp-proxy"
   ],
   "optional_units": [
     "smartdns.service",
-    "kea-dhcp4-server.service",
+    "dnsmasq.service",
     "xray.service",
     "ly-route-dns-vpp-proxy.service",
     "ly-route-dns-vpp-proxy-v6.service"

@@ -109,8 +109,8 @@ func run() error {
 	if envBool("LY_ROUTE_ENABLE_SERVICE_RUNTIME", false) {
 		options = append(options, httpapi.WithServiceRuntime(serviceRuntime.Runtime{Controller: serviceRuntime.FilesystemController{RootDir: env("LY_ROUTE_SERVICE_ROOT", ""), Runner: serviceRuntime.SystemctlRunner{}, XrayAPIAddress: env("LY_ROUTE_XRAY_API_ADDRESS", serviceRuntime.DefaultXrayRoutingAPIAddress)}}))
 	}
-	if profile.AllowsService(product.ServiceKea) {
-		options = append(options, httpapi.WithDHCPLeases(serviceRuntime.KeaMemfileLeaseCollector{Path: env("LY_ROUTE_KEA_LEASE_FILE", serviceRuntime.DefaultKeaDHCP4LeaseFile)}))
+	if profile.AllowsService(product.ServiceDnsmasq) {
+		options = append(options, httpapi.WithDHCPLeases(serviceRuntime.DnsmasqLeaseCollector{Path: env("LY_ROUTE_DNSMASQ_LEASE_FILE", serviceRuntime.DefaultDnsmasqLeaseFile)}))
 	}
 	if envBool("LY_ROUTE_ENABLE_VPP_INTERFACE_TELEMETRY", true) {
 		options = append(options, httpapi.WithInterfaceTelemetry(vppctlInterfaceTelemetry{binary: env("LY_ROUTE_VPPCTL", "vppctl")}))

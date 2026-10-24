@@ -51,11 +51,7 @@ $repo_root/packaging/rootfs-overlay/etc/ly-route/vcl.conf
 $repo_root/packaging/rootfs-overlay/etc/ly-route/vcl-v6.conf
 $repo_root/packaging/rootfs-overlay/etc/ly-route/default-config.json
 $repo_root/packaging/rootfs-overlay/etc/ly-route/runtime.env
-$repo_root/packaging/rootfs-overlay/etc/kea/kea-dhcp4.conf
-$repo_root/packaging/rootfs-overlay/etc/systemd/system/kea-dhcp4-server.service.d/ly-route-firstboot.conf
-$repo_root/packaging/rootfs-overlay/etc/systemd/system/kea-dhcp4-server.service.d/20-ly-route-lan-retry.conf
-$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/kea-wait-lan.sh
-$repo_root/packaging/rootfs-overlay/etc/udev/rules.d/90-ly-route-kea-lan.rules
+$repo_root/packaging/rootfs-overlay/etc/dnsmasq.d/ly-route-dhcp.conf
 $repo_root/packaging/nginx/ly-route-admin.conf
 $repo_root/backend/cmd/gateway-control/main.go
 $repo_root/backend/cmd/orchestrator-control/main.go
@@ -144,33 +140,24 @@ if ! grep -q '"active_path": "dataplane_locked"' "$repo_root/packaging/rootfs-ov
   exit 1
 fi
 
-if ! grep -q '"interfaces": \["lylan-' "$repo_root/packaging/rootfs-overlay/etc/kea/kea-dhcp4.conf"; then
-  echo "factory Kea config does not bind DHCP to a VPP LAN control interface" >&2
+factory_dhcp="$repo_root/packaging/rootfs-overlay/etc/dnsmasq.d/ly-route-dhcp.conf"
+if ! grep -q '^interface=lylan-' "$factory_dhcp"; then
+  echo "factory dnsmasq config does not bind DHCP to a VPP LAN control interface" >&2
   exit 1
 fi
 
-if grep -q '10\.0\.2\.' "$repo_root/packaging/rootfs-overlay/etc/kea/kea-dhcp4.conf"; then
-  echo "factory Kea config must not serve the management network" >&2
+if grep -q '10\.0\.2\.' "$factory_dhcp"; then
+  echo "factory dnsmasq config must not serve the management network" >&2
   exit 1
 fi
 
-if ! grep -q '192.168.88.100 - 192.168.88.199' "$repo_root/packaging/rootfs-overlay/etc/kea/kea-dhcp4.conf"; then
-  echo "factory Kea config does not expose the default LAN DHCP pool" >&2
+if ! grep -q '^dhcp-range=set:lyroute-factory,192.168.88.100,192.168.88.199,255.255.255.0,' "$factory_dhcp"; then
+  echo "factory dnsmasq config does not expose the default LAN DHCP pool" >&2
   exit 1
 fi
 
-if [ ! -x "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/kea-wait-lan.sh" ]; then
-  echo "Kea LAN readiness helper is missing or not executable" >&2
-  exit 1
-fi
-
-if ! grep -q '^ExecStartPre=/usr/lib/ly-route/kea-wait-lan.sh$' "$repo_root/packaging/rootfs-overlay/etc/systemd/system/kea-dhcp4-server.service.d/20-ly-route-lan-retry.conf"; then
-  echo "Kea service does not wait for the exact configured LAN interface" >&2
-  exit 1
-fi
-
-if ! grep -q 'KERNEL=="lylan-\*"' "$repo_root/packaging/rootfs-overlay/etc/udev/rules.d/90-ly-route-kea-lan.rules"; then
-  echo "Kea udev rule does not react to late VPP LAN taps" >&2
+if ! grep -q '^port=0$' "$factory_dhcp"; then
+  echo "factory dnsmasq config must not bind DNS port 53" >&2
   exit 1
 fi
 
@@ -224,13 +211,8 @@ if ! grep -q 'ly-route-control-api.service' "$repo_root/scripts/build-rootfs.sh"
   exit 1
 fi
 
-if ! grep -q 'kea-dhcp4-server.service' "$repo_root/scripts/build-rootfs.sh"; then
+if ! grep -q 'dnsmasq.service' "$repo_root/scripts/build-rootfs.sh"; then
   echo "factory LAN DHCP service is not enabled by the rootfs builder" >&2
-  exit 1
-fi
-
-if ! grep -q 'After=ly-route-firstboot.service' "$repo_root/packaging/rootfs-overlay/etc/systemd/system/kea-dhcp4-server.service.d/ly-route-firstboot.conf"; then
-  echo "factory LAN DHCP service is not ordered after firstboot LAN setup" >&2
   exit 1
 fi
 
@@ -249,7 +231,7 @@ if ! grep -q 'ly-route-recovery.service' "$repo_root/scripts/build-rootfs.sh"; t
   exit 1
 fi
 
-for package in kea-dhcp4-server ipset curl python3; do
+for package in dnsmasq ipset curl python3; do
   if ! grep -q "$package" "$repo_root/scripts/build-rootfs.sh"; then
     echo "rootfs builder does not include runtime package $package" >&2
     exit 1
@@ -429,7 +411,7 @@ for plugin in ly_route_pppoe_client_plugin.so pppoeclient_plugin.so ly_route_sec
   fi
 done
 
-for component in ly-route-dns-vpp-proxy ly-route-vpp-apply smartdns kea-dhcp4-server xray ipset; do
+for component in ly-route-dns-vpp-proxy ly-route-vpp-apply smartdns dnsmasq xray ipset; do
   if ! grep -q -- "$component" "$repo_root/packaging/runtime-boundaries/gateway.sh"; then
     echo "gateway packaging boundary does not declare runtime component $component" >&2
     exit 1

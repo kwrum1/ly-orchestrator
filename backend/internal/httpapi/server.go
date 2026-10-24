@@ -236,7 +236,7 @@ type RuntimePlan struct {
 	NftablesCapture    proxy.NftablesCapturePlan          `json:"nftables_tproxy_plan"`
 	DNSInterception    serviceRuntime.DNSInterceptionPlan `json:"dns_interception_plan"`
 	LinuxPolicyRouting proxy.LinuxPolicyRoutingPlan       `json:"linux_policy_routing_plan"`
-	DHCPServers        []serviceRuntime.KeaDHCP4Plan      `json:"dhcp_servers,omitempty"`
+	DHCPServers        []serviceRuntime.DnsmasqPlan       `json:"dhcp_servers,omitempty"`
 	PPPoEPeers         []RuntimePPPoEPeerSummary          `json:"pppoe_peers,omitempty"`
 	Components         []RuntimeComponentState            `json:"components"`
 	Warnings           []string                           `json:"warnings,omitempty"`
@@ -1619,7 +1619,7 @@ func (server *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func requiredCapability(name string) bool {
 	switch name {
-	case "vpp", "smartdns", "kea", "xray", "nftables", "linux_routing", "persistence":
+	case "vpp", "smartdns", "dnsmasq", "xray", "nftables", "linux_routing", "persistence":
 		return true
 	default:
 		return false
@@ -1759,8 +1759,8 @@ func (server *Server) capabilities(ctx context.Context) []controlapi.CapabilityS
 	if server.profile.AllowsService(product.ServiceSmartDNS) {
 		entries = append(entries, capabilityEntry{serviceRuntime.SmartDNS, "smartdns", "SmartDNS service runtime is not configured", false})
 	}
-	if server.profile.AllowsService(product.ServiceKea) {
-		entries = append(entries, capabilityEntry{serviceRuntime.Kea, "kea", "Kea service runtime is not configured", false})
+	if server.profile.AllowsService(product.ServiceDnsmasq) {
+		entries = append(entries, capabilityEntry{serviceRuntime.Dnsmasq, "dnsmasq", "Dnsmasq service runtime is not configured", false})
 	}
 	if server.profile.AllowsService(product.ServiceXray) {
 		entries = append(entries, capabilityEntry{serviceRuntime.Xray, "xray", "xray service runtime is not configured", false})
@@ -4833,7 +4833,7 @@ func (server *Server) degradedRuntimeCapabilities(ctx context.Context) []control
 	entries := []capabilityService{
 		{serviceRuntime.VPP, "vpp_runtime_apply", "VPP apply runtime is not configured"},
 		{serviceRuntime.SmartDNS, "smartdns_runtime_apply", "SmartDNS service runtime is not configured"},
-		{serviceRuntime.Kea, "kea_runtime_apply", "Kea service runtime is not configured"},
+		{serviceRuntime.Dnsmasq, "dnsmasq_runtime_apply", "Dnsmasq service runtime is not configured"},
 		{serviceRuntime.Xray, "xray_runtime_apply", "xray service runtime is not configured"},
 	}
 	results := make([]controlapi.CapabilityState, 0, len(entries))
@@ -5181,7 +5181,7 @@ func (server *Server) reprobeRuntimeComponents(ctx context.Context, components [
 	index := make(map[string]int, len(updated))
 	for position, component := range updated {
 		switch serviceRuntime.ServiceName(component.Name) {
-		case serviceRuntime.SmartDNS, serviceRuntime.Kea, serviceRuntime.Xray, serviceRuntime.PPPoE:
+		case serviceRuntime.SmartDNS, serviceRuntime.Dnsmasq, serviceRuntime.Xray, serviceRuntime.PPPoE:
 			services = append(services, serviceRuntime.ServiceName(component.Name))
 			index[component.Name] = position
 		}
@@ -5252,7 +5252,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		// doing the (bounded) systemctl probes here keeps them off the tail
 		// of the request and out of the 10s status budget.
 		go func() {
-			_, _ = server.services.HealthCheck(ctx, serviceRuntime.VPP, serviceRuntime.SmartDNS, serviceRuntime.Kea, serviceRuntime.Xray, serviceRuntime.PPPoE)
+			_, _ = server.services.HealthCheck(ctx, serviceRuntime.VPP, serviceRuntime.SmartDNS, serviceRuntime.Dnsmasq, serviceRuntime.Xray, serviceRuntime.PPPoE)
 		}()
 	}
 	addressAssignments, err := server.runtimeAddressAssignments(ctx)
@@ -6915,7 +6915,7 @@ func (server *Server) currentDNSUpstreams(ctx context.Context, policy trafficpol
 	return upstreams, cache, networks, nil
 }
 
-func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.AddressAssignment) ([]serviceRuntime.KeaDHCP4Plan, []serviceRuntime.RenderedArtifact, error) {
+func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.AddressAssignment) ([]serviceRuntime.DnsmasqPlan, []serviceRuntime.RenderedArtifact, error) {
 	items, err := server.desiredItems(ctx, "dhcp_server")
 	if err != nil {
 		return nil, nil, err
@@ -6924,7 +6924,7 @@ func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.
 	if err != nil {
 		return nil, nil, err
 	}
-	var plans []serviceRuntime.KeaDHCP4Plan
+	var plans []serviceRuntime.DnsmasqPlan
 	for _, item := range items {
 		if enabled, ok := item["enabled"].(bool); ok && !enabled {
 			continue
@@ -6938,7 +6938,11 @@ func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.
 		if len(routers) == 0 && lanRouter != "" {
 			routers = []string{lanRouter}
 		}
-		plan := serviceRuntime.KeaDHCP4Plan{ID: stringField(item, "id"), InterfaceID: controlInterface, Subnet: stringField(item, "subnet"), Pools: stringSliceField(item, "pools"), Routers: routers, NameServers: dhcpNameServers(stringSliceField(item, "name_servers"), routers), LeaseTime: firstIntField(item, "lease_time_seconds", "valid_lifetime", "valid_lifetime_seconds")}
+		subnet := stringField(item, "subnet")
+		if subnet == "" {
+			subnet = dhcpLANSubnet(assignments, controlInterface)
+		}
+		plan := serviceRuntime.DnsmasqPlan{ID: stringField(item, "id"), InterfaceID: controlInterface, Subnet: subnet, Pools: stringSliceField(item, "pools"), Routers: routers, NameServers: dhcpNameServers(stringSliceField(item, "name_servers"), routers), LeaseTime: firstIntField(item, "lease_time_seconds", "valid_lifetime", "valid_lifetime_seconds")}
 		plan.Reservations = reservationsForDHCPPlan(plan, reservations)
 		if plan.ID == "" || plan.InterfaceID == "" || plan.Subnet == "" || len(plan.Pools) == 0 {
 			continue
@@ -6948,7 +6952,7 @@ func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.
 	if len(plans) == 0 {
 		return plans, nil, nil
 	}
-	artifacts, err := serviceRuntime.RenderKeaDHCP4Config(plans)
+	artifacts, err := serviceRuntime.RenderDnsmasqConfig(plans)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -6981,6 +6985,20 @@ func (server *Server) dhcpLANControlInterface(ctx context.Context, interfaceID s
 	return "", "", false
 }
 
+// dhcpLANSubnet derives the DHCP subnet from the LAN assignment when the
+// operator leaves the subnet empty (the UI documents this as the default).
+func dhcpLANSubnet(assignments []vpp.AddressAssignment, controlInterface string) string {
+	for _, assignment := range assignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		if vpp.LANControlPlaneHostInterface(assignment.LinuxInterface) == controlInterface {
+			return strings.TrimSpace(assignment.CIDR)
+		}
+	}
+	return ""
+}
+
 func dhcpLANRouter(cidr string) string {
 	prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
 	if err != nil {
@@ -6989,12 +7007,12 @@ func dhcpLANRouter(cidr string) string {
 	return prefix.Addr().String()
 }
 
-func reservationsForDHCPPlan(plan serviceRuntime.KeaDHCP4Plan, reservations []serviceRuntime.KeaReservation) []serviceRuntime.KeaReservation {
+func reservationsForDHCPPlan(plan serviceRuntime.DnsmasqPlan, reservations []serviceRuntime.DnsmasqReservation) []serviceRuntime.DnsmasqReservation {
 	prefix, err := netip.ParsePrefix(strings.TrimSpace(plan.Subnet))
 	if err != nil {
 		return nil
 	}
-	filtered := make([]serviceRuntime.KeaReservation, 0, len(reservations))
+	filtered := make([]serviceRuntime.DnsmasqReservation, 0, len(reservations))
 	for _, reservation := range reservations {
 		address, err := netip.ParseAddr(strings.TrimSpace(reservation.IPAddress))
 		if err == nil && prefix.Contains(address) {
@@ -7004,17 +7022,17 @@ func reservationsForDHCPPlan(plan serviceRuntime.KeaDHCP4Plan, reservations []se
 	return filtered
 }
 
-func (server *Server) currentDHCPReservations(ctx context.Context) ([]serviceRuntime.KeaReservation, error) {
+func (server *Server) currentDHCPReservations(ctx context.Context) ([]serviceRuntime.DnsmasqReservation, error) {
 	items, err := server.desiredItems(ctx, "dhcp_static_binding")
 	if err != nil {
 		return nil, err
 	}
-	reservations := make([]serviceRuntime.KeaReservation, 0, len(items))
+	reservations := make([]serviceRuntime.DnsmasqReservation, 0, len(items))
 	for _, item := range items {
 		if enabled, ok := item["enabled"].(bool); ok && !enabled {
 			continue
 		}
-		reservation := serviceRuntime.KeaReservation{HWAddress: firstStringField(item, "mac", "hw_address", "hwaddr"), IPAddress: firstStringField(item, "ip_address", "ip", "address"), Hostname: firstStringField(item, "hostname", "name")}
+		reservation := serviceRuntime.DnsmasqReservation{HWAddress: firstStringField(item, "mac", "hw_address", "hwaddr"), IPAddress: firstStringField(item, "ip_address", "ip", "address"), Hostname: firstStringField(item, "hostname", "name")}
 		if reservation.HWAddress == "" || reservation.IPAddress == "" {
 			continue
 		}
@@ -7647,7 +7665,7 @@ func (server *Server) runtimeStatusComponents(ctx context.Context, artifacts []s
 	healthByService := map[serviceRuntime.ServiceName]serviceRuntime.Health{}
 	var healthErr error
 	if server.serviceRuntimeConfigured() {
-		health, err := server.services.HealthCheck(ctx, serviceRuntime.SmartDNS, serviceRuntime.Kea, serviceRuntime.Xray, serviceRuntime.PPPoE)
+		health, err := server.services.HealthCheck(ctx, serviceRuntime.SmartDNS, serviceRuntime.Dnsmasq, serviceRuntime.Xray, serviceRuntime.PPPoE)
 		healthErr = err
 		for _, item := range health {
 			healthByService[item.Service] = item
@@ -7658,7 +7676,7 @@ func (server *Server) runtimeStatusComponents(ctx context.Context, artifacts []s
 		runtimeService serviceRuntime.ServiceName
 	}{
 		{productService: product.ServiceSmartDNS, runtimeService: serviceRuntime.SmartDNS},
-		{productService: product.ServiceKea, runtimeService: serviceRuntime.Kea},
+		{productService: product.ServiceDnsmasq, runtimeService: serviceRuntime.Dnsmasq},
 		{productService: product.ServiceXray, runtimeService: serviceRuntime.Xray},
 		{productService: product.ServicePPPoE, runtimeService: serviceRuntime.PPPoE},
 	} {
@@ -9181,7 +9199,7 @@ func (server *Server) telemetryPayload(ctx context.Context, kind string) (any, [
 	case "online_users":
 		items, leaseCapabilities, err := server.dhcpLeaseSnapshot(ctx)
 		if err != nil {
-			return map[string]any{"items": []map[string]any{}, "runtime_state": runtimeStateValue, "degraded": true, "degraded_reason": err.Error()}, append(capabilities, controlapi.CapabilityState{Name: "kea_leases", Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()})
+			return map[string]any{"items": []map[string]any{}, "runtime_state": runtimeStateValue, "degraded": true, "degraded_reason": err.Error()}, append(capabilities, controlapi.CapabilityState{Name: "dnsmasq_leases", Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()})
 		}
 		neighbors := []GatewayNeighbor{}
 		neighborState := "unavailable"
@@ -9576,16 +9594,16 @@ func (server *Server) dhcpLeaseSnapshot(ctx context.Context) ([]map[string]any, 
 	if server.dhcpLeases != nil {
 		items, err := server.dhcpLeases.Leases(ctx)
 		if err == nil {
-			return normalizeDHCPLeases(items, "running", "", false), []controlapi.CapabilityState{{Name: "kea_leases", Available: true, State: controlapi.CapabilityAvailable}}, nil
+			return normalizeDHCPLeases(items, "running", "", false), []controlapi.CapabilityState{{Name: "dnsmasq_leases", Available: true, State: controlapi.CapabilityAvailable}}, nil
 		}
-		return nil, []controlapi.CapabilityState{{Name: "kea_leases", Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()}}, err
+		return nil, []controlapi.CapabilityState{{Name: "dnsmasq_leases", Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()}}, err
 	}
 	items, err := server.desiredItems(ctx, "dhcp_lease")
 	if err != nil {
 		return nil, nil, err
 	}
-	reason := "Kea lease collector is not configured"
-	return normalizeDHCPLeases(items, "degraded", reason, true), []controlapi.CapabilityState{{Name: "kea_leases", Available: false, State: controlapi.CapabilityDegraded, Reason: reason}}, nil
+	reason := "Dnsmasq lease collector is not configured"
+	return normalizeDHCPLeases(items, "degraded", reason, true), []controlapi.CapabilityState{{Name: "dnsmasq_leases", Available: false, State: controlapi.CapabilityDegraded, Reason: reason}}, nil
 }
 
 func normalizeDHCPLeases(items []map[string]any, state, reason string, degraded bool) []map[string]any {

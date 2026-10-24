@@ -39,9 +39,9 @@ func TestReconcileRuntimeKeepsCommittedGenerationWhenLiveServicesAreHealthy(t *t
 		t.Fatal(err)
 	}
 	controller := &httpServiceController{health: map[serviceRuntime.ServiceName]serviceRuntime.Health{
-		serviceRuntime.VPP: {Service: serviceRuntime.VPP, Available: true},
+		serviceRuntime.VPP:      {Service: serviceRuntime.VPP, Available: true},
 		serviceRuntime.SmartDNS: {Service: serviceRuntime.SmartDNS, Available: true},
-		serviceRuntime.Kea:      {Service: serviceRuntime.Kea, Available: true},
+		serviceRuntime.Dnsmasq:  {Service: serviceRuntime.Dnsmasq, Available: true},
 		serviceRuntime.Xray:     {Service: serviceRuntime.Xray, Available: true},
 		serviceRuntime.PPPoE:    {Service: serviceRuntime.PPPoE, Available: true},
 	}}

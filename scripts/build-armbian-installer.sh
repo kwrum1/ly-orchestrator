@@ -64,15 +64,14 @@ copy_path() {
   cp -a "$extracted/$source" "$overlay/$source"
 }
 for path in \
-  etc/ly-route etc/vpp etc/kea \
-  etc/udev/rules.d/90-ly-route-kea-lan.rules \
+  etc/ly-route etc/vpp etc/dnsmasq.d \
   etc/nginx/conf.d/ly-route-admin.conf \
   etc/systemd/network/10-ethernet-dhcp.network \
   opt/ly-route usr/lib/ly-route usr/share/ly-route; do
   copy_path "$path"
 done
 mkdir -p "$overlay/etc/systemd/system"
-for path in "$extracted"/etc/systemd/system/ly-route* "$extracted"/etc/systemd/system/kea-dhcp4-server.service.d; do
+for path in "$extracted"/etc/systemd/system/ly-route*; do
   [ -e "$path" ] || continue
   cp -a "$path" "$overlay/etc/systemd/system/"
 done
@@ -115,7 +114,7 @@ bundle_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y ca-certificates nginx-light openssh-server sudo openssl zstd \
-  iproute2 iputils-ping kea-dhcp4-server isc-dhcp-client python3 libunwind8 \
+  iproute2 iputils-ping dnsmasq isc-dhcp-client python3 libunwind8 \
   libnl-3-200 libnl-route-3-200 libpcap0.8 libnuma1 libelf1 zlib1g
 apt-get install -y "$bundle_dir"/packages/*.deb
 zstd -dc "$bundle_dir/overlay.tar.zst" | tar -xpf - -C /
@@ -125,7 +124,7 @@ systemctl enable systemd-networkd.service systemd-resolved.service nginx.service
   ly-route-firstboot.service ly-route-runtime-check.service ly-route-vpp-tune.service \
   ly-route-vpp-apply.service ly-route-control-api.service ly-route-recovery.service \
   ly-route-pppoe.target
-systemctl enable vpp.service smartdns.service kea-dhcp4-server.service xray.service
+systemctl enable vpp.service smartdns.service dnsmasq.service xray.service
 /usr/lib/ly-route/firstboot.sh
 systemctl restart ly-route-runtime-check.service
 systemctl restart ly-route-control-api.service nginx.service
@@ -171,7 +170,7 @@ ARM64 设备不得使用 x86 升级包。
 
 ```sh
 systemctl --failed
-systemctl status ly-route-control-api vpp nginx smartdns kea-dhcp4-server xray
+systemctl status ly-route-control-api vpp nginx smartdns dnsmasq xray
 vppctl show interface
 cat /var/lib/ly-route/runtime-readiness.json
 ```

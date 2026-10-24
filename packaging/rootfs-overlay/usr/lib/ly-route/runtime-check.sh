@@ -6,12 +6,12 @@ umask 077
 : "${LY_ROUTE_PRODUCT:=gateway}"
 # arch-v1 splits the readiness inventory. Only the control plane and the
 # dataplane path gate readiness: a clean first boot must reach a forwarding
-# dataplane without Kea, SmartDNS or xray being installed or live. Those
+# dataplane without dnsmasq, SmartDNS or xray being installed or live. Those
 # services are reported separately as optional degradations.
 : "${LY_ROUTE_REQUIRED_COMMANDS:=vpp,vppctl,/usr/lib/ly-route/vpp-apply,ipset,/usr/lib/ly-route/ly-route-pppoe-client,python3}"
 : "${LY_ROUTE_REQUIRED_UNITS:=vpp.service,ly-route-pppoe.target}"
-: "${LY_ROUTE_OPTIONAL_COMMANDS:=smartdns,kea-dhcp4,xray,/usr/lib/ly-route/ly-route-dns-vpp-proxy}"
-: "${LY_ROUTE_OPTIONAL_UNITS:=smartdns.service,kea-dhcp4-server.service,xray.service,ly-route-dns-vpp-proxy.service,ly-route-dns-vpp-proxy-v6.service}"
+: "${LY_ROUTE_OPTIONAL_COMMANDS:=smartdns,dnsmasq,xray,/usr/lib/ly-route/ly-route-dns-vpp-proxy}"
+: "${LY_ROUTE_OPTIONAL_UNITS:=smartdns.service,dnsmasq.service,xray.service,ly-route-dns-vpp-proxy.service,ly-route-dns-vpp-proxy-v6.service}"
 : "${LY_ROUTE_RUNTIME_READINESS:=/var/lib/ly-route/runtime-readiness.json}"
 : "${LY_ROUTE_VPP_CAPABILITY_PROOF:=/var/lib/ly-route/vpp-native-capabilities.json}"
 : "${LY_ROUTE_VPP_DATA_INTERFACES:=}"
@@ -272,7 +272,7 @@ for unit_name in $(split_csv "$LY_ROUTE_REQUIRED_UNITS"); do
   fi
 done
 
-# Optional services are reported, never gating. Kea, SmartDNS and xray are
+# Optional services are reported, never gating. dnsmasq, SmartDNS and xray are
 # features layered on top of forwarding: a clean first boot must still bring up
 # the data ports and reach a VPP-attachable path without them.
 optional_missing=""

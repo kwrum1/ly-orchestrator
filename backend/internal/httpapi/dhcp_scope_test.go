@@ -8,7 +8,7 @@ import (
 )
 
 // The default DHCP scope must be the logical LAN, never the management or WAN
-// network. Only an assignment explicitly marked as LAN may become a Kea
+// network. Only an assignment explicitly marked as LAN may become a Dnsmasq
 // control interface, and the router/DNS address is derived from that LAN.
 func TestDHCPLANControlInterfaceRejectsManagementAndWAN(t *testing.T) {
 	server := &Server{}

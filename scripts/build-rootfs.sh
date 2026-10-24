@@ -94,7 +94,7 @@ else
 fi
 
 case "$product,$extra_packages" in
-  orchestrator,*smartdns*|orchestrator,*kea-dhcp4-server*|orchestrator,*isc-dhcp-client*|orchestrator,*xray*|orchestrator,*ppp*)
+  orchestrator,*smartdns*|orchestrator,*dnsmasq*|orchestrator,*isc-dhcp-client*|orchestrator,*xray*|orchestrator,*ppp*)
     product_build_fail "Orchestrator extra packages contain a forbidden Gateway package"
     ;;
 esac
@@ -126,7 +126,7 @@ validate_extra_debs() {
     esac
     if [ "$product" = orchestrator ]; then
       case "$package_name" in
-        smartdns|kea-dhcp4-server|isc-dhcp-client|xray|ppp)
+        smartdns|dnsmasq|isc-dhcp-client|xray|ppp)
           product_build_fail "Orchestrator package set contains forbidden package: $package_name"
           ;;
       esac
@@ -307,15 +307,12 @@ EOF
     # unit must never enter a production gateway rootfs.
     rm -f "$target/etc/systemd/system/pppd@.service"
   elif [ "$product" = orchestrator ]; then
-    rm -rf "$target/etc/kea" "$target/etc/smartdns" "$target/etc/xray" "$target/etc/ppp"
+    rm -rf "$target/etc/dnsmasq.d" "$target/etc/smartdns" "$target/etc/xray" "$target/etc/ppp"
     rm -f "$target/etc/systemd/system/pppd@.service" \
       "$target/etc/systemd/system/ly-route-pppoe.target" \
       "$target/etc/systemd/system/ly-route-pppoe@.service" \
       "$target/etc/systemd/system/ly-route-policy-routing.service"
-    rm -rf "$target/etc/systemd/system/kea-dhcp4-server.service.d"
-    rm -f "$target/usr/lib/ly-route/kea-wait-lan.sh" \
-      "$target/etc/udev/rules.d/90-ly-route-kea-lan.rules"
-    sed -i '/kea-dhcp4-server\.service/d; s/ with DHCP enabled//' "$target/usr/lib/ly-route/firstboot.sh"
+    sed -i '/dnsmasq\.service/d; s/ with DHCP enabled//' "$target/usr/lib/ly-route/firstboot.sh"
   fi
 }
 
@@ -343,7 +340,7 @@ enable_units() {
   ln -sf /etc/systemd/system/ly-route-firstboot.service "$wants/ly-route-firstboot.service"
   if [ "$product" = gateway ]; then
     ln -sf /etc/systemd/system/ly-route-pppoe.target "$wants/ly-route-pppoe.target"
-    ln -sf /lib/systemd/system/kea-dhcp4-server.service "$wants/kea-dhcp4-server.service"
+    ln -sf /lib/systemd/system/dnsmasq.service "$wants/dnsmasq.service"
     [ ! -f "$target/lib/systemd/system/smartdns.service" ] || ln -sf /lib/systemd/system/smartdns.service "$wants/smartdns.service"
     [ ! -f "$target/lib/systemd/system/ly-route-dns-vpp-proxy.service" ] || ln -sf /lib/systemd/system/ly-route-dns-vpp-proxy.service "$wants/ly-route-dns-vpp-proxy.service"
     [ ! -f "$target/lib/systemd/system/ly-route-dns-vpp-proxy-v6.service" ] || ln -sf /lib/systemd/system/ly-route-dns-vpp-proxy-v6.service "$wants/ly-route-dns-vpp-proxy-v6.service"
@@ -390,7 +387,7 @@ if [ "${LY_ROUTE_ROOTFS_ALLOW_TAR_ONLY:-0}" = 1 ]; then
 elif command -v mmdebstrap >/dev/null 2>&1; then
   include='apt,systemd-sysv,dbus,nginx-light,openssh-server,sudo,openssl,ca-certificates,curl,gpgv,iproute2,iputils-ping,netbase,python3,python3-minimal,libunwind8,libnl-3-200,libnl-route-3-200,libpcap0.8,libnuma1,libelf1,libxdp1,zlib1g'
   if [ "$product" = gateway ]; then
-    include="$include,kea-dhcp4-server,isc-dhcp-client,ipset"
+    include="$include,dnsmasq,isc-dhcp-client,ipset"
   fi
   [ -z "$extra_packages" ] || include="$include,$extra_packages"
   mmdebstrap --architectures="$arch" --variant=minbase --components=main --include="$include" "$suite" "$rootfs" "$mirror"

@@ -15,7 +15,7 @@ import (
 func TestFilesystemController_missing_daemon_runner_restores_prior_artifact(t *testing.T) {
 	// Given
 	root := t.TempDir()
-	path := filepath.Join(root, "etc/kea/kea-dhcp4.conf")
+	path := filepath.Join(root, "etc/dnsmasq.d/ly-route-dhcp.conf")
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		t.Fatal(err)
 	}
@@ -25,8 +25,8 @@ func TestFilesystemController_missing_daemon_runner_restores_prior_artifact(t *t
 	controller := FilesystemController{RootDir: root}
 
 	// When
-	err := controller.ReloadOrRestart(context.Background(), Kea, []RenderedArtifact{
-		NewArtifact(Kea, "/etc/kea/kea-dhcp4.conf", "desired", "restart"),
+	err := controller.ReloadOrRestart(context.Background(), Dnsmasq, []RenderedArtifact{
+		NewArtifact(Dnsmasq, "/etc/dnsmasq.d/ly-route-dhcp.conf", "desired", "restart"),
 	})
 
 	// Then
@@ -44,8 +44,8 @@ func TestFilesystemController_missing_daemon_runner_restores_prior_artifact(t *t
 
 func TestFilesystemController_failed_apply_restores_prior_receipt_and_clears_rollback_metadata(t *testing.T) {
 	root := t.TempDir()
-	artifactPath := filepath.Join(root, "etc/kea/kea-dhcp4.conf")
-	receiptPath := filepath.Join(root, "var/lib/ly-route/service-runtime/receipt-kea.json")
+	artifactPath := filepath.Join(root, "etc/dnsmasq.d/ly-route-dhcp.conf")
+	receiptPath := filepath.Join(root, "var/lib/ly-route/service-runtime/receipt-dnsmasq.json")
 	for _, path := range []string{artifactPath, receiptPath} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 			t.Fatal(err)
@@ -55,11 +55,11 @@ func TestFilesystemController_failed_apply_restores_prior_receipt_and_clears_rol
 		t.Fatal(err)
 	}
 	runner := &fakeRunner{runErrs: map[string]error{
-		"systemctl start kea-dhcp4-server.service": errors.New("kea start failed"),
-	}, runErrCounts: map[string]int{"systemctl start kea-dhcp4-server.service": 1}}
+		"systemctl start dnsmasq.service": errors.New("kea start failed"),
+	}, runErrCounts: map[string]int{"systemctl start dnsmasq.service": 1}}
 	controller := FilesystemController{RootDir: root, Runner: runner}
-	if err := controller.saveApplyRecord(Kea, []RenderedArtifact{
-		NewArtifact(Kea, "/etc/kea/kea-dhcp4.conf", "prior-config", "restart"),
+	if err := controller.saveApplyRecord(Dnsmasq, []RenderedArtifact{
+		NewArtifact(Dnsmasq, "/etc/dnsmasq.d/ly-route-dhcp.conf", "prior-config", "restart"),
 	}, "prior-transaction"); err != nil {
 		t.Fatal(err)
 	}
@@ -68,8 +68,8 @@ func TestFilesystemController_failed_apply_restores_prior_receipt_and_clears_rol
 		t.Fatal(err)
 	}
 
-	err = controller.ReloadOrRestart(context.Background(), Kea, []RenderedArtifact{
-		NewArtifact(Kea, "/etc/kea/kea-dhcp4.conf", "desired-config", "restart"),
+	err = controller.ReloadOrRestart(context.Background(), Dnsmasq, []RenderedArtifact{
+		NewArtifact(Dnsmasq, "/etc/dnsmasq.d/ly-route-dhcp.conf", "desired-config", "restart"),
 	})
 
 	if err == nil || !strings.Contains(err.Error(), "kea start failed") {
@@ -87,7 +87,7 @@ func TestFilesystemController_failed_apply_restores_prior_receipt_and_clears_rol
 			t.Fatalf("%s after failed apply = %q, want %q", path, got, want)
 		}
 	}
-	rollbackPath := filepath.Join(root, "var/lib/ly-route/service-runtime/rollback-kea.json")
+	rollbackPath := filepath.Join(root, "var/lib/ly-route/service-runtime/rollback-dnsmasq.json")
 	if _, statErr := os.Stat(rollbackPath); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("failed transaction left rollback metadata: %v", statErr)
 	}
@@ -95,7 +95,7 @@ func TestFilesystemController_failed_apply_restores_prior_receipt_and_clears_rol
 
 func TestFilesystemController_failed_apply_discards_stale_prior_receipt(t *testing.T) {
 	root := t.TempDir()
-	artifactPath := filepath.Join(root, "etc/kea/kea-dhcp4.conf")
+	artifactPath := filepath.Join(root, "etc/dnsmasq.d/ly-route-dhcp.conf")
 	if err := os.MkdirAll(filepath.Dir(artifactPath), 0o750); err != nil {
 		t.Fatal(err)
 	}
@@ -103,17 +103,17 @@ func TestFilesystemController_failed_apply_discards_stale_prior_receipt(t *testi
 		t.Fatal(err)
 	}
 	runner := &fakeRunner{runErrs: map[string]error{
-		"systemctl start kea-dhcp4-server.service": errors.New("kea start failed"),
+		"systemctl start dnsmasq.service": errors.New("kea start failed"),
 	}}
 	controller := FilesystemController{RootDir: root, Runner: runner}
-	if err := controller.saveApplyRecord(Kea, []RenderedArtifact{
-		NewArtifact(Kea, "/etc/kea/kea-dhcp4.conf", "different-config", "restart"),
+	if err := controller.saveApplyRecord(Dnsmasq, []RenderedArtifact{
+		NewArtifact(Dnsmasq, "/etc/dnsmasq.d/ly-route-dhcp.conf", "different-config", "restart"),
 	}, "stale-transaction"); err != nil {
 		t.Fatal(err)
 	}
 
-	err := controller.ReloadOrRestart(context.Background(), Kea, []RenderedArtifact{
-		NewArtifact(Kea, "/etc/kea/kea-dhcp4.conf", "desired-config", "restart"),
+	err := controller.ReloadOrRestart(context.Background(), Dnsmasq, []RenderedArtifact{
+		NewArtifact(Dnsmasq, "/etc/dnsmasq.d/ly-route-dhcp.conf", "desired-config", "restart"),
 	})
 
 	if err == nil || !strings.Contains(err.Error(), "kea start failed") {
@@ -126,7 +126,7 @@ func TestFilesystemController_failed_apply_discards_stale_prior_receipt(t *testi
 	if got := string(content); got != "prior-config" {
 		t.Fatalf("artifact after failed apply = %q", got)
 	}
-	if _, statErr := os.Stat(controller.applyRecordPath(Kea)); !errors.Is(statErr, os.ErrNotExist) {
+	if _, statErr := os.Stat(controller.applyRecordPath(Dnsmasq)); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("stale receipt survived failed apply: %v", statErr)
 	}
 }
@@ -135,13 +135,13 @@ func TestFilesystemController_receipt_and_readback_bind_live_artifact_hashes(t *
 	// Given
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	runner := &fakeRunner{
-		health:  map[ServiceName]Health{Kea: {Service: Kea, Available: true}},
-		outputs: map[string]string{"kea-dhcp4 -t /etc/kea/kea-dhcp4.conf": "configuration test passed"},
+		health:  map[ServiceName]Health{Dnsmasq: {Service: Dnsmasq, Available: true}},
+		outputs: map[string]string{"dnsmasq -t /etc/dnsmasq.d/ly-route-dhcp.conf": "configuration test passed"},
 	}
 	controller := FilesystemController{RootDir: t.TempDir(), Runner: runner, Now: func() time.Time { return now }}
-	artifacts := []RenderedArtifact{NewArtifact(Kea, "/etc/kea/kea-dhcp4.conf", "desired", "restart")}
+	artifacts := []RenderedArtifact{NewArtifact(Dnsmasq, "/etc/dnsmasq.d/ly-route-dhcp.conf", "desired", "restart")}
 	request := EvidenceRequest{TransactionID: "txn-kea", Capability: "dhcp", Artifacts: artifacts}
-	if err := controller.ReloadOrRestart(context.Background(), Kea, artifacts); err != nil {
+	if err := controller.ReloadOrRestart(context.Background(), Dnsmasq, artifacts); err != nil {
 		t.Fatal(err)
 	}
 
@@ -160,13 +160,13 @@ func TestFilesystemController_receipt_and_readback_bind_live_artifact_hashes(t *
 		t.Fatalf("readback = %#v", readback)
 	}
 
-	path := filepath.Join(controller.RootDir, "etc/kea/kea-dhcp4.conf")
+	path := filepath.Join(controller.RootDir, "etc/dnsmasq.d/ly-route-dhcp.conf")
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, want := info.Mode().Perm(), os.FileMode(0o644); got != want {
-		t.Fatalf("Kea artifact mode = %o, want %o for the unprivileged daemon", got, want)
+		t.Fatalf("Dnsmasq artifact mode = %o, want %o for the unprivileged daemon", got, want)
 	}
 	if err := os.WriteFile(path, []byte("tampered"), 0o640); err != nil {
 		t.Fatal(err)
@@ -228,11 +228,11 @@ func TestFilesystemController_persist_only_VPP_plan_is_rollback_safe(t *testing.
 func TestRuntime_daemon_failure_degrades_only_affected_capability(t *testing.T) {
 	// Given
 	keaFailure := errors.New("kea daemon rejected configuration")
-	controller := &fakeController{applyErrs: map[ServiceName]error{Kea: keaFailure}}
+	controller := &fakeController{applyErrs: map[ServiceName]error{Dnsmasq: keaFailure}}
 	runtime := Runtime{Controller: controller}
 	artifacts := []RenderedArtifact{
 		NewArtifact(SmartDNS, "/etc/smartdns/conf.d/ly-route-default.conf", "address #", "reload"),
-		NewArtifact(Kea, "/etc/kea/kea-dhcp4.conf", "{}", "restart"),
+		NewArtifact(Dnsmasq, "/etc/dnsmasq.d/ly-route-dhcp.conf", "{}", "restart"),
 		NewArtifact(Xray, "/etc/xray/config.json", "{}", "restart"),
 	}
 
@@ -241,16 +241,16 @@ func TestRuntime_daemon_failure_degrades_only_affected_capability(t *testing.T) 
 
 	// Then
 	if !errors.Is(report.Err(), keaFailure) {
-		t.Fatalf("apply error = %v, want Kea failure", report.Err())
+		t.Fatalf("apply error = %v, want Dnsmasq failure", report.Err())
 	}
-	if got, want := strings.Join(controller.applied, ","), "smartdns,kea,xray"; got != want {
+	if got, want := strings.Join(controller.applied, ","), "smartdns,dnsmasq,xray"; got != want {
 		t.Fatalf("attempted services = %s, want %s", got, want)
 	}
 	if got, want := strings.Join(artifactServiceNames(report.AppliedArtifacts), ","), "smartdns,xray"; got != want {
 		t.Fatalf("applied capabilities = %s, want %s", got, want)
 	}
-	if len(report.Failures) != 1 || report.Failures[0].Service != Kea {
-		t.Fatalf("capability failures = %#v, want only Kea", report.Failures)
+	if len(report.Failures) != 1 || report.Failures[0].Service != Dnsmasq {
+		t.Fatalf("capability failures = %#v, want only Dnsmasq", report.Failures)
 	}
 }
 
@@ -293,14 +293,14 @@ func artifactServiceNames(artifacts []RenderedArtifact) []string {
 
 func TestSystemctlRunner_Kea_readback_uses_test_and_config_flags(t *testing.T) {
 	// When
-	commands, err := serviceReadbackCommands(Kea)
+	commands, err := serviceReadbackCommands(Dnsmasq)
 
 	// Then
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(commands) != 1 || strings.Join(commands[0], " ") != "kea-dhcp4 -t /etc/kea/kea-dhcp4.conf" {
-		t.Fatalf("Kea readback command = %#v", commands)
+	if len(commands) != 1 || strings.Join(commands[0], " ") != "dnsmasq -t /etc/dnsmasq.d/ly-route-dhcp.conf" {
+		t.Fatalf("Dnsmasq readback command = %#v", commands)
 	}
 }
 

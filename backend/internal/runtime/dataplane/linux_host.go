@@ -127,11 +127,11 @@ func (host *LinuxHost) StartVPP(ctx context.Context) error {
 	return err
 }
 
-func (host *LinuxHost) RebindKea(ctx context.Context) error {
-	if _, err := host.run(ctx, "systemctl", "is-active", "--quiet", "kea-dhcp4-server.service"); err != nil {
+func (host *LinuxHost) RebindDHCPService(ctx context.Context) error {
+	if _, err := host.run(ctx, "systemctl", "is-active", "--quiet", "dnsmasq.service"); err != nil {
 		return nil
 	}
-	_, err := host.run(ctx, "systemctl", "restart", "kea-dhcp4-server.service")
+	_, err := host.run(ctx, "systemctl", "restart", "dnsmasq.service")
 	return err
 }
 

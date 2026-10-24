@@ -523,7 +523,7 @@ func managementLCPCommands(lcp ManagementLCP) []string {
 
 // LANControlPlaneHostInterface returns the deterministic Linux interface paired
 // with a VPP-owned LAN. The name is short enough for Linux IFNAMSIZ and stable
-// across reboots so host services such as Kea and SmartDNS can bind safely.
+// across reboots so host services such as Dnsmasq and SmartDNS can bind safely.
 func LANControlPlaneHostInterface(linuxInterface string) string {
 	linuxInterface = strings.TrimSpace(strings.ToLower(linuxInterface))
 	var suffix strings.Builder

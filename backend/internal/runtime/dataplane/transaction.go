@@ -52,8 +52,8 @@ type ActiveStateStore interface {
 	ClearActiveState(context.Context) error
 }
 
-type KeaRebinder interface {
-	RebindKea(context.Context) error
+type DHCPServiceRebinder interface {
+	RebindDHCPService(context.Context) error
 }
 
 // Host owns privileged Linux/VPP operations. Its implementation must make
@@ -77,12 +77,12 @@ type Transaction struct {
 	initialized bool
 }
 
-func (transaction *Transaction) RebindKea(ctx context.Context) error {
-	rebinder, ok := transaction.Host.(KeaRebinder)
+func (transaction *Transaction) RebindDHCPService(ctx context.Context) error {
+	rebinder, ok := transaction.Host.(DHCPServiceRebinder)
 	if !ok {
 		return nil
 	}
-	return rebinder.RebindKea(ctx)
+	return rebinder.RebindDHCPService(ctx)
 }
 
 func (transaction *Transaction) Apply(ctx context.Context, request Request) (Receipt, error) {

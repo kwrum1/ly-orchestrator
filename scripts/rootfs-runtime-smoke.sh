@@ -17,7 +17,7 @@ fi
 required_files_defaulted=false
 if [ "${LY_ROUTE_ROOTFS_REQUIRED_FILES+x}" != x ]; then
   required_files_defaulted=true
-  LY_ROUTE_ROOTFS_REQUIRED_FILES="/usr/bin/vpp /usr/bin/vppctl /usr/bin/sudo /usr/sbin/ipset /usr/lib/systemd/system/vpp.service /usr/lib/ly-route/ly-route-control /usr/lib/ly-route/ly-route-pppoe-client /usr/lib/ly-route/vpp-apply /usr/lib/ly-route/vpp-apply-default /usr/lib/ly-route/policy-routing-apply-default /usr/lib/ly-route/tune-vpp.sh /usr/lib/ly-route/dns-ipset-sync.py /usr/lib/ly-route/active-dpdk-state.py /usr/sbin/smartdns /usr/bin/xray /usr/sbin/sshd /etc/ssh/sshd_config /etc/vpp/startup.conf /etc/smartdns/smartdns.conf /etc/xray/config.json /etc/ly-route/default-config.json /etc/ly-route/runtime.env /etc/ly-route/vpp-command-map.json /var/lib/ly-route/vpp/operations.json /etc/kea/kea-dhcp4.conf /etc/nginx/conf.d/ly-route-admin.conf /opt/ly-route/admin/index.html /opt/ly-route/admin/app.js /opt/ly-route/admin/shell.js /opt/ly-route/admin/styles.css /opt/ly-route/admin/capabilities.json /etc/systemd/network/10-ethernet-dhcp.network /etc/systemd/system/multi-user.target.wants/vpp.service /etc/systemd/system/multi-user.target.wants/ssh.service /etc/systemd/system/multi-user.target.wants/nginx.service /etc/systemd/system/multi-user.target.wants/ly-route-control-api.service /etc/systemd/system/kea-dhcp4-server.service.d/ly-route-firstboot.conf /etc/systemd/system/ly-route-vpp-tune.service /etc/systemd/system/ly-route-policy-routing.service /etc/systemd/system/timers.target.wants/ly-route-dns-ipset-sync.timer /etc/systemd/system/kea-dhcp4-server.service.d/ly-route-firstboot.conf /etc/systemd/system/kea-dhcp4-server.service.d/20-ly-route-lan-retry.conf /usr/lib/ly-route/kea-wait-lan.sh /etc/udev/rules.d/90-ly-route-kea-lan.rules /etc/systemd/system/ly-route-control-api.service /etc/systemd/system/ly-route-runtime-check.service /etc/systemd/system/ly-route-vpp-apply.service /etc/systemd/system/ly-route-vpp-tune.service /etc/systemd/system/ly-route-dns-ipset-sync.service /etc/systemd/system/ly-route-dns-ipset-sync.timer /etc/systemd/system/vpp.service.d/10-ly-route-tuning.conf /etc/systemd/system/ly-route-policy-routing.service /etc/systemd/system/ly-route-recovery.service"
+  LY_ROUTE_ROOTFS_REQUIRED_FILES="/usr/bin/vpp /usr/bin/vppctl /usr/bin/sudo /usr/sbin/ipset /usr/lib/systemd/system/vpp.service /usr/lib/ly-route/ly-route-control /usr/lib/ly-route/ly-route-pppoe-client /usr/lib/ly-route/vpp-apply /usr/lib/ly-route/vpp-apply-default /usr/lib/ly-route/policy-routing-apply-default /usr/lib/ly-route/tune-vpp.sh /usr/lib/ly-route/dns-ipset-sync.py /usr/lib/ly-route/active-dpdk-state.py /usr/sbin/smartdns /usr/sbin/dnsmasq /usr/bin/xray /usr/sbin/sshd /etc/ssh/sshd_config /etc/vpp/startup.conf /etc/smartdns/smartdns.conf /etc/xray/config.json /etc/ly-route/default-config.json /etc/ly-route/runtime.env /etc/ly-route/vpp-command-map.json /var/lib/ly-route/vpp/operations.json /etc/dnsmasq.d/ly-route-dhcp.conf /etc/nginx/conf.d/ly-route-admin.conf /opt/ly-route/admin/index.html /opt/ly-route/admin/app.js /opt/ly-route/admin/shell.js /opt/ly-route/admin/styles.css /opt/ly-route/admin/capabilities.json /etc/systemd/network/10-ethernet-dhcp.network /etc/systemd/system/multi-user.target.wants/vpp.service /etc/systemd/system/multi-user.target.wants/ssh.service /etc/systemd/system/multi-user.target.wants/nginx.service /etc/systemd/system/multi-user.target.wants/ly-route-control-api.service /etc/systemd/system/ly-route-vpp-tune.service /etc/systemd/system/ly-route-policy-routing.service /etc/systemd/system/timers.target.wants/ly-route-dns-ipset-sync.timer /etc/systemd/system/ly-route-control-api.service /etc/systemd/system/ly-route-runtime-check.service /etc/systemd/system/ly-route-vpp-apply.service /etc/systemd/system/ly-route-vpp-tune.service /etc/systemd/system/ly-route-dns-ipset-sync.service /etc/systemd/system/ly-route-dns-ipset-sync.timer /etc/systemd/system/vpp.service.d/10-ly-route-tuning.conf /etc/systemd/system/ly-route-policy-routing.service /etc/systemd/system/ly-route-recovery.service"
 fi
 : "${LY_ROUTE_ROOTFS_LIVE_REQUIRED:=false}"
 
@@ -128,24 +128,19 @@ if [ -f "$tmp/etc/ly-route/default-config.json" ]; then
     exit 1
   fi
 fi
-if [ -f "$tmp/etc/kea/kea-dhcp4.conf" ]; then
-  grep -q '"interfaces": \["lylan-' "$tmp/etc/kea/kea-dhcp4.conf"
-  grep -q '192.168.88.100 - 192.168.88.199' "$tmp/etc/kea/kea-dhcp4.conf"
-  if grep -q '10\.0\.2\.' "$tmp/etc/kea/kea-dhcp4.conf"; then
-    echo "rootfs Kea config must not serve the management network" >&2
+if [ -f "$tmp/etc/dnsmasq.d/ly-route-dhcp.conf" ]; then
+  grep -q '^interface=lylan-' "$tmp/etc/dnsmasq.d/ly-route-dhcp.conf"
+  grep -q '^dhcp-range=set:lyroute-factory,192.168.88.100,192.168.88.199,' "$tmp/etc/dnsmasq.d/ly-route-dhcp.conf"
+  grep -q '^port=0$' "$tmp/etc/dnsmasq.d/ly-route-dhcp.conf"
+  if grep -q '10\.0\.2\.' "$tmp/etc/dnsmasq.d/ly-route-dhcp.conf"; then
+    echo "rootfs dnsmasq config must not serve the management network" >&2
     exit 1
   fi
 fi
 if [ -f "$tmp/etc/systemd/network/10-ethernet-dhcp.network" ]; then
   grep -q 'DHCP=no' "$tmp/etc/systemd/network/10-ethernet-dhcp.network"
 fi
-if [ -f "$tmp/etc/systemd/system/kea-dhcp4-server.service.d/ly-route-firstboot.conf" ]; then
-  grep -q 'After=ly-route-firstboot.service' "$tmp/etc/systemd/system/kea-dhcp4-server.service.d/ly-route-firstboot.conf"
-fi
-if [ -f "$tmp/etc/systemd/system/kea-dhcp4-server.service.d/20-ly-route-lan-retry.conf" ]; then
-  grep -q '^ExecStartPre=/usr/lib/ly-route/kea-wait-lan.sh$' "$tmp/etc/systemd/system/kea-dhcp4-server.service.d/20-ly-route-lan-retry.conf"
-  grep -q '^Restart=on-failure$' "$tmp/etc/systemd/system/kea-dhcp4-server.service.d/20-ly-route-lan-retry.conf"
-fi
+
 
 if command -v systemd-nspawn >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
   printf 'systemd-nspawn and curl available; live boot smoke can be run by the hardware/VM validation plan.\n'

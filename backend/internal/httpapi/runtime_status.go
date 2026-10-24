@@ -61,7 +61,7 @@ func (server *Server) statusHealthComponents(ctx context.Context) []RuntimeCompo
 		service serviceRuntime.ServiceName
 	}{
 		{"smartdns", serviceRuntime.SmartDNS},
-		{"kea", serviceRuntime.Kea},
+		{"dnsmasq", serviceRuntime.Dnsmasq},
 		{"xray", serviceRuntime.Xray},
 		{"pppoe", serviceRuntime.PPPoE},
 	} {

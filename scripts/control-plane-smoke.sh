@@ -30,7 +30,7 @@ api POST /api/v1/dhcp/servers '{"id":"smoke-vpp-lan","interface_id":"lyroute-lan
 api POST /api/v1/dns/policies '{"id":"smoke-split","name":"smoke split dns","enabled":true,"policy":{"engine":"smartdns","miss":{"kind":"reject"},"rules":[{"id":"smoke-direct","source_prefixes":["192.168.30.0/24"],"domains":["direct.example"],"outcome":{"kind":"direct","upstream_id":"dns-direct-default"}},{"id":"smoke-block","source_prefixes":["192.168.30.0/24"],"domains":["blocked.example"],"outcome":{"kind":"reject"}}]}}' > "$tmpdir/dns.json"
 
 api GET /api/v1/runtime/preview > "$tmpdir/runtime-preview.json"
-jq -e '([.plan.service_artifacts[] | select(.service=="kea")] | length) == 1' "$tmpdir/runtime-preview.json" >/dev/null
+jq -e '([.plan.service_artifacts[] | select(.service=="dnsmasq")] | length) == 1' "$tmpdir/runtime-preview.json" >/dev/null
 jq -e '.plan.dhcp_servers[] | select(.id=="smoke-management" and .interface_id=="eth0")' "$tmpdir/runtime-preview.json" >/dev/null
 jq -e '.plan.dhcp_servers[] | select(.id=="smoke-vpp-lan" and .interface_id=="lyroute-lan0")' "$tmpdir/runtime-preview.json" >/dev/null
 jq -e '.plan.service_artifacts[] | select(.service=="smartdns" and (.path | contains("smoke-split")))' "$tmpdir/runtime-preview.json" >/dev/null

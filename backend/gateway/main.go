@@ -110,8 +110,8 @@ func run() error {
 			XrayMetricsAddress: env("LY_ROUTE_XRAY_METRICS_ADDRESS", serviceRuntime.DefaultXrayMetricsAddress),
 		}}))
 	}
-	if profile.AllowsService(product.ServiceKea) {
-		options = append(options, httpapi.WithDHCPLeases(serviceRuntime.KeaMemfileLeaseCollector{Path: env("LY_ROUTE_KEA_LEASE_FILE", serviceRuntime.DefaultKeaDHCP4LeaseFile)}))
+	if profile.AllowsService(product.ServiceDnsmasq) {
+		options = append(options, httpapi.WithDHCPLeases(serviceRuntime.DnsmasqLeaseCollector{Path: env("LY_ROUTE_DNSMASQ_LEASE_FILE", serviceRuntime.DefaultDnsmasqLeaseFile)}))
 	}
 	vppctl := env("LY_ROUTE_VPPCTL", "vppctl")
 	if envBool("LY_ROUTE_ENABLE_VPP_INTERFACE_TELEMETRY", true) {
