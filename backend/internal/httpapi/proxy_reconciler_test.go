@@ -350,6 +350,38 @@ func TestProxyFailurePageActivatesForFastestSubscription(t *testing.T) {
 	}
 }
 
+func TestProxyFailurePageClearsStaleGenerationWhenProxyIsHealthy(t *testing.T) {
+	store := openProxyFailureStore(t, "proxy-failure-stale-generation")
+	saveTestProxyNode(t, store)
+	saveProxyFailureEgress(t, store, testProxyEgressWithNode())
+	controller := &httpServiceController{
+		health: map[serviceRuntime.ServiceName]serviceRuntime.Health{
+			serviceRuntime.Xray: {Service: serviceRuntime.Xray, Available: true},
+		},
+		xrayObservations: []serviceRuntime.XrayObservatoryState{{OutboundTag: "node-proxy-node-test", Alive: true, DelayMilliseconds: 9}},
+	}
+	// Simulate a page left behind by the systemd crash path while the control
+	// API was down.
+	actuator := &fakeProxyFailureActuator{active: true}
+	server, _ := newProxyFailureServer(t, store, controller, actuator)
+
+	if err := observeProxyFailure(t, server, controller, controller.xrayObservations); err != nil {
+		t.Fatal(err)
+	}
+	if actuator.active || actuator.deactivations != 1 {
+		t.Fatalf("stale failure generation was not cleared: %#v", actuator)
+	}
+	if !server.proxyFailure.failureCleared() {
+		t.Fatal("tracker did not record the healthy clear")
+	}
+	if err := observeProxyFailure(t, server, controller, controller.xrayObservations); err != nil {
+		t.Fatal(err)
+	}
+	if actuator.deactivations != 1 {
+		t.Fatalf("healthy clear is not idempotent: %#v", actuator)
+	}
+}
+
 func TestProxyFailurePageIsDisabledWhenProxyEgressIsRemoved(t *testing.T) {
 	store := openProxyFailureStore(t, "proxy-failure-egress-removed")
 	saveTestProxyNode(t, store)

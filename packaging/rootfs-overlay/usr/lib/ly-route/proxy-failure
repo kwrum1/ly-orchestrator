@@ -253,16 +253,21 @@ apply_guard() {
 
 leave() {
     failed=0
+    removed=0
     for table in "$FAILURE_TABLE" "$GUARD_TABLE"; do
         if "$NFT" list table "$CAPTURE_FAMILY" "$table" >/dev/null 2>&1; then
-            "$NFT" delete table "$CAPTURE_FAMILY" "$table" || failed=1
+            if "$NFT" delete table "$CAPTURE_FAMILY" "$table"; then
+                removed=$((removed + 1))
+            else
+                failed=1
+            fi
         fi
     done
     if [ "$failed" -ne 0 ]; then
         log "failed to remove the failure generation"
         exit 1
     fi
-    log "failure page removed"
+    [ "$removed" -gt 0 ] && log "failure page removed"
 }
 
 status() {

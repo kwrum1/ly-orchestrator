@@ -191,6 +191,7 @@ func TestEnsureFailureFallbackIsIdempotentBlackholedAndMarked(t *testing.T) {
 	if strings.Contains(string(payload), `"fallbackTag":"direct"`) || strings.Contains(string(payload), `"tag":"direct"`) {
 		t.Fatalf("rendered Xray config still contains a direct path: %s", payload)
 	}
+	assertNoCapturedPathReachesDirect(t, config)
 }
 
 func TestEnsureFailureFallbackDropsLegacyDirectOutboundAndCatchAll(t *testing.T) {

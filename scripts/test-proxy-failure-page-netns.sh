@@ -86,6 +86,19 @@ PORT=$(sed -n 2p "$TMP/fields")
 MARK=$(sed -n 3p "$TMP/fields")
 TABLE=$(sed -n 4p "$TMP/fields")
 PRIORITY=$(sed -n 5p "$TMP/fields")
+# This is the exact state contract written by the control API
+# (proxyFailurePageConfig in backend/internal/httpapi/proxy_reconciler.go).
+cat >"$TMP/failure-state.json" <<EOF
+{
+  "version": 1,
+  "enabled": true,
+  "active": false,
+  "egress_id": "proxy-netns",
+  "ingress_interface": "$INGRESS",
+  "page_port": $PAGE_PORT,
+  "bypass_destinations": ["10.200.0.0/24", "10.200.1.0/24"]
+}
+EOF
 log "ingress=$INGRESS tproxy-port=$PORT mark=$MARK table=$TABLE rule-priority=$PRIORITY"
 
 log "== choose proxy engine =="
@@ -376,7 +389,7 @@ log "upstream bytes after normal mode: $before -> $after"
 
 log "== failure mode: helper enter =="
 : >"$TMP/upstream.log"
-ip netns exec "$PROXY" "$HELPER" enter "$INGRESS" "$PAGE_PORT" "10.200.0.0/24" "10.200.1.0/24"
+ip netns exec "$PROXY" env LY_ROUTE_PROXY_FAILURE_STATE="$TMP/failure-state.json" "$HELPER" enter
 ip netns exec "$PROXY" nft list table inet ly_route_proxy_failure >"$TMP/failure.nft"
 ip netns exec "$PROXY" nft list table inet ly_route_proxy_failure_guard >>"$TMP/failure.nft"
 if ip netns exec "$PROXY" nft list chain inet ly_route_proxy_capture proxy_prerouting | grep -q tproxy; then
@@ -417,7 +430,7 @@ if ip netns exec "$PROXY" ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -q ":
     fail "could not stop the page listener on :$PAGE_PORT"
 fi
 : >"$TMP/upstream.log"
-ip netns exec "$PROXY" env LY_ROUTE_PAGE_WAIT_ATTEMPTS=1 "$HELPER" enter "$INGRESS" "$PAGE_PORT" "10.200.0.0/24" "10.200.1.0/24"
+ip netns exec "$PROXY" env LY_ROUTE_PROXY_FAILURE_STATE="$TMP/failure-state.json" LY_ROUTE_PAGE_WAIT_ATTEMPTS=1 "$HELPER" enter
 if ip netns exec "$PROXY" nft list table inet ly_route_proxy_failure | grep -q 'redirect to'; then
     fail "page-down failure mode still redirects TCP/80 to a dead page server"
 fi
@@ -428,7 +441,7 @@ log "blackhole upstream bytes: http=$(upstream_http_bytes)"
 
 log "== recovery: re-install capture, then helper leave =="
 ip netns exec "$PROXY" nft -f "$TMP/capture.nft"
-ip netns exec "$PROXY" "$HELPER" leave
+ip netns exec "$PROXY" env LY_ROUTE_PROXY_FAILURE_STATE="$TMP/failure-state.json" "$HELPER" leave
 ip netns exec "$PROXY" nft list table inet ly_route_proxy_failure 2>/dev/null && fail "failure generation survived recovery" || true
 before=$(upstream_http_bytes)
 expect recovered-proxy DIRECT-UPSTREAM http 203.0.113.10 80

@@ -191,6 +191,10 @@ type proxyFailureTracker struct {
 	downStreak   int
 	baselineHash string
 	captureHash  string
+	// cleared records that a healthy sample already removed any leftover
+	// failure generation (for example one installed by the systemd fast path
+	// while the control API was down).
+	cleared bool
 }
 
 func newProxyFailureTracker() *proxyFailureTracker {
@@ -225,6 +229,7 @@ func (tracker *proxyFailureTracker) reset() {
 	tracker.downStreak = 0
 	tracker.baselineHash = ""
 	tracker.captureHash = ""
+	tracker.cleared = false
 }
 
 func (tracker *proxyFailureTracker) baselineUnchanged(hash string) bool {
@@ -237,6 +242,18 @@ func (tracker *proxyFailureTracker) setBaselineHash(hash string) {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
 	tracker.baselineHash = hash
+}
+
+func (tracker *proxyFailureTracker) failureCleared() bool {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	return tracker.cleared
+}
+
+func (tracker *proxyFailureTracker) markCleared() {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	tracker.cleared = true
 }
 
 func (tracker *proxyFailureTracker) captureUnchanged(hash string) bool {
@@ -293,6 +310,7 @@ func (tracker *proxyFailureTracker) recordError(now time.Time, err error) {
 func (tracker *proxyFailureTracker) markActivated(now time.Time, reason string) {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
+	tracker.cleared = false
 	tracker.status.FailurePageActive = true
 	tracker.status.AllNodesDown = true
 	tracker.status.FailureReason = reason
@@ -317,6 +335,7 @@ func (tracker *proxyFailureTracker) markRecovered(now time.Time) {
 	tracker.status.FailureError = ""
 	tracker.downStreak = 0
 	tracker.captureHash = ""
+	tracker.cleared = true
 }
 
 type proxyLivenessSample struct {
@@ -331,7 +350,8 @@ type proxyLivenessSample struct {
 // drives the fixed failure page when every proxy node is dead. It deliberately
 // does not require a full gateway apply to toggle the page.
 func (server *Server) StartProxyReconciler(ctx context.Context, interval time.Duration) {
-	if server == nil || server.profile.ID() != product.Gateway().ID() || server.services == nil || server.services.Controller == nil {
+	if server == nil || server.profile.ID() != product.Gateway().ID() || server.services == nil || server.services.Controller == nil ||
+		server.proxyFailure == nil || server.proxyFailurePage == nil {
 		return
 	}
 	observer, ok := server.services.Controller.(serviceRuntime.XrayObservatoryStateController)
@@ -441,6 +461,19 @@ func (server *Server) reconcileProxyHealth(ctx context.Context, observer service
 		// While all nodes are down there is no healthy lane plan to install;
 		// the second sample activates the failure page instead.
 		return nil
+	}
+
+	// A previous control-plane instance (or the systemd fast path) may have
+	// left a failure generation behind. Once the proxy is observed healthy,
+	// remove it exactly once. This also clears a page left over from a failed
+	// crash path, so a healthy proxy can never be stuck behind a stale guard.
+	if !server.proxyFailure.failureCleared() {
+		if err := server.proxyFailurePage.Deactivate(ctx); err != nil {
+			server.proxyFailure.recordError(now, err)
+			return fmt.Errorf("clear stale proxy failure generation: %w", err)
+		}
+		server.proxyFailure.markCleared()
+		log.Printf("proxy failure generation cleared: proxy is healthy")
 	}
 
 	// Preserve the previous adaptive behaviour: re-balance the capture lanes
