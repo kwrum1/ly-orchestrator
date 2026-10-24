@@ -10,4 +10,6 @@ Type=oneshot
 TimeoutStartSec=60s
 TimeoutStopSec=15s
 Environment=LY_ROUTE_DNS_SYNC_API_TIMEOUT_SECONDS=10
+# Create policy-referenced sets before the first observation pass.
+ExecStartPre=-/usr/bin/timeout 15 /usr/lib/ly-route/dns-ipset-sync.py --prepare
 ExecStart=/usr/lib/ly-route/dns-ipset-sync.py

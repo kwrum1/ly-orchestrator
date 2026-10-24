@@ -238,8 +238,12 @@ if grep -q 'After=ly-route-control-api.service' "$repo_root/packaging/rootfs-ove
   echo "SmartDNS is ordered behind the control API and can miss the boot health window" >&2
   exit 1
 fi
-if ! grep -q 'timeout 15 /usr/lib/ly-route/dns-ipset-sync.py --prepare' "$repo_root/packaging/rootfs-overlay/etc/systemd/system/smartdns.service.d/10-ly-route-vpp-lifecycle.conf"; then
-  echo "SmartDNS ipset preparation is not bounded" >&2
+if grep -q 'ExecStartPre' "$repo_root/packaging/rootfs-overlay/etc/systemd/system/smartdns.service.d/10-ly-route-vpp-lifecycle.conf"; then
+  echo "SmartDNS has a start-pre step that can hold it in activating at the boot check" >&2
+  exit 1
+fi
+if ! grep -q 'timeout 15 /usr/lib/ly-route/dns-ipset-sync.py --prepare' "$repo_root/packaging/rootfs-overlay/etc/systemd/system/ly-route-dns-ipset-sync.service"; then
+  echo "ipset preparation is not bounded in the sync oneshot" >&2
   exit 1
 fi
 
