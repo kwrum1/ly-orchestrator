@@ -755,7 +755,6 @@ func proxySteeringCommands(steering proxy.VPPSteeringInstruction, behavior nat.B
 		if underlay == "" {
 			underlay = "local"
 		}
-		underlayPath := routePathVia("", "", underlay)
 		commands := []string{
 			fmt.Sprintf("?create tap id %d host-if-name %s no-gso", network.IngressTapID, network.IngressHostInterface),
 			fmt.Sprintf("?set interface name tap%d %s", network.IngressTapID, network.IngressVPPInterface),
@@ -766,11 +765,13 @@ func proxySteeringCommands(steering proxy.VPPSteeringInstruction, behavior nat.B
 			fmt.Sprintf("?set interface name tap%d %s", network.EgressTapID, network.EgressVPPInterface),
 			fmt.Sprintf("?set interface state %s up", network.EgressVPPInterface),
 			fmt.Sprintf("?set interface mtu packet %d %s", network.MTU, network.EgressVPPInterface),
-			fmt.Sprintf("?ip table add %d", network.OutboundTableID),
-			fmt.Sprintf("?set interface ip table %s %d", network.EgressVPPInterface, network.OutboundTableID),
+			// Keep the egress TAP in VPP's global FIB.  NAT44-ED keys its
+			// inside-to-outside session on the ingress FIB index; when the TAP
+			// lives in a private table the SYN is translated but every later
+			// packet (including the TCP ACK) misses the session and is dropped.
+			// The underlay WAN route is already present in the global FIB, so
+			// the Linux egress table default route below still selects it.
 			fmt.Sprintf("?set interface ip address %s %s", network.EgressVPPInterface, network.EgressCIDR),
-			fmt.Sprintf("?ip route del table %d 0.0.0.0/0", network.OutboundTableID),
-			fmt.Sprintf("?ip route add table %d 0.0.0.0/0 via %s", network.OutboundTableID, underlayPath),
 		}
 		underlayFields := strings.Fields(underlay)
 		if behavior == nat.BehaviorFullCone && len(underlayFields) > 0 {
@@ -789,7 +790,10 @@ func proxySteeringCommands(steering proxy.VPPSteeringInstruction, behavior nat.B
 		commands = append(commands,
 			fmt.Sprintf("show interface address %s", network.IngressVPPInterface),
 			fmt.Sprintf("show interface address %s", network.EgressVPPInterface),
-			fmt.Sprintf("show ip fib table %d", network.OutboundTableID),
+			// The egress TAP is intentionally in the global FIB (see above);
+			// proving a private table would silently accept the broken NAT44
+			// return path that made Xray unable to dial its node.
+			"show ip fib table 0",
 		)
 		if behavior == nat.BehaviorFullCone {
 			commands = append(commands, "show nat44 ei interfaces")
@@ -1461,11 +1465,23 @@ func routePolicyCommands(policy trafficpolicy.RoutePolicy, wanGroups map[string]
 	return routePolicyCommandsWithOptions(policy, wanGroups, routePolicyCommandOptions{})
 }
 
+// routePolicyUsesProxyServiceInterface reports whether a route policy steers
+// into a VPP proxy service ingress TAP.  Those policies must keep the explicit
+// ABF policy/attach in the compiled plan (the runtime pre-NAT classifier is
+// installed on top of it), so the proxy handoff is visible to the gateway
+// readback and a missing ABF object can never be reported as committed.
+func routePolicyUsesProxyServiceInterface(policy trafficpolicy.RoutePolicy) bool {
+	if policy.Path == nil {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(policy.Path.VPPInterface)), "lypxin")
+}
+
 func routePolicyCommandsWithOptions(policy trafficpolicy.RoutePolicy, wanGroups map[string]trafficpolicy.WANGroup, options routePolicyCommandOptions) []string {
 	aclID := stableID("route-acl:"+policy.ID, 10000, 49999)
 	policyID := stableID("route-abf:"+policy.ID, 10000, 8999)
 	tableID := stableID("route-table:"+policy.ID, 50000, 49999)
-	if !routePolicyNeedsLocalACLDeny(policy, options) {
+	if !routePolicyNeedsLocalACLDeny(policy, options) && !routePolicyUsesProxyServiceInterface(policy) {
 		if commands, ok := routePolicyRadixCommands(policy, wanGroups, options, policyID, tableID); ok {
 			return commands
 		}

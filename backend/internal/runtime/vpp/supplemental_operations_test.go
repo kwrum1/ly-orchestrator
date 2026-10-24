@@ -281,7 +281,7 @@ func TestVerifySupplementalOperationAcceptsFullConeProxyNATReadback(t *testing.T
 	results := []VPPCTLCommandResult{
 		{Command: "show interface address " + network.IngressVPPInterface, Stdout: network.IngressVPPInterface + " " + network.IngressCIDR},
 		{Command: "show interface address " + network.EgressVPPInterface, Stdout: network.EgressVPPInterface + " " + network.EgressCIDR},
-		{Command: "show ip fib table " + strconv.Itoa(network.OutboundTableID), Stdout: "table " + strconv.Itoa(network.OutboundTableID)},
+		{Command: "show ip fib table 0", Stdout: "ipv4-VRF:0, fib_index:0"},
 		{Command: "show nat44 ei interfaces", Stdout: network.EgressVPPInterface + " in\npppoe_session1 out"},
 		{Command: "show tap", Stdout: network.IngressVPPInterface + " host-if-name " + network.IngressHostInterface},
 	}

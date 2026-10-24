@@ -1715,6 +1715,10 @@ func renderProxyServiceNetwork(plan proxy.LinuxPolicyRoutingPlan, natBehavior na
 	var builder strings.Builder
 	builder.WriteString("#!/bin/sh\nset -eu\n\n")
 	builder.WriteString("VPPCTL=${LY_ROUTE_VPPCTL:-vppctl}\n")
+	// Clear any previous readiness marker before proving the underlay.  A
+	// failed run must not leave a marker that lets the systemd unit report a
+	// half-installed proxy generation as ready.
+	builder.WriteString("rm -f /run/ly-route/proxy-policy-ready\n")
 	readinessTarget := serviceUnderlayInterface(underlay)
 	if dynamicUnderlay {
 		readinessTarget = underlay
@@ -1724,13 +1728,16 @@ func renderProxyServiceNetwork(plan proxy.LinuxPolicyRoutingPlan, natBehavior na
 		return nil, err
 	}
 	strictReadiness := fmt.Sprintf("if ! wait_vpp_underlay %s; then\n  echo \"VPP underlay %s is unavailable; retrying dependent policy routing\" >&2\n  exit 1\nfi\n", readinessTarget, readinessTarget)
-	optionalReadiness := fmt.Sprintf("if wait_vpp_underlay %s; then\n  proxy_underlay_ready=true\nelse\n  echo \"VPP proxy underlay %s unavailable; bypassing proxy service\" >&2\n  proxy_underlay_ready=false\nfi\n", readinessTarget, readinessTarget)
 	if !strings.Contains(readiness, strictReadiness) {
 		return nil, fmt.Errorf("proxy readiness block is missing")
 	}
-	readiness = strings.Replace(readiness, strictReadiness, optionalReadiness, 1)
+	// A selected proxy egress must never commit with its policy routing
+	// silently skipped.  The previous optional branch exited 0 after leaving
+	// the Linux egress table and the capture generation uninstalled, which made
+	// the apply report committed while LAN traffic fell through to the direct
+	// WAN path.  Fail instead so the transaction rolls back and systemd retries
+	// once the native underlay is ready.
 	builder.WriteString(readiness)
-	builder.WriteString("if [ \"$proxy_underlay_ready\" = true ]; then\n")
 	if dynamicUnderlay {
 		builder.WriteString(fmt.Sprintf("UNDERLAY_IF=$(resolve_underlay %s)\n", underlayPath))
 	}
@@ -1761,22 +1768,22 @@ func renderProxyServiceNetwork(plan proxy.LinuxPolicyRoutingPlan, natBehavior na
 	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface mtu packet %d %s\n", network.MTU, network.EgressVPPInterface))
 	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface ip address del %s %s 2>/dev/null || true\n", network.IngressVPPInterface, network.IngressCIDR))
 	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface ip address %s %s 2>/dev/null || true\n", network.IngressVPPInterface, network.IngressCIDR))
-	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip table add %d 2>/dev/null || true\n", network.OutboundTableID))
 	// VPP's delete form places `del` before the interface. Keeping address
 	// removal idempotent is essential while this script is retried during a
 	// runtime transaction.
 	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface ip address del %s %s 2>/dev/null || true\n", network.EgressVPPInterface, network.EgressCIDR))
-	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface ip table %s %d\n", network.EgressVPPInterface, network.OutboundTableID))
+	// NAT44-ED keys its inside session on the ingress FIB.  Moving the egress
+	// TAP into a private table makes the SYN translate but every later packet
+	// miss the session, so Xray cannot complete a TCP handshake with its node.
+	// Keep the TAP in the global FIB and prove the selected underlay route is
+	// still resolvable there; the Linux policy table below still forces Xray's
+	// marked sockets through this TAP.
+	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface ip table %s 0\n", network.EgressVPPInterface))
 	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface ip address %s %s 2>/dev/null || true\n", network.EgressVPPInterface, network.EgressCIDR))
-	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip route del table %d 0.0.0.0/0 2>/dev/null || true\n", network.OutboundTableID))
 	if dynamicUnderlay {
-		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip route add table %d 0.0.0.0/0 via \"$UNDERLAY_IF\"\n", network.OutboundTableID))
-		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" show ip fib table %d | grep -F \"$UNDERLAY_IF\" >/dev/null\n", network.OutboundTableID))
-	} else {
-		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip route add table %d 0.0.0.0/0 via %s\n", network.OutboundTableID, underlayPath))
-		if name := serviceUnderlayInterface(underlay); name != "" {
-			builder.WriteString(fmt.Sprintf("\"$VPPCTL\" show ip fib table %d | grep -F %s >/dev/null\n", network.OutboundTableID, name))
-		}
+		builder.WriteString("\"$VPPCTL\" show ip fib table 0 | grep -F \"$UNDERLAY_IF\" >/dev/null\n")
+	} else if name := serviceUnderlayInterface(underlay); name != "" {
+		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" show ip fib table 0 | grep -F %s >/dev/null\n", name))
 	}
 	// Proxy traffic enters VPP again from the Linux/Xray egress TAP. It must be
 	// the NAT inside interface for the selected WAN; otherwise the proxy node
@@ -1842,8 +1849,6 @@ func renderProxyServiceNetwork(plan proxy.LinuxPolicyRoutingPlan, natBehavior na
 	// reporting success with no TPROXY policy rules installed.
 	builder.WriteString("mkdir -p /run/ly-route\n")
 	builder.WriteString("printf 'ready\\n' > /run/ly-route/proxy-policy-ready\n")
-
-	builder.WriteString("else\n  rm -f /run/ly-route/proxy-policy-ready\n  echo \"proxy service bypassed because its WAN underlay is unavailable\" >&2\nfi\n")
 	return []RenderedArtifact{NewArtifact(LinuxRouting, "/var/lib/ly-route/policy-routing/apply.sh", builder.String(), "restart")}, nil
 }
 

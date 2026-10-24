@@ -178,7 +178,11 @@ func verifyProxySteeringReadback(steering proxy.VPPSteeringInstruction, results 
 		if err := requireSupplementalIdentity(results, "show interface address "+network.EgressVPPInterface, network.EgressVPPInterface); err != nil {
 			return err
 		}
-		if err := requireSupplementalIdentity(results, "show ip fib table "+strconv.Itoa(network.OutboundTableID), strconv.Itoa(network.OutboundTableID)); err != nil {
+		// The egress TAP deliberately remains in the global FIB; a private
+		// table breaks the NAT44-ED return session. Prove the global FIB is
+		// readable instead of accepting the table that made Xray's node dial
+		// fail.
+		if err := requireSupplementalIdentity(results, "show ip fib table 0", "ipv4-VRF:0"); err != nil {
 			return err
 		}
 		// The proxy egress is a NAT inside interface in full-cone (NAT44 EI)

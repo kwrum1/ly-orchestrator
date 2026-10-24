@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -382,6 +383,68 @@ func TestRuntimeHealthCheckUsesControllerStatus(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].Service != SmartDNS || !results[0].Available {
 		t.Fatalf("health = %#v", results)
+	}
+}
+
+func compiledProxyForRender(t *testing.T) proxy.CompiledEgress {
+	t.Helper()
+	compiled, err := proxy.CompileEgress(proxy.NewProxyEgress("proxy-render", "xray-tproxy-outbound"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proxy.BindServiceNetwork(&compiled, "100.77.0.1 lyroute-wan0", []string{"192.168.77.0/24"}, 1500); err != nil {
+		t.Fatal(err)
+	}
+	return compiled
+}
+
+func TestRenderProxyEgressNftablesCaptureContainsTPROXYRules(t *testing.T) {
+	compiled := compiledProxyForRender(t)
+	network := compiled.ServiceNetwork
+	nftables, err := RenderGatewayNftablesCapture(compiled.NftablesCapture, DNSInterceptionPlan{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nftables) != 1 {
+		t.Fatalf("nftables artifacts = %#v", nftables)
+	}
+	capture := nftables[0].Content
+	if strings.Count(capture, "tproxy ip to :"+fmt.Sprint(network.ListenerPort)) != 2 {
+		t.Fatalf("capture render is missing TCP/UDP TPROXY rules:\n%s", capture)
+	}
+	if !strings.Contains(capture, fmt.Sprintf("iifname %q", network.IngressHostInterface)) {
+		t.Fatalf("capture render is not scoped to the proxy ingress TAP %q:\n%s", network.IngressHostInterface, capture)
+	}
+	if _, _, _, err := expectedNftablesRules(capture); err != nil {
+		t.Fatalf("capture render is not a readable capture generation: %v", err)
+	}
+}
+
+func TestRenderProxyEgressLinuxPolicyRoutingContainsDefaultRoute(t *testing.T) {
+	compiled := compiledProxyForRender(t)
+	network := compiled.ServiceNetwork
+	routing, err := RenderLinuxPolicyRouting(compiled.LinuxPolicyRouting, nat.BehaviorEndpointDependent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := routing[0].Content
+	required := []string{
+		fmt.Sprintf("ip rule add fwmark 0x%x/0xffffffff table %d priority %d", network.OutboundMark, network.OutboundTableID, network.OutboundRulePriority),
+		fmt.Sprintf("ip route replace default via %s dev %s table %d", network.EgressVPPAddress, network.EgressHostInterface, network.OutboundTableID),
+		"wait_vpp_underlay",
+	}
+	for _, want := range required {
+		if !strings.Contains(script, want) {
+			t.Fatalf("linux policy routing missing %q:\n%s", want, script)
+		}
+	}
+	// The egress TAP must stay in the global FIB: a private VPP table breaks
+	// the NAT44 return session so Xray's node dial never completes.
+	if strings.Contains(script, "set interface ip table "+network.EgressVPPInterface+" "+fmt.Sprint(network.OutboundTableID)) {
+		t.Fatalf("egress TAP was moved into the private VPP table:\n%s", script)
+	}
+	if strings.Contains(script, "bypassing proxy service") {
+		t.Fatalf("proxy policy routing can still silently skip installation:\n%s", script)
 	}
 }
 
