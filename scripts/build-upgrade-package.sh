@@ -187,6 +187,13 @@ if [ "$product" = gateway ]; then
 fi
 firstboot_service="$package_root/etc/systemd/system/ly-route-firstboot.service"
 cp "$repo_root/packaging/rootfs-overlay/etc/systemd/system/ly-route-firstboot.service" "$firstboot_service"
+# The fail-closed helper is wired into xray through this drop-in. Shipping the
+# helper without the drop-in leaves an upgraded device fail-open, so both must
+# travel together and be covered by the checksums.
+xray_failclosed_dropin="$package_root/etc/systemd/system/xray.service.d/10-ly-route-proxy-fail-open.conf"
+mkdir -p "$(dirname "$xray_failclosed_dropin")"
+cp "$repo_root/packaging/rootfs-overlay/etc/systemd/system/xray.service.d/10-ly-route-proxy-fail-open.conf" \
+  "$xray_failclosed_dropin"
 awk -v profile='Environment=LY_ROUTE_PRODUCT_PROFILE=/etc/ly-route/product-manifest.json' \
     -v database="Environment=LY_ROUTE_DB_PATH=$PRODUCT_DATABASE_PATH" \
     -v config="Environment=LY_ROUTE_CONFIG_PATH=$PRODUCT_CONFIG_PATH" '
@@ -220,6 +227,12 @@ firstboot_service_hash=$(sha256sum "$firstboot_service" | cut -d' ' -f1)
 commercial_css_hash=$(sha256sum "$package_root/opt/ly-route/admin/commercial.css" | cut -d' ' -f1)
 profile_hash=$(sha256sum "$package_root/etc/ly-route/product-manifest.json" | cut -d' ' -f1)
 artifact_manifest_hash=$(sha256sum "$package_root/usr/share/ly-route/artifact-manifest.json" | cut -d' ' -f1)
+proxy_assets_hash=$(sha256sum \
+  "$package_root/usr/lib/ly-route/proxy-failopen" \
+  "$package_root/usr/lib/ly-route/proxy-failure" \
+  "$package_root/usr/share/ly-route/proxy-failure/index.html" \
+  "$package_root/etc/nginx/conf.d/ly-route-proxy-failure.conf" \
+  "$xray_failclosed_dropin" | sed "s#  $package_root/#  #")
 cat >"$package_root/checksums.sha256" <<EOF
 $control_hash  usr/lib/ly-route/ly-route-control
 $vpp_apply_hash  usr/lib/ly-route/vpp-apply
@@ -237,6 +250,7 @@ $firstboot_service_hash  etc/systemd/system/ly-route-firstboot.service
 $commercial_css_hash  opt/ly-route/admin/commercial.css
 $profile_hash  etc/ly-route/product-manifest.json
 $artifact_manifest_hash  usr/share/ly-route/artifact-manifest.json
+$proxy_assets_hash
 EOF
 if [ "$product" = gateway ]; then
   cat >>"$package_root/checksums.sha256" <<EOF
@@ -258,13 +272,15 @@ node - "$package_root/manifest.json" "$PRODUCT_BUILD_PROFILE" "$product" "$suite
   "$capabilities_hash" "$index_hash" "$shell_hash" "$styles_hash" "$nginx_hash" \
   "$service_hash" "$runtime_check_hash" "$firstboot_hash" "$firstboot_service_hash" \
   "$commercial_css_hash" "$profile_hash" "$artifact_manifest_hash" \
-  "$recover_runtime_hash" "$plugin_hash" "$helper_hash" "$vpp_plugin_rel" <<'NODE'
+  "$recover_runtime_hash" "$plugin_hash" "$helper_hash" "$vpp_plugin_rel" \
+  "$proxy_assets_hash" <<'NODE'
 const { readFileSync, writeFileSync } = require("node:fs");
 const [output, profilePath, product, suite, arch, commit, createdAt,
   controlHash, vppHash, appHash, capabilitiesHash, indexHash, shellHash, stylesHash,
   nginxHash, serviceHash, runtimeCheckHash, firstbootHash, firstbootServiceHash,
   commercialCSSHash, profileHash, artifactManifestHash,
-  recoverRuntimeHash, pluginHash, helperHash, pluginRelativePath] = process.argv.slice(2);
+  recoverRuntimeHash, pluginHash, helperHash, pluginRelativePath,
+  proxyAssets] = process.argv.slice(2);
 const profile = JSON.parse(readFileSync(profilePath, "utf8"));
 const checksums = {
   "usr/lib/ly-route/ly-route-control": controlHash,
@@ -284,6 +300,12 @@ const checksums = {
   "etc/ly-route/product-manifest.json": profileHash,
   "usr/share/ly-route/artifact-manifest.json": artifactManifestHash,
 };
+for (const line of String(proxyAssets || "").trim().split("\n")) {
+  const split = line.indexOf("  ");
+  if (split > 0) {
+    checksums[line.slice(split + 2).trim()] = line.slice(0, split).trim();
+  }
+}
 if (product === "gateway") {
   checksums[pluginRelativePath] = pluginHash;
   checksums["usr/lib/ly-route/ly-route-pppoe-plugin"] = helperHash;

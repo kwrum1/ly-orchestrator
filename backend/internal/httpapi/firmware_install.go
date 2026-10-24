@@ -101,6 +101,21 @@ fi
 if [ -e /usr/share/ly-route/artifact-manifest.json ]; then
   cp -a /usr/share/ly-route/artifact-manifest.json "$backup/artifact-manifest.json"
 fi
+# Proxy fail-closed assets: helper, failure-page actuator, page, vhost and the
+# xray drop-in that wires them. They are backed up individually so a failed
+# upgrade restores the exact previous fail-closed posture.
+for proxy_path in \
+  usr/lib/ly-route/proxy-failopen \
+  usr/lib/ly-route/proxy-failure \
+  etc/nginx/conf.d/ly-route-proxy-failure.conf \
+  etc/systemd/system/xray.service.d/10-ly-route-proxy-fail-open.conf; do
+  if [ -e "/$proxy_path" ]; then
+    cp -a "/$proxy_path" "$backup/proxy-$(printf '%s' "$proxy_path" | tr '/' '_')"
+  fi
+done
+if [ -e /usr/share/ly-route/proxy-failure ]; then
+  cp -a /usr/share/ly-route/proxy-failure "$backup/proxy-page"
+fi
 
 restore_backup() {
   echo "upgrade failed; restoring $backup" >&2
@@ -143,6 +158,24 @@ restore_backup() {
   if [ -e "$backup/artifact-manifest.json" ]; then
     install -D -m 0644 "$backup/artifact-manifest.json" /usr/share/ly-route/artifact-manifest.json
   fi
+  for proxy_path in \
+    usr/lib/ly-route/proxy-failopen \
+    usr/lib/ly-route/proxy-failure \
+    etc/nginx/conf.d/ly-route-proxy-failure.conf \
+    etc/systemd/system/xray.service.d/10-ly-route-proxy-fail-open.conf; do
+    proxy_backup="$backup/proxy-$(printf '%s' "$proxy_path" | tr '/' '_')"
+    if [ -e "$proxy_backup" ]; then
+      install -D -m 0755 "$proxy_backup" "/$proxy_path"
+    else
+      rm -f "/$proxy_path"
+    fi
+  done
+  if [ -e "$backup/proxy-page" ]; then
+    rm -rf /usr/share/ly-route/proxy-failure
+    cp -a "$backup/proxy-page" /usr/share/ly-route/proxy-failure
+  else
+    rm -rf /usr/share/ly-route/proxy-failure
+  fi
   # Stop the candidate before restoring files. If it is crash-looping, a
   # plain restart can hold the install open for minutes and keep spawning
   # failures. Bound the stop/start as well so restore itself stays fast.
@@ -169,11 +202,26 @@ install -m 0755 "$tmp/usr/lib/ly-route/ly-route-pppoe-plugin" "$target_dir/ly-ro
 if [ -f "$tmp/usr/lib/ly-route/recover-runtime.sh" ]; then
   install -m 0755 "$tmp/usr/lib/ly-route/recover-runtime.sh" "$target_dir/recover-runtime.sh"
 fi
-for runtime_script in runtime-check.sh firstboot.sh; do
+for runtime_script in runtime-check.sh firstboot.sh proxy-failopen proxy-failure; do
   if [ -f "$tmp/usr/lib/ly-route/$runtime_script" ]; then
     install -m 0755 "$tmp/usr/lib/ly-route/$runtime_script" "$target_dir/$runtime_script"
   fi
 done
+if [ -f "$tmp/etc/nginx/conf.d/ly-route-proxy-failure.conf" ]; then
+  install -D -m 0644 "$tmp/etc/nginx/conf.d/ly-route-proxy-failure.conf" \
+    /etc/nginx/conf.d/ly-route-proxy-failure.conf
+fi
+if [ -d "$tmp/usr/share/ly-route/proxy-failure" ]; then
+  rm -rf /usr/share/ly-route/proxy-failure.new
+  mkdir -p /usr/share/ly-route/proxy-failure.new
+  cp -a "$tmp/usr/share/ly-route/proxy-failure/." /usr/share/ly-route/proxy-failure.new/
+  rm -rf /usr/share/ly-route/proxy-failure
+  mv /usr/share/ly-route/proxy-failure.new /usr/share/ly-route/proxy-failure
+fi
+if [ -f "$tmp/etc/systemd/system/xray.service.d/10-ly-route-proxy-fail-open.conf" ]; then
+  install -D -m 0644 "$tmp/etc/systemd/system/xray.service.d/10-ly-route-proxy-fail-open.conf" \
+    /etc/systemd/system/xray.service.d/10-ly-route-proxy-fail-open.conf
+fi
 if [ "$target_dir" = "/usr/lib/ly-route" ] && [ -f "$tmp/etc/systemd/system/ly-route-firstboot.service" ]; then
   install -D -m 0644 "$tmp/etc/systemd/system/ly-route-firstboot.service" /etc/systemd/system/ly-route-firstboot.service
 fi

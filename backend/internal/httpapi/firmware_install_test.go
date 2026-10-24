@@ -23,3 +23,30 @@ func TestFirmwareUpgradeInstallerHasBackupRollbackAndDataplaneCheck(t *testing.T
 		t.Fatal("installer still forces an unconditional reboot")
 	}
 }
+
+// An upgrade must deliver the proxy fail-closed assets, not just the control
+// binary. A payload that ships the helper without installing it would leave
+// the device fail-open after flashing an otherwise valid upgrade package.
+func TestFirmwareUpgradeInstallsProxyFailClosedAssets(t *testing.T) {
+	script := firmwareUpgradeInstallScript
+	for _, required := range []string{
+		"usr/lib/ly-route/proxy-failopen",
+		"usr/lib/ly-route/proxy-failure",
+		"etc/nginx/conf.d/ly-route-proxy-failure.conf",
+		"etc/systemd/system/xray.service.d/10-ly-route-proxy-fail-open.conf",
+		"usr/share/ly-route/proxy-failure",
+		"proxy-failopen proxy-failure",
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("installer script does not install %q", required)
+		}
+	}
+	for _, restored := range []string{
+		`"$backup/proxy-$(printf '%s' "$proxy_path" | tr '/' '_')"`,
+		"$backup/proxy-page",
+	} {
+		if !strings.Contains(script, restored) {
+			t.Fatalf("installer rollback does not restore %q", restored)
+		}
+	}
+}
