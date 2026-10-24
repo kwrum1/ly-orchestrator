@@ -7075,24 +7075,38 @@ func (server *Server) applyLivePPPoEIPv6(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	waited := map[string]bool{}
 	for _, lan := range interfaces {
 		ipv6, _ := lan["ipv6"].(map[string]any)
 		wanID := stringField(ipv6, "source_wan_id")
 		if strings.ToLower(stringField(ipv6, "mode")) != "delegated_prefix" || wanID == "" {
 			continue
 		}
-		lanInterface := server.resolveInterfaceID(ctx, firstNonEmpty(stringField(lan, "interface_id"), stringField(lan, "id")))
-		if !strings.HasPrefix(lanInterface, "lyroute-") {
-			lanInterface = "lyroute-" + lanInterface
+		if waited[wanID] {
+			continue
 		}
-		if err := waitForPPPoEIPv6Convergence(ctx, wanID, lanInterface); err != nil {
+		waited[wanID] = true
+		// Reconcile the complete, deterministically ordered LAN list so every
+		// LAN index maps to the same sub-delegated /64 that dnsmasq and VPP
+		// programming use.
+		_, lanInterfaces, err := server.pppoeIPv6LANConfig(ctx, wanID)
+		if err != nil {
 			return err
+		}
+		for index := range lanInterfaces {
+			if err := waitForPPPoEIPv6Convergence(ctx, wanID, lanInterfaces, index); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-func waitForPPPoEIPv6Convergence(ctx context.Context, wanID, lanInterface string) error {
+func waitForPPPoEIPv6Convergence(ctx context.Context, wanID string, lanInterfaces []string, index int) error {
+	if index < 0 || index >= len(lanInterfaces) {
+		return fmt.Errorf("PPPoE LAN index %d is outside the configured LAN list", index)
+	}
+	lanInterface := lanInterfaces[index]
 	statusDir := strings.TrimSpace(os.Getenv("LY_ROUTE_PPPOE_STATUS_DIR"))
 	if statusDir == "" {
 		statusDir = "/run/ly-route/pppoe"
@@ -7114,24 +7128,28 @@ func waitForPPPoEIPv6Convergence(ctx context.Context, wanID, lanInterface string
 			if json.Unmarshal(content, &status) == nil && status.State == "connected" && status.Interface != "" && status.Session.IPv6Ready {
 				prefix, parseErr := netip.ParsePrefix(strings.TrimSpace(status.Session.DelegatedPrefix))
 				if parseErr == nil && prefix.Addr().Is6() && prefix.Bits() <= 64 {
-					lanPrefix := netip.PrefixFrom(prefix.Masked().Addr(), 64)
-					raw := lanPrefix.Addr().As16()
-					raw[15] = 1
-					lanAddress := netip.PrefixFrom(netip.AddrFrom16(raw), 64).String()
-					addresses, addressErr := runLiveVPP(ctx, "show", "interface", "address", lanInterface)
-					ra, raErr := runLiveVPP(ctx, "show", "ip6", "interface", lanInterface)
-					addressReady := addressErr == nil && strings.Contains(addresses, lanAddress)
-					raReady := raErr == nil && strings.Contains(ra, "prefix "+lanPrefix.Addr().String()+", length 64")
-					if addressReady && raReady {
-						return nil
+					lanPrefix, prefixErr := serviceRuntime.DelegatedLANPrefix(prefix.String(), index)
+					if prefixErr != nil {
+						lastReason = prefixErr.Error()
+					} else {
+						raw := lanPrefix.Addr().As16()
+						raw[15] = 1
+						lanAddress := netip.PrefixFrom(netip.AddrFrom16(raw), 64).String()
+						addresses, addressErr := runLiveVPP(ctx, "show", "interface", "address", lanInterface)
+						ra, raErr := runLiveVPP(ctx, "show", "ip6", "interface", lanInterface)
+						addressReady := addressErr == nil && strings.Contains(addresses, lanAddress)
+						raReady := raErr == nil && strings.Contains(ra, "prefix "+lanPrefix.Addr().String()+", length 64")
+						if addressReady && raReady {
+							return nil
+						}
+						lastReason = fmt.Sprintf("LAN address ready=%t, RA ready=%t", addressReady, raReady)
 					}
-					lastReason = fmt.Sprintf("LAN address ready=%t, RA ready=%t", addressReady, raReady)
 					if lastReconcile.IsZero() || time.Since(lastReconcile) >= time.Second {
 						lastReconcile = time.Now()
 						err := pppoeclient.ReconcileDelegatedPrefix(ctx, pppoeclient.VPPConfig{
 							Binary:            liveVPPBinary(),
 							IPv6PrefixGroup:   "ly-route-" + wanID,
-							IPv6LANInterfaces: []string{lanInterface},
+							IPv6LANInterfaces: lanInterfaces,
 						}, prefix.String())
 						if err != nil {
 							lastReason += "; reconciliation: " + err.Error()
