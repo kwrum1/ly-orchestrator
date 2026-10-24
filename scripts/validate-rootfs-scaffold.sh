@@ -228,6 +228,21 @@ if ! grep -q 'getty.target.wants/serial-getty@ttyS0.service' "$repo_root/scripts
   exit 1
 fi
 
+# Exactly one DNS owner: SmartDNS on :53, no resolved stub, and the SmartDNS
+# unit must not be blocked behind the control API.
+if ! grep -q 'DNSStubListener=no' "$repo_root/scripts/build-rootfs.sh"; then
+  echo "rootfs builder leaves the systemd-resolved stub enabled; it conflicts with SmartDNS" >&2
+  exit 1
+fi
+if grep -q 'After=ly-route-control-api.service' "$repo_root/packaging/rootfs-overlay/etc/systemd/system/smartdns.service.d/10-ly-route-vpp-lifecycle.conf"; then
+  echo "SmartDNS is ordered behind the control API and can miss the boot health window" >&2
+  exit 1
+fi
+if ! grep -q 'timeout 15 /usr/lib/ly-route/dns-ipset-sync.py --prepare' "$repo_root/packaging/rootfs-overlay/etc/systemd/system/smartdns.service.d/10-ly-route-vpp-lifecycle.conf"; then
+  echo "SmartDNS ipset preparation is not bounded" >&2
+  exit 1
+fi
+
 # A factory image must not bind SmartDNS to an address that only exists after
 # a LAN apply; that makes DNS fail on clean boot and locks firstboot behind it.
 if grep -q 'bind 192.168.88.1:53' "$repo_root/scripts/build-rootfs.sh"; then

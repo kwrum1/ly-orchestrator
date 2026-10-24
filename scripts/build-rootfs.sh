@@ -334,7 +334,9 @@ enable_units() {
   ln -sf /lib/systemd/system/serial-getty@.service \
     "$target/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service"
   ln -sf /lib/systemd/system/systemd-networkd.service "$wants/systemd-networkd.service"
-  ln -sf /lib/systemd/system/systemd-resolved.service "$wants/systemd-resolved.service"
+  if [ "$product" != gateway ]; then
+    ln -sf /lib/systemd/system/systemd-resolved.service "$wants/systemd-resolved.service"
+  fi
   ln -sf /etc/systemd/system/ly-route-runtime-check.service "$wants/ly-route-runtime-check.service"
   ln -sf /etc/systemd/system/ly-route-vpp-apply.service "$wants/ly-route-vpp-apply.service"
   ln -sf /etc/systemd/system/ly-route-vpp-session-enable.service "$wants/ly-route-vpp-session-enable.service"
@@ -475,8 +477,13 @@ printf 'ly-route\n' >"$rootfs/etc/hostname"
 mkdir -p "$rootfs/etc/systemd/resolved.conf.d"
 cat >"$rootfs/etc/systemd/resolved.conf.d/ly-route.conf" <<'EOF'
 [Resolve]
-DNSStubListener=yes
+# The gateway's DNS owner is SmartDNS on :53. A local resolved stub would
+# conflict with the wildcard bind and make DNS fail on clean boot.
+DNSStubListener=no
 EOF
+if [ "$product" = gateway ]; then
+  printf 'nameserver 127.0.0.1\nnameserver 223.5.5.5\noptions timeout:2 attempts:3\n'     >"$rootfs/etc/resolv.conf"
+fi
 
 for text_root in "$rootfs/etc" "$rootfs/usr/lib/systemd" "$rootfs/usr/lib/ly-route"; do
   [ ! -d "$text_root" ] || find "$text_root" -type f -exec sh -c '
