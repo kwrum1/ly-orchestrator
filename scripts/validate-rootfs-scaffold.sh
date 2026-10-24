@@ -216,6 +216,17 @@ if ! grep -q 'dnsmasq.service' "$repo_root/scripts/build-rootfs.sh"; then
   exit 1
 fi
 
+# A factory image must not bind SmartDNS to an address that only exists after
+# a LAN apply; that makes DNS fail on clean boot and locks firstboot behind it.
+if grep -q 'bind 192.168.88.1:53' "$repo_root/scripts/build-rootfs.sh"; then
+  echo "rootfs builder hard-codes the post-apply LAN address as the SmartDNS bind" >&2
+  exit 1
+fi
+if ! grep -q 'bind 0.0.0.0:53' "$repo_root/scripts/build-rootfs.sh"; then
+  echo "rootfs builder does not bind SmartDNS to a boot-safe wildcard address" >&2
+  exit 1
+fi
+
 if ! grep -q 'ly-route-runtime-check.service' "$repo_root/scripts/build-rootfs.sh"; then
   echo "runtime readiness service is not enabled by the rootfs builder" >&2
   exit 1
