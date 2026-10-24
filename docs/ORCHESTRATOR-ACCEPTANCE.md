@@ -1,0 +1,393 @@
+# Orchestrator transparent acceptance on ESXi (AF_PACKET mode)
+
+Run `20261024T1530Z-orch-af`. This is a functional and UI acceptance of the
+**Orchestrator product** only; Gateway results are never substituted for it.
+The data path runs in the product's explicit **AF_PACKET acceptance mode**
+(`hook=af_packet`, `mode=linux_packet_socket`, `acceptance_only=true`,
+`high_performance=false`). Nothing here is a line-rate, 1G or 10G claim.
+
+## Verdict
+
+| Requirement | Result | Evidence |
+|---|---|---|
+| VPP drives both data NICs in AF_PACKET mode | **PASS** | `vpp-and-host.txt`, `api-*`, capability proof |
+| `POST /api/v1/runtime/apply` commits | **PASS** (`committed` / `running`) | `api-runtime-apply.json` |
+| `/api/v1/runtime/status` committed with non-empty generation, vpp + persistence running/available | **PASS** | `api-runtime-status.json` |
+| Transparent generation visible in VPP | **PASS** | `show ly-route orchestrator` in `vpp-and-host.txt` |
+| Survives control-api restart | **PASS** (same generation) | `persist-status-after-api.json`, `persist-vpp-after-api-restart.txt` |
+| Survives VPP restart | **PASS** (auto-recovered in ~2 s) | `persist-vpp-after-restart.txt`, `persist-ping-after-vpp-restart.txt` |
+| Bidirectional reachability across the transparent path | **PASS** (ICMP 5/5 both ways) | `fn-icmp.txt` |
+| Policy positive case | **PASS** (TCP 8080 HTTP 200) | `fn-tcp-8080.txt` |
+| Policy negative case | **PASS** (TCP 9000 dropped while a listener is up; rule counter increments) | `fn-tcp-9000.txt`, `fn-vpp-after.txt` |
+| Reverse-direction TCP | **PASS** (WAN client → LAN server 8082, HTTP 200) | `fn-reverse-8082.txt` |
+| UI: 11 pages in real Chromium | **PASS** 11/11 | `ui/result.json`, `ui/*.png` |
+| UI console: no raw 404s | **PASS** (0 × 404; one expected pre-auth 401 session probe) | `ui/result.json` |
+| `go build ./...` | **PASS** | `regression-tests.txt` |
+| Targeted orchestrator tests | **PASS** | `regression-tests.txt` |
+| Product code changes needed | **none** | this branch adds docs + the acceptance harness only |
+
+Pre-existing, unrelated failures in the shared `internal/runtime/vpp` package
+(16 gateway-path tests, stale command-string expectations) are recorded in
+`regression-tests.txt`; see [Regression](#regression) for the exact list and why
+they are not part of this acceptance.
+
+## 1. What was tested
+
+The Orchestrator is an inline (bump-in-the-wire) transparent policy node: two
+data ports are the WAN/LAN boundary and the VPP plugin `ly-route-orchestrator`
+forwards frames between them, evaluating ordered IP/port policy in the
+client-to-server orientation (`runtime/vpp-orchestrator/.../node.c`).
+
+```
+   netns "lan"  10.99.0.3/24                         netns "wan"  10.99.0.2/24
+   (peer VM)  ── ens256 ── [ lyacc-orch-b-pg ] ── ens256 ─┐
+                                                          │ lyacc-orch-e2c16ef
+                                                          │  VPP AF_PACKET
+   (peer VM)  ── ens224 ── [ lyacc-orch-pg  ] ── ens224 ─┘  (generation fd3afd6b…)
+```
+
+The peer is a real VM (`lyacc-orch-peer`, 10.1.18.204) with two network
+namespaces, one per isolated data leg. Every frame crosses a vSwitch and the
+VPP data plane; nothing is generated inside the appliance.
+
+## 2. Environment and fixtures
+
+| Item | Value |
+|---|---|
+| vCenter / host | `https://10.1.18.110` / `10.1.18.121` |
+| Orchestrator VM | `lyacc-orch-e2c16ef`, datastore `data (1)`, 4 vCPU / 4 GB |
+| Management | `10.1.18.203/24` on `ens192` (00:50:56:aa:bb:31) |
+| Data NICs | `ens224` 00:50:56:aa:bb:32 (`lyacc-orch-pg`, WAN) and `ens256` 00:50:56:aa:bb:33 (`lyacc-orch-b-pg`, LAN) |
+| Product image | `/root/work/dist-orchestrator-e2c16ef/…` (tag `orchestrator-rc-e2c16ef`) |
+| Backend source | `feat/orchestrator-backend` @ `e2c16ef` (product mainline) |
+| Binary | `/usr/lib/ly-route/ly-route-control` sha256 `fcd8ee51f4e2d3e49993b65eb09bb4438f2d88e35966a6d62c288ee43dd5b0db` |
+| UI bundle | commit `08af368`, `app.js` sha256 `0787685e8117c87e2e87a932c5e2f54e389ba668621c92bff65af00466199d35` |
+| Peer VM | `lyacc-orch-peer` on `data (1)`, Debian 12 cloud image, 3 vmxnet3 NICs |
+| Data legs | `lyacc-orch-pg` and `lyacc-orch-b-pg`, both isolated vSwitches without uplinks |
+
+### Lab changes made for this acceptance (additive, reversible)
+
+1. Orchestrator VM: one extra vmxnet3 NIC (`00:50:56:aa:bb:33`) on the new
+   `lyacc-orch-b-pg`. The VM shipped with a single data NIC; the transparent
+   profile requires two distinct boundary ports.
+2. Host `10.1.18.121`: new isolated vSwitch `lyacc-orch-b` and port group
+   `lyacc-orch-b-pg` (no uplink, permissive security policy). No existing
+   switch, port group or VM was modified.
+3. New disposable peer VM `lyacc-orch-peer` (10.1.18.204) on `data (1)`.
+4. Orchestrator VM `/etc/ly-route/runtime.env`: the two AF_PACKET acceptance
+   lines below (backup kept as `/root/runtime.env.bak-*`).
+5. Orchestrator control DB: the `auth_users.admin` hash row was reset to a
+   freshly generated lab password (`/root/work/esxi-acceptance/.secrets/orch-admin.pass`,
+   root-only) because the previous credential was not recorded. This is a lab
+   recovery step, not a product change.
+
+Not touched: `palog`, `DNS-8`/`dns8`, `vCLS`, any cluster-control VM, and the
+Gateway acceptance VMs (`lyacc-gw-*`, `lyacc-lan-client`, `lyacc-wan-peer`).
+No shared infrastructure was rebooted.
+
+## 3. AF_PACKET bring-up
+
+The exact switch is the one the product code reads (not a guess):
+
+- `packaging/rootfs-overlay/usr/lib/ly-route/runtime-check.sh` probes a
+  temporary AF_PACKET host-interface only when
+  `LY_ROUTE_VMXNET3_AF_PACKET_ACCEPTANCE=true` and the driver is `vmxnet3`,
+  and records `acceptance_only=true`, `high_performance=false`.
+- `backend/internal/runtime/vpp/selection.go` (`LoadNativePathRequest`) reads
+  the same variable and `acceptanceAFPacketProof()` accepts the proof only when
+  that flag is set, the proof is acceptance-only, and the driver is
+  `vmxnet3`/`e1000`.
+- Both the probe service and the control API consume `/etc/ly-route/runtime.env`.
+
+Applied on the appliance:
+
+```
+LY_ROUTE_VMXNET3_AF_PACKET_ACCEPTANCE=true
+LY_ROUTE_VPP_DATA_INTERFACES=ens224,ens256
+# already present in /etc/ly-route/control-api.env:
+LY_ROUTE_MANAGEMENT_INTERFACE=ens192
+```
+
+```bash
+systemctl restart ly-route-runtime-check.service
+systemctl restart ly-route-control-api.service
+```
+
+Capability proof (`/var/lib/ly-route/vpp-native-capabilities.json`):
+
+```json
+{"management_interface":"ens192","proofs":[
+ {"linux_interface":"ens224","candidates":[{"tier":"vpp_native","hook":"af_packet",
+  "mode":"linux_packet_socket","runtime_verified":true,"native":true,
+  "high_performance":false,"acceptance_only":true,"kernel_driver":"vmxnet3",
+  "mac_address":"00:50:56:aa:bb:32"}]},
+ {"linux_interface":"ens256","candidates":[{"tier":"vpp_native","hook":"af_packet",
+  "mode":"linux_packet_socket","runtime_verified":true,"native":true,
+  "high_performance":false,"acceptance_only":true,"kernel_driver":"vmxnet3",
+  "mac_address":"00:50:56:aa:bb:33"}]}]}
+```
+
+Before the topology was committed VPP had only `local0` and
+`show ly-route orchestrator` was `state locked` (`baseline-vpp.txt`,
+`baseline-journal.txt`): the earlier `degraded` status was honest.
+
+After the topology PUT the VPP data plane owned both NICs:
+
+```
+$ vppctl show interface
+lyroute-ens224   1  up  9000/0/0/0
+lyroute-ens256   2  up  9000/0/0/0
+
+$ vppctl show hardware-interfaces lyroute-ens256
+  Ethernet address 00:50:56:aa:bb:33
+  Linux PACKET socket interface v3
+  Link speed: unknown
+```
+
+`lyroute-<linux-if>` is created by `DataplaneAttachOperation`
+(`backend/internal/runtime/vpp/adapter.go`) with `?create host-interface name
+<linux-if> cksum-gso-disable`, renamed, given the physical MAC and brought up.
+The tolerant `?` prefix makes the attach idempotent across repeated applies and
+startup reconcile.
+
+## 4. Configuration through the public API
+
+The Orchestrator profile is single-site: its target model is exactly
+`PUT /api/v1/orchestrator/topology` (management interface, the logical LAN/WAN
+interface pair and optional orchestration groups) plus
+`PUT /api/v1/orchestrator/policy`; there are no separate site or network
+resources to create. No files were edited to create the topology. Sequence
+(admin session cookie):
+
+```bash
+curl -sk -c cookies -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<lab>"}' https://10.1.18.203/api/v1/auth/login
+
+curl -sk -b cookies -X PUT -H 'Content-Type: application/json' -d @topology.json \
+  https://10.1.18.203/api/v1/orchestrator/topology
+# 200 {"checksum":"bf358a50…"}
+
+curl -sk -b cookies -X PUT -H 'Content-Type: application/json' -d @policy.json \
+  https://10.1.18.203/api/v1/orchestrator/policy
+# 200 {"checksum":"ef06f111…"}
+```
+
+`topology.json`:
+
+```json
+{"schema_version":1,"management_interface":"ens192",
+ "interfaces":[{"name":"wan0","role":"wan","port":"ens224"},
+               {"name":"lan0","role":"lan","port":"ens256"}],
+ "orchestration_groups":[]}
+```
+
+`policy.json` (client = LAN, server = WAN; drop TCP/9000 to the server):
+
+```json
+{"schema_version":1,
+ "ip_objects":[{"id":"wan_server","prefixes":["10.99.0.2/32"]}],
+ "policy_groups":[{"id":"g1","position":10,"rules":[
+   {"id":"drop-9000","sequence":10,
+    "match":{"sources":["any"],"destinations":["wan_server"],"protocol":"tcp",
+             "destination_ports":[{"start":9000,"end":9000}]},
+    "action":{"kind":"drop"}}]}],
+ "default":{"kind":"direct"}}
+```
+
+The control-plane compiler agrees with the intent before it is programmed:
+
+```
+port 8080 -> lan []
+port 9000 -> drop [{'policy_group': 'g1', 'rule_id': 'drop-9000', 'sequence': 10, 'action': 'drop'}]
+```
+
+Runtime apply and status:
+
+```json
+POST /api/v1/runtime/apply -> {"status":"committed","runtime_state":"running",
+  "transaction_id":"runtime-ff564e771c6fc35d944737daa2142160"}
+
+GET /api/v1/runtime/status -> {"status":"running",
+  "components":[
+    {"name":"vpp","state":"running","available":true,
+     "reason":"transparent VPP generation fd3afd6b… verified"},
+    {"name":"persistence","state":"running","available":true,
+     "reason":"persisted topology and policy are available"}],
+  "last_apply":{"status":"committed","runtime_state":"running"}}
+```
+
+`GET /api/v1/health` → `{"status":"ok", … "vpp":"available","persistence":"available"}`.
+
+## 5. Generation proof and restart persistence
+
+```bash
+$ vppctl show ly-route orchestrator
+state running
+generation fd3afd6b162faed4fe22188ab88cf55295ef096e4c742dad35d7bee9441b28e0
+boundary wan lyroute-ens224 lan lyroute-ens256
+default direct
+policy drop-9000 group-position 10 sequence 10 action drop packets 3 bytes 222
+```
+
+The generation is the SHA-256 of the persisted topology + policy, so a
+re-apply of unchanged state reproduces the same value (verified on every
+restart below).
+
+**control-api restart** (`systemctl restart ly-route-control-api`):
+`reconcileTransparentStartup` re-applies the persisted state; the process
+serves again with `transaction_id=orchestrator-startup`, the **same**
+generation, `status=committed`, and the datapath still forwards
+(`persist-ping-after-api-restart.txt`).
+
+**VPP restart** (`systemctl restart vpp`): VPP comes back with
+`state locked`; `runTransparentRecovery` (2 s interval) re-attaches the
+AF_PACKET interfaces and re-commits in **~2 s**, with the same generation.
+ICMP across the path works immediately afterwards
+(`persist-vpp-after-restart.txt`, `persist-ping-after-vpp-restart.txt`).
+
+## 6. Functional results
+
+Peer: `netns lan` = 10.99.0.3/24 (client), `netns wan` = 10.99.0.2/24 (server),
+plus a reverse listener on 10.99.0.3:8082.
+
+| Check | Command (peer) | Result |
+|---|---|---|
+| ICMP LAN→WAN | `ip netns exec lan ping -c 5 10.99.0.2` | 5/5, RTT 8.8–14.8 ms |
+| ICMP WAN→LAN | `ip netns exec wan ping -c 5 10.99.0.3` | 5/5, RTT 9.3–15.5 ms |
+| Positive: TCP/8080 | `ip netns exec lan curl http://10.99.0.2:8080/blob.bin` | HTTP 200, 960 024 B in 20 s (curl deadline) |
+| Negative: TCP/9000 | `ip netns exec lan curl -m 6 http://10.99.0.2:9000/index.html` | timeout (`rc=28`), listener was up |
+| Reverse TCP | `ip netns exec wan curl http://10.99.0.3:8082/index.html` | HTTP 200 |
+| Informational throughput | 2 MiB download over the path | 2 097 152 B / 37.55 s = **55 852 B/s ≈ 0.45 Mbit/s** |
+
+The negative case is a policy drop, not a closed port: the peer had
+`10.99.0.2:9000` listening (`fn-listeners.txt`), the client timed out rather
+than receiving a reset, and VPP recorded the match:
+
+```
+policy drop-9000 group-position 10 sequence 10 action drop packets 3 bytes 222
+ly-route-orchestrator  packets dropped by orchestration policy  12
+```
+
+Interface counters moved on both legs (`fn-vpp-after.txt`): `lyroute-ens224`
+rx 2102 / tx 2345, `lyroute-ens256` rx 2348 / tx 2099 during the run.
+
+**Policy orientation (important):** rules are canonicalised to the
+client→server direction, where **LAN ingress is the request direction**
+(`node.c`: WAN ingress is the return tuple and is reversed before matching).
+A deployment whose clients sit on the WAN side must express rules with
+source/destination mirrored. This acceptance proves the supported orientation.
+
+## 7. UI acceptance
+
+Served bundle `08af368` (`app.js` sha256 `0787685e…`) on `https://10.1.18.203`,
+real Chromium (headless, HTTPS errors ignored only for the lab certificate),
+authenticated as `admin`, sidebar navigation per page, 3 s settle, full-page
+screenshot, console + response capture.
+
+| # | Page | Path | H1 | Result |
+|---|---|---|---|---|
+| 1 | 单机总览 | `/` | 单机总览 | PASS |
+| 2 | 单机拓扑 | `/topology` | 单机拓扑 | PASS |
+| 3 | 编排组 | `/groups` | 编排组 | PASS |
+| 4 | 流量编排 | `/policy` | 流量编排 | PASS |
+| 5 | 透明编排 | `/transparent` | 透明编排 | PASS |
+| 6 | 遥测 | `/telemetry` | 遥测 | PASS |
+| 7 | 运行态 | `/runtime` | 运行态 | PASS |
+| 8 | 配置与快照 | `/config` | 配置与快照 | PASS |
+| 9 | 升级 / 回滚 | `/upgrades` | 升级 / 回滚 | PASS |
+| 10 | 产品转换 | `/conversions` | 产品转换 | PASS |
+| 11 | 用户管理 | `/system/users` | 用户管理 | PASS |
+
+Console / network (machine-readable in `ui/result.json`):
+
+- **0 × HTTP 404** and no page shows raw 404/`Not Found` text.
+- 1 × console error: `GET /api/v1/auth/session → 401` **before** login. That is
+  the session probe returning the correct "unauthenticated" semantic; it is not
+  a page error and disappears after login.
+- **No gateway-only endpoint is requested at all.** The sweep issued 19
+  `/api/v1/...` calls, all product/orchestrator-scoped
+  (`/product`, `/health`, `/runtime/status`, `/orchestrator/{topology,policy,
+  conversions,upgrades,operations/current}`, `/telemetry/*`, `/interfaces`,
+  `/management/network`, `/dashboard/summary`, `/config/snapshots`,
+  `/auth/*`). `/dhcp/*`, `/dns/*` and `/firmware/update/*` are never called by
+  the Orchestrator profile, so the DHCP/DNS/firmware panels are hidden rather
+  than broken.
+- The runtime page shows `vpp: 运行中` and `persistence: 运行中` with generation
+  `fd3afd6b…`; the overview shows LAN `ens256`, WAN `ens224`, 1 policy group /
+  1 rule and the applied generation.
+
+The earlier acceptance note ("UI console 404s") was **not reproducible** with
+the currently served bundle: those resources are not referenced by any page
+query in this profile.
+
+## 8. Regression
+
+On `feat/orch-acceptance` (base `e2c16ef`, no product code changed):
+
+```
+cd backend && go build ./...                 -> BUILD_OK
+go test ./internal/orchestrator/... ./internal/orchestratorapi/... ./orchestrator/...
+                                             -> ok (4 packages)
+go test ./internal/runtime/vpp/ -run 'TransparentOrchestrator|TransparentBond|…'
+                                             -> 12/12 PASS
+go test ./internal/httpapi/ -run Orchestrator -> 62 PASS / 0 FAIL (incl. subtests)
+```
+
+Known baseline noise, **not introduced here and not fixed here**: the shared
+`internal/runtime/vpp` package has 16 failing gateway-path tests at `e2c16ef`
+(e.g. `TestBuildOperationsIncludesRoutePolicyAndSecurityACL`,
+`TestRoutePolicyCatchAllPreservesLocalLAN`,
+`TestBuildOperationsAddsGatewayDNSTransparentInterception`). Sampled output
+shows stale expectations: the tests still assert the legacy
+`ip route add table …` command text while the compiler emits
+`?ip route add <prefix> table …`. They belong to the Gateway route/NAT/ACL
+compiler and do not touch the transparent orchestrator. The full list and
+output are in `evidence/…/regression-tests.txt`.
+
+## 9. Findings and limitations
+
+1. **Policy orientation is LAN→WAN.** See §6. A WAN-side client cannot express
+   `destination_ports` directly; it must mirror the rule. Documented, not
+   changed (changing it would be a product semantics change).
+2. **AF_PACKET is slow.** ~0.45 Mbit/s and ~12 ms RTT in this lab. The product
+   itself marks the path `acceptance_only=true`, `high_performance=false`.
+   No performance claim is made beyond the labelled informational number.
+3. **`af-packet-input` "timed out block" errors** appear continuously in this
+   mode; they are the expected interrupt-mode artefact and do not indicate
+   packet loss (counters and traffic agree).
+4. **Idempotent attach matters.** Repeated `PUT` (topology then policy),
+   control-api restart and VPP restart all re-run the attach; the tolerant
+   `?create host-interface` / `?set interface name` commands make this safe.
+5. **UI wording:** the overview states the transparent mode is an "L3 service
+   chain, not L2 bridging". The proven data path forwards frames between the
+   two boundary ports (L2 cross-connect) and matches on IP/port policy. Worth a
+   copy review, not an acceptance blocker.
+6. **Not exercised:** orchestration-group hops (`via`) — they need a second
+   data-port pair; IPv6 policy path; upgrade/rollback of the transparent
+   generation; host reboot.
+7. The appliance clock lags the control host by ~2 minutes; all timestamps in
+   this document are UTC from the control host, product timestamps come from
+   the appliance.
+
+## 10. Reproduce
+
+```bash
+export ORCH_HOST=10.1.18.203 ORCH_SSH=root@10.1.18.203
+export PEER_SSH=root@10.1.18.204
+export SSH_KEY=/root/work/esxi-acceptance/.secrets/acc_ed25519
+export ORCH_PASS_FILE=/root/work/esxi-acceptance/.secrets/orch-admin.pass
+scripts/acceptance/orchestrator-esxi/datapath-test.sh
+scripts/acceptance/orchestrator-esxi/restart-persistence-test.sh
+ORCH_BASE=https://10.1.18.203 ORCH_OUT=./ui \
+  node scripts/acceptance/orchestrator-esxi/ui-sweep.mjs
+```
+
+The scripts assume the fixture in §2 (two isolated legs, peer in two
+namespaces) and do not create or destroy VMs.
+
+## Evidence
+
+`/root/work/orch-acceptance/evidence/20261024T1530Z-orch-af/` — see its
+`README.md` for the file index, `summary.json` for the machine-readable
+verdict, `ui/result.json` + 11 screenshots for the UI, and
+`regression-tests.txt` for the build/test transcript.
