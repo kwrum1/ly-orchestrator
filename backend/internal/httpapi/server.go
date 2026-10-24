@@ -173,9 +173,8 @@ type Server struct {
 	trafficTrend                  TrafficTrendCollector
 	gatewayTelemetry              GatewayTelemetryCollector
 	gatewayState                  *gatewayTelemetryState
-	smartQoSObserver              SmartQoSRuntimeObserver
 	securityGuardObserver         SecurityGuardRuntimeObserver
-	requireSmartQoS               bool
+	capabilityProber              *vpp.CapabilityProber
 	runtimeMu                     sync.Mutex
 	runtimeApplyMu                sync.Mutex
 	configApplyAsyncMu            sync.Mutex
@@ -243,7 +242,13 @@ type RuntimePlan struct {
 	Warnings           []string                           `json:"warnings,omitempty"`
 	DataplaneState     string                             `json:"dataplane_state"`
 	DataplaneProof     []vpp.PrerequisiteResult           `json:"dataplane_prerequisites,omitempty"`
-	GatewayPlan        vpp.Plan                           `json:"-"`
+	// DataplaneDegradations lists optional features that are unavailable while
+	// the dataplane keeps forwarding (arch-v1: retired Smart QoS).
+	DataplaneDegradations []vpp.Degradation `json:"dataplane_degradations,omitempty"`
+	// CapabilitySource reports where the observed dataplane capability came
+	// from: runtime_probe, cached_report, committed_state or unavailable.
+	CapabilitySource string   `json:"capability_source,omitempty"`
+	GatewayPlan      vpp.Plan `json:"-"`
 }
 
 type RuntimeArtifactSummary struct {
@@ -380,11 +385,11 @@ func WithGatewayTransaction(transaction apply.GatewayTransactionRunner) Option {
 	return func(server *Server) { server.gatewayTransaction = transaction }
 }
 
-func WithSmartQoSRuntime(observer SmartQoSRuntimeObserver, required bool) Option {
-	return func(server *Server) {
-		server.smartQoSObserver = observer
-		server.requireSmartQoS = required
-	}
+// WithCapabilityProber installs the active dataplane capability prober used by
+// plan building and apply. Without it the control plane falls back to the last
+// observed report and reports a degradation instead of locking the dataplane.
+func WithCapabilityProber(prober *vpp.CapabilityProber) Option {
+	return func(server *Server) { server.capabilityProber = prober }
 }
 
 func WithSecurityGuardRuntime(observer SecurityGuardRuntimeObserver) Option {
@@ -3788,7 +3793,7 @@ func (server *Server) runtimeAddressAssignments(ctx context.Context) ([]vpp.Addr
 			continue
 		}
 		role := stringField(item, "gateway_role")
-		assignments = append(assignments, vpp.AddressAssignment{ID: nonEmpty(stringField(item, "id"), linuxInterface), LinuxInterface: linuxInterface, VPPInterface: vppInterfaceName(linuxInterface), CIDR: parsedCIDR, Role: role, BandwidthKbps: smartQoSBandwidthKbps(item, role)})
+		assignments = append(assignments, vpp.AddressAssignment{ID: nonEmpty(stringField(item, "id"), linuxInterface), LinuxInterface: linuxInterface, VPPInterface: vppInterfaceName(linuxInterface), CIDR: parsedCIDR, Role: role})
 	}
 	for _, item := range wanItems {
 		if truthy(item["deleted"]) || wanDesiredIPv4Mode(item) == "dhcp4" {
@@ -3810,10 +3815,10 @@ func (server *Server) runtimeAddressAssignments(ctx context.Context) ([]vpp.Addr
 			removeStaticCIDRs[linuxInterface] = appendUniqueString(removeStaticCIDRs[linuxInterface], parsedCIDR)
 			continue
 		}
-		assignments = append(assignments, vpp.AddressAssignment{ID: nonEmpty(stringField(item, "id"), linuxInterface), LinuxInterface: linuxInterface, VPPInterface: vppInterfaceName(linuxInterface), CIDR: parsedCIDR, Role: "wan", BandwidthKbps: smartQoSBandwidthKbps(item, "wan")})
+		assignments = append(assignments, vpp.AddressAssignment{ID: nonEmpty(stringField(item, "id"), linuxInterface), LinuxInterface: linuxInterface, VPPInterface: vppInterfaceName(linuxInterface), CIDR: parsedCIDR, Role: "wan"})
 	}
 	for linuxInterface, item := range dhcpWANs {
-		assignments = append(assignments, vpp.AddressAssignment{ID: nonEmpty(stringField(item, "id"), linuxInterface), LinuxInterface: linuxInterface, VPPInterface: vppInterfaceName(linuxInterface), Mode: "dhcp4", RemoveCIDRs: removeStaticCIDRs[linuxInterface], Role: "wan", BandwidthKbps: smartQoSBandwidthKbps(item, "wan")})
+		assignments = append(assignments, vpp.AddressAssignment{ID: nonEmpty(stringField(item, "id"), linuxInterface), LinuxInterface: linuxInterface, VPPInterface: vppInterfaceName(linuxInterface), Mode: "dhcp4", RemoveCIDRs: removeStaticCIDRs[linuxInterface], Role: "wan"})
 	}
 	if server.managementNetworkShared(ctx) {
 		management := server.managementNetworkState(ctx, false)
@@ -3833,98 +3838,6 @@ func (server *Server) runtimeAddressAssignments(ctx context.Context) ([]vpp.Addr
 				}
 			}
 		}
-	}
-	return assignments, nil
-}
-
-// runtimeSmartQoSAssignments maps the user-facing WAN upload/download limits to
-// the physical VPP egress interfaces. PPPoE has no WAN address assignment of its
-// own, but its encapsulated packets still leave through the underlay interface.
-// The aggregate WAN download rate is shaped on the logical LAN egress.
-func (server *Server) runtimeSmartQoSAssignments(ctx context.Context, addressAssignments []vpp.AddressAssignment, proxyEgress proxy.Egress, hasProxyEgress bool) ([]vpp.AddressAssignment, error) {
-	wanItems, err := server.desiredItems(ctx, "wan_link")
-	if err != nil {
-		return nil, err
-	}
-
-	wanOrder := make([]string, 0, len(addressAssignments)+len(wanItems))
-	wanAssignments := map[string]vpp.AddressAssignment{}
-	wanInterfaceByID := map[string]string{}
-	downloadByWAN := map[string]uint64{}
-	for _, assignment := range addressAssignments {
-		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "wan") || strings.TrimSpace(assignment.LinuxInterface) == "" {
-			continue
-		}
-		if _, exists := wanAssignments[assignment.LinuxInterface]; !exists {
-			wanOrder = append(wanOrder, assignment.LinuxInterface)
-		}
-		wanAssignments[assignment.LinuxInterface] = assignment
-	}
-	for _, item := range wanItems {
-		if truthy(item["deleted"]) {
-			continue
-		}
-		if enabled, present := item["enabled"]; present && !truthy(enabled) {
-			continue
-		}
-		linuxInterface := server.resolveInterfaceID(ctx, firstNonEmpty(stringField(item, "interface_id"), stringField(item, "id"), stringField(item, "name")))
-		if linuxInterface == "" || (!server.managementNetworkShared(ctx) && linuxInterface == server.managementInterfaceID(ctx)) || !vppInterfaceNameSafe(linuxInterface) {
-			continue
-		}
-		if _, exists := wanAssignments[linuxInterface]; !exists {
-			wanOrder = append(wanOrder, linuxInterface)
-		}
-		uploadKbps := smartQoSBandwidthKbps(item, "wan")
-		if wanID := firstStringField(item, "id", "name"); wanID != "" {
-			wanInterfaceByID[wanID] = linuxInterface
-		}
-		downloadByWAN[linuxInterface] = smartQoSBandwidthKbps(item, "lan")
-		wanAssignments[linuxInterface] = vpp.AddressAssignment{
-			ID: nonEmpty(stringField(item, "id"), linuxInterface), LinuxInterface: linuxInterface,
-			VPPInterface: vppInterfaceName(linuxInterface), Role: "wan", BandwidthKbps: uploadKbps,
-		}
-	}
-	if hasProxyEgress {
-		underlayWANIDs, resolveErr := server.proxyUnderlayWANIDs(ctx, proxyEgress)
-		if resolveErr != nil {
-			return nil, resolveErr
-		}
-		for _, wanID := range underlayWANIDs {
-			linuxInterface := wanInterfaceByID[wanID]
-			if linuxInterface == "" {
-				return nil, fmt.Errorf("proxy egress %q underlay WAN %q has no eligible physical VPP interface", proxyEgress.ID, wanID)
-			}
-			if _, exists := wanAssignments[linuxInterface]; !exists {
-				return nil, fmt.Errorf("proxy egress %q underlay WAN %q is not covered by smart QoS", proxyEgress.ID, wanID)
-			}
-		}
-	}
-
-	var aggregateDownloadKbps uint64
-	for _, downloadKbps := range downloadByWAN {
-		if ^uint64(0)-aggregateDownloadKbps < downloadKbps {
-			return nil, fmt.Errorf("aggregate WAN download bandwidth overflows")
-		}
-		aggregateDownloadKbps += downloadKbps
-	}
-
-	assignments := make([]vpp.AddressAssignment, 0, len(addressAssignments)+len(wanOrder))
-	seenLAN := map[string]struct{}{}
-	for _, assignment := range addressAssignments {
-		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
-			continue
-		}
-		if _, duplicate := seenLAN[assignment.VPPInterface]; duplicate {
-			continue
-		}
-		seenLAN[assignment.VPPInterface] = struct{}{}
-		if aggregateDownloadKbps > 0 {
-			assignment.BandwidthKbps = aggregateDownloadKbps
-		}
-		assignments = append(assignments, assignment)
-	}
-	for _, linuxInterface := range wanOrder {
-		assignments = append(assignments, wanAssignments[linuxInterface])
 	}
 	return assignments, nil
 }
@@ -3967,22 +3880,6 @@ func (server *Server) proxyUnderlayWANIDs(ctx context.Context, egress proxy.Egre
 		return members, nil
 	}
 	return nil, fmt.Errorf("proxy egress %q references unknown underlay WAN %q", egress.ID, underlayID)
-}
-
-func smartQoSBandwidthKbps(item map[string]any, role string) uint64 {
-	keys := []string{"smart_qos_bandwidth_kbps", "bandwidth_kbps"}
-	if strings.EqualFold(strings.TrimSpace(role), "lan") {
-		keys = append([]string{"smart_qos_download_kbps", "download_kbps"}, keys...)
-	} else if strings.EqualFold(strings.TrimSpace(role), "wan") {
-		keys = append([]string{"smart_qos_upload_kbps", "upload_kbps"}, keys...)
-	}
-	for _, key := range keys {
-		value := intField(item, key)
-		if value > 0 {
-			return uint64(value)
-		}
-	}
-	return 0
 }
 
 func (server *Server) desiredInterfaceCIDRs(ctx context.Context) map[string]string {
@@ -5062,11 +4959,10 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 	applyCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), runtimeApplyTimeout)
 	defer cancel()
 	transactionID := "runtime-" + newRequestID()
-	if err := server.refreshVPPNativeProof(applyCtx); err != nil {
-		server.recordRuntimeApply(applyCtx, RuntimeApplyResult{Status: "dataplane_locked", RuntimeState: "degraded", TransactionID: transactionID, Reason: err.Error(), AppliedAt: server.now().UTC()}, session, r)
-		writeJSON(w, http.StatusAccepted, map[string]any{"status": "dataplane_locked", "runtime_state": "degraded", "reason": err.Error(), "transaction_id": transactionID, "request_id": requestID(r)})
-		return
-	}
+	// Force a live capability observation before committing. A probe failure is
+	// reported by the plan as a degradation and never aborts the apply: the
+	// previous generation keeps forwarding until a real eligibility failure.
+	_ = server.refreshDataplaneCapability(applyCtx)
 	plan, err := server.buildRuntimePlan(applyCtx, transactionID)
 	if err != nil {
 		result := degradedRuntimeResult(transactionID, err.Error(), server.now().UTC())
@@ -5077,19 +4973,22 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": result.Reason, "transaction_id": transactionID, "request_id": requestID(r)})
 		return
 	}
-	if plan.DataplaneState == "dataplane_locked" && len(plan.GatewayPlan.NativePath.Assignments) > 0 {
+	if (plan.DataplaneState == "dataplane_locked" || plan.DataplaneState == "dataplane_degraded") && len(plan.GatewayPlan.NativePath.Assignments) > 0 {
 		reason := "dataplane prerequisites are not satisfied"
+		if plan.DataplaneState == "dataplane_degraded" {
+			reason = "dataplane capability could not be observed; the previous generation is preserved"
+		}
 		if len(plan.Warnings) > 0 && strings.TrimSpace(plan.Warnings[0]) != "" {
 			reason = plan.Warnings[0]
 		}
 		result := degradedRuntimeResult(transactionID, reason, server.now().UTC())
-		result.Status = "dataplane_locked"
+		result.Status = plan.DataplaneState
 		result.GatewayPlan = &plan.GatewayPlan
 		result.Components = plan.Components
 		if recordErr := server.recordRuntimeApply(applyCtx, result, session, r); recordErr != nil {
 			result.Reason += ": audit persistence: " + recordErr.Error()
 		}
-		writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": result.Reason, "transaction_id": transactionID, "components": result.Components, "dataplane_prerequisites": plan.DataplaneProof, "request_id": requestID(r)})
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": result.Reason, "transaction_id": transactionID, "components": result.Components, "dataplane_prerequisites": plan.DataplaneProof, "dataplane_degradations": plan.DataplaneDegradations, "capability_source": plan.CapabilitySource, "request_id": requestID(r)})
 		return
 	}
 	if !server.serviceRuntimeConfigured() {
@@ -5177,49 +5076,49 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, statusCode, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": result.Reason, "transaction_id": transactionID, "components": components, "applied_services": result.Applied, "capability_failures": result.CapabilityFailures, "snapshot_hash": result.SnapshotHash, "request_id": requestID(r)})
 }
 
-func (server *Server) refreshVPPNativeProof(ctx context.Context) error {
+// capabilityObservationDegradesDataplane reports whether a failed capability
+// observation — rather than a real eligibility failure — is why no forwarding
+// path could be selected. It is only true when there is nothing at all to fall
+// back to and real data ports exist: a missing probe must be reported as a
+// degradation, while a genuine prerequisite failure stays dataplane_locked.
+func capabilityObservationDegradesDataplane(observation vpp.Observation, assignments int) bool {
+	return observation.Source == vpp.ProbeSourceAbsent && assignments > 0
+}
+
+// observeDataplaneCapability runs the active capability probe and returns the
+// observed capability. It never returns an error: a probe failure is a QoS or
+// observability degradation, never a dataplane lock.
+func (server *Server) observeDataplaneCapability(ctx context.Context, interfaces []string) vpp.Observation {
+	prober := server.capabilityProber
+	if prober == nil {
+		prober = vpp.NewCapabilityProber(
+			envOrDefault("LY_ROUTE_VPP_PROBE_COMMAND", "/usr/lib/ly-route/runtime-check.sh"),
+			envOrDefault("LY_ROUTE_VPP_CAPABILITY_PROOF", "/var/lib/ly-route/vpp-native-capabilities.json"),
+			envOrDefault("LY_ROUTE_DATAPLANE_ACTIVE_STATE", "/var/lib/ly-route/dataplane/active.json"),
+		)
+	}
+	return prober.Observe(ctx, vpp.ProbeTarget{
+		ManagementInterface: server.managementInterfaceID(ctx),
+		ManagementShared:    server.managementNetworkShared(ctx),
+		DataInterfaces:      interfaces,
+	})
+}
+
+// refreshDataplaneCapability forces a live probe before an apply commits. A
+// failed probe is recorded as a degradation and the apply continues against the
+// last observed or committed capability; it must not abort forwarding.
+func (server *Server) refreshDataplaneCapability(ctx context.Context) vpp.Observation {
 	interfaces := server.runtimeDataInterfaces(ctx)
-	if len(interfaces) == 0 {
-		return nil
+	prober := server.capabilityProber
+	if prober == nil {
+		return server.observeDataplaneCapability(ctx, interfaces)
 	}
-	commandPath := envOrDefault("LY_ROUTE_VPP_PROBE_COMMAND", "/usr/lib/ly-route/runtime-check.sh")
-	if _, err := os.Stat(commandPath); err != nil {
-		return nil
-	}
-	proofPath := envOrDefault("LY_ROUTE_VPP_CAPABILITY_PROOF", "/var/lib/ly-route/vpp-native-capabilities.json")
-	// The probe creates temporary AF_XDP/AF_PACKET interfaces and is expensive.
-	// Reuse a recent non-empty proof, but never past its own validity window:
-	// an expired acceptance proof makes every data interface fail
-	// `fresh_runtime_proof` even though the probe itself succeeded minutes ago.
-	proofTTL := 5 * time.Minute
-	if raw := strings.TrimSpace(os.Getenv("LY_ROUTE_VPP_PROOF_TTL_SECONDS")); raw != "" {
-		if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
-			proofTTL = time.Duration(seconds) * time.Second
-		}
-	}
-	if info, err := os.Stat(proofPath); err == nil && time.Since(info.ModTime()) < proofTTL {
-		if payload, readErr := os.ReadFile(proofPath); readErr == nil {
-			var proof struct {
-				Proofs []json.RawMessage `json:"proofs"`
-			}
-			if json.Unmarshal(payload, &proof) == nil && len(proof.Proofs) > 0 {
-				return nil
-			}
-		}
-	}
-	proofCtx, cancel := context.WithTimeout(ctx, 150*time.Second)
-	defer cancel()
-	command := exec.CommandContext(proofCtx, commandPath)
-	command.Env = append(os.Environ(),
-		"LY_ROUTE_MANAGEMENT_INTERFACE="+server.managementInterfaceID(ctx),
-		"LY_ROUTE_MANAGEMENT_SHARED="+strconv.FormatBool(server.managementNetworkShared(ctx)),
-		"LY_ROUTE_VPP_DATA_INTERFACES="+strings.Join(interfaces, ","),
-		"LY_ROUTE_VPP_CAPABILITY_PROOF="+proofPath,
-	)
-	if output, err := command.CombinedOutput(); err != nil {
-		return fmt.Errorf("dataplane_locked: VPP native capability proof failed: %s", strings.TrimSpace(string(output)))
-	}
-	return nil
+	prober.Invalidate()
+	return prober.Observe(ctx, vpp.ProbeTarget{
+		ManagementInterface: server.managementInterfaceID(ctx),
+		ManagementShared:    server.managementNetworkShared(ctx),
+		DataInterfaces:      interfaces,
+	})
 }
 
 func (server *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) {
@@ -5361,7 +5260,6 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		return RuntimePlan{}, err
 	}
 	mark("address-assignments")
-	var smartQoSAssignments []vpp.AddressAssignment
 	var compiledProxy proxy.CompiledEgress
 	var compiledFlow flow.CompiledIntent
 	var artifacts []serviceRuntime.RenderedArtifact
@@ -5383,11 +5281,6 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		}
 	}
 	mark("proxy")
-	smartQoSAssignments, err = server.runtimeSmartQoSAssignments(ctx, addressAssignments, proxyEgress, hasProxyEgress && proxyRuntimeWarning == "")
-	if err != nil {
-		return RuntimePlan{}, err
-	}
-	mark("smart-qos")
 	if hasFlowIntent {
 		var err error
 		runtimeFlowIntent, expandErr := server.expandFlowIntentAddressGroups(ctx, flowIntent)
@@ -5510,12 +5403,11 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		planningWarnings = append(planningWarnings, ipv6Warning)
 	}
 	dataInterfaces := server.runtimeDataInterfaces(ctx)
-	proofPath := strings.TrimSpace(os.Getenv("LY_ROUTE_VPP_CAPABILITY_PROOF"))
-	if proofPath == "" {
-		proofPath = "/var/lib/ly-route/vpp-native-capabilities.json"
+	observation := server.observeDataplaneCapability(ctx, dataInterfaces)
+	nativePath := observation.NativePathRequest(server.managementInterfaceID(ctx), dataInterfaces, server.now().UTC(), server.managementNetworkShared(ctx))
+	if observation.Degraded {
+		planningWarnings = append(planningWarnings, "dataplane capability degraded ("+string(observation.Source)+"): "+observation.Reason)
 	}
-	nativePath := vpp.LoadNativePathRequestWithSharedManagement(proofPath, server.managementInterfaceID(ctx), dataInterfaces, server.now().UTC(), server.managementNetworkShared(ctx))
-	nativePath.RequireSmartQoS = server.requireSmartQoS
 	mark("native-path")
 	dnsInterceptionEnabled := server.profile.ID() == product.Gateway().ID() && hasLANAddressAssignment(addressAssignments)
 	dataplanePrepared := false
@@ -5538,12 +5430,23 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		gatewayPolicy.SecurityACLs = nil
 	}
 	selectedPath, selectionErr := vpp.SelectNativePath(nativePath)
-	smartQoSEnabled := selectionErr == nil && selectedPath.SmartQoS
-	canonicalGatewayPlan := vpp.Plan{RequestID: requestID, NativePath: nativePath, DataplanePrepared: dataplanePrepared, AddressAssignments: addressAssignments, SmartQoSAssignments: smartQoSAssignments, SmartQoSEnabled: smartQoSEnabled, Proxy: compiledProxy, Flow: gatewayFlow, NAT: compiledNAT, Policy: gatewayPolicy, RetiredRoutePolicyIDs: retiredRoutePolicyIDs, Security: securityGeneration, DNSInterception: dnsInterceptionEnabled, DNSServiceNetworks: dnsServiceNetworks}
+	canonicalGatewayPlan := vpp.Plan{RequestID: requestID, NativePath: nativePath, DataplanePrepared: dataplanePrepared, AddressAssignments: addressAssignments, Proxy: compiledProxy, Flow: gatewayFlow, NAT: compiledNAT, Policy: gatewayPolicy, RetiredRoutePolicyIDs: retiredRoutePolicyIDs, Security: securityGeneration, DNSInterception: dnsInterceptionEnabled, DNSServiceNetworks: dnsServiceNetworks}
 	operations, err := vpp.BuildOperations(canonicalGatewayPlan)
 	mark("build-operations")
 	dataplaneState := "native_ready"
 	var dataplaneProof []vpp.PrerequisiteResult
+	dataplaneDegradations := []vpp.Degradation{}
+	degradedObservation := capabilityObservationDegradesDataplane(observation, len(nativePath.Assignments))
+	if selectionErr == nil {
+		dataplaneDegradations = append(dataplaneDegradations, selectedPath.Degradations...)
+		dataplaneProof = selectedPath.Prerequisites
+	} else if observation.Degraded {
+		dataplaneDegradations = append(dataplaneDegradations, vpp.Degradation{
+			Name:   "dataplane_capability_observation",
+			Reason: observation.Reason,
+			Impact: "dataplane_apply",
+		})
+	}
 	warnings := append([]string(nil), planningWarnings...)
 	gatewayBonds := []vpp.BondState{}
 	if err != nil {
@@ -5553,12 +5456,13 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		}
 		operations = nil
 		dataplaneState = locked.Code()
+		// A failed observation is a degradation, not an eligibility verdict, but
+		// only when it is the reason no path exists.
+		if degradedObservation {
+			dataplaneState = "dataplane_degraded"
+		}
 		dataplaneProof = locked.Prerequisites
 		warnings = append(warnings, err.Error())
-	}
-	if err == nil && smartQoSEnabled {
-		dataplaneState = "smart_qos_ready"
-		dataplaneProof = selectedPath.Prerequisites
 	}
 	if err == nil {
 		bondOperations, err := server.currentInterfaceBondOperations(ctx, requestID)
@@ -5569,6 +5473,9 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 			}
 			operations = nil
 			dataplaneState = locked.Code()
+			if degradedObservation {
+				dataplaneState = "dataplane_degraded"
+			}
 			dataplaneProof = append(dataplaneProof, locked.Prerequisites...)
 			warnings = append(warnings, err.Error())
 		} else {
@@ -5576,7 +5483,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 			gatewayBonds = bondStatesFromOperations(bondOperations)
 		}
 	}
-	if dataplaneState == "dataplane_locked" {
+	if dataplaneState == "dataplane_locked" || dataplaneState == "dataplane_degraded" {
 		artifacts = nonForwardingArtifacts(artifacts)
 		compiledProxy.NftablesCapture = proxy.NftablesCapturePlan{}
 		compiledProxy.LinuxPolicyRouting = proxy.LinuxPolicyRoutingPlan{}
@@ -5605,7 +5512,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	gatewayPlan := canonicalGatewayPlan
 	gatewayPlan.Interfaces = gatewayInterfaces
 	gatewayPlan.Bonds = gatewayBonds
-	return RuntimePlan{ProxyEgress: proxyEgress, CompiledProxy: compiledProxy, FlowIntent: flowIntent, CompiledFlow: compiledFlow, CompiledNAT: compiledNAT, CompiledPolicy: compiledPolicy, DNSPolicies: dnsPolicies, ServiceArtifacts: summarizeRuntimeArtifacts(artifacts), RuntimeArtifacts: artifacts, VppOperations: operations, NftablesCapture: compiledProxy.NftablesCapture, DNSInterception: dnsInterception, LinuxPolicyRouting: compiledProxy.LinuxPolicyRouting, DHCPServers: dhcpPlans, PPPoEPeers: summarizePPPoEPeers(pppoePeers), Components: components, Warnings: warnings, DataplaneState: dataplaneState, DataplaneProof: dataplaneProof, GatewayPlan: gatewayPlan}, nil
+	return RuntimePlan{ProxyEgress: proxyEgress, CompiledProxy: compiledProxy, FlowIntent: flowIntent, CompiledFlow: compiledFlow, CompiledNAT: compiledNAT, CompiledPolicy: compiledPolicy, DNSPolicies: dnsPolicies, ServiceArtifacts: summarizeRuntimeArtifacts(artifacts), RuntimeArtifacts: artifacts, VppOperations: operations, NftablesCapture: compiledProxy.NftablesCapture, DNSInterception: dnsInterception, LinuxPolicyRouting: compiledProxy.LinuxPolicyRouting, DHCPServers: dhcpPlans, PPPoEPeers: summarizePPPoEPeers(pppoePeers), Components: components, Warnings: warnings, DataplaneState: dataplaneState, DataplaneProof: dataplaneProof, DataplaneDegradations: dataplaneDegradations, CapabilitySource: string(observation.Source), GatewayPlan: gatewayPlan}, nil
 }
 
 func hasLANAddressAssignment(assignments []vpp.AddressAssignment) bool {
@@ -8148,20 +8055,11 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 	if transactionID == "" {
 		transactionID = "txn-" + newRequestID()
 	}
-	// Capability proofs are intentionally short-lived. The UI writes through
-	// this endpoint, so refresh the proof before compiling the transaction
-	// rather than relying on the boot-time readiness check.
-	if err := server.refreshVPPNativeProof(r.Context()); err != nil {
-		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", err.Error(), r)
-		writeJSON(w, http.StatusLocked, map[string]any{
-			"status":         "dataplane_locked",
-			"runtime_state":  "degraded",
-			"reason":         err.Error(),
-			"transaction_id": transactionID,
-			"request_id":     requestID(r),
-		})
-		return
-	}
+	// Dataplane capability is observed actively before compiling the
+	// transaction. A probe failure is a degradation reported by the plan, never
+	// a dataplane lock: the UI writes through this endpoint and a transient
+	// probe outage must not block an otherwise valid configuration change.
+	_ = server.refreshDataplaneCapability(r.Context())
 	runtimePlan, proxyEgress, flowIntent, err := server.configApplyPlan(r.Context(), transactionID, req.ProxyEgress, req.FlowIntent)
 	if err != nil {
 		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", err.Error(), r)
@@ -8197,14 +8095,16 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 	}
-	if runtimePlan.DataplaneState == "dataplane_locked" {
+	if runtimePlan.DataplaneState == "dataplane_locked" || runtimePlan.DataplaneState == "dataplane_degraded" {
 		reason := dataplaneLockedReason(runtimePlan.DataplaneProof, runtimePlan.Warnings)
 		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", reason, r)
 		writeJSON(w, http.StatusLocked, map[string]any{
-			"status":                  "dataplane_locked",
+			"status":                  runtimePlan.DataplaneState,
 			"runtime_state":           "degraded",
 			"reason":                  reason,
 			"dataplane_prerequisites": runtimePlan.DataplaneProof,
+			"dataplane_degradations":  runtimePlan.DataplaneDegradations,
+			"capability_source":       runtimePlan.CapabilitySource,
 			"transaction_id":          transactionID,
 			"request_id":              requestID(r),
 		})

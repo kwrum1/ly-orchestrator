@@ -196,7 +196,7 @@ func TestNativePath_vmxnet3AFPacketAcceptanceBuildsHostInterface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(path.Attachments) != 2 || path.Attachments[0].Hook != NativeHookAFPacket || path.Attachments[1].Hook != NativeHookAFPacket || !path.SmartQoS {
+	if len(path.Attachments) != 2 || path.Attachments[0].Hook != NativeHookAFPacket || path.Attachments[1].Hook != NativeHookAFPacket || path.SmartQoS {
 		t.Fatalf("path = %#v", path)
 	}
 	operations, err := BuildOperations(Plan{RequestID: "vmxnet3-af-packet", NativePath: request, AddressAssignments: []AddressAssignment{

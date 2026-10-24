@@ -22,9 +22,13 @@ import (
 )
 
 type Plan struct {
-	RequestID           string
-	NativePath          NativePathRequest
-	AddressAssignments  []AddressAssignment
+	RequestID          string
+	NativePath         NativePathRequest
+	AddressAssignments []AddressAssignment
+	// SmartQoSAssignments and SmartQoSEnabled are retained for wire/API
+	// compatibility with pre-arch-v1 plans, receipts and evidence. They never
+	// produce VPP operations: built-in Smart QoS is retired and its plugin is no
+	// longer shipped.
 	SmartQoSAssignments []AddressAssignment `json:"smart_qos_assignments,omitempty"`
 	SmartQoSEnabled     bool                `json:"smart_qos_enabled,omitempty"`
 	Interfaces          []InterfaceState
@@ -275,16 +279,6 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 			prerequisite("address_assignment_vpp_interface_matches", linuxInterface, proven && vppInterface == attachment.VPPInterface, "address assignment VPP interface does not match the selected native attachment"),
 		)
 	}
-	for _, assignment := range plan.SmartQoSAssignments {
-		linuxInterface := strings.TrimSpace(assignment.LinuxInterface)
-		vppInterface := strings.TrimSpace(assignment.VPPInterface)
-		attachment, proven := attachments[linuxInterface]
-		prerequisites = append(prerequisites,
-			prerequisite("smart_qos_assignment_management_excluded", linuxInterface, management != "" && (plan.NativePath.ManagementShared || linuxInterface != management), "smart QoS assignment references the management interface"),
-			prerequisite("smart_qos_assignment_proven", linuxInterface, proven, "smart QoS assignment has no selected runtime-proven native attachment"),
-			prerequisite("smart_qos_assignment_vpp_interface_matches", linuxInterface, proven && vppInterface == attachment.VPPInterface, "smart QoS assignment VPP interface does not match the selected native attachment"),
-		)
-	}
 	for _, result := range prerequisites {
 		if !result.Passed {
 			return nil, &DataplaneLockedError{Prerequisites: prerequisites}
@@ -322,15 +316,6 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 		operation := Operation{Name: "vpp.interface.address", RequestID: plan.RequestID, Resource: assignment.ID, Payload: assignment}
 		operation.VPPCtlCommands = interfaceAddressCommands(assignment)
 		operations = append(operations, operation)
-	}
-	if nativePath.SmartQoS {
-		smartQoSAssignments := plan.SmartQoSAssignments
-		if len(smartQoSAssignments) == 0 {
-			smartQoSAssignments = plan.AddressAssignments
-		}
-		smartQoSOperations, smartQoSPrerequisites := buildSmartQoSOperations(plan.RequestID, smartQoSAssignments)
-		prerequisites = append(prerequisites, smartQoSPrerequisites...)
-		operations = append(operations, smartQoSOperations...)
 	}
 	managementLCP, lcpReady := managementLCPOperation(plan)
 	if plan.NativePath.ManagementShared && !lcpReady {
@@ -504,58 +489,6 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 		}
 	}
 	return operations, nil
-}
-
-func buildSmartQoSOperations(requestID string, assignments []AddressAssignment) ([]Operation, []PrerequisiteResult) {
-	operations := []Operation{}
-	prerequisites := []PrerequisiteResult{}
-	seen := map[string]bool{}
-	hasLAN := false
-	hasWAN := false
-	for _, assignment := range assignments {
-		role := strings.ToLower(strings.TrimSpace(assignment.Role))
-		if role != "lan" && role != "wan" {
-			continue
-		}
-		vppInterface := strings.TrimSpace(assignment.VPPInterface)
-		if vppInterface == "" || seen[vppInterface] {
-			continue
-		}
-		seen[vppInterface] = true
-		if role == "lan" {
-			hasLAN = true
-		} else {
-			hasWAN = true
-		}
-		configured := assignment.BandwidthKbps >= 64 && assignment.BandwidthKbps <= 400_000_000
-		prerequisites = append(prerequisites, prerequisite(
-			"smart_qos_bandwidth_configured", vppInterface, configured,
-			"LAN download or WAN upload bandwidth_kbps must be between 64 and 400000000",
-		))
-		if !configured {
-			continue
-		}
-		isolation := "source"
-		if role == "lan" {
-			isolation = "destination"
-		}
-		payload := SmartQoSInterface{VPPInterface: vppInterface, Role: role, RateKbps: assignment.BandwidthKbps, HostIsolation: isolation}
-		operations = append(operations, Operation{
-			Name:      "vpp.smart-qos",
-			RequestID: requestID,
-			Resource:  vppInterface,
-			Payload:   payload,
-			VPPCtlCommands: []string{
-				fmt.Sprintf("set ly-route smart-qos interface %s rate %d host-isolation %s", vppInterface, assignment.BandwidthKbps, isolation),
-				"show ly-route smart-qos",
-			},
-		})
-	}
-	prerequisites = append(prerequisites,
-		prerequisite("smart_qos_lan_present", "", hasLAN, "built-in smart QoS requires one logical LAN output"),
-		prerequisite("smart_qos_wan_present", "", hasWAN, "built-in smart QoS requires at least one WAN output"),
-	)
-	return operations, prerequisites
 }
 
 func managementLCPOperation(plan Plan) (ManagementLCP, bool) {

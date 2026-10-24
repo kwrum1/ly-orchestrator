@@ -475,19 +475,20 @@ import sys
 qos = json.load(open(sys.argv[1], encoding="utf-8"))
 traffic = json.load(open(sys.argv[2], encoding="utf-8"))
 item = qos.get("item", qos)
-if item.get("runtime_state") != "running" or not item.get("enabled"):
-    print("Smart QoS is not running: %s" % item.get("runtime_state"))
+# arch-v1: built-in Smart QoS is retired. The compatibility stub must answer
+# read-only with runtime_state=retired and must never assert a dataplane lock.
+if item.get("runtime_state") != "retired" or item.get("enabled") is not False:
+    print("Smart QoS is not retired: state=%s enabled=%s" % (item.get("runtime_state"), item.get("enabled")))
     raise SystemExit(1)
 items = traffic.get("items", traffic if isinstance(traffic, list) else [])
 if not items:
     print("no traffic-control policy is configured for a loaded-flow acceptance probe")
     raise SystemExit(2)
-print("Smart QoS is running with %d traffic-control policy object(s)" % len(items))
+print("Smart QoS is retired; traffic-control owns %d policy object(s)" % len(items))
 PY
   )
   rc=$?
   record_python_result smart_qos_runtime "$rc" "$detail"
-  run_probe smart_qos_loaded_flow LY_ROUTE_PROBE_SMART_QOS || true
 }
 
 check_monitoring_api() {

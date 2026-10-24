@@ -12,7 +12,7 @@ if [ ! -f "$artifact" ]; then
 fi
 
 if [ "${LY_ROUTE_ROOTFS_REQUIRED_PACKAGES+x}" != x ]; then
-  LY_ROUTE_ROOTFS_REQUIRED_PACKAGES="libvppinfra vpp vpp-plugin-core vpp-plugin-dpdk ly-route-vpp-apply ly-route-vpp-pppoe-client ly-route-vpp-smart-qos ly-route-vpp-security-guard ly-route-vpp-dns-intercept ly-route-vpp-pre-nat-route smartdns ly-route-dns-vpp-proxy xray openssh-server sudo"
+  LY_ROUTE_ROOTFS_REQUIRED_PACKAGES="libvppinfra vpp vpp-plugin-core vpp-plugin-dpdk ly-route-vpp-apply ly-route-vpp-pppoe-client ly-route-vpp-security-guard ly-route-vpp-dns-intercept ly-route-vpp-pre-nat-route smartdns ly-route-dns-vpp-proxy xray openssh-server sudo"
 fi
 required_files_defaulted=false
 if [ "${LY_ROUTE_ROOTFS_REQUIRED_FILES+x}" != x ]; then
@@ -23,7 +23,7 @@ fi
 
 if [ "$required_files_defaulted" = true ]; then
   multiarch=${LY_ROUTE_ROOTFS_MULTIARCH:-x86_64-linux-gnu}
-  LY_ROUTE_ROOTFS_REQUIRED_FILES="$LY_ROUTE_ROOTFS_REQUIRED_FILES /usr/lib/$multiarch/vpp_plugins/abf_plugin.so /usr/lib/$multiarch/vpp_plugins/dpdk_plugin.so /usr/lib/$multiarch/vpp_plugins/af_packet_plugin.so /usr/lib/$multiarch/vpp_plugins/ly_route_pppoe_client_plugin.so /usr/lib/$multiarch/vpp_plugins/pppoeclient_plugin.so /usr/lib/$multiarch/vpp_plugins/ly_route_smart_qos_plugin.so /usr/lib/$multiarch/vpp_plugins/ly_route_security_guard_plugin.so /usr/lib/$multiarch/vpp_plugins/ly_route_dns_intercept_plugin.so /usr/lib/$multiarch/vpp_plugins/ly_route_pre_nat_route_plugin.so"
+  LY_ROUTE_ROOTFS_REQUIRED_FILES="$LY_ROUTE_ROOTFS_REQUIRED_FILES /usr/lib/$multiarch/vpp_plugins/abf_plugin.so /usr/lib/$multiarch/vpp_plugins/dpdk_plugin.so /usr/lib/$multiarch/vpp_plugins/af_packet_plugin.so /usr/lib/$multiarch/vpp_plugins/ly_route_pppoe_client_plugin.so /usr/lib/$multiarch/vpp_plugins/pppoeclient_plugin.so /usr/lib/$multiarch/vpp_plugins/ly_route_security_guard_plugin.so /usr/lib/$multiarch/vpp_plugins/ly_route_dns_intercept_plugin.so /usr/lib/$multiarch/vpp_plugins/ly_route_pre_nat_route_plugin.so"
   LY_ROUTE_ROOTFS_REQUIRED_FILES="$LY_ROUTE_ROOTFS_REQUIRED_FILES /usr/lib/$multiarch/vpp_plugins/linux_cp_plugin.so /usr/lib/$multiarch/vpp_plugins/linux_nl_plugin.so"
   LY_ROUTE_ROOTFS_REQUIRED_FILES="$LY_ROUTE_ROOTFS_REQUIRED_FILES /usr/lib/ly-route/ly-route-dns-vpp-proxy /usr/lib/ly-route/ly-route-dns-vpp-proxy-v6 /usr/lib/ly-route/dns-vpp-v6-namespace-apply /usr/lib/ly-route/dns-vpp-session-apply /etc/ly-route/vcl.conf /etc/ly-route/vcl-v6.conf /etc/systemd/system/ly-route-dns-vpp-v6-namespace.service /etc/systemd/system/ly-route-dns-vpp-session.service /etc/systemd/system/smartdns.service.d/10-ly-route-vpp-lifecycle.conf /etc/systemd/system/ly-route-policy-routing.service.d/10-dns-vpp-lifecycle.conf /usr/lib/systemd/system/ly-route-dns-vpp-proxy.service /usr/lib/systemd/system/ly-route-dns-vpp-proxy-v6.service /etc/systemd/system/multi-user.target.wants/ly-route-dns-vpp-v6-namespace.service /etc/systemd/system/multi-user.target.wants/ly-route-dns-vpp-session.service /etc/systemd/system/multi-user.target.wants/ly-route-dns-vpp-proxy.service /etc/systemd/system/multi-user.target.wants/ly-route-dns-vpp-proxy-v6.service"
 fi

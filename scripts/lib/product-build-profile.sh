@@ -16,6 +16,7 @@ const [path, field] = process.argv.slice(2);
 const value = JSON.parse(readFileSync(path, "utf8"))[field];
 if (Array.isArray(value)) process.stdout.write(value.join(","));
 else if (typeof value === "string") process.stdout.write(value);
+else if (value === undefined) process.stdout.write("");
 else throw new Error(`unsupported build profile field ${field}`);
 NODE
 }
@@ -80,6 +81,8 @@ NODE
   PRODUCT_REQUIRED_PACKAGES=$(product_build_json_field required_packages)
   PRODUCT_REQUIRED_COMMANDS=$(product_build_json_field required_commands)
   PRODUCT_REQUIRED_UNITS=$(product_build_json_field required_units)
+  PRODUCT_OPTIONAL_COMMANDS=$(product_build_json_field optional_commands)
+  PRODUCT_OPTIONAL_UNITS=$(product_build_json_field optional_units)
   product_build_require_file "$PRODUCT_DEFAULT_CONFIG"
 }
 

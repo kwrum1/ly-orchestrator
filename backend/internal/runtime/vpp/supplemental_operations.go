@@ -206,6 +206,22 @@ func supplementalOperations(plan Plan, owner SupplementalOwner) ([]Operation, er
 	return selected, nil
 }
 
+// activeSupplementalReadback drops evidence rows that belong to a retired
+// feature. A gateway upgraded from firmware that applied built-in Smart QoS
+// still carries those rows in its committed plan, while arch-v1 no longer
+// builds the operation; ignoring them keeps restart evidence valid instead of
+// surfacing a false snapshot_mismatch.
+func activeSupplementalReadback(items []SupplementalOperationReadback) []SupplementalOperationReadback {
+	active := make([]SupplementalOperationReadback, 0, len(items))
+	for _, item := range items {
+		if strings.HasPrefix(strings.TrimSpace(item.Name), "vpp.smart-qos") {
+			continue
+		}
+		active = append(active, item)
+	}
+	return active
+}
+
 func targetOwnedByGroup(groups []flow.VPPObjectGroup, target flow.Target) bool {
 	for _, group := range groups {
 		if group.Kind != target.Kind {
@@ -228,6 +244,7 @@ func targetOwnedByGroup(groups []flow.VPPObjectGroup, target flow.Target) bool {
 // degraded state. Missing or malformed evidence still fails closed.
 func ValidateCommittedSupplementalReadback(plan Plan, owner SupplementalOwner, actual []SupplementalOperationReadback, referenceTime time.Time) error {
 	plan.NativePath.Now = referenceTime
+	actual = activeSupplementalReadback(actual)
 	operations, err := supplementalOperations(plan, owner)
 	if err != nil {
 		return err
@@ -250,6 +267,7 @@ func ValidateCommittedSupplementalReadback(plan Plan, owner SupplementalOwner, a
 func ValidateSupplementalReadback(plan Plan, owner SupplementalOwner, actual []SupplementalOperationReadback, referenceTime time.Time) error {
 	evidencePlan := plan
 	evidencePlan.NativePath.Now = referenceTime
+	actual = activeSupplementalReadback(actual)
 	operations, err := supplementalOperations(evidencePlan, owner)
 	if err != nil {
 		return err

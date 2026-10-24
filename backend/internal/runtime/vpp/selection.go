@@ -92,6 +92,9 @@ type CapabilityProof struct {
 	HugepagesAvailable      bool          `json:"hugepages_available,omitempty"`
 	DPDKPluginAvailable     bool          `json:"dpdk_plugin_available,omitempty"`
 	HQoSAvailable           bool          `json:"hqos_available,omitempty"`
+	// SmartQoSPluginAvailable is retained only so capability reports written by
+	// pre-arch-v1 firmware still decode (the report loader rejects unknown
+	// fields). It never influences eligibility.
 	SmartQoSPluginAvailable bool          `json:"smart_qos_plugin_available,omitempty"`
 	AcceptanceOnly          bool          `json:"acceptance_only,omitempty"`
 }
@@ -106,6 +109,9 @@ type NativeAssignment struct {
 type NativePathRequest struct {
 	ManagementInterface string               `json:"management_interface"`
 	ManagementShared    bool                 `json:"management_shared,omitempty"`
+	// RequireSmartQoS is accepted for wire compatibility but ignored. Smart QoS
+	// was removed as a dataplane prerequisite: requiring it turned a missing
+	// optional plugin into dataplane_locked and blocked clean first boot.
 	RequireSmartQoS     bool                 `json:"require_smart_qos,omitempty"`
 	Assignments         []NativeAssignment   `json:"assignments"`
 	ReportPrerequisites []PrerequisiteResult `json:"report_prerequisites,omitempty"`
@@ -158,7 +164,7 @@ func declarativeNativePath(request NativePathRequest) NativePath {
 			IOMMUGroup:     proof.IOMMUGroup,
 		})
 	}
-	return NativePath{Tier: tier, SmartQoS: request.RequireSmartQoS, Attachments: attachments}
+	return NativePath{Tier: tier, SmartQoS: false, Attachments: attachments, Degradations: []Degradation{smartQoSRetiredDegradation()}}
 }
 
 type NativeAttachment struct {
@@ -181,12 +187,38 @@ type PrerequisiteResult struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
+// Degradation records an optional feature that is unavailable while the
+// dataplane keeps forwarding. Degradations are deliberately separate from
+// Prerequisites: a degraded optional feature must never produce
+// dataplane_locked.
+type Degradation struct {
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
+	Impact string `json:"impact"`
+}
+
+// SmartQoSRetiredReason is the operator-facing explanation returned whenever a
+// caller asks about built-in Smart QoS. The feature is retired; ordinary
+// traffic-control (rate limiting and blocking) remains the supported QoS path.
+const SmartQoSRetiredReason = "built-in Smart QoS is retired; dataplane eligibility depends only on interface presence, FIB/routing and NAT, and QoS degrades to traffic-control"
+
+// smartQoSRetiredDegradation is reported on every selected path so operators
+// can see that QoS shaping was dropped without mistaking it for a forwarding
+// failure.
+func smartQoSRetiredDegradation() Degradation {
+	return Degradation{Name: "smart_qos", Reason: SmartQoSRetiredReason, Impact: "qos"}
+}
+
 type NativePath struct {
-	Tier          DataplaneTier         `json:"tier,omitempty"`
+	Tier DataplaneTier `json:"tier,omitempty"`
+	// SmartQoS is retained for wire compatibility with pre-arch-v1 plans and
+	// receipts. It is always false: the retired feature never participates in
+	// dataplane selection or operation building.
 	SmartQoS      bool                  `json:"smart_qos,omitempty"`
 	Attachments   []NativeAttachment    `json:"attachments"`
 	Prerequisites []PrerequisiteResult  `json:"prerequisites"`
 	Candidates    []CandidateEvaluation `json:"candidates,omitempty"`
+	Degradations  []Degradation         `json:"degradations,omitempty"`
 }
 
 type CandidateEvaluation struct {
@@ -238,10 +270,9 @@ func SelectNativePath(request NativePathRequest) (NativePath, error) {
 	}
 	management := strings.TrimSpace(request.ManagementInterface)
 	results := append([]PrerequisiteResult(nil), request.ReportPrerequisites...)
-	if request.RequireSmartQoS {
-		results = append(results, prerequisite("smart_qos_candidate_report", "", false, "smart QoS requires a multi-candidate production VPP smart-QoS plugin capability proof"))
-		return NativePath{}, &DataplaneLockedError{Prerequisites: results}
-	}
+	// Smart QoS is not a dataplane prerequisite. A device without the plugin
+	// must still be able to commit forwarding; the absence is reported as a
+	// QoS degradation on the selected path instead of locking the dataplane.
 	results = append(results,
 		prerequisite("management_identified", "", management != "", "management interface is required"),
 		prerequisite("data_assignment_present", "", len(request.Assignments) > 0, "at least one explicit data interface assignment is required"),
@@ -301,7 +332,7 @@ func SelectNativePath(request NativePathRequest) (NativePath, error) {
 			return NativePath{}, &DataplaneLockedError{Prerequisites: results}
 		}
 	}
-	return NativePath{Tier: DataplaneTierNative, Attachments: attachments, Prerequisites: results}, nil
+	return NativePath{Tier: DataplaneTierNative, SmartQoS: false, Attachments: attachments, Prerequisites: results, Degradations: []Degradation{smartQoSRetiredDegradation()}}, nil
 }
 
 func isRuntimeCapabilityProof(proof CapabilityProof) bool {
@@ -318,10 +349,9 @@ func LoadNativePathRequest(path, management string, interfaces []string, now tim
 }
 
 func LoadNativePathRequestWithSharedManagement(path, management string, interfaces []string, now time.Time, managementShared bool) NativePathRequest {
-	proofs := map[string]CapabilityProof{}
-	candidates := map[string][]CapabilityProof{}
-	proofCounts := map[string]int{}
 	reportPrerequisites := []PrerequisiteResult{}
+	report := CapabilityReport{}
+	loaded := false
 	file, err := os.Open(path)
 	if err != nil {
 		reportPrerequisites = append(reportPrerequisites, prerequisite("capability_report_loaded", "", false, "runtime capability report is unavailable"))
@@ -330,7 +360,6 @@ func LoadNativePathRequestWithSharedManagement(path, management string, interfac
 		info, statErr := file.Stat()
 		securePermissions := statErr == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o022 == 0
 		reportPrerequisites = append(reportPrerequisites, prerequisite("capability_report_permissions", "", securePermissions, "runtime capability report must not be group or world writable"))
-		var report CapabilityReport
 		decoder := json.NewDecoder(file)
 		decoder.DisallowUnknownFields()
 		decodeErr := decoder.Decode(&report)
@@ -343,24 +372,35 @@ func LoadNativePathRequestWithSharedManagement(path, management string, interfac
 		reportPrerequisites = append(reportPrerequisites, prerequisite("capability_report_loaded", "", decodeErr == nil, "runtime capability report is malformed"))
 		managementMatches := decodeErr == nil && securePermissions && strings.TrimSpace(report.ManagementInterface) == strings.TrimSpace(management)
 		reportPrerequisites = append(reportPrerequisites, prerequisite("capability_report_management_matches", "", managementMatches, "runtime capability report belongs to a different management interface"))
-		if managementMatches {
-			for _, item := range report.Proofs {
-				name := strings.TrimSpace(item.LinuxInterface)
-				proofCounts[name]++
-				if proofCounts[name] > 1 {
-					continue
-				}
-				if len(item.Candidates) > 0 {
-					candidates[name] = append([]CapabilityProof(nil), item.Candidates...)
-				} else {
-					// Older runtime reports emit one proof instead of a candidate
-					// array. A single data interface must not be rejected merely
-					// because the report has one candidate; smart-QoS availability
-					// is still checked by candidateRejectionReasons.
-					proofs[name] = item.Proof
-					candidates[name] = []CapabilityProof{item.Proof}
-				}
-			}
+		loaded = managementMatches
+	}
+	if !loaded {
+		report = CapabilityReport{}
+	}
+	return nativePathRequestFromReport(report, reportPrerequisites, management, interfaces, now, managementShared)
+}
+
+// nativePathRequestFromReport turns a validated observed capability report into
+// a selection request. It is shared by the report-file loader and the active
+// capability prober so both paths apply identical eligibility rules.
+func nativePathRequestFromReport(report CapabilityReport, reportPrerequisites []PrerequisiteResult, management string, interfaces []string, now time.Time, managementShared bool) NativePathRequest {
+	proofs := map[string]CapabilityProof{}
+	candidates := map[string][]CapabilityProof{}
+	proofCounts := map[string]int{}
+	for _, item := range report.Proofs {
+		name := strings.TrimSpace(item.LinuxInterface)
+		proofCounts[name]++
+		if proofCounts[name] > 1 {
+			continue
+		}
+		if len(item.Candidates) > 0 {
+			candidates[name] = append([]CapabilityProof(nil), item.Candidates...)
+		} else {
+			// Older runtime reports emit one proof instead of a candidate array.
+			// A single data interface must not be rejected merely because the
+			// report has one candidate.
+			proofs[name] = item.Proof
+			candidates[name] = []CapabilityProof{item.Proof}
 		}
 	}
 	assignments := make([]NativeAssignment, 0, len(interfaces))

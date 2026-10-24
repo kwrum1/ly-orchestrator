@@ -114,18 +114,29 @@ func TestCommonTierSmartQoSPreservesPreferredNativeTierWhenPluginIsAvailable(t *
 	}
 }
 
-func TestCommonTierSmartQoSLocksWhenProductionPluginIsMissing(t *testing.T) {
+// TestCommonTierSmartQoSIsNotADataplanePrerequisite pins arch-v1: a missing
+// smart-QoS plugin degrades QoS but must never lock the dataplane.
+func TestCommonTierSmartQoSIsNotADataplanePrerequisite(t *testing.T) {
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 	proof := eligibleDPDKProof(now, 80)
 	proof.SmartQoSPluginAvailable = false
-	_, err := SelectNativePath(NativePathRequest{ManagementInterface: "eth0", RequireSmartQoS: true, Now: now, Assignments: []NativeAssignment{{LinuxInterface: "eth1", Explicit: true, Candidates: []CapabilityProof{proof}}}})
-
-	var locked *DataplaneLockedError
-	if !errors.As(err, &locked) {
-		t.Fatalf("error = %v, want DataplaneLockedError", err)
+	path, err := SelectNativePath(NativePathRequest{ManagementInterface: "eth0", RequireSmartQoS: true, Now: now, Assignments: []NativeAssignment{{LinuxInterface: "eth1", Explicit: true, Candidates: []CapabilityProof{proof}}}})
+	if err != nil {
+		t.Fatalf("missing smart-QoS plugin must not lock the dataplane: %v", err)
 	}
-	if len(locked.Candidates) != 1 || !containsString(locked.Candidates[0].Reasons, "production VPP smart-QoS plugin is unavailable") {
-		t.Fatalf("candidate evaluation = %#v", locked.Candidates)
+	if path.Tier != DataplaneTierDPDK || len(path.Attachments) != 1 {
+		t.Fatalf("selected path = %#v, want one committed DPDK attachment", path)
+	}
+	if path.SmartQoS {
+		t.Fatalf("retired smart QoS must never be enabled on the selected path")
+	}
+	if len(path.Degradations) != 1 || path.Degradations[0].Name != "smart_qos" || path.Degradations[0].Impact != "qos" {
+		t.Fatalf("degradations = %#v, want a single smart_qos/qos degradation", path.Degradations)
+	}
+	for _, candidate := range path.Candidates {
+		if containsString(candidate.Reasons, "production VPP smart-QoS plugin is unavailable") {
+			t.Fatalf("smart-QoS availability must not appear in candidate rejection reasons: %#v", candidate)
+		}
 	}
 }
 

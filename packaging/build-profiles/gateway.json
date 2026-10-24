@@ -45,7 +45,6 @@
     "vpp-plugin-dpdk",
     "ly-route-vpp-apply",
     "ly-route-vpp-pppoe-client",
-    "ly-route-vpp-smart-qos",
     "ly-route-vpp-security-guard",
     "ly-route-vpp-dns-intercept",
     "ly-route-vpp-pre-nat-route",
@@ -59,20 +58,24 @@
     "vpp",
     "vppctl",
     "/usr/lib/ly-route/vpp-apply",
-    "smartdns",
-    "/usr/lib/ly-route/ly-route-dns-vpp-proxy",
-    "kea-dhcp4",
-    "xray",
     "ipset",
     "/usr/lib/ly-route/ly-route-pppoe-client"
   ],
   "required_units": [
     "vpp.service",
+    "ly-route-pppoe.target"
+  ],
+  "optional_commands": [
+    "smartdns",
+    "kea-dhcp4",
+    "xray",
+    "/usr/lib/ly-route/ly-route-dns-vpp-proxy"
+  ],
+  "optional_units": [
     "smartdns.service",
-    "ly-route-dns-vpp-proxy.service",
-    "ly-route-dns-vpp-proxy-v6.service",
     "kea-dhcp4-server.service",
     "xray.service",
-    "ly-route-pppoe.target"
+    "ly-route-dns-vpp-proxy.service",
+    "ly-route-dns-vpp-proxy-v6.service"
   ]
 }

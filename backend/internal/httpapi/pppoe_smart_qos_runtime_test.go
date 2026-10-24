@@ -13,7 +13,7 @@ import (
 	"ly-route/backend/internal/persistence"
 )
 
-func TestRuntimePreviewSmartQoSUsesPPPoEUnderlayAndWANDownloadForLAN(t *testing.T) {
+func TestRuntimePreviewIgnoresRetiredSmartQoSOnPPPoEUnderlay(t *testing.T) {
 	ctx := context.Background()
 	store, err := persistence.Open(ctx, "file:httpapi-pppoe-smart-qos-test?mode=memory&cache=shared")
 	if err != nil {
@@ -59,24 +59,27 @@ func TestRuntimePreviewSmartQoSUsesPPPoEUnderlayAndWANDownloadForLAN(t *testing.
 	server := New(
 		WithStore(store),
 		WithClock(fixedClock()),
-		WithSmartQoSRuntime(fakeSmartQoSObserver{}, true),
 		WithGatewayTransaction(preparedGatewayTransaction{}),
 	)
 	preview := request(t, server, http.MethodGet, "/api/v1/runtime/preview")
 	if preview.Code != http.StatusOK {
 		t.Fatalf("preview status = %d, want 200: %s", preview.Code, preview.Body.String())
 	}
+	body := preview.Body.String()
 	for _, required := range []string{
-		`"dataplane_state":"smart_qos_ready"`,
 		`"underlay_wan_id":"pppoe-wan"`,
-		"set ly-route smart-qos interface lyroute-eth1 rate 1000000 host-isolation destination",
-		"set ly-route smart-qos interface lyroute-eth2 rate 500000 host-isolation source",
+		`"dataplane_degradations":[{"name":"smart_qos"`,
 	} {
-		if !strings.Contains(preview.Body.String(), required) {
-			t.Fatalf("PPPoE smart QoS preview missing %q: %s", required, preview.Body.String())
+		if !strings.Contains(body, required) {
+			t.Fatalf("PPPoE preview missing %q: %s", required, body)
 		}
 	}
-	if strings.Contains(preview.Body.String(), "set interface ip address lyroute-eth2") || strings.Contains(preview.Body.String(), "set dhcp client intfc lyroute-eth2") {
-		t.Fatalf("PPPoE underlay received an invented IP assignment: %s", preview.Body.String())
+	// arch-v1: legacy per-WAN bandwidth is accepted but drives no shaping
+	// operation, and it must not turn the preview into a smart-QoS state.
+	if strings.Contains(body, "set ly-route smart-qos") || strings.Contains(body, `"dataplane_state":"smart_qos_ready"`) {
+		t.Fatalf("retired smart QoS reached the dataplane plan: %s", body)
+	}
+	if strings.Contains(body, "set interface ip address lyroute-eth2") || strings.Contains(body, "set dhcp client intfc lyroute-eth2") {
+		t.Fatalf("PPPoE underlay received an invented IP assignment: %s", body)
 	}
 }

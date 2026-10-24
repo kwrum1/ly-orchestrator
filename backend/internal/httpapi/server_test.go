@@ -130,11 +130,11 @@ func TestDNSPoliciesMergeByPriorityAndUseDedicatedDefaultMiss(t *testing.T) {
 		t.Fatalf("login status = %d: %s", login.Code, login.Body.String())
 	}
 	cookie := login.Result().Cookies()[0]
-	local := `{"id":"dns-cn","name":"国内","priority":10,"enabled":true,"policy":{"engine":"smartdns","miss":{"kind":"reject"},"rules":[{"id":"cn-rule","domains":["cn.example"],"outcome":{"kind":"direct","upstream_id":"ali"}}]}}`
+	local := `{"id":"dns-cn","name":"鍥藉唴","priority":10,"enabled":true,"policy":{"engine":"smartdns","miss":{"kind":"reject"},"rules":[{"id":"cn-rule","domains":["cn.example"],"outcome":{"kind":"direct","upstream_id":"ali"}}]}}`
 	if res := authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/dns/policies", local, cookie); res.Code != http.StatusOK {
 		t.Fatalf("local DNS policy status = %d: %s", res.Code, res.Body.String())
 	}
-	defaultPolicy := `{"id":"dns-default","name":"缺省","priority":100,"enabled":true,"policy":{"engine":"smartdns","miss":{"kind":"direct","wan_egress_id":"proxy"},"rules":[]}}`
+	defaultPolicy := `{"id":"dns-default","name":"缂虹渷","priority":100,"enabled":true,"policy":{"engine":"smartdns","miss":{"kind":"direct","wan_egress_id":"proxy"},"rules":[]}}`
 	if res := authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/dns/policies", defaultPolicy, cookie); res.Code != http.StatusOK {
 		t.Fatalf("default DNS policy status = %d: %s", res.Code, res.Body.String())
 	}
@@ -2505,7 +2505,7 @@ func TestRuntimePreviewIncludesLANBridgeVPPOperation(t *testing.T) {
 		t.Fatalf("login status = %d, want 200: %s", login.Code, login.Body.String())
 	}
 	cookie := login.Result().Cookies()[0]
-	bridge := `{"id":"lan-bridge-1","name":"lan桥1","kind":"lan_bridge","type":"lan_bridge","gateway_role":"lan","bridge_members":["eth1","eth2"],"cidr":"192.168.30.1/24","dns_servers":["192.168.30.1"]}`
+	bridge := `{"id":"lan-bridge-1","name":"lan妗?","kind":"lan_bridge","type":"lan_bridge","gateway_role":"lan","bridge_members":["eth1","eth2"],"cidr":"192.168.30.1/24","dns_servers":["192.168.30.1"]}`
 	if res := authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/interfaces", bridge, cookie); res.Code != http.StatusOK {
 		t.Fatalf("create LAN bridge status=%d body=%s", res.Code, res.Body.String())
 	}
@@ -2559,7 +2559,7 @@ func TestRuntimeApplyProofRefreshUsesExplicitAssignments(t *testing.T) {
 	directory := t.TempDir()
 	proofPath := filepath.Join(directory, "proof.json")
 	probePath := filepath.Join(directory, "probe.sh")
-	probe := "#!/bin/sh\nset -eu\nprintf '{\"management_interface\":\"%s\",\"management_shared\":\"%s\",\"interfaces\":\"%s\"}\\n' \"$LY_ROUTE_MANAGEMENT_INTERFACE\" \"$LY_ROUTE_MANAGEMENT_SHARED\" \"$LY_ROUTE_VPP_DATA_INTERFACES\" > \"$LY_ROUTE_VPP_CAPABILITY_PROOF\"\n"
+	probe := "#!/bin/sh\nset -eu\nprintf '%s|%s|%s\\n' \"$LY_ROUTE_MANAGEMENT_INTERFACE\" \"$LY_ROUTE_MANAGEMENT_SHARED\" \"$LY_ROUTE_VPP_DATA_INTERFACES\" > \"$LY_ROUTE_VPP_CAPABILITY_PROOF.env\"\nprintf '{\"management_interface\":\"%s\"}\\n' \"$LY_ROUTE_MANAGEMENT_INTERFACE\" > \"$LY_ROUTE_VPP_CAPABILITY_PROOF\"\n"
 	if err := os.WriteFile(probePath, []byte(probe), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -2567,16 +2567,17 @@ func TestRuntimeApplyProofRefreshUsesExplicitAssignments(t *testing.T) {
 	t.Setenv("LY_ROUTE_VPP_CAPABILITY_PROOF", proofPath)
 	server := New(WithStore(store), WithClock(fixedClock()))
 
-	if err := server.refreshVPPNativeProof(ctx); err != nil {
-		t.Fatal(err)
+	observation := server.refreshDataplaneCapability(ctx)
+	if string(observation.Source) != "runtime_probe" {
+		t.Fatalf("capability source = %q, want runtime_probe (reason %q)", observation.Source, observation.Reason)
 	}
-	proofBytes, err := os.ReadFile(proofPath)
+	envBytes, err := os.ReadFile(proofPath + ".env")
 	if err != nil {
 		t.Fatal(err)
 	}
-	proofText := string(proofBytes)
-	if !strings.Contains(proofText, `"management_interface":"eth0"`) || !strings.Contains(proofText, `"management_shared":"false"`) || !strings.Contains(proofText, `"interfaces":"eth1"`) {
-		t.Fatalf("refreshed proof input = %s", proofText)
+	envText := strings.TrimSpace(string(envBytes))
+	if envText != "eth0|false|eth1" {
+		t.Fatalf("probe environment = %q, want eth0|false|eth1", envText)
 	}
 }
 
@@ -2600,7 +2601,7 @@ func TestRuntimeApplyProofRefreshCarriesSharedManagementAssignment(t *testing.T)
 	directory := t.TempDir()
 	proofPath := filepath.Join(directory, "proof.json")
 	probePath := filepath.Join(directory, "probe.sh")
-	probe := "#!/bin/sh\nset -eu\nprintf '{\"management_interface\":\"%s\",\"management_shared\":\"%s\",\"interfaces\":\"%s\"}\\n' \"$LY_ROUTE_MANAGEMENT_INTERFACE\" \"$LY_ROUTE_MANAGEMENT_SHARED\" \"$LY_ROUTE_VPP_DATA_INTERFACES\" > \"$LY_ROUTE_VPP_CAPABILITY_PROOF\"\n"
+	probe := "#!/bin/sh\nset -eu\nprintf '%s|%s|%s\\n' \"$LY_ROUTE_MANAGEMENT_INTERFACE\" \"$LY_ROUTE_MANAGEMENT_SHARED\" \"$LY_ROUTE_VPP_DATA_INTERFACES\" > \"$LY_ROUTE_VPP_CAPABILITY_PROOF.env\"\nprintf '{\"management_interface\":\"%s\"}\\n' \"$LY_ROUTE_MANAGEMENT_INTERFACE\" > \"$LY_ROUTE_VPP_CAPABILITY_PROOF\"\n"
 	if err := os.WriteFile(probePath, []byte(probe), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -2608,16 +2609,17 @@ func TestRuntimeApplyProofRefreshCarriesSharedManagementAssignment(t *testing.T)
 	t.Setenv("LY_ROUTE_VPP_CAPABILITY_PROOF", proofPath)
 	server := New(WithStore(store), WithClock(fixedClock()))
 
-	if err := server.refreshVPPNativeProof(ctx); err != nil {
-		t.Fatal(err)
+	observation := server.refreshDataplaneCapability(ctx)
+	if string(observation.Source) != "runtime_probe" {
+		t.Fatalf("capability source = %q, want runtime_probe (reason %q)", observation.Source, observation.Reason)
 	}
-	proofBytes, err := os.ReadFile(proofPath)
+	envBytes, err := os.ReadFile(proofPath + ".env")
 	if err != nil {
 		t.Fatal(err)
 	}
-	proofText := string(proofBytes)
-	if !strings.Contains(proofText, `"management_interface":"eth0"`) || !strings.Contains(proofText, `"management_shared":"true"`) || !strings.Contains(proofText, `"interfaces":"eth0"`) {
-		t.Fatalf("shared refreshed proof input = %s", proofText)
+	envText := strings.TrimSpace(string(envBytes))
+	if envText != "eth0|true|eth0" {
+		t.Fatalf("shared probe environment = %q, want eth0|true|eth0", envText)
 	}
 }
 
@@ -2684,7 +2686,7 @@ func TestRuntimePreviewReportsNativeReadyWithoutForwardingOperations(t *testing.
 	}
 }
 
-func TestRuntimePreviewRequiresAndSelectsProductionSmartQoS(t *testing.T) {
+func TestRuntimePreviewDoesNotRequireOrSelectRetiredSmartQoS(t *testing.T) {
 	ctx := context.Background()
 	store, err := persistence.Open(ctx, "file:httpapi-runtime-dpdk-hqos-test?mode=memory&cache=shared")
 	if err != nil {
@@ -2706,6 +2708,8 @@ func TestRuntimePreviewRequiresAndSelectsProductionSmartQoS(t *testing.T) {
 	}
 	now := fixedClock()().UTC()
 	proofPath := filepath.Join(t.TempDir(), "proof.json")
+	// The legacy report still advertises the smart-QoS plugin. arch-v1 must
+	// ignore that capability entirely.
 	proof := fmt.Sprintf(`{"management_interface":"eth0","proofs":[{"linux_interface":"eth1","candidates":[{"tier":"vpp_dpdk","hook":"dpdk","mode":"vfio_pci","source":"runtime_probe","runtime_verified":true,"native":false,"high_performance":true,"observed_at":%q,"valid_until":%q,"performance_score":80,"pci_address":"0000:03:00.0","kernel_driver":"ixgbe","iommu_group":"17","iommu_protected":true,"vfio_available":true,"hugepages_available":true,"dpdk_plugin_available":true,"smart_qos_plugin_available":true}]},{"linux_interface":"eth2","candidates":[{"tier":"vpp_dpdk","hook":"dpdk","mode":"vfio_pci","source":"runtime_probe","runtime_verified":true,"native":false,"high_performance":true,"observed_at":%q,"valid_until":%q,"performance_score":80,"pci_address":"0000:04:00.0","kernel_driver":"ixgbe","iommu_group":"18","iommu_protected":true,"vfio_available":true,"hugepages_available":true,"dpdk_plugin_available":true,"smart_qos_plugin_available":true}]}]}`, now.Add(-time.Minute).Format(time.RFC3339), now.Add(time.Minute).Format(time.RFC3339), now.Add(-time.Minute).Format(time.RFC3339), now.Add(time.Minute).Format(time.RFC3339))
 	if err := os.WriteFile(proofPath, []byte(proof), 0o600); err != nil {
 		t.Fatal(err)
@@ -2714,21 +2718,28 @@ func TestRuntimePreviewRequiresAndSelectsProductionSmartQoS(t *testing.T) {
 	server := New(
 		WithStore(store),
 		WithClock(fixedClock()),
-		WithSmartQoSRuntime(fakeSmartQoSObserver{}, true),
 		WithGatewayTransaction(preparedGatewayTransaction{}),
 	)
 
 	preview := request(t, server, http.MethodGet, "/api/v1/runtime/preview")
-	if preview.Code != http.StatusOK || !strings.Contains(preview.Body.String(), `"dataplane_state":"smart_qos_ready"`) {
-		t.Fatalf("smart QoS preview = %d %s", preview.Code, preview.Body.String())
+	if preview.Code != http.StatusOK {
+		t.Fatalf("preview = %d %s", preview.Code, preview.Body.String())
 	}
-	if !strings.Contains(preview.Body.String(), `"tier":"vpp_dpdk"`) || strings.Contains(preview.Body.String(), `"vpp_operations":null`) {
-		t.Fatalf("DPDK operations not carried into smart QoS runtime plan: %s", preview.Body.String())
+	body := preview.Body.String()
+	if strings.Contains(body, `"dataplane_state":"smart_qos_ready"`) || strings.Contains(body, `"dataplane_state":"dataplane_locked"`) || strings.Contains(body, `"dataplane_state":"dataplane_degraded"`) {
+		t.Fatalf("retired smart QoS changed the dataplane state: %s", body)
 	}
-	for _, required := range []string{"set ly-route smart-qos interface lyroute-eth1 rate 100000 host-isolation destination", "set ly-route smart-qos interface lyroute-eth2 rate 50000 host-isolation source"} {
-		if !strings.Contains(preview.Body.String(), required) {
-			t.Fatalf("smart QoS preview missing %q: %s", required, preview.Body.String())
-		}
+	if !strings.Contains(body, `"tier":"vpp_dpdk"`) || strings.Contains(body, `"vpp_operations":null`) {
+		t.Fatalf("DPDK operations not carried into the runtime plan: %s", body)
+	}
+	if strings.Contains(body, "set ly-route smart-qos") {
+		t.Fatalf("retired smart-QoS operation was emitted: %s", body)
+	}
+	if !strings.Contains(body, `"dataplane_degradations":[{"name":"smart_qos"`) {
+		t.Fatalf("retired smart QoS degradation missing: %s", body)
+	}
+	if !strings.Contains(body, "set interface ip address lyroute-eth1 192.168.10.1/24") {
+		t.Fatalf("ordinary addressing operations missing from the retired-feature preview: %s", body)
 	}
 }
 

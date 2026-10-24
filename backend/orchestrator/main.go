@@ -67,7 +67,6 @@ func run() error {
 			CookieSecure:        envBool("LY_ROUTE_SESSION_COOKIE_SECURE", false),
 			ForcePasswordChange: envBool("LY_ROUTE_FORCE_PASSWORD_CHANGE", true),
 		}),
-		httpapi.WithSmartQoSRuntime(productionSmartQoSObserver{transaction: dataplaneController}, false),
 	}
 	if profile.ID() == product.Orchestrator().ID() {
 		repository, repositoryErr := orchestrator.NewRepository(store, orchestrator.RepositoryOptions{Now: time.Now})
@@ -143,33 +142,6 @@ func productionDataplaneController() *dataplane.Transaction {
 	host.StateDir = env("LY_ROUTE_DATAPLANE_STATE_DIR", "/var/lib/ly-route/dataplane")
 	host.VPPCTL = env("LY_ROUTE_VPPCTL", "vppctl")
 	return &dataplane.Transaction{Host: host, Now: time.Now}
-}
-
-type productionSmartQoSObserver struct {
-	transaction *dataplane.Transaction
-}
-
-func (observer productionSmartQoSObserver) VerifySmartQoS(ctx context.Context, selected vpp.NativePath) error {
-	if observer.transaction == nil || observer.transaction.Host == nil {
-		return fmt.Errorf("dataplane runtime is unavailable")
-	}
-	host, ok := observer.transaction.Host.(*dataplane.LinuxHost)
-	if !ok {
-		return fmt.Errorf("production Linux dataplane observer is unavailable")
-	}
-	if selected.Tier == vpp.DataplaneTierDPDK {
-		active, found, err := host.LoadActiveState(ctx)
-		if err != nil {
-			return fmt.Errorf("load active dataplane state: %w", err)
-		}
-		if !found {
-			return fmt.Errorf("active dataplane state is unavailable")
-		}
-		if !dataplane.SameNativePath(active.Path, selected) {
-			return fmt.Errorf("active dataplane path differs from current capability selection")
-		}
-	}
-	return host.VerifySmartQoS(ctx, selected)
 }
 
 type productionOrchestratorRuntime struct {
@@ -489,7 +461,6 @@ func (runtime *productionOrchestratorRuntime) ApplyServiceChainTransition(ctx co
 
 func (runtime *productionOrchestratorRuntime) selectAndPrepare(ctx context.Context, requestID string, interfaces []string) (vpp.NativePath, error) {
 	request := vpp.LoadNativePathRequest(runtime.capabilityReport, runtime.managementInterface, interfaces, time.Now().UTC())
-	request.RequireSmartQoS = false
 	path, err := vpp.SelectNativePath(request)
 	if err != nil {
 		return vpp.NativePath{}, err

@@ -3,8 +3,6 @@ package httpapi
 import (
 	"context"
 	"errors"
-	"os"
-	"strings"
 
 	"ly-route/backend/internal/runtime/apply"
 	"ly-route/backend/internal/runtime/flow"
@@ -30,12 +28,9 @@ func (server *Server) buildOrchestratorRuntimePlan(ctx context.Context, requestI
 		return RuntimePlan{}, err
 	}
 
-	proofPath := strings.TrimSpace(os.Getenv("LY_ROUTE_VPP_CAPABILITY_PROOF"))
-	if proofPath == "" {
-		proofPath = "/var/lib/ly-route/vpp-native-capabilities.json"
-	}
-	nativePath := vpp.LoadNativePathRequestWithSharedManagement(proofPath, server.managementInterfaceID(ctx), server.runtimeDataInterfaces(ctx), server.now().UTC(), server.managementNetworkShared(ctx))
-	nativePath.RequireSmartQoS = false
+	interfaces := server.runtimeDataInterfaces(ctx)
+	observation := server.observeDataplaneCapability(ctx, interfaces)
+	nativePath := observation.NativePathRequest(server.managementInterfaceID(ctx), interfaces, server.now().UTC(), server.managementNetworkShared(ctx))
 	dataplanePrepared := false
 	if composition, ok := server.gatewayTransaction.(apply.ProductionGatewayComposition); ok {
 		dataplanePrepared = composition.HasDataplaneController()
@@ -44,7 +39,11 @@ func (server *Server) buildOrchestratorRuntimePlan(ctx context.Context, requestI
 	operations, buildErr := vpp.BuildOperations(gatewayPlan)
 	dataplaneState := "native_ready"
 	var dataplaneProof []vpp.PrerequisiteResult
+	var dataplaneDegradations []vpp.Degradation
 	var warnings []string
+	if observation.Degraded {
+		warnings = append(warnings, "dataplane capability degraded ("+string(observation.Source)+"): "+observation.Reason)
+	}
 	if buildErr != nil {
 		var locked *vpp.DataplaneLockedError
 		if !errors.As(buildErr, &locked) {
@@ -52,6 +51,10 @@ func (server *Server) buildOrchestratorRuntimePlan(ctx context.Context, requestI
 		}
 		operations = nil
 		dataplaneState = locked.Code()
+		if capabilityObservationDegradesDataplane(observation, len(nativePath.Assignments)) {
+			dataplaneState = "dataplane_degraded"
+			dataplaneDegradations = append(dataplaneDegradations, vpp.Degradation{Name: "dataplane_capability_observation", Reason: observation.Reason, Impact: "dataplane_apply"})
+		}
 		dataplaneProof = locked.Prerequisites
 		warnings = append(warnings, buildErr.Error())
 	}
@@ -68,7 +71,7 @@ func (server *Server) buildOrchestratorRuntimePlan(ctx context.Context, requestI
 		FlowIntent: flowIntent, CompiledFlow: compiledFlow, CompiledPolicy: compiledPolicy,
 		ServiceArtifacts: summarizeRuntimeArtifacts(artifacts), RuntimeArtifacts: artifacts,
 		VppOperations: operations, Components: components, Warnings: warnings,
-		DataplaneState: dataplaneState, DataplaneProof: dataplaneProof, GatewayPlan: gatewayPlan,
+		DataplaneState: dataplaneState, DataplaneProof: dataplaneProof, DataplaneDegradations: dataplaneDegradations, CapabilitySource: string(observation.Source), GatewayPlan: gatewayPlan,
 	}, nil
 }
 

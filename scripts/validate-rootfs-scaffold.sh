@@ -271,7 +271,7 @@ if ! grep -q 'dpkg-deb -x' "$repo_root/scripts/build-rootfs.sh"; then
   exit 1
 fi
 
-for target in smartdns xray vpp vpp-apply vpp-pppoe-client vpp-smart-qos vpp-security-guard; do
+for target in smartdns xray vpp vpp-apply vpp-pppoe-client vpp-security-guard; do
   if ! grep -q "$target" "$repo_root/scripts/build-runtime-debs.sh"; then
     echo "runtime .deb source builder does not expose target $target" >&2
     exit 1
@@ -418,7 +418,7 @@ if ! grep -q 'vpp-pppoe-client' "$repo_root/.github/workflows/gateway-release.ym
   echo "gateway release workflow does not build the native PPPoE VPP plugin" >&2
   exit 1
 fi
-for plugin in ly_route_pppoe_client_plugin.so pppoeclient_plugin.so ly_route_smart_qos_plugin.so ly_route_security_guard_plugin.so; do
+for plugin in ly_route_pppoe_client_plugin.so pppoeclient_plugin.so ly_route_security_guard_plugin.so; do
   if ! grep -R -q -- "$plugin" "$repo_root/scripts/rootfs-runtime-smoke.sh" "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/runtime-check.sh"; then
     echo "gateway runtime gate does not verify VPP plugin $plugin" >&2
     exit 1

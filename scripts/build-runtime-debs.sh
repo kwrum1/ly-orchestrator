@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/build-runtime-debs.sh [smartdns|dns-vpp-proxy|xray|vpp|vpp-fdio|vpp-pppoe-client|vpp-smart-qos|vpp-security-guard|vpp-dns-intercept|vpp-pre-nat-route|vpp-orchestrator|vpp-apply|all]
+Usage: scripts/build-runtime-debs.sh [smartdns|dns-vpp-proxy|xray|vpp|vpp-fdio|vpp-pppoe-client|vpp-security-guard|vpp-dns-intercept|vpp-pre-nat-route|vpp-orchestrator|vpp-apply|all]
 
 Builds source-backed runtime .deb packages for commercial Ly Route rootfs builds.
 
@@ -48,7 +48,6 @@ if [ ! -f "$runtime_stamp" ] || [ "$(cat "$runtime_stamp")" != "$source_fingerpr
     ly-route-dns-vpp-proxy_*.deb \
     ly-route-vpp-apply_*.deb \
     ly-route-vpp-pppoe-client_*.deb \
-    ly-route-vpp-smart-qos_*.deb \
     ly-route-vpp-security-guard_*.deb \
     ly-route-vpp-dns-intercept_*.deb \
     ly-route-vpp-pre-nat-route_*.deb \
@@ -1663,7 +1662,13 @@ case "$target" in
   vpp) build_vpp ;;
   vpp-fdio) build_vpp_fdio ;;
   vpp-pppoe-client) build_vpp_pppoe_client ;;
-  vpp-smart-qos) build_vpp_smart_qos ;;
+  # Built-in Smart QoS is retired in arch-v1. The vpp-smart-qos .deb payload is
+  # no longer produced; the plugin source and build script remain in tree for
+  # rollback. Requesting the retired target is reported, not silently ignored.
+  vpp-smart-qos)
+    echo "vpp-smart-qos is retired in arch-v1 and is no longer built" >&2
+    exit 2
+    ;;
   vpp-security-guard) build_vpp_security_guard ;;
   vpp-dns-intercept) build_vpp_dns_intercept ;;
   vpp-pre-nat-route) build_vpp_pre_nat_route ;;
@@ -1680,7 +1685,6 @@ case "$target" in
       build_vpp_fdio
     fi
     build_vpp_pppoe_client
-    build_vpp_smart_qos
     build_vpp_security_guard
     build_vpp_dns_intercept
     build_vpp_pre_nat_route

@@ -61,7 +61,6 @@ chroot "$rootfs" /bin/bash -eu -c '
   apt-get install -y --no-install-recommends build-essential cmake pkg-config
   export LY_ROUTE_VPP_DEV_DEBS_DIR=/packages
   export LY_ROUTE_VPP_SECURITY_GUARD_BUILD_DIR=/build/security-guard
-  export LY_ROUTE_VPP_SMART_QOS_BUILD_DIR=/build/smart-qos
   export LY_ROUTE_VPP_PPPOE_CLIENT_BUILD_DIR=/build/pppoe-client
   export LY_ROUTE_VPP_DNS_INTERCEPT_BUILD_DIR=/build/dns-intercept
   export LY_ROUTE_VPP_PRE_NAT_ROUTE_BUILD_DIR=/build/pre-nat-route
@@ -69,12 +68,7 @@ chroot "$rootfs" /bin/bash -eu -c '
     cat /tmp/security-plugin-build.log
     exit 1
   fi
-  if ! /src/ly-route/scripts/build-vpp-smart-qos-plugin.sh > /tmp/qos-plugin-build.log 2>&1; then
-    cat /tmp/qos-plugin-build.log
-    exit 1
-  fi
   security_plugin=$(tail -n 1 /tmp/security-plugin-build.log)
-  qos_plugin=$(tail -n 1 /tmp/qos-plugin-build.log)
   if ! /src/ly-route/scripts/build-vpp-pppoe-client-plugin.sh > /tmp/pppoe-plugin-build.log 2>&1; then
     cat /tmp/pppoe-plugin-build.log
     exit 1
@@ -91,19 +85,16 @@ chroot "$rootfs" /bin/bash -eu -c '
   fi
   pre_nat_route_plugin=$(tail -n 1 /tmp/pre-nat-route-plugin-build.log)
   install -m 0644 "$security_plugin" /out/ly_route_security_guard_plugin.so
-  install -m 0644 "$qos_plugin" /out/ly_route_smart_qos_plugin.so
   install -m 0644 "$pppoe_plugin" /out/ly_route_pppoe_client_plugin.so
   install -m 0644 "$dns_intercept_plugin" /out/ly_route_dns_intercept_plugin.so
   install -m 0644 "$pre_nat_route_plugin" /out/ly_route_pre_nat_route_plugin.so
   ldd /out/ly_route_security_guard_plugin.so
-  ldd /out/ly_route_smart_qos_plugin.so
   ldd /out/ly_route_pppoe_client_plugin.so
   ldd /out/ly_route_dns_intercept_plugin.so
   ldd /out/ly_route_pre_nat_route_plugin.so
 '
 
 install -m 0644 "$rootfs/out/ly_route_security_guard_plugin.so" "$out/ly_route_security_guard_plugin.so"
-install -m 0644 "$rootfs/out/ly_route_smart_qos_plugin.so" "$out/ly_route_smart_qos_plugin.so"
 install -m 0644 "$rootfs/out/ly_route_pppoe_client_plugin.so" "$out/ly_route_pppoe_client_plugin.so"
 install -m 0644 "$rootfs/out/ly_route_dns_intercept_plugin.so" "$out/ly_route_dns_intercept_plugin.so"
 install -m 0644 "$rootfs/out/ly_route_pre_nat_route_plugin.so" "$out/ly_route_pre_nat_route_plugin.so"

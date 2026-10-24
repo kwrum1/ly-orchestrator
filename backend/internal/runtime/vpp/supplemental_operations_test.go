@@ -314,7 +314,10 @@ func TestSupplementalOperationsIncludesOnlyUngroupedDirectFlowTargets(t *testing
 	}
 }
 
-func TestSupplementalQoSOwnsSmartQoSApplyAndRollbackDisable(t *testing.T) {
+// TestSupplementalQoSNeverOwnsRetiredSmartQoS pins arch-v1: the QoS supplemental
+// owner must not produce smart-QoS apply or rollback operations, so a rollback
+// on a plugin-free image cannot fail.
+func TestSupplementalQoSNeverOwnsRetiredSmartQoS(t *testing.T) {
 	now := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
 	proof := provenAFXDPProof(now)
 	proof.SmartQoSPluginAvailable = true
@@ -333,20 +336,42 @@ func TestSupplementalQoSOwnsSmartQoSApplyAndRollbackDisable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(operations) != 2 || operations[0].Name != "vpp.smart-qos" || operations[1].Name != "vpp.smart-qos" {
-		t.Fatalf("Smart QoS supplemental operations = %#v, want two interface operations", operations)
+	for _, operation := range operations {
+		if strings.HasPrefix(operation.Name, "vpp.smart-qos") {
+			t.Fatalf("retired smart-QoS supplemental operation = %#v", operation)
+		}
+	}
+	if HasSupplementalOperations(plan, SupplementalQoS) {
+		t.Fatalf("retired smart QoS must not claim supplemental operations")
 	}
 	cleanup, err := SupplementalCleanupOperations(plan, SupplementalQoS)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cleanup) != 2 {
-		t.Fatalf("Smart QoS cleanup count = %d, want 2", len(cleanup))
-	}
 	for _, operation := range cleanup {
-		if operation.Name != "vpp.smart-qos.rollback-delete" || !operationHasCommand(operation, " disable") || !operationHasCommand(operation, "show ly-route smart-qos") {
-			t.Fatalf("Smart QoS cleanup operation = %#v, want disable plus semantic readback", operation)
+		if strings.HasPrefix(operation.Name, "vpp.smart-qos") {
+			t.Fatalf("retired smart-QoS cleanup operation = %#v", operation)
 		}
+	}
+}
+
+// TestSupplementalReadbackIgnoresLegacySmartQoSEvidence proves an upgraded
+// gateway keeps a healthy committed generation: evidence rows written by a
+// pre-arch-v1 firmware no longer count as a mismatch.
+func TestSupplementalReadbackIgnoresLegacySmartQoSEvidence(t *testing.T) {
+	now := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	proof := provenAFXDPProof(now)
+	plan := Plan{
+		RequestID: "txn-legacy-smart-qos-evidence",
+		NativePath: NativePathRequest{ManagementInterface: "eth0", Now: now, Assignments: []NativeAssignment{
+			{LinuxInterface: "eth1", Explicit: true, Candidates: []CapabilityProof{proof}},
+		}},
+	}
+	legacy := []SupplementalOperationReadback{
+		{Name: "vpp.smart-qos", Resource: "lyroute-eth1", PayloadHash: "legacy", Shows: []VPPCTLCommandResult{{Command: "show ly-route smart-qos"}}},
+	}
+	if err := ValidateCommittedSupplementalReadback(plan, SupplementalQoS, legacy, now); err != nil {
+		t.Fatalf("legacy smart-QoS evidence must be ignored: %v", err)
 	}
 }
 

@@ -221,7 +221,10 @@ func gatewayPlanResources(plan vpp.Plan) map[string]struct{} {
 	if len(plan.Policy.SecurityACLs) > 0 || len(plan.Security.ACLs) > 0 || len(plan.Security.MACIP) > 0 || len(plan.Security.AttackRules) > 0 || hasSupplemental(vpp.SupplementalSecurity) {
 		resources["acls"] = struct{}{}
 	}
-	if len(plan.Flow.VPPGroups) > 0 || len(plan.SmartQoSAssignments) > 0 || hasSupplemental(vpp.SupplementalQoS) {
+	// SmartQoSAssignments is deliberately not consulted: built-in Smart QoS is
+	// retired and no longer owns VPP operations, so legacy plans that only
+	// carried bandwidth hints must not expect a QoS evidence row.
+	if len(plan.Flow.VPPGroups) > 0 || hasSupplemental(vpp.SupplementalQoS) {
 		resources["qos"] = struct{}{}
 	}
 	if len(plan.NAT.StaticMappings) > 0 {

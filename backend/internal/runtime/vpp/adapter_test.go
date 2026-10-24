@@ -578,15 +578,22 @@ func TestBuildOperationsLocksSharedManagementOutsideLAN(t *testing.T) {
 	}
 }
 
-func TestBuildOperationsActivatesBuiltInSmartQoSOnLANAndWAN(t *testing.T) {
+// TestBuildOperationsNeverEmitsRetiredSmartQoS pins arch-v1: even when a legacy
+// plan carries bandwidth hints and a proof that still advertises the plugin, the
+// operation graph must not contain a smart-QoS operation.
+func TestBuildOperationsNeverEmitsRetiredSmartQoS(t *testing.T) {
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	proof := provenAFXDPProof(now)
 	proof.SmartQoSPluginAvailable = true
 	plan := Plan{
-		RequestID: "req-smart-qos",
+		RequestID: "req-smart-qos-retired",
 		AddressAssignments: []AddressAssignment{
 			{ID: "lan", LinuxInterface: "eth1", VPPInterface: "lyroute-eth1", CIDR: "192.168.10.1/24", Role: "lan", BandwidthKbps: 100000},
 			{ID: "wan", LinuxInterface: "eth2", VPPInterface: "lyroute-eth2", CIDR: "203.0.113.2/30", Role: "wan", BandwidthKbps: 50000},
+		},
+		// Legacy config still asks for the retired feature; it must be ignored.
+		SmartQoSAssignments: []AddressAssignment{
+			{ID: "lan", LinuxInterface: "eth1", VPPInterface: "lyroute-eth1", Role: "lan", BandwidthKbps: 100000},
 		},
 		NativePath: NativePathRequest{ManagementInterface: "eth0", RequireSmartQoS: true, Now: now, Assignments: []NativeAssignment{
 			{LinuxInterface: "eth1", Explicit: true, Candidates: []CapabilityProof{proof}},
@@ -594,14 +601,26 @@ func TestBuildOperationsActivatesBuiltInSmartQoSOnLANAndWAN(t *testing.T) {
 		}},
 	}
 	operations := mustBuildOperations(t, plan)
-	assertOperationCommand(t, operations, "vpp.smart-qos", "interface lyroute-eth1 rate 100000 host-isolation destination")
-	assertOperationCommand(t, operations, "vpp.smart-qos", "interface lyroute-eth2 rate 50000 host-isolation source")
+	hasAttachment := false
+	for _, operation := range operations {
+		if strings.HasPrefix(operation.Name, "vpp.smart-qos") {
+			t.Fatalf("retired smart-QoS operation must not be built: %+v", operation)
+		}
+		if operation.Name == "vpp.dataplane.attach" {
+			hasAttachment = true
+		}
+	}
+	if !hasAttachment {
+		t.Fatalf("dataplane attachment missing from retired-feature plan: %+v", operations)
+	}
 }
 
-func TestBuildOperationsLocksSmartQoSWithoutExplicitLineBandwidth(t *testing.T) {
+// TestBuildOperationsDoesNotLockOnMissingBandwidth pins arch-v1: legacy line
+// bandwidth is a hint for a retired feature, so its absence is not a
+// dataplane prerequisite.
+func TestBuildOperationsDoesNotLockOnMissingBandwidth(t *testing.T) {
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	proof := provenAFXDPProof(now)
-	proof.SmartQoSPluginAvailable = true
 	plan := Plan{
 		RequestID: "req-smart-qos-no-bandwidth",
 		AddressAssignments: []AddressAssignment{
@@ -613,9 +632,7 @@ func TestBuildOperationsLocksSmartQoSWithoutExplicitLineBandwidth(t *testing.T) 
 			{LinuxInterface: "eth2", Explicit: true, Candidates: []CapabilityProof{proof}},
 		}},
 	}
-	_, err := BuildOperations(plan)
-	var locked *DataplaneLockedError
-	if !errors.As(err, &locked) || !strings.Contains(err.Error(), "smart_qos_bandwidth_configured") {
-		t.Fatalf("expected explicit bandwidth prerequisite lock, got %v", err)
+	if _, err := BuildOperations(plan); err != nil {
+		t.Fatalf("missing legacy bandwidth must not lock the dataplane: %v", err)
 	}
 }

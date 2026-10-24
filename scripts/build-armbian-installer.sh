@@ -77,7 +77,7 @@ for path in "$extracted"/etc/systemd/system/ly-route* "$extracted"/etc/systemd/s
   cp -a "$path" "$overlay/etc/systemd/system/"
 done
 
-required_packages='libvppinfra vpp vpp-plugin-core vpp-plugin-dpdk ly-route-vpp-apply ly-route-vpp-smart-qos ly-route-vpp-security-guard ly-route-vpp-pppoe-client ly-route-dns-vpp-proxy smartdns xray'
+required_packages='libvppinfra vpp vpp-plugin-core vpp-plugin-dpdk ly-route-vpp-apply ly-route-vpp-security-guard ly-route-vpp-pppoe-client ly-route-dns-vpp-proxy smartdns xray'
 for package in $required_packages; do
   found=
   for deb in "$runtime_debs/${package}_"*"_arm64.deb"; do

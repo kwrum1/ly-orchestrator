@@ -4,8 +4,14 @@ umask 077
 
 : "${LY_ROUTE_COMMERCIAL_RUNTIME_REQUIRED:=true}"
 : "${LY_ROUTE_PRODUCT:=gateway}"
-: "${LY_ROUTE_REQUIRED_COMMANDS:=vpp,vppctl,/usr/lib/ly-route/vpp-apply,smartdns,kea-dhcp4,xray,ipset,/usr/lib/ly-route/ly-route-pppoe-client,python3}"
-: "${LY_ROUTE_REQUIRED_UNITS:=vpp.service,smartdns.service,kea-dhcp4-server.service,xray.service,ly-route-pppoe.target}"
+# arch-v1 splits the readiness inventory. Only the control plane and the
+# dataplane path gate readiness: a clean first boot must reach a forwarding
+# dataplane without Kea, SmartDNS or xray being installed or live. Those
+# services are reported separately as optional degradations.
+: "${LY_ROUTE_REQUIRED_COMMANDS:=vpp,vppctl,/usr/lib/ly-route/vpp-apply,ipset,/usr/lib/ly-route/ly-route-pppoe-client,python3}"
+: "${LY_ROUTE_REQUIRED_UNITS:=vpp.service,ly-route-pppoe.target}"
+: "${LY_ROUTE_OPTIONAL_COMMANDS:=smartdns,kea-dhcp4,xray,/usr/lib/ly-route/ly-route-dns-vpp-proxy}"
+: "${LY_ROUTE_OPTIONAL_UNITS:=smartdns.service,kea-dhcp4-server.service,xray.service,ly-route-dns-vpp-proxy.service,ly-route-dns-vpp-proxy-v6.service}"
 : "${LY_ROUTE_RUNTIME_READINESS:=/var/lib/ly-route/runtime-readiness.json}"
 : "${LY_ROUTE_VPP_CAPABILITY_PROOF:=/var/lib/ly-route/vpp-native-capabilities.json}"
 : "${LY_ROUTE_VPP_DATA_INTERFACES:=}"
@@ -266,6 +272,21 @@ for unit_name in $(split_csv "$LY_ROUTE_REQUIRED_UNITS"); do
   fi
 done
 
+# Optional services are reported, never gating. Kea, SmartDNS and xray are
+# features layered on top of forwarding: a clean first boot must still bring up
+# the data ports and reach a VPP-attachable path without them.
+optional_missing=""
+for command_name in $(split_csv "${LY_ROUTE_OPTIONAL_COMMANDS:-}"); do
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    optional_missing=$(append_missing "$optional_missing" "$command_name")
+  fi
+done
+for unit_name in $(split_csv "${LY_ROUTE_OPTIONAL_UNITS:-}"); do
+  if ! systemctl list-unit-files "$unit_name" >/dev/null 2>&1; then
+    optional_missing=$(append_missing "$optional_missing" "$unit_name")
+  fi
+done
+
 mkdir -p "$(dirname "$LY_ROUTE_RUNTIME_READINESS")"
 status=ready
 if [ -n "$missing_commands" ] || [ -n "$missing_units" ]; then
@@ -278,15 +299,6 @@ proof_items=
 proof_first=1
 all_native=true
 all_dpdk=true
-smart_qos_plugin_available=false
-if command -v vppctl >/dev/null 2>&1 && plugin_output=$(vppctl show plugin 2>/dev/null) && cli_output=$(vppctl show cli 2>/dev/null) && smart_qos_output=$(vppctl show ly-route smart-qos 2>/dev/null | tr -d '\r'); then
-  if printf '%s\n' "$plugin_output" | grep -q 'ly_route_smart_qos_plugin.so' &&
-     printf '%s\n' "$cli_output" | grep -q 'show ly-route smart-qos' &&
-     printf '%s\n' "$smart_qos_output" | grep -qx 'algorithm fq-codel' &&
-     printf '%s\n' "$smart_qos_output" | grep -qx 'qualification production'; then
-    smart_qos_plugin_available=true
-  fi
-fi
 if [ "$LY_ROUTE_PRODUCT" = orchestrator ]; then
   orchestrator_plugin_available=false
   if command -v vppctl >/dev/null 2>&1 &&
@@ -304,10 +316,8 @@ if [ "$LY_ROUTE_PRODUCT" = orchestrator ]; then
   fi
 fi
 if [ "$LY_ROUTE_PRODUCT" = gateway ]; then
-  if [ "$smart_qos_plugin_available" != true ]; then
-    missing_commands=$(append_missing "$missing_commands" vpp-smart-qos-plugin)
-    status=missing-runtime
-  fi
+  # Built-in Smart QoS is retired in arch-v1: the plugin is no longer shipped and
+  # its absence must not fail the runtime gate or lock the dataplane.
   pppoe_client_plugin_available=false
   if command -v vppctl >/dev/null 2>&1 &&
      plugin_output=$(vppctl show plugin 2>/dev/null) &&
@@ -462,7 +472,7 @@ for interface_name in $(split_csv "$LY_ROUTE_VPP_DATA_INTERFACES"); do
        printf '%s\n' "$plugin_output" | grep -q 'af_packet_plugin.so' &&
        ip link set dev "$interface_name" promisc on >/dev/null 2>&1 &&
        native_score=$(probe_native_candidate "$interface_name" af_packet linux_packet_socket); then
-      vmxnet3_af_packet_candidate="{\"tier\":\"vpp_native\",\"hook\":\"af_packet\",\"mode\":\"linux_packet_socket\",\"source\":\"runtime_probe\",\"runtime_verified\":true,\"native\":true,\"high_performance\":false,\"acceptance_only\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$native_score,\"kernel_driver\":\"$interface_driver\",\"mac_address\":\"$(json_escape "$interface_mac")\",\"smart_qos_plugin_available\":$smart_qos_plugin_available}"
+      vmxnet3_af_packet_candidate="{\"tier\":\"vpp_native\",\"hook\":\"af_packet\",\"mode\":\"linux_packet_socket\",\"source\":\"runtime_probe\",\"runtime_verified\":true,\"native\":true,\"high_performance\":false,\"acceptance_only\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$native_score,\"kernel_driver\":\"$interface_driver\",\"mac_address\":\"$(json_escape "$interface_mac")\"}"
       native_candidate=$vmxnet3_af_packet_candidate
     fi
     # VMXNET3 is validated through AF_PACKET only. Its unsupported native
@@ -476,7 +486,7 @@ for interface_name in $(split_csv "$LY_ROUTE_VPP_DATA_INTERFACES"); do
         native_plugin=$3
         if printf '%s\n' "$plugin_output" | grep -q "$native_plugin"; then
           if native_score=$(probe_native_candidate "$interface_name" "$native_hook" "$native_mode"); then
-            candidate="{\"tier\":\"vpp_native\",\"hook\":\"$native_hook\",\"mode\":\"$native_mode\",\"source\":\"runtime_probe\",\"runtime_verified\":true,\"native\":true,\"high_performance\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$native_score,\"mac_address\":\"$(json_escape "$interface_mac")\",\"smart_qos_plugin_available\":$smart_qos_plugin_available}"
+            candidate="{\"tier\":\"vpp_native\",\"hook\":\"$native_hook\",\"mode\":\"$native_mode\",\"source\":\"runtime_probe\",\"runtime_verified\":true,\"native\":true,\"high_performance\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$native_score,\"mac_address\":\"$(json_escape "$interface_mac")\"}"
             if [ -n "$native_candidate" ]; then native_candidate="$native_candidate,$candidate"; else native_candidate=$candidate; fi
           fi
         fi
@@ -489,11 +499,11 @@ for interface_name in $(split_csv "$LY_ROUTE_VPP_DATA_INTERFACES"); do
     dpdk_source=active_runtime_readback
     dpdk_score=80
     [ "$dpdk_mode" = uio_pci_generic ] && dpdk_score=75
-    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true,\"smart_qos_plugin_available\":$smart_qos_plugin_available}"
+    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true}"
   elif command -v vppctl >/dev/null 2>&1 && probe_dpdk_interface "$interface_name"; then
     dpdk_score=80
     [ "$dpdk_mode" = uio_pci_generic ] && dpdk_score=75
-    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true,\"smart_qos_plugin_available\":$smart_qos_plugin_available}"
+    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true}"
   else
     all_dpdk=false
   fi
@@ -539,6 +549,10 @@ proof_tmp=
   printf '  "missing_units": '
   # shellcheck disable=SC2086
   json_array $missing_units
+  printf ',\n'
+  printf '  "optional_missing": '
+  # shellcheck disable=SC2086
+  json_array $optional_missing
   printf '\n}\n'
 } > "$LY_ROUTE_RUNTIME_READINESS"
 

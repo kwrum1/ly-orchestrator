@@ -91,12 +91,17 @@ func run() error {
 		return fmt.Errorf("initialize product selection: %w", err)
 	}
 	dataplaneController := productionDataplaneController()
+	capabilityProber := vpp.NewCapabilityProber(
+		env("LY_ROUTE_VPP_PROBE_COMMAND", "/usr/lib/ly-route/runtime-check.sh"),
+		env("LY_ROUTE_VPP_CAPABILITY_PROOF", "/var/lib/ly-route/vpp-native-capabilities.json"),
+		env("LY_ROUTE_DATAPLANE_ACTIVE_STATE", "/var/lib/ly-route/dataplane/active.json"),
+	)
 	options := []httpapi.Option{
 		httpapi.WithVersion(Version()),
 		httpapi.WithStore(store),
 		httpapi.WithAuthConfig(gatewayAuthConfig()),
 		httpapi.WithGatewayTransaction(productionGatewayTransactionWithController(dataplaneController)),
-		httpapi.WithSmartQoSRuntime(productionSmartQoSObserver{transaction: dataplaneController}, true),
+		httpapi.WithCapabilityProber(capabilityProber),
 	}
 	if envBool("LY_ROUTE_ENABLE_SERVICE_RUNTIME", false) {
 		options = append(options, httpapi.WithServiceRuntime(serviceRuntime.Runtime{Controller: serviceRuntime.FilesystemController{
@@ -129,6 +134,23 @@ func run() error {
 		return fmt.Errorf("initialize control API: %w", err)
 	}
 	server.StartAdaptiveProxyReconciler(context.Background(), 10*time.Second)
+	// Probe dataplane capability at startup instead of trusting a pre-generated
+	// proof file. The observation warms the cache used by plan building; a
+	// failure is logged as a degradation and never blocks forwarding.
+	go func() {
+		probeCtx, cancel := context.WithTimeout(context.Background(), vpp.DefaultProbeTimeout+10*time.Second)
+		defer cancel()
+		observation := capabilityProber.Observe(probeCtx, vpp.ProbeTarget{
+			ManagementInterface: env("LY_ROUTE_MANAGEMENT_INTERFACE", ""),
+			ManagementShared:    envBool("LY_ROUTE_MANAGEMENT_SHARED", false),
+			DataInterfaces:      splitCSV(env("LY_ROUTE_VPP_DATA_INTERFACES", "")),
+		})
+		if observation.Degraded {
+			log.Printf("dataplane capability degraded (source=%s): %s", observation.Source, observation.Reason)
+			return
+		}
+		log.Printf("dataplane capability observed (source=%s, interfaces=%d)", observation.Source, len(observation.Report.Proofs))
+	}()
 	log.Printf("ly-route %s control API listening on %s database=%s config=%s", profile.ID(), addr, databasePath, configPath)
 	if err := httpapi.ListenAndServe(addr, server); err != nil {
 		return fmt.Errorf("serve control API: %w", err)
@@ -163,33 +185,6 @@ func productionDataplaneController() *dataplane.Transaction {
 	host.StateDir = env("LY_ROUTE_DATAPLANE_STATE_DIR", "/var/lib/ly-route/dataplane")
 	host.VPPCTL = env("LY_ROUTE_VPPCTL", "vppctl")
 	return &dataplane.Transaction{Host: host, Now: time.Now}
-}
-
-type productionSmartQoSObserver struct {
-	transaction *dataplane.Transaction
-}
-
-func (observer productionSmartQoSObserver) VerifySmartQoS(ctx context.Context, selected vpp.NativePath) error {
-	if observer.transaction == nil || observer.transaction.Host == nil {
-		return fmt.Errorf("dataplane runtime is unavailable")
-	}
-	host, ok := observer.transaction.Host.(*dataplane.LinuxHost)
-	if !ok {
-		return fmt.Errorf("production Linux dataplane observer is unavailable")
-	}
-	if selected.Tier == vpp.DataplaneTierDPDK {
-		active, found, err := host.LoadActiveState(ctx)
-		if err != nil {
-			return fmt.Errorf("load active dataplane state: %w", err)
-		}
-		if !found {
-			return fmt.Errorf("active dataplane state is unavailable")
-		}
-		if !dataplane.SameNativePath(active.Path, selected) {
-			return fmt.Errorf("active dataplane path differs from current capability selection")
-		}
-	}
-	return host.VerifySmartQoS(ctx, selected)
 }
 
 /* type productionOrchestratorRuntime struct {
@@ -509,7 +504,6 @@ func (runtime *productionOrchestratorRuntime) ApplyServiceChainTransition(ctx co
 
 func (runtime *productionOrchestratorRuntime) selectAndPrepare(ctx context.Context, requestID string, interfaces []string) (vpp.NativePath, error) {
 	request := vpp.LoadNativePathRequest(runtime.capabilityReport, runtime.managementInterface, interfaces, time.Now().UTC())
-	request.RequireSmartQoS = false
 	path, err := vpp.SelectNativePath(request)
 	if err != nil {
 		return vpp.NativePath{}, err
@@ -654,6 +648,19 @@ func envBool(key string, fallback bool) bool {
 		return fallback
 	}
 	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+// splitCSV parses the comma-separated interface list the appliance environment
+// uses for dataplane targets.
+func splitCSV(value string) []string {
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			items = append(items, trimmed)
+		}
+	}
+	return items
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {

@@ -37,7 +37,7 @@ func selectCommonDataplanePath(request NativePathRequest) (NativePath, error) {
 		eligible[name] = eligibleByTier{}
 		for _, proof := range assignment.Candidates {
 			tier := proofTier(proof)
-			reasons := candidateRejectionReasons(proof, request.Now, tier, request.RequireSmartQoS, request.AcceptanceAFPacket)
+			reasons := candidateRejectionReasons(proof, request.Now, tier, request.AcceptanceAFPacket)
 			evaluation := CandidateEvaluation{LinuxInterface: name, Tier: tier, Hook: proof.Hook, Mode: proof.Mode, PerformanceScore: proof.PerformanceScore, Eligible: len(reasons) == 0, Reasons: reasons}
 			evaluations = append(evaluations, evaluation)
 			if evaluation.Eligible {
@@ -67,11 +67,7 @@ func selectCommonDataplanePath(request NativePathRequest) (NativePath, error) {
 		}
 	}
 	if selectedTier == "" {
-		reason := "no single high-performance tier is eligible on every active data interface"
-		if request.RequireSmartQoS {
-			reason = "smart QoS requires the production VPP smart-QoS plugin on every active data interface"
-		}
-		results = append(results, prerequisite("common_dataplane_tier", "", false, reason))
+		results = append(results, prerequisite("common_dataplane_tier", "", false, "no single high-performance tier is eligible on every active data interface"))
 		return NativePath{}, &DataplaneLockedError{Prerequisites: results, Candidates: evaluations}
 	}
 	selectedDPDKMode := NativeMode("")
@@ -138,10 +134,10 @@ func selectCommonDataplanePath(request NativePathRequest) (NativePath, error) {
 		}))
 	}
 	results = append(results, prerequisite("common_dataplane_tier", "", true, ""))
-	if request.RequireSmartQoS {
-		results = append(results, prerequisite("smart_qos_scheduler", "", true, ""))
-	}
-	return NativePath{Tier: selectedTier, SmartQoS: request.RequireSmartQoS, Attachments: attachments, Prerequisites: results, Candidates: evaluations}, nil
+	// Smart QoS never participates in tier selection. Its absence is reported
+	// as a QoS degradation only, so a plugin-free image still reaches a
+	// committed forwarding generation.
+	return NativePath{Tier: selectedTier, SmartQoS: false, Attachments: attachments, Prerequisites: results, Candidates: evaluations, Degradations: []Degradation{smartQoSRetiredDegradation()}}, nil
 }
 
 func proofTier(proof CapabilityProof) DataplaneTier {
@@ -161,7 +157,7 @@ func selectedVPPInterface(proof CapabilityProof, linuxInterface string) string {
 	return "lyroute-" + linuxInterface
 }
 
-func candidateRejectionReasons(proof CapabilityProof, now time.Time, tier DataplaneTier, requireSmartQoS bool, acceptanceAFPacket bool) []string {
+func candidateRejectionReasons(proof CapabilityProof, now time.Time, tier DataplaneTier, acceptanceAFPacket bool) []string {
 	reasons := make([]string, 0)
 	acceptancePath := acceptanceAFPacketProof(acceptanceAFPacket, proof)
 	runtimeProof := isRuntimeCapabilityProof(proof) && proof.RuntimeVerified && !proof.ObservedAt.IsZero()
@@ -218,9 +214,8 @@ func candidateRejectionReasons(proof CapabilityProof, now time.Time, tier Datapl
 	default:
 		reasons = append(reasons, "unknown dataplane tier")
 	}
-	if requireSmartQoS && !proof.SmartQoSPluginAvailable {
-		reasons = append(reasons, "production VPP smart-QoS plugin is unavailable")
-	}
+	// Smart QoS availability is intentionally not part of candidate rejection:
+	// the feature is retired and must never lock a forwarding candidate.
 	return reasons
 }
 

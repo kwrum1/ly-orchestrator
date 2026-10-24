@@ -61,7 +61,6 @@ run_case security-generation scripts/test-security-generation-vpp.sh
 run_case dns-priority-vpp-route-policy scripts/test-route-policy-vpp.sh
 run_case wan-groups scripts/test-wan-group-vpp-netns.sh
 run_case user-rate-limit scripts/test-vpp-policer-netns.sh
-run_case smart-qos scripts/test-vpp-smart-qos-multiworker.sh
 run_case xray-config-binary scripts/test-xray-runtime.sh
 run_case proxy-fastest-failover scripts/test-xray-fastest-failover-container.sh
 run_case gateway-product-contract scripts/test-gateway-product-contract.sh

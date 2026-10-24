@@ -131,7 +131,7 @@ func TestGatewayCompatibilityConstructorPreservesRepresentativeResponses(t *test
 	}{
 		{name: "health remains available", path: "/api/v1/health", wantStatus: http.StatusOK, wantFragment: `"status":"degraded"`},
 		{name: "traffic control remains available", path: "/api/v1/gateway/traffic-control", wantStatus: http.StatusOK, wantFragment: "classify-default"},
-		{name: "built-in smart QoS remains read-only", path: "/api/v1/flow-control/smart-qos", wantStatus: http.StatusOK, wantFragment: `"mutable":false`},
+		{name: "built-in smart QoS is retired", path: "/api/v1/flow-control/smart-qos", wantStatus: http.StatusGone, wantFragment: `"code":"feature_retired"`},
 		{name: "proxy egress remains available", path: "/api/v1/proxy/egress", wantStatus: http.StatusOK, wantFragment: "proxy_egress"},
 		{name: "dns resolution remains available", path: "/api/v1/dns/resolve?domain=example.test", wantStatus: http.StatusOK, wantFragment: `"answer":"NODATA"`},
 		{name: "unknown route remains typed", path: "/api/v1/characterization-missing", wantStatus: http.StatusNotFound, wantFragment: `"code":"not_found"`},

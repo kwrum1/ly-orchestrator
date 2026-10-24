@@ -22,13 +22,7 @@ cat > "$tmp/bin/vppctl" <<'EOF'
 printf '%s\n' "$*" >> "$VPPCTL_LOG"
 case "$*" in
   'show plugin') printf '%s\n' "$VPPCTL_PLUGINS" ;;
-  'show cli')
-    printf '%s\n' 'show dpdk interface'
-    case "$VPPCTL_PLUGINS" in *ly_route_smart_qos_plugin.so*) printf '%s\n' 'show ly-route smart-qos' ;; esac
-    ;;
-  'show ly-route smart-qos')
-    printf '%s\n' 'state locked' 'algorithm fq-codel' "qualification ${VPPCTL_SMART_QOS_QUALIFICATION:-development-single-worker}"
-    ;;
+  'show cli') printf '%s\n' 'show dpdk interface' ;;
   show\ hardware-interfaces\ *) printf '%s PCI %s\n' "$3" "${VPPCTL_ACTIVE_PCI:-}" ;;
   'show threads') printf '%s\n' "${VPPCTL_THREADS:-vpp_main}" ;;
   'show dpdk interface hqos placement') printf '%s\n' "${VPPCTL_HQOS_PLACEMENT:-}" ;;
@@ -119,6 +113,10 @@ EOF
 
 run_check native eth0 eth1 af_xdp_plugin.so 1
 grep -q '"dataplane_state": "native_ready"' "$tmp/native/readiness.json"
+# arch-v1 first boot: optional services (SmartDNS/Kea/xray) are reported as
+# degradations and never gate readiness or the dataplane.
+grep -q '"status": "ready"' "$tmp/native/readiness.json"
+grep -q '"optional_missing": \["smartdns"' "$tmp/native/readiness.json"
 grep -q '"hook":"af_xdp"' "$tmp/native/proof.json"
 grep -Eq 'create interface af_xdp host-if eth1 name lyroute-proof-[0-9]+-[0-9]+-af_xdp .*zero-copy' "$tmp/native/vppctl.log"
 if grep -q 'host-if eth0' "$tmp/native/vppctl.log"; then
@@ -147,28 +145,26 @@ grep -q '"iommu_group":"17"' "$tmp/dpdk/proof.json"
 grep -q '"dpdk_plugin_available":true' "$tmp/dpdk/proof.json"
 
 setup_active_dpdk_fixture dpdk-active eth1
-VPPCTL_ACTIVE_PCI=0000:03:00.0 VPPCTL_SMART_QOS_QUALIFICATION=production \
-  run_check dpdk-active eth0 eth1 'dpdk_plugin.so ly_route_smart_qos_plugin.so' 0
+VPPCTL_ACTIVE_PCI=0000:03:00.0 run_check dpdk-active eth0 eth1 dpdk_plugin.so 0
 grep -q '"dataplane_state": "dpdk_ready"' "$tmp/dpdk-active/readiness.json"
 grep -q '"source":"active_runtime_readback"' "$tmp/dpdk-active/proof.json"
 grep -q '"linux_interface":"eth1"' "$tmp/dpdk-active/proof.json"
 grep -q '"kernel_driver":"ixgbe"' "$tmp/dpdk-active/proof.json"
-grep -q '"smart_qos_plugin_available":true' "$tmp/dpdk-active/proof.json"
 if [ -e "$tmp/dpdk-active/sys/class/net/eth1" ]; then
   echo "active DPDK fixture unexpectedly retained a Linux netdev" >&2
   exit 1
 fi
 
-setup_active_dpdk_fixture dpdk-active-no-smart-qos eth1
-VPPCTL_ACTIVE_PCI=0000:03:00.0 run_check dpdk-active-no-smart-qos eth0 eth1 dpdk_plugin.so 0
-grep -q '"dataplane_state": "dpdk_ready"' "$tmp/dpdk-active-no-smart-qos/readiness.json"
-grep -q '"smart_qos_plugin_available":false' "$tmp/dpdk-active-no-smart-qos/proof.json"
-
-setup_active_dpdk_fixture dpdk-active-development-smart-qos eth1
-VPPCTL_ACTIVE_PCI=0000:03:00.0 VPPCTL_SMART_QOS_QUALIFICATION=development-single-worker \
-  run_check dpdk-active-development-smart-qos eth0 eth1 'dpdk_plugin.so ly_route_smart_qos_plugin.so' 0
-grep -q '"dataplane_state": "dpdk_ready"' "$tmp/dpdk-active-development-smart-qos/readiness.json"
-grep -q '"smart_qos_plugin_available":false' "$tmp/dpdk-active-development-smart-qos/proof.json"
+# arch-v1: the retired smart-QoS plugin must not appear in the observed
+# capability, and its presence or absence must not change the tier decision.
+setup_active_dpdk_fixture dpdk-retired-smart-qos eth1
+VPPCTL_ACTIVE_PCI=0000:03:00.0 \
+  run_check dpdk-retired-smart-qos eth0 eth1 'dpdk_plugin.so ly_route_smart_qos_plugin.so' 0
+grep -q '"dataplane_state": "dpdk_ready"' "$tmp/dpdk-retired-smart-qos/readiness.json"
+if grep -q 'smart_qos' "$tmp/dpdk-retired-smart-qos/proof.json"; then
+  echo "retired smart-QoS capability leaked into the observed proof" >&2
+  exit 1
+fi
 
 mkdir -p "$tmp/dpdk-no-iommu/sys/class/net/eth1" "$tmp/dpdk-no-iommu/sys/devices/pci0000:00/0000:03:00.0" \
   "$tmp/dpdk-no-iommu/sys/bus/pci/drivers/ixgbe" "$tmp/dpdk-no-iommu/sys/module/vfio_pci" \
