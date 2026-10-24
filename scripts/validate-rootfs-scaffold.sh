@@ -269,6 +269,10 @@ if ! grep -q 'bind 0.0.0.0:53' "$repo_root/scripts/build-rootfs.sh"; then
   echo "rootfs builder does not bind SmartDNS to a boot-safe wildcard address" >&2
   exit 1
 fi
+if ! grep -q 'bind \[::\]:53' "$repo_root/scripts/build-rootfs.sh"; then
+  echo "rootfs builder does not bind SmartDNS to IPv6 for DHCPv6-advertised DNS" >&2
+  exit 1
+fi
 
 if ! grep -q 'ly-route-runtime-check.service' "$repo_root/scripts/build-rootfs.sh"; then
   echo "runtime readiness service is not enabled by the rootfs builder" >&2

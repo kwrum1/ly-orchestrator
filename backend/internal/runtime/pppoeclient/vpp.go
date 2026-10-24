@@ -2,6 +2,7 @@ package pppoeclient
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -805,13 +806,19 @@ func pppoeExplicitWANAvailable(ctx context.Context, config VPPConfig) bool {
 }
 
 func configureDelegatedPrefix(ctx context.Context, config VPPConfig, delegated string) error {
-	prefix, address, err := delegatedLANPrefix(delegated)
-	if err != nil {
-		return err
-	}
-	for _, lan := range config.IPv6LANInterfaces {
+	for index, lan := range config.IPv6LANInterfaces {
 		lan = strings.TrimSpace(lan)
 		if lan == "" {
+			continue
+		}
+		prefix, address, err := delegatedLANPrefix(delegated, index)
+		if err != nil {
+			if index == 0 {
+				return err
+			}
+			// The delegated prefix cannot address another LAN. dnsmasq skips
+			// the same LAN for the same reason, so leave it without IPv6
+			// instead of failing the whole PPPoE session.
 			continue
 		}
 		if err := ensureIPv6Interface(ctx, config.Binary, lan); err != nil {
@@ -873,13 +880,13 @@ func ensureIPv6Interface(ctx context.Context, binary, interfaceName string) erro
 }
 
 func removeDelegatedPrefix(ctx context.Context, config VPPConfig, delegated string) {
-	prefix, address, err := delegatedLANPrefix(delegated)
-	if err != nil {
-		return
-	}
-	for _, lan := range config.IPv6LANInterfaces {
+	for index, lan := range config.IPv6LANInterfaces {
 		lan = strings.TrimSpace(lan)
 		if lan == "" {
+			continue
+		}
+		prefix, address, err := delegatedLANPrefix(delegated, index)
+		if err != nil {
 			continue
 		}
 		_, _ = runVPP(ctx, config.Binary, "ip6", "nd", lan, "no", "prefix", prefix)
@@ -887,16 +894,25 @@ func removeDelegatedPrefix(ctx context.Context, config VPPConfig, delegated stri
 	}
 }
 
-func delegatedLANPrefix(delegated string) (string, string, error) {
-	prefix, err := netip.ParsePrefix(strings.TrimSpace(delegated))
-	if err != nil || !prefix.Addr().Is6() || prefix.Bits() > 64 {
+// delegatedLANPrefix returns the index-th LAN /64 and its ::1 gateway address.
+// Multiple LANs behind one delegated prefix must not share an on-link /64.
+func delegatedLANPrefix(delegated string, index int) (string, string, error) {
+	prefixed, err := netip.ParsePrefix(strings.TrimSpace(delegated))
+	if err != nil || !prefixed.Addr().Is6() || prefixed.Bits() > 64 || index < 0 {
 		return "", "", fmt.Errorf("invalid delegated IPv6 prefix %q", delegated)
 	}
-	prefix = netip.PrefixFrom(prefix.Masked().Addr(), 64)
-	raw := prefix.Addr().As16()
-	raw[15] = 1
-	address := netip.AddrFrom16(raw)
-	return prefix.String(), netip.PrefixFrom(address, 64).String(), nil
+	prefixed = prefixed.Masked()
+	available := uint64(1) << (64 - prefixed.Bits())
+	if available == 0 || uint64(index) >= available {
+		return "", "", fmt.Errorf("delegated IPv6 prefix %q cannot allocate LAN index %d", delegated, index)
+	}
+	raw := prefixed.Addr().As16()
+	high := binary.BigEndian.Uint64(raw[:8])
+	binary.BigEndian.PutUint64(raw[:8], high+uint64(index))
+	prefix := netip.PrefixFrom(netip.AddrFrom16(raw), 64)
+	gateway := prefix.Masked().Addr().As16()
+	gateway[15] = 1
+	return prefix.String(), netip.PrefixFrom(netip.AddrFrom16(gateway), 64).String(), nil
 }
 
 func (session *VPPSession) UpdateDelegatedPrefix(ctx context.Context, delegated string) error {

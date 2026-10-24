@@ -5425,23 +5425,19 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		}
 		artifacts = append(artifacts, nftablesArtifacts...)
 	}
-	dhcpPlans, dhcpArtifacts, err := server.currentDHCPServers(ctx, addressAssignments)
+	dhcpPlans, dhcpArtifacts, dhcpWarnings, err := server.currentDHCPServers(ctx, addressAssignments)
 	if err != nil {
 		return RuntimePlan{}, err
 	}
 	mark("dhcp")
 	artifacts = append(artifacts, dhcpArtifacts...)
+	planningWarnings = append(planningWarnings, dhcpWarnings...)
 	pppoePeers, pppoeArtifacts, err := server.currentPPPoEPeers(ctx)
 	if err != nil {
 		return RuntimePlan{}, err
 	}
 	mark("pppoe-peers")
 	artifacts = append(artifacts, pppoeArtifacts...)
-	ipv6Artifacts, ipv6Warning := server.currentIPv6RAArtifacts(ctx)
-	artifacts = append(artifacts, ipv6Artifacts...)
-	if ipv6Warning != "" {
-		planningWarnings = append(planningWarnings, ipv6Warning)
-	}
 	dataInterfaces := server.runtimeDataInterfaces(ctx)
 	observation := server.observeDataplaneCapability(ctx, dataInterfaces)
 	nativePath := observation.NativePathRequest(server.managementInterfaceID(ctx), dataInterfaces, server.now().UTC(), server.managementNetworkShared(ctx))
@@ -5539,9 +5535,6 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	components := server.runtimeStatusComponents(componentCtx, artifacts, len(operations) > 0)
 	cancelComponents()
 	mark("components")
-	if ipv6Warning != "" {
-		components = markComponentDegraded(components, string(serviceRuntime.IPv6RA), ipv6Warning)
-	}
 	if proxyRuntimeWarning != "" {
 		components = markComponentDegraded(components, string(serviceRuntime.Xray), proxyRuntimeWarning)
 	}
@@ -6958,14 +6951,14 @@ func (server *Server) currentDNSUpstreams(ctx context.Context, policy trafficpol
 	return upstreams, cache, networks, nil
 }
 
-func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.AddressAssignment) ([]serviceRuntime.DnsmasqPlan, []serviceRuntime.RenderedArtifact, error) {
+func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.AddressAssignment) ([]serviceRuntime.DnsmasqPlan, []serviceRuntime.RenderedArtifact, []string, error) {
 	items, err := server.desiredItems(ctx, "dhcp_server")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	reservations, err := server.currentDHCPReservations(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	var plans []serviceRuntime.DnsmasqPlan
 	for _, item := range items {
@@ -6975,7 +6968,7 @@ func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.
 		configuredInterface := stringField(item, "interface_id")
 		controlInterface, lanRouter, ok := server.dhcpLANControlInterface(ctx, configuredInterface, assignments)
 		if !ok {
-			return nil, nil, fmt.Errorf("DHCP service interface %s is not a configured logical LAN", configuredInterface)
+			return nil, nil, nil, fmt.Errorf("DHCP service interface %s is not a configured logical LAN", configuredInterface)
 		}
 		routers := stringSliceField(item, "routers")
 		if len(routers) == 0 && lanRouter != "" {
@@ -6987,19 +6980,28 @@ func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.
 		}
 		plan := serviceRuntime.DnsmasqPlan{ID: stringField(item, "id"), InterfaceID: controlInterface, Subnet: subnet, Pools: stringSliceField(item, "pools"), Routers: routers, NameServers: dhcpNameServers(stringSliceField(item, "name_servers"), routers), LeaseTime: firstIntField(item, "lease_time_seconds", "valid_lifetime", "valid_lifetime_seconds")}
 		plan.Reservations = reservationsForDHCPPlan(plan, reservations)
-		if plan.ID == "" || plan.InterfaceID == "" || plan.Subnet == "" || len(plan.Pools) == 0 {
+		if plan.ID == "" || plan.InterfaceID == "" {
+			continue
+		}
+		if plan.Subnet == "" || len(plan.Pools) == 0 {
+			// The LAN may only be configured for IPv6; the IPv6 pass below
+			// still creates a dnsmasq plan when a prefix is available.
 			continue
 		}
 		plans = append(plans, plan)
 	}
+	plans, ipv6Warnings, err := server.dnsmasqIPv6LANPlans(ctx, plans, assignments)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	if len(plans) == 0 {
-		return plans, nil, nil
+		return plans, nil, ipv6Warnings, nil
 	}
 	artifacts, err := serviceRuntime.RenderDnsmasqConfig(plans)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return plans, artifacts, nil
+	return plans, artifacts, ipv6Warnings, nil
 }
 
 func dhcpNameServers(configured, routers []string) []string {
@@ -7116,24 +7118,38 @@ func (server *Server) applyLivePPPoEIPv6(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	waited := map[string]bool{}
 	for _, lan := range interfaces {
 		ipv6, _ := lan["ipv6"].(map[string]any)
 		wanID := stringField(ipv6, "source_wan_id")
 		if strings.ToLower(stringField(ipv6, "mode")) != "delegated_prefix" || wanID == "" {
 			continue
 		}
-		lanInterface := server.resolveInterfaceID(ctx, firstNonEmpty(stringField(lan, "interface_id"), stringField(lan, "id")))
-		if !strings.HasPrefix(lanInterface, "lyroute-") {
-			lanInterface = "lyroute-" + lanInterface
+		if waited[wanID] {
+			continue
 		}
-		if err := waitForPPPoEIPv6Convergence(ctx, wanID, lanInterface); err != nil {
+		waited[wanID] = true
+		// Reconcile the complete, deterministically ordered LAN list so every
+		// LAN index maps to the same sub-delegated /64 that dnsmasq and VPP
+		// programming use.
+		_, lanInterfaces, err := server.pppoeIPv6LANConfig(ctx, wanID)
+		if err != nil {
 			return err
+		}
+		for index := range lanInterfaces {
+			if err := waitForPPPoEIPv6Convergence(ctx, wanID, lanInterfaces, index); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-func waitForPPPoEIPv6Convergence(ctx context.Context, wanID, lanInterface string) error {
+func waitForPPPoEIPv6Convergence(ctx context.Context, wanID string, lanInterfaces []string, index int) error {
+	if index < 0 || index >= len(lanInterfaces) {
+		return fmt.Errorf("PPPoE LAN index %d is outside the configured LAN list", index)
+	}
+	lanInterface := lanInterfaces[index]
 	statusDir := strings.TrimSpace(os.Getenv("LY_ROUTE_PPPOE_STATUS_DIR"))
 	if statusDir == "" {
 		statusDir = "/run/ly-route/pppoe"
@@ -7155,24 +7171,28 @@ func waitForPPPoEIPv6Convergence(ctx context.Context, wanID, lanInterface string
 			if json.Unmarshal(content, &status) == nil && status.State == "connected" && status.Interface != "" && status.Session.IPv6Ready {
 				prefix, parseErr := netip.ParsePrefix(strings.TrimSpace(status.Session.DelegatedPrefix))
 				if parseErr == nil && prefix.Addr().Is6() && prefix.Bits() <= 64 {
-					lanPrefix := netip.PrefixFrom(prefix.Masked().Addr(), 64)
-					raw := lanPrefix.Addr().As16()
-					raw[15] = 1
-					lanAddress := netip.PrefixFrom(netip.AddrFrom16(raw), 64).String()
-					addresses, addressErr := runLiveVPP(ctx, "show", "interface", "address", lanInterface)
-					ra, raErr := runLiveVPP(ctx, "show", "ip6", "interface", lanInterface)
-					addressReady := addressErr == nil && strings.Contains(addresses, lanAddress)
-					raReady := raErr == nil && strings.Contains(ra, "prefix "+lanPrefix.Addr().String()+", length 64")
-					if addressReady && raReady {
-						return nil
+					lanPrefix, prefixErr := serviceRuntime.DelegatedLANPrefix(prefix.String(), index)
+					if prefixErr != nil {
+						lastReason = prefixErr.Error()
+					} else {
+						raw := lanPrefix.Addr().As16()
+						raw[15] = 1
+						lanAddress := netip.PrefixFrom(netip.AddrFrom16(raw), 64).String()
+						addresses, addressErr := runLiveVPP(ctx, "show", "interface", "address", lanInterface)
+						ra, raErr := runLiveVPP(ctx, "show", "ip6", "interface", lanInterface)
+						addressReady := addressErr == nil && strings.Contains(addresses, lanAddress)
+						raReady := raErr == nil && strings.Contains(ra, "prefix "+lanPrefix.Addr().String()+", length 64")
+						if addressReady && raReady {
+							return nil
+						}
+						lastReason = fmt.Sprintf("LAN address ready=%t, RA ready=%t", addressReady, raReady)
 					}
-					lastReason = fmt.Sprintf("LAN address ready=%t, RA ready=%t", addressReady, raReady)
 					if lastReconcile.IsZero() || time.Since(lastReconcile) >= time.Second {
 						lastReconcile = time.Now()
 						err := pppoeclient.ReconcileDelegatedPrefix(ctx, pppoeclient.VPPConfig{
 							Binary:            liveVPPBinary(),
 							IPv6PrefixGroup:   "ly-route-" + wanID,
-							IPv6LANInterfaces: []string{lanInterface},
+							IPv6LANInterfaces: lanInterfaces,
 						}, prefix.String())
 						if err != nil {
 							lastReason += "; reconciliation: " + err.Error()

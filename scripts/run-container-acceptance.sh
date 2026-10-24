@@ -54,6 +54,7 @@ run_case shared-lan-management-lcp scripts/test-shared-lan-lcp-netns.sh
 run_case gateway-network-transaction scripts/test-gateway-network-transaction-vpp.sh
 run_case smartdns-ttl scripts/test-smartdns-netns.sh
 run_case dnsmasq-dhcp scripts/test-dnsmasq-dhcp-netns.sh
+run_case dnsmasq-dhcpv6 scripts/test-dnsmasq-dhcpv6-netns.sh
 run_case pppoe scripts/test-pppoe-netns.sh
 run_case nat44 scripts/test-nat44-vpp-netns.sh
 run_case security-acl scripts/test-security-acl-vpp.sh

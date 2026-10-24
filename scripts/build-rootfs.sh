@@ -220,7 +220,7 @@ install_extra_debs() {
     # SmartDNS must start on a clean boot even before any LAN address exists.
     # Bind the wildcard: the DNS interception rules keep WAN-side queries out,
     # and LAN/management interfaces are served as soon as they appear.
-    grep -q '^bind 0.0.0.0:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind 0.0.0.0:53 -no-speed-check\nbind-tcp 0.0.0.0:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
+    grep -q '^bind 0.0.0.0:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind 0.0.0.0:53 -no-speed-check\nbind-tcp 0.0.0.0:53 -no-speed-check\nbind [::]:53 -no-speed-check\nbind-tcp [::]:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
     fi
     vcl_library=$(find "$target/usr/lib" -type f -name 'libvcl_ldpreload.so.*' -print -quit)
     if [ -n "$vcl_library" ]; then
@@ -245,7 +245,7 @@ install_extra_debs() {
     # SmartDNS must start on a clean boot even before any LAN address exists.
     # Bind the wildcard: the DNS interception rules keep WAN-side queries out,
     # and LAN/management interfaces are served as soon as they appear.
-    grep -q '^bind 0.0.0.0:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind 0.0.0.0:53 -no-speed-check\nbind-tcp 0.0.0.0:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
+    grep -q '^bind 0.0.0.0:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind 0.0.0.0:53 -no-speed-check\nbind-tcp 0.0.0.0:53 -no-speed-check\nbind [::]:53 -no-speed-check\nbind-tcp [::]:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
   fi
 }
 
