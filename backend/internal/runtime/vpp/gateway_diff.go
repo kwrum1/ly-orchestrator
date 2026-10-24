@@ -145,9 +145,20 @@ func ReconcileGatewayPlan(input GatewayReconciliationInput) (GatewayDiff, error)
 		},
 		ACLs:     ACLQoSPlan{TransactionID: transactionID, IngressVPPInterface: routeIngressVPPInterface, ACLs: acls.apply, DeleteACLs: acls.delete},
 		QoS:      ACLQoSPlan{TransactionID: transactionID, IngressVPPInterface: routeIngressVPPInterface, QoS: qos.apply, DeleteQoS: qos.delete},
-		NAT44:    NAT44Plan{TransactionID: transactionID, Behavior: desired.NAT.Behavior, IngressVPPInterface: routeIngressVPPInterface, IngressLANPrefix: routeIngressLANPrefix, StaticMappings: staticMappings.apply, DeleteStaticMappings: staticMappings.delete},
-		PortMaps: NAT44Plan{TransactionID: transactionID, Behavior: desired.NAT.Behavior, IngressVPPInterface: routeIngressVPPInterface, IngressLANPrefix: routeIngressLANPrefix, PortMappings: portMappings.apply, DeletePortMappings: portMappings.delete},
+		NAT44:    NAT44Plan{TransactionID: transactionID, Behavior: desired.NAT.Behavior, IngressVPPInterface: routeIngressVPPInterface, WANIngressInterface: wanIngressVPPInterface(desired), IngressLANPrefix: routeIngressLANPrefix, StaticMappings: staticMappings.apply, DeleteStaticMappings: staticMappings.delete},
+		PortMaps: NAT44Plan{TransactionID: transactionID, Behavior: desired.NAT.Behavior, IngressVPPInterface: routeIngressVPPInterface, WANIngressInterface: wanIngressVPPInterface(desired), IngressLANPrefix: routeIngressLANPrefix, PortMappings: portMappings.apply, DeletePortMappings: portMappings.delete},
 	}, nil
+}
+
+// wanIngressVPPInterface returns the configured VPP WAN interface. It is
+// empty until a WAN link is configured.
+func wanIngressVPPInterface(plan Plan) string {
+	for _, assignment := range plan.AddressAssignments {
+		if strings.EqualFold(strings.TrimSpace(assignment.Role), "wan") {
+			return strings.TrimSpace(assignment.VPPInterface)
+		}
+	}
+	return ""
 }
 
 func queueWANGroupDependentRoutes(diff *resourceDiff[trafficpolicy.RoutePolicy], prior, desired []trafficpolicy.RoutePolicy, changedGroups []string) {

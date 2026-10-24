@@ -98,7 +98,13 @@ func BuildACLQoSOperations(plan ACLQoSPlan) ([]Operation, error) {
 	if transactionID == "" {
 		return nil, fmt.Errorf("%w: transaction ID is required", ErrSnapshotIncomplete)
 	}
-	operations := make([]Operation, 0, len(plan.ACLs)+len(plan.QoS)+len(plan.DeleteACLs)+len(plan.DeleteQoS))
+	operations := make([]Operation, 0, 1+len(plan.ACLs)+len(plan.QoS)+len(plan.DeleteACLs)+len(plan.DeleteQoS))
+	// Self-heal an in-place upgrade: builds before this fix attached the
+	// seeded catch-all WAN deny to the LAN output, which blackholes DHCP
+	// replies and every client return path. It is no longer desired, so no
+	// diff operation is generated for it; detach and delete it by tag on
+	// every apply instead (both a no-op and idempotent when it is absent).
+	operations = append(operations, builtInWANDenyCleanupOperation(transactionID))
 	// Delete before create/update. A replacement keeps the same ACL/policer
 	// identity; creating first would let the old delete remove the new object.
 	for _, id := range plan.DeleteACLs {
@@ -123,7 +129,18 @@ func BuildACLQoSOperations(plan ACLQoSPlan) ([]Operation, error) {
 		operations = append(operations, Operation{Name: "vpp.qos", RequestID: transactionID, Resource: id, Payload: group, VPPCtlCommands: flowGroupDeleteCommands(group)})
 	}
 	for _, acl := range plan.ACLs {
-		operations = append(operations, Operation{Name: "vpp.security-acl", RequestID: transactionID, Resource: acl.ID, Payload: acl, VPPCtlCommands: securityACLCommands(acl)})
+		if acl.ID == builtInWANDenyACLID {
+			// The seeded catch-all WAN deny has no deployable attachment:
+			// the LAN attachment blackholes clients (DHCP replies first)
+			// and WAN ingress drops NAT44 return traffic. NAT44-ED remains
+			// stateful for unsolicited inbound traffic.
+			continue
+		}
+		commands := securityACLCommands(acl)
+		if len(commands) == 0 {
+			continue
+		}
+		operations = append(operations, Operation{Name: "vpp.security-acl", RequestID: transactionID, Resource: acl.ID, Payload: acl, VPPCtlCommands: commands})
 	}
 	for _, group := range plan.QoS {
 		// Keep the operation identity for empty groups so rollback and evidence
@@ -133,6 +150,20 @@ func BuildACLQoSOperations(plan ACLQoSPlan) ([]Operation, error) {
 		operations = append(operations, Operation{Name: "vpp.qos", RequestID: transactionID, Resource: group.Kind, Payload: group, VPPCtlCommands: flowGroupCommands(group)})
 	}
 	return operations, nil
+}
+
+// builtInWANDenyCleanupOperation removes any pre-fix attachment of the seeded
+// catch-all WAN deny ACL. Both LAN directions are detached because the legacy
+// bug attached it as "output"; a missing tag is a no-op.
+func builtInWANDenyCleanupOperation(transactionID string) Operation {
+	acl := trafficpolicy.SecurityACL{ID: builtInWANDenyACLID, Action: "deny", Match: trafficpolicy.Match{Direction: "both"}}
+	return Operation{
+		Name:           "vpp.security-acl.rollback-delete",
+		RequestID:      transactionID,
+		Resource:       builtInWANDenyACLID,
+		Payload:        acl,
+		VPPCtlCommands: deleteACLCommands(acl),
+	}
 }
 
 func (a Adapter) aclQoSFailure(ctx context.Context, channel Channel, transactionID, operation string, cause error, prior Snapshot, current ACLQoSPlan) error {
@@ -170,6 +201,9 @@ func cleanupACLQoS(ctx context.Context, channel Channel, transactionID string, p
 func applyACLQoSSnapshot(ctx context.Context, channel Channel, transactionID string, snapshot Snapshot) error {
 	var replay []error
 	for _, acl := range snapshot.ACLs {
+		if acl.ID == builtInWANDenyACLID {
+			continue
+		}
 		operation := Operation{Name: "vpp.security-acl.rollback", RequestID: transactionID, Resource: acl.ID, Payload: acl, VPPCtlCommands: securityACLCommands(acl)}
 		if _, err := doOperation(ctx, channel, operation); err != nil {
 			replay = append(replay, err)

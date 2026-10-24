@@ -30,8 +30,17 @@ func TestGatewayACLQoSApplyReadsBackLiveState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Receipt.RequestID != "txn-acl-qos-apply" || len(result.Receipt.Operations) != 2 {
+	if result.Receipt.RequestID != "txn-acl-qos-apply" {
 		t.Fatalf("result = %#v, want transaction-bound ACL/QoS receipt", result)
+	}
+	var desired []Operation
+	for _, operation := range result.Receipt.Operations {
+		if operation.Resource == "acl-guest" || operation.Resource == qos.Kind {
+			desired = append(desired, operation)
+		}
+	}
+	if len(desired) != 2 {
+		t.Fatalf("result = %#v, want one ACL and one QoS operation", result.Receipt.Operations)
 	}
 	if len(result.Readback.ACLs) != 1 || len(result.Readback.QoS) != 1 {
 		t.Fatalf("readback = %#v, want typed live ACL/QoS state", result.Readback)
@@ -81,14 +90,20 @@ func TestBuildACLQoSOperationsDeletesReplacementBeforeCreate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(operations) != 2 {
+	var qos []Operation
+	for _, operation := range operations {
+		if operation.Name == "vpp.qos" {
+			qos = append(qos, operation)
+		}
+	}
+	if len(qos) != 2 {
 		t.Fatalf("operations = %#v, want delete and create", operations)
 	}
-	if !strings.Contains(strings.Join(operations[0].VPPCtlCommands, "\n"), "policer del") {
-		t.Fatalf("first operation = %#v, want replacement delete", operations[0])
+	if !strings.Contains(strings.Join(qos[0].VPPCtlCommands, "\n"), "policer del") {
+		t.Fatalf("first operation = %#v, want replacement delete", qos[0])
 	}
-	if !strings.Contains(strings.Join(operations[1].VPPCtlCommands, "\n"), "policer add") {
-		t.Fatalf("second operation = %#v, want replacement create", operations[1])
+	if !strings.Contains(strings.Join(qos[1].VPPCtlCommands, "\n"), "policer add") {
+		t.Fatalf("second operation = %#v, want replacement create", qos[1])
 	}
 }
 

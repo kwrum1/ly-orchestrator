@@ -17,6 +17,13 @@ func (channel vppctlChannel) doSecurityACLLifecycle(ctx context.Context, operati
 	if err != nil || deleting {
 		return routePolicyLifecycleReply(operation, results), err
 	}
+	if acl.ID == builtInWANDenyACLID {
+		// Persisted plans written before this fix may still carry an
+		// attachment. removeSecurityACLState has detached it above; never
+		// re-attach a catch-all deny (LAN blackhole, or NAT44 return-path
+		// drop at WAN ingress).
+		return routePolicyLifecycleReply(operation, results), nil
+	}
 	stableACLID := stableID("security-acl:"+acl.ID, 50000, 49999)
 	create := ""
 	for _, raw := range operation.VPPCtlCommands {

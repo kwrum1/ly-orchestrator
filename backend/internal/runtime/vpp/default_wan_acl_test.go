@@ -7,7 +7,12 @@ import (
 	"ly-route/backend/internal/runtime/trafficpolicy"
 )
 
-func TestBuildOperationsDefaultWANDenyNeverAttachesToLAN(t *testing.T) {
+// The seeded default WAN deny is an unconditional catch-all. Attaching it to
+// any interface is destructive: LAN output/input blackholes DHCP replies and
+// every client return path, and WAN input drops NAT44 return traffic and
+// port-forwarded flows before translation. NAT44-ED is stateful, so the rule
+// must never be deployed.
+func TestBuildOperationsDefaultWANDenyIsNeverDeployed(t *testing.T) {
 	acl := trafficpolicy.SecurityACL{
 		ID:     "sec-acl-default-deny-wan",
 		Action: "deny",
@@ -18,11 +23,8 @@ func TestBuildOperationsDefaultWANDenyNeverAttachesToLAN(t *testing.T) {
 			Direction:    "input",
 		},
 	}
-	commands := strings.Join(securityACLCommands(acl, "lyroute-eth2"), "\n")
-	if !strings.Contains(commands, "intfc lyroute-eth2") || strings.Contains(commands, "intfc lyroute-eth1") {
-		t.Fatalf("default WAN deny attachment = %q", commands)
-	}
-	if !strings.Contains(commands, "set interface input acl intfc lyroute-eth2") || strings.Contains(commands, "set interface output acl intfc lyroute-eth2") {
-		t.Fatalf("default WAN deny direction = %q", commands)
+	commands := strings.Join(securityACLCommands(acl), "\n")
+	if commands != "" {
+		t.Fatalf("default WAN deny must not be deployed: %q", commands)
 	}
 }

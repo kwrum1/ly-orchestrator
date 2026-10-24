@@ -17,9 +17,12 @@ type NAT44Readback struct {
 }
 
 type NAT44Plan struct {
-	TransactionID          string
-	Behavior               nat.Behavior
-	IngressVPPInterface    string
+	TransactionID       string
+	Behavior            nat.Behavior
+	IngressVPPInterface string
+	// WANIngressInterface is the outside WAN whose address joins the NAT44
+	// translation pool.
+	WANIngressInterface    string
 	IngressLANPrefix       string
 	StaticMappings         []nat.StaticMapping
 	PortMappings           []nat.PortMapping
@@ -85,6 +88,19 @@ func (a Adapter) ApplyNAT44(ctx context.Context, plan NAT44Plan, prior Snapshot,
 		if plan.Behavior != nat.BehaviorFullCone {
 			initialize = append(initialize, "set interface nat44 in "+strings.TrimSpace(plan.IngressVPPInterface))
 		}
+		// NAT44 translates through the outside interface address. Without
+		// it in the pool VPP reports "out of ports" and drops every LAN->WAN
+		// flow even though the inside/outside bindings are correct.
+		for _, wan := range nat44OutsideInterfaces(plan) {
+			if plan.Behavior == nat.BehaviorFullCone {
+				initialize = append(initialize, "?nat44 ei add interface address "+wan)
+				continue
+			}
+			initialize = append(initialize, "?nat44 add interface address "+wan)
+		}
+		if plan.Behavior != nat.BehaviorFullCone {
+			initialize = append(initialize, "show nat44 addresses")
+		}
 		if _, err := doOperation(ctx, channel, Operation{Name: "vpp.nat44.initialize", RequestID: plan.TransactionID, Resource: string(plan.Behavior), VPPCtlCommands: initialize}); err != nil {
 			return NAT44ApplyResult{}, a.nat44Failure(ctx, channel, plan.TransactionID, "initialize", err, prior, rollbackPlan)
 		}
@@ -108,6 +124,31 @@ func (a Adapter) ApplyNAT44(ctx context.Context, plan NAT44Plan, prior Snapshot,
 		return NAT44ApplyResult{}, a.nat44Failure(ctx, channel, plan.TransactionID, "readback", err, prior, rollbackPlan)
 	}
 	return NAT44ApplyResult{Receipt: Receipt{RequestID: plan.TransactionID, Operations: operations}, Readback: readback}, nil
+}
+
+// nat44OutsideInterfaces returns the deduplicated WAN interfaces that carry
+// translated traffic for this plan.
+func nat44OutsideInterfaces(plan NAT44Plan) []string {
+	seen := map[string]bool{}
+	result := make([]string, 0, 2)
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		result = append(result, name)
+	}
+	for _, mapping := range plan.StaticMappings {
+		add(mapping.WANInterface)
+	}
+	for _, mapping := range plan.PortMappings {
+		add(mapping.WANInterface)
+	}
+	if len(result) == 0 {
+		add(plan.WANIngressInterface)
+	}
+	return result
 }
 
 func BuildNAT44Operations(plan NAT44Plan) ([]Operation, error) {
