@@ -265,8 +265,8 @@ if grep -q 'bind 192.168.88.1:53' "$repo_root/scripts/build-rootfs.sh"; then
   echo "rootfs builder hard-codes the post-apply LAN address as the SmartDNS bind" >&2
   exit 1
 fi
-if ! grep -q 'bind 0.0.0.0:53' "$repo_root/scripts/build-rootfs.sh"; then
-  echo "rootfs builder does not bind SmartDNS to a boot-safe wildcard address" >&2
+if grep -q 'bind 0\.0\.0\.0:53' "$repo_root/scripts/build-rootfs.sh"; then
+  echo "rootfs builder binds both the IPv4 and IPv6 wildcard; SmartDNS cannot hold 0.0.0.0:53 and [::]:53 at the same time" >&2
   exit 1
 fi
 if ! grep -q 'bind \[::\]:53' "$repo_root/scripts/build-rootfs.sh"; then

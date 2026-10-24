@@ -218,9 +218,11 @@ install_extra_debs() {
       sed -i 's/^bind .*/bind 127.0.0.1:1053 -no-speed-check/; s/^bind-tcp .*/bind-tcp 127.0.0.1:1053 -no-speed-check/; /^server /d' "$target/etc/smartdns/smartdns.conf"
       sed -i 's#^conf-file .*#conf-file /etc/smartdns/conf.d/ly-route-active.conf#' "$target/etc/smartdns/smartdns.conf"
     # SmartDNS must start on a clean boot even before any LAN address exists.
-    # Bind the wildcard: the DNS interception rules keep WAN-side queries out,
-    # and LAN/management interfaces are served as soon as they appear.
-    grep -q '^bind 0.0.0.0:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind 0.0.0.0:53 -no-speed-check\nbind-tcp 0.0.0.0:53 -no-speed-check\nbind [::]:53 -no-speed-check\nbind-tcp [::]:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
+    # A single dual-stack [::] wildcard serves IPv4 and IPv6 because
+    # net.ipv6.bindv6only is 0.  Do not add 0.0.0.0:53 next to it: SmartDNS
+    # cannot hold both wildcards at once, the second bind fails with
+    # EADDRINUSE and the unit crash-loops on every boot.
+    grep -q '^bind \[::\]:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind [::]:53 -no-speed-check\nbind-tcp [::]:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
     fi
     vcl_library=$(find "$target/usr/lib" -type f -name 'libvcl_ldpreload.so.*' -print -quit)
     if [ -n "$vcl_library" ]; then
@@ -243,9 +245,11 @@ install_extra_debs() {
     sed -i 's/^bind .*/bind 127.0.0.1:1053 -no-speed-check/; s/^bind-tcp .*/bind-tcp 127.0.0.1:1053 -no-speed-check/; /^server /d' "$target/etc/smartdns/smartdns.conf"
     sed -i 's#^conf-file .*#conf-file /etc/smartdns/conf.d/ly-route-active.conf#' "$target/etc/smartdns/smartdns.conf"
     # SmartDNS must start on a clean boot even before any LAN address exists.
-    # Bind the wildcard: the DNS interception rules keep WAN-side queries out,
-    # and LAN/management interfaces are served as soon as they appear.
-    grep -q '^bind 0.0.0.0:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind 0.0.0.0:53 -no-speed-check\nbind-tcp 0.0.0.0:53 -no-speed-check\nbind [::]:53 -no-speed-check\nbind-tcp [::]:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
+    # A single dual-stack [::] wildcard serves IPv4 and IPv6 because
+    # net.ipv6.bindv6only is 0.  Do not add 0.0.0.0:53 next to it: SmartDNS
+    # cannot hold both wildcards at once, the second bind fails with
+    # EADDRINUSE and the unit crash-loops on every boot.
+    grep -q '^bind \[::\]:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind [::]:53 -no-speed-check\nbind-tcp [::]:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
   fi
 }
 
