@@ -228,6 +228,15 @@ if ! grep -q 'getty.target.wants/serial-getty@ttyS0.service' "$repo_root/scripts
   exit 1
 fi
 
+# The product overlay must be applied after extra debs, otherwise a stale
+# package payload silently reverts product integration files.
+overlay_line=$(grep -n 'cp -a "$overlay/\." "$rootfs/"' "$repo_root/scripts/build-rootfs.sh" | tail -1 | cut -d: -f1)
+debs_line=$(grep -n 'install_extra_debs "$rootfs"' "$repo_root/scripts/build-rootfs.sh" | tail -1 | cut -d: -f1)
+if [ -z "$overlay_line" ] || [ -z "$debs_line" ] || [ "$overlay_line" -le "$debs_line" ]; then
+  echo "rootfs builder applies the product overlay before extra debs; package payloads can revert product files" >&2
+  exit 1
+fi
+
 # Exactly one DNS owner: SmartDNS on :53, no resolved stub, and the SmartDNS
 # unit must not be blocked behind the control API.
 if ! grep -q 'DNSStubListener=no' "$repo_root/scripts/build-rootfs.sh"; then

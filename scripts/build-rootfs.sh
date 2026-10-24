@@ -417,6 +417,10 @@ copy_payload "$rootfs"
 build_control_binary "$rootfs"
 build_pppoe_client_binary "$rootfs"
 install_extra_debs "$rootfs"
+# Package payloads may ship older copies of product integration files (for
+# example the SmartDNS drop-in). The checked-out overlay is the source of
+# truth, so apply it once more after the debs are installed.
+cp -a "$overlay/." "$rootfs/"
 # Runtime packages can replace the shared Ly Route library directory while
 # being configured. Reassert the native PPPoE client after package install so
 # the gateway image always contains the client required by its systemd unit.
