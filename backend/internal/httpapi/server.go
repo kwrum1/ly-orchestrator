@@ -5587,12 +5587,15 @@ func dataplaneLockedReason(proof []vpp.PrerequisiteResult, warnings []string) st
 	return "dataplane_locked: forwarding prerequisites failed"
 }
 
-func runtimePolicyForAddressAssignments(policy trafficpolicy.Config, assignments []vpp.AddressAssignment) trafficpolicy.Config {
-	for _, assignment := range assignments {
-		if strings.EqualFold(strings.TrimSpace(assignment.Role), "wan") && strings.TrimSpace(assignment.VPPInterface) != "" {
-			return policy
-		}
-	}
+// runtimePolicyForAddressAssignments drops resources the dataplane must never
+// render. The seeded "Default WAN Inbound Deny" ACL compiles to an
+// unconditional catch-all deny (its "dst_ip: wan" selector degrades to
+// 0.0.0.0/0): applied to the LAN it blackholes DHCP replies and every client
+// return path, and applied to WAN ingress it drops NAT44 return traffic and
+// port-forwarded flows before translation. NAT44-ED is stateful and already
+// drops unsolicited inbound traffic, so the built-in rule is excluded for
+// every WAN type instead of being attached somewhere destructive.
+func runtimePolicyForAddressAssignments(policy trafficpolicy.Config, _ []vpp.AddressAssignment) trafficpolicy.Config {
 	filtered := policy
 	filtered.SecurityACLs = make([]trafficpolicy.SecurityACL, 0, len(policy.SecurityACLs))
 	for _, acl := range policy.SecurityACLs {

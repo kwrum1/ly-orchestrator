@@ -364,6 +364,19 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 				initializeCommands = append(initializeCommands, "set interface nat44 in "+lan)
 			}
 		}
+		// NAT44 requires the outside interface address in the translation
+		// pool. Without it VPP answers "out of ports" and drops every
+		// LAN->WAN flow even though the inside/outside bindings are correct.
+		for _, wan := range natOutsideInterfaces(plan) {
+			if plan.NAT.Behavior == nat.BehaviorFullCone {
+				initializeCommands = append(initializeCommands, "?nat44 ei add interface address "+wan)
+				continue
+			}
+			initializeCommands = append(initializeCommands, "?nat44 add interface address "+wan)
+		}
+		if plan.NAT.Behavior != nat.BehaviorFullCone {
+			initializeCommands = append(initializeCommands, "show nat44 addresses")
+		}
 		operations = append(operations, Operation{
 			Name:           "vpp.nat44.initialize",
 			RequestID:      plan.RequestID,
@@ -428,23 +441,16 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 		operation.VPPCtlCommands = routePolicyCommandsWithOptions(policy, wanGroups, options)
 		operations = append(operations, operation)
 	}
-	wanIngressInterface := ""
-	for _, assignment := range plan.AddressAssignments {
-		if strings.EqualFold(strings.TrimSpace(assignment.Role), "wan") {
-			wanIngressInterface = strings.TrimSpace(assignment.VPPInterface)
-			break
-		}
-	}
 	for _, acl := range plan.Policy.SecurityACLs {
-		// The built-in rule protects WAN ingress. A PPPoE interface is created
-		// only after negotiation, so attaching this rule to LAN would lock out
-		// all clients. NAT44-ED remains stateful while the dynamic WAN has no
-		// attachable interface; the PPPoE lifecycle owns its later WAN binding.
-		if acl.ID == "sec-acl-default-deny-wan" && wanIngressInterface == "" {
+		// The seeded catch-all WAN deny is not deployable on any interface:
+		// on the LAN it locks out every client and on WAN ingress it drops
+		// NAT44 return and port-forward traffic before translation. NAT44-ED
+		// is stateful, so the built-in rule stays uninstalled.
+		if acl.ID == builtInWANDenyACLID {
 			continue
 		}
 		operation := Operation{Name: "vpp.security-acl", RequestID: plan.RequestID, Resource: acl.ID, Payload: acl}
-		operation.VPPCtlCommands = securityACLCommands(acl, wanIngressInterface)
+		operation.VPPCtlCommands = securityACLCommands(acl)
 		operations = append(operations, operation)
 	}
 	if len(plan.Security.ACLs) > 0 || len(plan.Security.MACIP) > 0 || len(plan.Security.AttackRules) > 0 {
@@ -1059,6 +1065,36 @@ func planRequiresNAT(plan Plan) bool {
 	return false
 }
 
+// natOutsideInterfaces returns the deduplicated WAN interfaces that carry
+// NAT44 translated traffic. Explicit mappings win; otherwise every configured
+// WAN link is a candidate so a plain NAT gateway still gets a pool address.
+func natOutsideInterfaces(plan Plan) []string {
+	seen := map[string]bool{}
+	result := make([]string, 0, 2)
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		result = append(result, name)
+	}
+	for _, mapping := range plan.NAT.StaticMappings {
+		add(mapping.WANInterface)
+	}
+	for _, mapping := range plan.NAT.PortMappings {
+		add(mapping.WANInterface)
+	}
+	if len(result) == 0 {
+		for _, assignment := range plan.AddressAssignments {
+			if strings.EqualFold(strings.TrimSpace(assignment.Role), "wan") {
+				add(assignment.VPPInterface)
+			}
+		}
+	}
+	return result
+}
+
 func natInitializeCommands(behavior nat.Behavior) []string {
 	if behavior == nat.BehaviorFullCone {
 		return []string{
@@ -1551,25 +1587,29 @@ func vppABFPriority(priority int) int {
 	return priority
 }
 
-func securityACLCommands(acl trafficpolicy.SecurityACL, wanIngressInterfaces ...string) []string {
+// builtInWANDenyACLID is the seeded catch-all "Default WAN Inbound Deny"
+// rule. It is never rendered into the dataplane: see securityACLCommands.
+const builtInWANDenyACLID = "sec-acl-default-deny-wan"
+
+func securityACLCommands(acl trafficpolicy.SecurityACL) []string {
 	aclID := stableID("security-acl:"+acl.ID, 50000, 49999)
 	commands := aclMatchCommands(aclID, acl.ID, acl.Match, acl.Action)
 	interfaceName := "lyroute-$LY_ROUTE_LAN_INTERFACE"
-	wanIngressInterface := ""
-	if len(wanIngressInterfaces) > 0 {
-		wanIngressInterface = wanIngressInterfaces[0]
-	}
-	if acl.ID == "sec-acl-default-deny-wan" && strings.TrimSpace(wanIngressInterface) != "" {
-		interfaceName = strings.TrimSpace(wanIngressInterface)
-	}
 	directions := securityDirections(acl.Match.Direction)
-	if acl.ID == "sec-acl-default-deny-wan" && strings.TrimSpace(wanIngressInterface) != "" {
-		directions = []string{"input"}
+	if acl.ID == builtInWANDenyACLID {
+		// The seeded "Default WAN Inbound Deny" is an unconditional
+		// catch-all deny (the "dst_ip: wan" selector compiles to
+		// 0.0.0.0/0). It cannot be deployed: at LAN egress/ingress it
+		// blackholes every client including DHCP replies, and at WAN
+		// ingress it drops NAT44 return traffic and port-forwarded flows
+		// before translation. NAT44-ED is stateful and already drops
+		// unsolicited inbound traffic, so the rule stays unattached.
+		return nil
 	}
 	for _, direction := range directions {
 		commands = append(commands, fmt.Sprintf("?set interface %s acl intfc %s ip4-table %d", direction, interfaceName, aclID))
 	}
-	commands = append(commands, fmt.Sprintf("show acl-plugin acl index %d", aclID), "show interface lyroute-$LY_ROUTE_LAN_INTERFACE")
+	commands = append(commands, fmt.Sprintf("show acl-plugin acl index %d", aclID), "show interface "+interfaceName)
 	return commands
 }
 
