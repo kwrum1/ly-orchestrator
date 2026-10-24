@@ -85,6 +85,9 @@ validate_prebuilt_vpp_apply "$vpp_apply_binary"
 
 product_build_require_file "$repo_root/scripts/build-controller-shell.sh"
 product_build_require_file "$repo_root/packaging/nginx/ly-route-admin.conf"
+product_build_require_file "$repo_root/packaging/nginx/ly-route-proxy-failure.conf"
+product_build_require_file "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/proxy-failure"
+product_build_require_file "$repo_root/packaging/rootfs-overlay/usr/share/ly-route/proxy-failure/index.html"
 if [ -n "$frontend_bundle" ]; then
   validate_frontend_bundle "$frontend_bundle" "$product"
 else
@@ -187,6 +190,7 @@ copy_payload() {
   mkdir -p "$target/opt/ly-route/admin" "$target/etc/nginx/conf.d"
   copy_product_frontend "$target/opt/ly-route/admin" "$frontend_bundle" "$product"
   cp "$repo_root/packaging/nginx/ly-route-admin.conf" "$target/etc/nginx/conf.d/ly-route-admin.conf"
+  cp "$repo_root/packaging/nginx/ly-route-proxy-failure.conf" "$target/etc/nginx/conf.d/ly-route-proxy-failure.conf"
   rm -f "$target/etc/nginx/sites-enabled/default"
   if [ "$product" = gateway ]; then
     if [ "${LY_ROUTE_ROOTFS_ALLOW_TAR_ONLY:-0}" != 1 ]; then

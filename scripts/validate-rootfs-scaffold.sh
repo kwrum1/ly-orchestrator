@@ -53,6 +53,9 @@ $repo_root/packaging/rootfs-overlay/etc/ly-route/default-config.json
 $repo_root/packaging/rootfs-overlay/etc/ly-route/runtime.env
 $repo_root/packaging/rootfs-overlay/etc/dnsmasq.d/ly-route-dhcp.conf
 $repo_root/packaging/nginx/ly-route-admin.conf
+$repo_root/packaging/nginx/ly-route-proxy-failure.conf
+$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/proxy-failure
+$repo_root/packaging/rootfs-overlay/usr/share/ly-route/proxy-failure/index.html
 $repo_root/backend/cmd/gateway-control/main.go
 $repo_root/backend/cmd/orchestrator-control/main.go
 $repo_root/backend/gateway/main.go
@@ -320,6 +323,36 @@ fi
 
 if ! grep -q 'go build .*./cmd/\$product-control' "$repo_root/scripts/build-rootfs.sh"; then
   echo "rootfs builder does not build the product-specific Go control API binary" >&2
+  exit 1
+fi
+
+if ! grep -qE '^ *listen 8081;' "$repo_root/packaging/nginx/ly-route-proxy-failure.conf"; then
+  echo "proxy failure nginx listener is not on the dedicated port 8081" >&2
+  exit 1
+fi
+
+if ! grep -q 'root /usr/share/ly-route/proxy-failure;' "$repo_root/packaging/nginx/ly-route-proxy-failure.conf"; then
+  echo "proxy failure nginx listener does not serve the packaged page" >&2
+  exit 1
+fi
+
+if ! grep -q 'LY-ROUTE-PROXY-FAILURE-PAGE' "$repo_root/packaging/rootfs-overlay/usr/share/ly-route/proxy-failure/index.html"; then
+  echo "proxy failure page marker is missing" >&2
+  exit 1
+fi
+
+if grep -qE '<(script|link)[^>]+(src|href)=' "$repo_root/packaging/rootfs-overlay/usr/share/ly-route/proxy-failure/index.html"; then
+  echo "proxy failure page must not reference external assets" >&2
+  exit 1
+fi
+
+if ! grep -q 'ly_route_proxy_failure' "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/proxy-failure"; then
+  echo "proxy failure helper does not manage its nftables table" >&2
+  exit 1
+fi
+
+if [ ! -x "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/proxy-failure" ]; then
+  echo "proxy failure helper is not executable" >&2
   exit 1
 fi
 
