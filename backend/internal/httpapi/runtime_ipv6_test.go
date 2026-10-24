@@ -175,7 +175,7 @@ func TestRuntimePlanMultipleLANsGetDistinctDelegated64s(t *testing.T) {
 			"ipv6": map[string]any{"mode": "delegated_prefix", "source_wan_id": "wan0"},
 		}, now),
 		configDocument(t, "wan_link", "wan0", map[string]any{
-			"id": "wan0", "type": "pppoe", "interface_id": "eth1",
+			"id": "wan0", "type": "pppoe", "interface_id": "eth1", "username": "subscriber", "password": "secret",
 			"ipv6": map[string]any{"delegated_prefix": "2001:db8:100::/56"},
 		}, now),
 	)
