@@ -12,6 +12,7 @@ tests=(
   "security-contract|scripts/test-gateway-security-contract.sh"
   "operations|scripts/test-gateway-operations-acceptance.sh"
   "dnsmasq-dhcp|scripts/test-dnsmasq-dhcp-netns.sh"
+  "dnsmasq-dhcpv6|scripts/test-dnsmasq-dhcpv6-netns.sh"
   "nat44|scripts/test-nat44-vpp-netns.sh"
   "smartdns|scripts/test-smartdns-netns.sh"
   "wan-group|scripts/test-wan-group-vpp-netns.sh"
