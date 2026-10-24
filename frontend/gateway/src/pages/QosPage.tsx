@@ -4,11 +4,11 @@ import { useQueryClient } from "@tanstack/react-query";
 import { CircleGauge, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { API } from "../api/endpoints";
 import { deleteJson, patchJson, postJson } from "../api/client";
-import { useObjectGroups, useSmartQos, useTrafficControl } from "../api/hooks";
+import { useObjectGroups, useTrafficControl } from "../api/hooks";
 import type { TrafficControlRule } from "../api/types";
 import { AddressListEditor } from "../components/AddressListEditor";
 import { DataTable } from "../components/DataTable";
-import { Badge, Button, Card, Field, Input, Modal, PageHeader, Select, useToast } from "../components/ui";
+import { Badge, Button, Field, Input, Modal, PageHeader, Select, useToast } from "../components/ui";
 import { useApply, useAuth, useConfirm } from "../state/providers";
 import { splitTokens, stateLabel, text } from "../lib/format";
 
@@ -38,7 +38,6 @@ export function QosPage() {
   const { session } = useAuth();
   const rules = useTrafficControl();
   const objects = useObjectGroups();
-  const smartQos = useSmartQos();
   const [editor, setEditor] = useState<TrafficControlRule | null | undefined>(undefined);
   const [form, setForm] = useState<any>({});
   const [busy, setBusy] = useState(false);
@@ -124,24 +123,16 @@ export function QosPage() {
     { id: "actions", header: "操作", cell: ({ row }) => <div className="row-actions"><Button size="sm" variant="text" icon={<Pencil size={13} />} onClick={() => open(row.original)} disabled={session?.role === "readonly"}>编辑</Button><Button size="sm" variant="text" icon={<Trash2 size={13} />} onClick={() => remove(row.original)} disabled={session?.role === "readonly"}>删除</Button></div>, meta: { width: 120, align: "right", hideable: false } },
   ], [session?.role]);
 
-  const qos = smartQos.data?.item || smartQos.data || {};
   return (
     <div className="page">
       <PageHeader
-        title="流量控制"
-        subtitle="规则限速/阻断与内置 Smart QoS 状态"
-        actions={<><Button size="sm" icon={<RefreshCw size={14} />} onClick={() => { rules.refetch(); smartQos.refetch(); objects.refetch(); }}>刷新</Button><Button size="sm" variant="primary" icon={<Plus size={14} />} onClick={() => open()} disabled={session?.role === "readonly"}>新增</Button></>}
+        title="流控"
+        subtitle="按策略限速与阻断，保存即生效"
+        actions={<><Button size="sm" icon={<RefreshCw size={14} />} onClick={() => { rules.refetch(); objects.refetch(); }}>刷新</Button><Button size="sm" variant="primary" icon={<Plus size={14} />} onClick={() => open()} disabled={session?.role === "readonly"}>新增</Button></>}
       />
-      <Card title="内置 Smart QoS" subtitle="系统内置，只读状态" actions={<Badge tone={qos.runtime_state === "running" ? "success" : "warning"} dot>{stateLabel(qos.runtime_state || "locked")}</Badge>}>
-        <div className="qos-status">
-          <div><span>运行状态</span><strong>{qos.runtime_state === "running" ? "运行中" : qos.runtime_state === "adapter_pending" ? "适配器待实现" : "能力锁定"}</strong></div>
-          <div><span>数据路径</span><strong>{text(qos.selected_dataplane_tier, "未选定")}</strong></div>
-          <div className="span-2"><span>原因</span><strong className="muted">{text(qos.reason, "尚未取得能力探测结果")}</strong></div>
-        </div>
-      </Card>
-      <DataTable data={rules.data?.items || []} columns={columns} loading={rules.isLoading} error={rules.isError ? rules.error : null} onRetry={() => rules.refetch()} emptyTitle="暂无流量控制规则" emptyDescription="创建限速或阻断规则；Smart QoS 由系统统一管理。" emptyAction={<Button size="sm" variant="primary" onClick={() => open()} disabled={session?.role === "readonly"}>新增规则</Button>} getRowId={(row) => row.id} />
+      <DataTable data={rules.data?.items || []} columns={columns} loading={rules.isLoading} error={rules.isError ? rules.error : null} onRetry={() => rules.refetch()} emptyTitle="暂无流控规则" emptyDescription="创建限速或阻断规则，保存后立即生效。" emptyAction={<Button size="sm" variant="primary" onClick={() => open()} disabled={session?.role === "readonly"}>新增规则</Button>} getRowId={(row) => row.id} />
 
-      <Modal open={editor !== undefined} onClose={() => !busy && setEditor(undefined)} title={editor ? "编辑流量控制" : "新增流量控制"} size="lg" busy={busy} footer={<><Button onClick={() => setEditor(undefined)} disabled={busy}>取消</Button><Button variant="primary" loading={busy} onClick={save}>保存并应用</Button></>}>
+      <Modal open={editor !== undefined} onClose={() => !busy && setEditor(undefined)} title={editor ? "编辑流控" : "新增流控"} size="lg" busy={busy} footer={<><Button onClick={() => setEditor(undefined)} disabled={busy}>取消</Button><Button variant="primary" loading={busy} onClick={save}>保存并应用</Button></>}>
         <div className="form-grid">
           <Field label="策略序号" required hint="1–65535"><Input type="number" min={1} max={65535} value={form.priority || ""} onChange={(event) => setForm({ ...form, priority: event.target.value })} /></Field>
           <Field label="备注"><Input value={form.name || ""} onChange={(event) => setForm({ ...form, name: event.target.value })} /></Field>

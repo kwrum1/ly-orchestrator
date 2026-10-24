@@ -155,7 +155,7 @@ export function DhcpPage() {
     <div className="page">
       <PageHeader
         title="DHCP 服务"
-        subtitle="Kea 动态地址池与静态分配；服务依赖 LAN 接口"
+        subtitle="动态地址池、静态分配与租约；服务依赖 LAN 接口"
         actions={<><Button size="sm" icon={<RefreshCw size={14} />} onClick={() => { servers.refetch(); bindings.refetch(); interfaces.refetch(); }}>刷新</Button><Button size="sm" variant="primary" icon={<Plus size={14} />} onClick={() => tab === "servers" ? openServer() : openBinding()} disabled={session?.role === "readonly"}>{tab === "servers" ? "新增服务" : "新增静态分配"}</Button></>}
       />
       <Tabs value={tab} onChange={(value) => setTab(value as any)} items={[{ key: "servers", label: "服务列表", count: servers.data?.items?.length }, { key: "bindings", label: "静态分配", count: bindings.data?.items?.length }]} />

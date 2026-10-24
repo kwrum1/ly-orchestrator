@@ -23,7 +23,7 @@ export function ConnectionsPage() {
   return (
     <div className="page">
       <PageHeader
-        title="连接排行"
+        title="Top 连接"
         subtitle="后端返回的 Top 连接；不推断策略或出口归属"
         actions={<Button size="sm" icon={<RefreshCw size={14} />} onClick={() => sessions.refetch()}>刷新</Button>}
       />
@@ -53,7 +53,7 @@ export function DomainsPage() {
   return (
     <div className="page">
       <PageHeader
-        title="域名排行"
+        title="Top 域名"
         subtitle="Top 域名与命中次数；数据来自 DNS 遥测"
         actions={<Button size="sm" icon={<RefreshCw size={14} />} onClick={() => domains.refetch()}>刷新</Button>}
       />

@@ -54,7 +54,6 @@ export const API = {
     objectExport: (id: string) => `/api/v1/objects/groups/${encodeURIComponent(id)}/export`,
     trafficControl: "/api/v1/gateway/traffic-control",
     trafficControlItem: (id: string) => `/api/v1/gateway/traffic-control/${encodeURIComponent(id)}`,
-    smartQos: "/api/v1/flow-control/smart-qos",
     securityAcls: "/api/v1/security/acls",
     securityAcl: (id: string) => `/api/v1/security/acls/${encodeURIComponent(id)}`,
     securityIpMac: "/api/v1/security/ip-mac-bindings",

@@ -121,8 +121,6 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
       interfaceId: item?.interface_id || item?.underlay_wan_id || "",
       type,
       mtu: item?.mtu || 1492,
-      upload: Number(item?.smart_qos_upload_kbps || 0) / 1000 || "",
-      download: Number(item?.smart_qos_download_kbps || 0) / 1000 || "",
       address: address.split("/")[0] || "",
       prefix: address.split("/")[1] || (type === "static6" ? "64" : "24"),
       gateway: item?.gateway || "",
@@ -246,9 +244,6 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
           type: type === "static4" ? "static" : type,
           wan_type: type === "static4" ? "static" : type,
           mtu: Number(form.mtu || 1500),
-          bandwidth: `${form.upload || 0}/${form.download || 0} M`,
-          smart_qos_upload_kbps: Math.round(Number(form.upload || 0) * 1000),
-          smart_qos_download_kbps: Math.round(Number(form.download || 0) * 1000),
           description: form.description || "",
           runtime_state: "desired_not_applied",
         };
@@ -328,7 +323,6 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
     { id: "state", header: "状态", accessorFn: (row) => wanState(row), cell: ({ row }) => <Badge tone={wanHealth(row.original) === "healthy" ? "success" : wanHealth(row.original) === "failed" ? "danger" : "warning"} dot>{stateLabel(wanState(row.original))}</Badge>, meta: { width: 95 } },
     { id: "type", header: "线路类型", accessorFn: (row) => wanType(row), cell: ({ row }) => <Badge tone="info">{row.original.isProxy ? "代理线路" : wanTypeLabel(wanType(row.original))}</Badge>, meta: { width: 105 } },
     { id: "mtu", header: "MTU", accessorFn: (row) => row.mtu, cell: ({ getValue }) => text(getValue()), meta: { width: 65, align: "right" } },
-    { id: "bandwidth", header: "带宽", accessorFn: (row) => row.bandwidth, cell: ({ getValue }) => text(getValue(), "--"), meta: { width: 100 } },
     { id: "desc", header: "备注", accessorFn: (row) => row.description, cell: ({ getValue }) => <span className="muted">{text(getValue(), "")}</span>, meta: { width: 120 } },
     { id: "actions", header: "操作", cell: ({ row }) => <div className="row-actions"><Button size="sm" variant="text" icon={<Pencil size={13} />} onClick={() => row.original.isProxy ? navigate("/proxy") : openWan(row.original)} disabled={session?.role === "readonly"}>编辑</Button>{row.original.id !== "proxy-egress-default" && <Button size="sm" variant="text" icon={<Trash2 size={13} />} onClick={() => remove(row.original.isProxy ? "proxy" : "wan", row.original)} disabled={session?.role === "readonly"}>删除</Button>}</div>, meta: { width: 120, align: "right", hideable: false } },
   ], [session?.role, navigate]);
@@ -519,10 +513,6 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
               <Field label={type === "static4" ? "IPv4 地址" : "IPv6 地址"} required><Input value={form.address || ""} onChange={(event) => setForm({ ...form, address: event.target.value })} placeholder={type === "static4" ? "203.0.113.18" : "2001:db8::2"} /></Field>
               <Field label="前缀" required><Input type="number" value={form.prefix || (type === "static4" ? "24" : "64")} onChange={(event) => setForm({ ...form, prefix: event.target.value })} /></Field>
               <Field label="网关" required><Input value={form.gateway || ""} onChange={(event) => setForm({ ...form, gateway: event.target.value })} /></Field>
-            </>}
-            {type !== "proxy" && <>
-              <Field label="上行带宽 (Mbps)" required><Input type="number" value={form.upload || ""} onChange={(event) => setForm({ ...form, upload: event.target.value })} placeholder="100" /></Field>
-              <Field label="下行带宽 (Mbps)" required><Input type="number" value={form.download || ""} onChange={(event) => setForm({ ...form, download: event.target.value })} placeholder="500" /></Field>
             </>}
             {type === "proxy" && <>
               <Field label="承载出口" required><Select value={form.underlay || ""} onChange={(event) => setForm({ ...form, underlay: event.target.value })}><option value="">请选择 WAN</option>{wanItems.map((item) => <option key={item.id} value={item.id}>{item.name || item.id}</option>)}</Select></Field>

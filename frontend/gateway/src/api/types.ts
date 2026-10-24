@@ -153,8 +153,6 @@ export interface WanLink {
   username?: string;
   ipv4?: AnyRecord;
   ipv6?: AnyRecord;
-  smart_qos_upload_kbps?: number;
-  smart_qos_download_kbps?: number;
   runtime_state?: string;
   status?: string;
   state?: string;

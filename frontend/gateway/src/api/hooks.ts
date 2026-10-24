@@ -263,14 +263,6 @@ export function usePPPoEStatus() {
   });
 }
 
-export function useSmartQos() {
-  return useQuery<any>({
-    queryKey: ["smart-qos"],
-    queryFn: () => getJson(API.resources.smartQos),
-    refetchInterval: 15_000,
-  });
-}
-
 export function useFirmwareStatus() {
   return useQuery<any>({
     queryKey: ["firmware-status"],

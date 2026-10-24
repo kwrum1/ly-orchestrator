@@ -145,7 +145,7 @@ export function ProxyPage() {
   return (
     <div className="page">
       <PageHeader
-        title="代理线路"
+        title="代理资源"
         subtitle="Xray 出口、节点、订阅与运行态；仅转发 VPP 已选择的流量"
         actions={<><Button size="sm" icon={<RefreshCw size={14} />} onClick={() => { egresses.refetch(); nodes.refetch(); subscriptions.refetch(); status.refetch(); logs.refetch(); }}>刷新</Button><Button size="sm" variant="primary" icon={<Plus size={14} />} onClick={() => open(tab)} disabled={session?.role === "readonly"}>{tab === "egress" ? "新增出口" : tab === "nodes" ? "新增节点" : "新增订阅"}</Button></>}
       />
