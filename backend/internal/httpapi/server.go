@@ -5757,6 +5757,25 @@ func (server *Server) buildApplyHooks(
 			*appliedArtifacts = append(*appliedArtifacts, report.AppliedArtifacts...)
 			*capabilityFailures = append(*capabilityFailures, serviceFailureEvidence(report.Failures)...)
 			evidenceRequest.Artifacts = *appliedArtifacts
+			if len(plan.GatewayPlan.Proxy.VPPSteering) > 0 {
+				// A selected proxy egress is not committed unless the capture,
+				// Linux policy routing, and Xray runtime are all installed.
+				// Treating their failures as degraded evidence silently produced a
+				// committed apply with no TPROXY rules, so LAN traffic fell through
+				// to the direct WAN path. Fail the transaction instead; the graph
+				// then rolls back and the caller never sees "committed".
+				for _, required := range []serviceRuntime.ServiceName{serviceRuntime.Nftables, serviceRuntime.LinuxRouting, serviceRuntime.Xray} {
+					if len(artifactsForService(otherArtifacts, required)) == 0 {
+						return fmt.Errorf("proxy steering requires a %s artifact; refusing to commit without it", required)
+					}
+				}
+				for _, failure := range report.Failures {
+					switch failure.Service {
+					case serviceRuntime.Nftables, serviceRuntime.LinuxRouting, serviceRuntime.Xray, serviceRuntime.VPP:
+						return fmt.Errorf("proxy steering %s apply failed: %w", failure.Service, failure)
+					}
+				}
+			}
 			if len(plan.GatewayPlan.NAT.PortMappings) > 0 {
 				// A port mapping is not committed until the standalone replay
 				// operations have been persisted. Otherwise VPP can contain the

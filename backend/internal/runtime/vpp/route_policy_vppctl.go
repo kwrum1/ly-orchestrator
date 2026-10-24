@@ -253,6 +253,14 @@ func routePolicySupportsNativePreNAT(policy trafficpolicy.RoutePolicy) bool {
 	if action == "deny" || policy.Path == nil {
 		return false
 	}
+	// A proxy-service handoff keeps the full ABF policy/attach lifecycle even
+	// though the pre-NAT classifier is also installed by that lifecycle.  The
+	// ABF object is the readback that proves the proxy route exists; silently
+	// replacing it with the native-only path let an apply commit while the
+	// proxy steering was absent.
+	if routePolicyUsesProxyServiceInterface(policy) {
+		return false
+	}
 	sources, sourceErr := preNATIPv4Selectors(policy.Match.Sources)
 	destinations, destinationErr := preNATIPv4Selectors(policy.Match.Destinations)
 	_, sourcePortErr := preNATPortRanges(policy.Match.SourcePorts)

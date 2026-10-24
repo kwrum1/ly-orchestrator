@@ -100,7 +100,7 @@ func TestProxyServiceNetworkReadbackRejectsDuplicateInputNAT(t *testing.T) {
 	results := []VPPCTLCommandResult{
 		{Command: "show interface address " + network.IngressVPPInterface, Stdout: network.IngressVPPInterface + " " + network.IngressVPPAddress},
 		{Command: "show interface address " + network.EgressVPPInterface, Stdout: network.EgressVPPInterface + " " + network.EgressVPPAddress},
-		{Command: fmt.Sprintf("show ip fib table %d", network.OutboundTableID), Stdout: fmt.Sprintf("table %d", network.OutboundTableID)},
+		{Command: "show ip fib table 0", Stdout: "ipv4-VRF:0, fib_index:0"},
 		{Command: "show nat44 interfaces", Stdout: network.EgressVPPInterface + " in"},
 		{Command: "show tap", Stdout: network.IngressVPPInterface},
 	}
@@ -272,6 +272,76 @@ func TestRoutePolicyCommandsUseResolvedDirectWANPath(t *testing.T) {
 	}, nil), "\n")
 	if !strings.Contains(commands, "via 198.51.100.1 lyroute-eth1") || strings.Contains(commands, "via wan-resource") || !strings.Contains(commands, "show abf attach lyroute-$LY_ROUTE_LAN_INTERFACE") {
 		t.Fatalf("direct WAN route commands = %s", commands)
+	}
+}
+
+func TestBuildOperationsEmitsABFForProxyEgressRoutePolicy(t *testing.T) {
+	compiled, err := proxy.CompileEgress(proxy.NewProxyEgress("proxy-route-plan", "xray-tproxy-outbound"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proxy.BindServiceNetwork(&compiled, "100.77.0.1 lyroute-wan0", []string{"192.168.77.0/24"}, 1500); err != nil {
+		t.Fatal(err)
+	}
+	network := compiled.ServiceNetwork
+	path := trafficpolicy.WANPath{VPPInterface: network.IngressVPPInterface, NextHop: network.IngressHostAddress}
+	plan := provenPlan(Plan{
+		RequestID:          "req-proxy-route",
+		AddressAssignments: []AddressAssignment{{ID: "lan", LinuxInterface: "enp2s0", VPPInterface: "lyroute-enp2s0", CIDR: "192.168.77.1/24", Role: "lan"}},
+		Proxy:              compiled,
+		Policy: trafficpolicy.Config{RoutePolicies: []trafficpolicy.RoutePolicy{{
+			ID: "proxy-route", Priority: 40, Action: "route", Egress: network.EgressID, Path: &path,
+			Match: trafficpolicy.Match{Sources: []string{"192.168.77.0/24"}, Destinations: []string{"203.0.113.2/32"}, Protocols: []string{"tcp"}},
+		}}},
+	}, "enp2s0")
+	operations := mustBuildOperations(t, plan)
+	found := false
+	for _, operation := range operations {
+		if operation.Name != "vpp.route-policy" || operation.Resource != "proxy-route" {
+			continue
+		}
+		found = true
+		commands := strings.Join(operation.VPPCtlCommands, "\n")
+		for _, want := range []string{
+			"abf policy add",
+			"abf attach ip4 policy",
+			"0.0.0.0/0 via " + network.IngressHostAddress + " " + network.IngressVPPInterface,
+		} {
+			if !strings.Contains(commands, want) {
+				t.Fatalf("proxy route operation missing %q:\n%s", want, commands)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("compiled plan has no proxy route operation: %#v", operations)
+	}
+}
+
+func TestProxyEgressRoutePolicyKeepsABFPolicyAttachedToProxyIngressTable(t *testing.T) {
+	network := proxy.ServiceNetworkForEgressID("proxy-route")
+	path := trafficpolicy.WANPath{VPPInterface: network.IngressVPPInterface, NextHop: network.IngressHostAddress}
+	commands := strings.Join(routePolicyCommands(trafficpolicy.RoutePolicy{
+		ID: "proxy-route", Priority: 40, Action: "route", Egress: network.EgressID, Path: &path,
+		Match: trafficpolicy.Match{
+			Sources:      []string{"192.168.77.0/24"},
+			Destinations: []string{"203.0.113.2/32"},
+			Protocols:    []string{"tcp"},
+		},
+	}, nil), "\n")
+	required := []string{
+		"abf policy add",
+		"abf attach ip4 policy",
+		"lyroute-$LY_ROUTE_LAN_INTERFACE",
+		"0.0.0.0/0 via " + network.IngressHostAddress + " " + network.IngressVPPInterface,
+		"show abf attach lyroute-$LY_ROUTE_LAN_INTERFACE",
+	}
+	for _, want := range required {
+		if !strings.Contains(commands, want) {
+			t.Fatalf("proxy route plan missing %q:\n%s", want, commands)
+		}
+	}
+	if !routePolicyUsesProxyServiceInterface(trafficpolicy.RoutePolicy{Path: &path}) {
+		t.Fatal("proxy ingress TAP route was not recognized as a proxy service handoff")
 	}
 }
 
