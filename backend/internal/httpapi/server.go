@@ -5385,23 +5385,19 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		}
 		artifacts = append(artifacts, nftablesArtifacts...)
 	}
-	dhcpPlans, dhcpArtifacts, err := server.currentDHCPServers(ctx, addressAssignments)
+	dhcpPlans, dhcpArtifacts, dhcpWarnings, err := server.currentDHCPServers(ctx, addressAssignments)
 	if err != nil {
 		return RuntimePlan{}, err
 	}
 	mark("dhcp")
 	artifacts = append(artifacts, dhcpArtifacts...)
+	planningWarnings = append(planningWarnings, dhcpWarnings...)
 	pppoePeers, pppoeArtifacts, err := server.currentPPPoEPeers(ctx)
 	if err != nil {
 		return RuntimePlan{}, err
 	}
 	mark("pppoe-peers")
 	artifacts = append(artifacts, pppoeArtifacts...)
-	ipv6Artifacts, ipv6Warning := server.currentIPv6RAArtifacts(ctx)
-	artifacts = append(artifacts, ipv6Artifacts...)
-	if ipv6Warning != "" {
-		planningWarnings = append(planningWarnings, ipv6Warning)
-	}
 	dataInterfaces := server.runtimeDataInterfaces(ctx)
 	observation := server.observeDataplaneCapability(ctx, dataInterfaces)
 	nativePath := observation.NativePathRequest(server.managementInterfaceID(ctx), dataInterfaces, server.now().UTC(), server.managementNetworkShared(ctx))
@@ -5499,9 +5495,6 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	components := server.runtimeStatusComponents(componentCtx, artifacts, len(operations) > 0)
 	cancelComponents()
 	mark("components")
-	if ipv6Warning != "" {
-		components = markComponentDegraded(components, string(serviceRuntime.IPv6RA), ipv6Warning)
-	}
 	if proxyRuntimeWarning != "" {
 		components = markComponentDegraded(components, string(serviceRuntime.Xray), proxyRuntimeWarning)
 	}
@@ -6915,14 +6908,14 @@ func (server *Server) currentDNSUpstreams(ctx context.Context, policy trafficpol
 	return upstreams, cache, networks, nil
 }
 
-func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.AddressAssignment) ([]serviceRuntime.DnsmasqPlan, []serviceRuntime.RenderedArtifact, error) {
+func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.AddressAssignment) ([]serviceRuntime.DnsmasqPlan, []serviceRuntime.RenderedArtifact, []string, error) {
 	items, err := server.desiredItems(ctx, "dhcp_server")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	reservations, err := server.currentDHCPReservations(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	var plans []serviceRuntime.DnsmasqPlan
 	for _, item := range items {
@@ -6932,7 +6925,7 @@ func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.
 		configuredInterface := stringField(item, "interface_id")
 		controlInterface, lanRouter, ok := server.dhcpLANControlInterface(ctx, configuredInterface, assignments)
 		if !ok {
-			return nil, nil, fmt.Errorf("DHCP service interface %s is not a configured logical LAN", configuredInterface)
+			return nil, nil, nil, fmt.Errorf("DHCP service interface %s is not a configured logical LAN", configuredInterface)
 		}
 		routers := stringSliceField(item, "routers")
 		if len(routers) == 0 && lanRouter != "" {
@@ -6944,19 +6937,28 @@ func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.
 		}
 		plan := serviceRuntime.DnsmasqPlan{ID: stringField(item, "id"), InterfaceID: controlInterface, Subnet: subnet, Pools: stringSliceField(item, "pools"), Routers: routers, NameServers: dhcpNameServers(stringSliceField(item, "name_servers"), routers), LeaseTime: firstIntField(item, "lease_time_seconds", "valid_lifetime", "valid_lifetime_seconds")}
 		plan.Reservations = reservationsForDHCPPlan(plan, reservations)
-		if plan.ID == "" || plan.InterfaceID == "" || plan.Subnet == "" || len(plan.Pools) == 0 {
+		if plan.ID == "" || plan.InterfaceID == "" {
+			continue
+		}
+		if plan.Subnet == "" || len(plan.Pools) == 0 {
+			// The LAN may only be configured for IPv6; the IPv6 pass below
+			// still creates a dnsmasq plan when a prefix is available.
 			continue
 		}
 		plans = append(plans, plan)
 	}
+	plans, ipv6Warnings, err := server.dnsmasqIPv6LANPlans(ctx, plans, assignments)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	if len(plans) == 0 {
-		return plans, nil, nil
+		return plans, nil, ipv6Warnings, nil
 	}
 	artifacts, err := serviceRuntime.RenderDnsmasqConfig(plans)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return plans, artifacts, nil
+	return plans, artifacts, ipv6Warnings, nil
 }
 
 func dhcpNameServers(configured, routers []string) []string {

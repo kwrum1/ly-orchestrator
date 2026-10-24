@@ -135,6 +135,8 @@ install_smartdns_defaults() {
 server-name ly-route-smartdns
 bind 127.0.0.1:1053 -no-speed-check
 bind-tcp 127.0.0.1:1053 -no-speed-check
+bind [::1]:1053 -no-speed-check
+bind-tcp [::1]:1053 -no-speed-check
 audit-enable yes
 audit-file /var/log/smartdns/smartdns-audit.log
 audit-size 16M

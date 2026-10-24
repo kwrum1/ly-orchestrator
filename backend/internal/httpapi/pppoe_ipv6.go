@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"sort"
 	"strings"
 )
 
@@ -32,5 +33,8 @@ func (server *Server) pppoeIPv6LANConfig(ctx context.Context, wanID string) (str
 	if len(lanInterfaces) == 0 {
 		return "", nil, nil
 	}
+	// Keep the VPP LAN order identical to the dnsmasq planner's order so a
+	// delegated /56 is sub-delegated to the same /64 on both sides.
+	sort.Strings(lanInterfaces)
 	return "ly-route-" + wanID, lanInterfaces, nil
 }

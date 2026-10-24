@@ -424,3 +424,63 @@ ipv4-VRF:93153, fib_index:5
 		t.Fatalf("FIB tables = %#v, want [0 38136 93153]", got)
 	}
 }
+
+func TestConfigureDelegatedPrefixAllocatesDistinct64PerLAN(t *testing.T) {
+	temp := t.TempDir()
+	logPath := filepath.Join(temp, "vppctl.log")
+	binary := filepath.Join(temp, "vppctl")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$LY_ROUTE_TEST_LOG\"\n"
+	if err := os.WriteFile(binary, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LY_ROUTE_TEST_LOG", logPath)
+	err := configureDelegatedPrefix(context.Background(), VPPConfig{
+		Binary: binary, IPv6PrefixGroup: "pd",
+		IPv6LANInterfaces: []string{"lyroute-lan0", "lyroute-lan1"},
+	}, "2001:db8:100::/56")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"set interface ip address lyroute-lan0 2001:db8:100::1/64",
+		"ip6 nd lyroute-lan0 prefix 2001:db8:100::/64 infinite",
+		"set interface ip address lyroute-lan1 2001:db8:100:1::1/64",
+		"ip6 nd lyroute-lan1 prefix 2001:db8:100:1::/64 infinite",
+	} {
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("per-LAN delegated prefix command missing %q:\n%s", want, content)
+		}
+	}
+}
+
+func TestConfigureDelegatedPrefixSkipsLANsBeyondSmallPrefix(t *testing.T) {
+	temp := t.TempDir()
+	logPath := filepath.Join(temp, "vppctl.log")
+	binary := filepath.Join(temp, "vppctl")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$LY_ROUTE_TEST_LOG\"\n"
+	if err := os.WriteFile(binary, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LY_ROUTE_TEST_LOG", logPath)
+	err := configureDelegatedPrefix(context.Background(), VPPConfig{
+		Binary: binary, IPv6PrefixGroup: "pd",
+		IPv6LANInterfaces: []string{"lyroute-lan0", "lyroute-lan1"},
+	}, "2001:db8:100::/64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "ip6 nd lyroute-lan0 prefix 2001:db8:100::/64 infinite") {
+		t.Fatalf("first LAN did not receive the /64:\n%s", content)
+	}
+	if strings.Contains(string(content), "lyroute-lan1") {
+		t.Fatalf("second LAN cannot be addressed from a single /64 and must be skipped:\n%s", content)
+	}
+}

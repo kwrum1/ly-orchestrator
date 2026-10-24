@@ -178,12 +178,22 @@ func main() {
 	if prefixDelegationEnabled {
 		serve = func(ctx context.Context) error {
 			return client.ServeWithDelegatedPrefixRecovery(ctx, session, prefixLease, func(ctx context.Context, updated pppoeclient.DelegatedPrefixLease) error {
+				previousPrefix := strings.TrimSpace(session.DelegatedPrefix)
 				if err := programmed.UpdateDelegatedPrefix(ctx, updated.Prefix.String()); err != nil {
 					return err
 				}
 				session = sessionWithPrefixLease(session, updated)
 				programmed.Session = session
 				writeStatus(*statusFile, map[string]any{"state": "connected", "interface": programmed.Interface, "session": session})
+				// dnsmasq derives the LAN /64 from this status file. A renewed
+				// or newly acquired prefix must re-render its RA/DHCPv6
+				// configuration; the recovery transaction is idempotent and
+				// does not touch unrelated services when nothing changed.
+				if previousPrefix != updated.Prefix.String() {
+					if err := notifyDependentRuntime(*reconcileUnit); err != nil {
+						fmt.Fprintf(os.Stderr, "IPv6 prefix runtime reconciliation: %v\n", err)
+					}
+				}
 				return nil
 			})
 		}

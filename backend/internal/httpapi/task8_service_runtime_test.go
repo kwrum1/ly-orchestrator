@@ -64,7 +64,7 @@ func TestRuntimeApply_xray_failure_degrades_only_proxy_capability(t *testing.T) 
 	}
 }
 
-func TestRuntimePlan_prefix_too_small_blocks_only_IPv6_RA(t *testing.T) {
+func TestRuntimePlan_prefix_too_small_omits_dnsmasq_IPv6_without_failing(t *testing.T) {
 	// Given
 	ctx := context.Background()
 	store, err := persistence.Open(ctx, "file:httpapi-task8-ipv6-prefix?mode=memory&cache=shared")
@@ -73,7 +73,7 @@ func TestRuntimePlan_prefix_too_small_blocks_only_IPv6_RA(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	now := fixedClock()()
-	if err := store.SaveConfig(ctx, configDocument(t, "interface", "lan0", map[string]any{"id": "lan0", "interface_id": "lan0", "gateway_role": "lan"}, now)); err != nil {
+	if err := store.SaveConfig(ctx, configDocument(t, "interface", "lan0", map[string]any{"id": "lan0", "interface_id": "lan0", "gateway_role": "lan", "ipv6": map[string]any{"mode": "delegated_prefix", "source_wan_id": "wan0"}}, now)); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.SaveConfig(ctx, configDocument(t, "wan_link", "wan0", map[string]any{"id": "wan0", "type": "dhcp", "ipv6": map[string]any{"delegated_prefix": "2001:db8:100::/65"}}, now)); err != nil {
@@ -93,17 +93,16 @@ func TestRuntimePlan_prefix_too_small_blocks_only_IPv6_RA(t *testing.T) {
 	}
 	for _, artifact := range plan.RuntimeArtifacts {
 		if artifact.Service == serviceRuntime.IPv6RA {
-			t.Fatalf("invalid prefix emitted RA artifact: %#v", artifact)
+			t.Fatalf("invalid prefix emitted radvd artifact: %#v", artifact)
+		}
+		if artifact.Service == serviceRuntime.Dnsmasq && (strings.Contains(artifact.Content, "enable-ra") || strings.Contains(artifact.Content, "2001:db8:100")) {
+			t.Fatalf("invalid prefix emitted dnsmasq IPv6 state: %#v", artifact)
 		}
 	}
-	found := false
 	for _, component := range plan.Components {
 		if component.Name == string(serviceRuntime.IPv6RA) {
-			found = component.State == "degraded" && !component.Available
+			t.Fatalf("gateway path must not expose an IPv6 RA/radvd component: %#v", plan.Components)
 		}
-	}
-	if !found {
-		t.Fatalf("IPv6 RA degradation missing: %#v", plan.Components)
 	}
 }
 
