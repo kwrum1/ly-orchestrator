@@ -136,7 +136,7 @@ func TestFilesystemController_receipt_and_readback_bind_live_artifact_hashes(t *
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	runner := &fakeRunner{
 		health:  map[ServiceName]Health{Dnsmasq: {Service: Dnsmasq, Available: true}},
-		outputs: map[string]string{"dnsmasq -t /etc/dnsmasq.d/ly-route-dhcp.conf": "configuration test passed"},
+		outputs: map[string]string{"dnsmasq --test -C /etc/dnsmasq.d/ly-route-dhcp.conf": "configuration test passed"},
 	}
 	controller := FilesystemController{RootDir: t.TempDir(), Runner: runner, Now: func() time.Time { return now }}
 	artifacts := []RenderedArtifact{NewArtifact(Dnsmasq, "/etc/dnsmasq.d/ly-route-dhcp.conf", "desired", "restart")}
@@ -299,7 +299,7 @@ func TestSystemctlRunner_Kea_readback_uses_test_and_config_flags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(commands) != 1 || strings.Join(commands[0], " ") != "dnsmasq -t /etc/dnsmasq.d/ly-route-dhcp.conf" {
+	if len(commands) != 1 || strings.Join(commands[0], " ") != "dnsmasq --test -C /etc/dnsmasq.d/ly-route-dhcp.conf" {
 		t.Fatalf("Dnsmasq readback command = %#v", commands)
 	}
 }

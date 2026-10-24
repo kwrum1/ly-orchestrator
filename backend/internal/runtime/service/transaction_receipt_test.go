@@ -10,7 +10,7 @@ func TestFilesystemController_transactionReceiptCannotBeReboundByOlderStatusRead
 	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
 	runner := &fakeRunner{
 		health:  map[ServiceName]Health{Dnsmasq: {Service: Dnsmasq, Available: true}},
-		outputs: map[string]string{"dnsmasq -t /etc/dnsmasq.d/ly-route-dhcp.conf": "configuration test passed"},
+		outputs: map[string]string{"dnsmasq --test -C /etc/dnsmasq.d/ly-route-dhcp.conf": "configuration test passed"},
 	}
 	controller := FilesystemController{RootDir: t.TempDir(), Runner: runner, Now: func() time.Time { return now }}
 	artifacts := []RenderedArtifact{NewArtifact(Dnsmasq, "/etc/dnsmasq.d/ly-route-dhcp.conf", "desired", "restart")}
