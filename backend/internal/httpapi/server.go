@@ -186,6 +186,8 @@ type Server struct {
 	firmwareStatus                FirmwareUpdateStatus
 	firmwareInstallStart          func(firmwareInstallInvocation) error
 	dnsSyncToken                  string
+	proxyFailurePage              proxyFailureActuator
+	proxyFailure                  *proxyFailureTracker
 }
 
 type InterfaceTelemetryCollector interface {
@@ -377,6 +379,16 @@ func WithServiceRuntime(runtime serviceRuntime.Runtime) Option {
 	return func(server *Server) { server.services = &runtime }
 }
 
+// withProxyFailureActuator replaces the packaged nftables helper. It is used
+// by the state-machine tests; production always uses the packaged helper.
+func withProxyFailureActuator(actuator proxyFailureActuator) Option {
+	return func(server *Server) {
+		if actuator != nil {
+			server.proxyFailurePage = actuator
+		}
+	}
+}
+
 func WithVPPReceiptPath(path string) Option {
 	return func(server *Server) { server.vppReceiptPath = strings.TrimSpace(path) }
 }
@@ -503,6 +515,15 @@ func newServer(profile product.Profile, options ...Option) *Server {
 		now:          time.Now,
 		sessions:     newSessionStore(time.Now),
 		gatewayState: newGatewayTelemetryState(),
+		// The failure page is driven by a packaged helper so toggling it never
+		// requires a full gateway apply. The persisted state is also what the
+		// systemd stop/crash path reads.
+		proxyFailurePage: newProxyFailureHelper(
+			envOrDefault("LY_ROUTE_PROXY_FAILURE_HELPER", ""),
+			envOrDefault("LY_ROUTE_PROXY_FAILURE_STATE", ""),
+			time.Now,
+		),
+		proxyFailure: newProxyFailureTracker(),
 	}
 	for _, option := range options {
 		option(server)
@@ -1993,7 +2014,11 @@ func (server *Server) handleProxyXrayRuntime(action string) http.HandlerFunc {
 			return
 		}
 		if !server.serviceRuntimeConfigured() {
-			writeJSON(w, http.StatusOK, map[string]any{"service": "xray", "state": "degraded", "available": false, "reason": "xray service runtime is not configured", "request_id": requestID(r)})
+			payload := map[string]any{"service": "xray", "state": "degraded", "available": false, "reason": "xray service runtime is not configured", "request_id": requestID(r)}
+			for key, value := range proxyFailureStatusFields(server.proxyFailureSnapshot()) {
+				payload[key] = value
+			}
+			writeJSON(w, http.StatusOK, payload)
 			return
 		}
 		switch action {
@@ -2015,7 +2040,11 @@ func (server *Server) handleProxyXrayRuntime(action string) http.HandlerFunc {
 					item.Reason = serviceRuntime.Redact(err.Error())
 				}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"service": "xray", "state": availabilityState(item.Available), "available": item.Available, "reason": item.Reason, "balancers": balancers, "request_id": requestID(r)})
+			payload := map[string]any{"service": "xray", "state": availabilityState(item.Available), "available": item.Available, "reason": item.Reason, "balancers": balancers, "request_id": requestID(r)}
+			for key, value := range proxyFailureStatusFields(server.proxyFailureSnapshot()) {
+				payload[key] = value
+			}
+			writeJSON(w, http.StatusOK, payload)
 		case "logs":
 			controller, ok := server.services.Controller.(serviceRuntime.LogController)
 			if !ok {

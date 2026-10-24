@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNftablesCaptureGuardsBypassBeforeTPROXY(t *testing.T) {
@@ -117,90 +118,245 @@ func TestFailOpenNftablesCaptureHasNoTPROXYRules(t *testing.T) {
 	}
 }
 
-func TestEnsureDirectFallbackIsIdempotentAndMarked(t *testing.T) {
+func TestEnsureFailureFallbackIsIdempotentBlackholedAndMarked(t *testing.T) {
 	config := XrayConfigPayload{
 		Inbounds:  []XrayInbound{{Tag: "proxy-in", Protocol: "dokodemo-door", Settings: XrayDokodemoSettings{Network: "tcp,udp"}}},
 		Outbounds: []XrayOutbound{{Tag: "node-a", Protocol: "vless"}},
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		if err := EnsureDirectFallback(&config, ProxyDirectProbeURL); err != nil {
+		if err := EnsureFailureFallback(&config, ProxyProbeURL); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if len(config.Outbounds) != 2 {
-		t.Fatalf("outbounds = %#v, want proxy node plus one direct fallback", config.Outbounds)
+		t.Fatalf("outbounds = %#v, want one proxy node plus one failure blackhole", config.Outbounds)
 	}
-	if config.Outbounds[1].Tag != ProxyDirectOutboundTag || config.Outbounds[1].Protocol != "freedom" {
-		t.Fatalf("direct fallback outbound = %#v", config.Outbounds[1])
+	if config.Outbounds[1].Tag != ProxyFailureOutboundTag || config.Outbounds[1].Protocol != "blackhole" {
+		t.Fatalf("failure fallback outbound = %#v", config.Outbounds[1])
+	}
+	for _, outbound := range config.Outbounds {
+		if outbound.Tag == ProxyDirectOutboundTag || strings.EqualFold(outbound.Protocol, "freedom") {
+			t.Fatalf("fail-closed config still contains a direct outbound: %#v", outbound)
+		}
 	}
 	if config.Routing == nil || len(config.Routing.Balancers) != 1 {
 		t.Fatalf("routing balancers = %#v", config.Routing)
 	}
 	balancer := config.Routing.Balancers[0]
-	if balancer.FallbackTag != ProxyDirectOutboundTag || len(balancer.Selector) != 1 || balancer.Selector[0] != "node-a" {
-		t.Fatalf("fallback balancer = %#v", balancer)
+	if balancer.FallbackTag != ProxyFailureOutboundTag || len(balancer.Selector) != 1 || balancer.Selector[0] != "node-a" {
+		t.Fatalf("failure balancer = %#v", balancer)
 	}
 	routed := 0
-	directCatchAll := 0
-	for _, rule := range config.Routing.Rules {
+	catchAll := 0
+	for index, rule := range config.Routing.Rules {
 		if rule.BalancerTag == balancer.Tag {
 			routed++
 		}
-		if isDirectCatchAll(rule) {
-			directCatchAll++
+		if isFailureCatchAll(rule) {
+			catchAll++
+			if index != len(config.Routing.Rules)-1 {
+				t.Fatalf("failure catch-all is not terminal: %#v", config.Routing.Rules)
+			}
 		}
 	}
-	if routed != 1 || directCatchAll != 1 {
+	if routed != 1 || catchAll != 1 {
 		t.Fatalf("routing rules = %#v", config.Routing.Rules)
 	}
-	if config.Observatory == nil || !containsString(config.Observatory.SubjectSelector, "node-a") || config.Observatory.ProbeURL != ProxyDirectProbeURL {
+	if config.Observatory == nil || !containsString(config.Observatory.SubjectSelector, "node-a") || config.Observatory.ProbeURL != ProxyProbeURL {
 		t.Fatalf("observatory = %#v", config.Observatory)
+	}
+	if config.Metrics == nil || config.Metrics.Listen != DefaultXrayMetricsListen {
+		t.Fatalf("observatory metrics are not enabled: %#v", config.Metrics)
 	}
 
 	ApplyOutboundSocketMark(&config, 0x200001)
-	for _, index := range []int{0, 1} {
-		stream := config.Outbounds[index].StreamSettings
-		sockopt, _ := stream["sockopt"].(map[string]any)
-		if sockopt["mark"] != uint32(0x200001) {
-			// VPP owns the WAN interface. Without the proxy egress mark the
-			// direct fallback would use the management/default table and fail.
-			t.Fatalf("outbound %q lost the egress mark: %#v", config.Outbounds[index].Tag, sockopt)
-		}
+	stream := config.Outbounds[0].StreamSettings
+	sockopt, _ := stream["sockopt"].(map[string]any)
+	if sockopt["mark"] != uint32(0x200001) {
+		t.Fatalf("proxy outbound lost the egress mark: %#v", sockopt)
+	}
+	if stream := config.Outbounds[1].StreamSettings; len(stream) != 0 {
+		t.Fatalf("blackhole outbound must not be socket-marked: %#v", stream)
 	}
 
 	payload, err := json.Marshal(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(payload), `"fallbackTag":"direct"`) {
-		t.Fatalf("fallbackTag missing from rendered Xray config: %s", payload)
+	for _, required := range []string{`"fallbackTag":"failure"`, `"protocol":"blackhole"`, `"metrics":{"listen":"127.0.0.1:11111"}`} {
+		if !strings.Contains(string(payload), required) {
+			t.Fatalf("rendered Xray config is missing %s: %s", required, payload)
+		}
 	}
+	if strings.Contains(string(payload), `"fallbackTag":"direct"`) || strings.Contains(string(payload), `"tag":"direct"`) {
+		t.Fatalf("rendered Xray config still contains a direct path: %s", payload)
+	}
+	assertNoCapturedPathReachesDirect(t, config)
 }
 
-func TestEnsureDirectFallbackRewritesAdaptiveLaneRules(t *testing.T) {
+func TestEnsureFailureFallbackDropsLegacyDirectOutboundAndCatchAll(t *testing.T) {
 	config := XrayConfigPayload{
-		Inbounds: []XrayInbound{
-			{Tag: "lane-a", Protocol: "dokodemo-door"},
-			{Tag: "lane-b", Protocol: "dokodemo-door"},
+		Inbounds: []XrayInbound{{Tag: "proxy-in", Protocol: "dokodemo-door", Settings: XrayDokodemoSettings{Network: "tcp,udp"}}},
+		Outbounds: []XrayOutbound{
+			{Tag: "direct", Protocol: "freedom"},
+			{Tag: "node-a", Protocol: "vless"},
 		},
-		Outbounds: []XrayOutbound{{Tag: "node-a", Protocol: "vless"}, {Tag: "node-b", Protocol: "vless"}},
-		Routing:   &XrayRouting{Rules: []XrayRoutingRule{{Type: "field", InboundTags: []string{"lane-a"}, OutboundTag: "node-a"}, {Type: "field", InboundTags: []string{"lane-b"}, OutboundTag: "node-b"}}},
+		Routing: &XrayRouting{Rules: []XrayRoutingRule{
+			{Type: "field", InboundTags: []string{"proxy-in"}, OutboundTag: "node-a"},
+			{Type: "field", Network: "tcp,udp", OutboundTag: "direct"},
+		}},
+		Observatory: &XrayObservatory{SubjectSelector: []string{"node-a", "direct"}, ProbeURL: ProxyProbeURL, ProbeInterval: "10s"},
 	}
-	if err := EnsureDirectFallback(&config, ""); err != nil {
+	if err := EnsureFailureFallback(&config, ""); err != nil {
 		t.Fatal(err)
 	}
-	if len(config.Routing.Balancers) != 2 {
-		t.Fatalf("adaptive fallback balancers = %#v", config.Routing.Balancers)
+	for _, outbound := range config.Outbounds {
+		if outbound.Tag == "direct" || strings.EqualFold(outbound.Protocol, "freedom") {
+			t.Fatalf("legacy direct outbound survived: %#v", config.Outbounds)
+		}
 	}
 	for _, rule := range config.Routing.Rules {
-		if len(rule.InboundTags) > 0 && rule.BalancerTag == "" {
-			t.Fatalf("lane rule was not rewritten to a fallback balancer: %#v", rule)
+		if rule.OutboundTag == "direct" || rule.OutboundTag == ProxyDirectOutboundTag {
+			t.Fatalf("legacy direct rule survived: %#v", config.Routing.Rules)
+		}
+	}
+	if last := config.Routing.Rules[len(config.Routing.Rules)-1]; !isFailureCatchAll(last) {
+		t.Fatalf("terminal rule is not a failure catch-all: %#v", config.Routing.Rules)
+	}
+	for _, balancer := range config.Routing.Balancers {
+		if balancer.FallbackTag != ProxyFailureOutboundTag {
+			t.Fatalf("balancer %q keeps a non-failure fallback: %#v", balancer.Tag, balancer)
+		}
+		for _, selected := range balancer.Selector {
+			if selected == "direct" {
+				t.Fatalf("balancer %q still selects direct: %#v", balancer.Tag, balancer)
+			}
 		}
 	}
 }
 
-func TestEnsureDirectFallbackRejectsEmptyRuntime(t *testing.T) {
-	if err := EnsureDirectFallback(&XrayConfigPayload{}, ""); err == nil {
-		t.Fatal("direct fallback accepted a runtime without proxy outbounds")
+func TestEnsureFailureFallbackRewritesAdaptiveLaneRules(t *testing.T) {
+	now := time.Now().UTC()
+	nodes := []Node{
+		{ID: "a", Protocol: "vless", Address: "127.0.0.1", Port: 21001, Secret: "11111111-1111-1111-1111-111111111111"},
+		{ID: "b", Protocol: "vless", Address: "127.0.0.1", Port: 21002, Secret: "11111111-1111-1111-1111-111111111111"},
+	}
+	subscription := Subscription{ID: "main", URL: "https://subscription.invalid/list", Enabled: true, NodeRefs: []string{"a", "b"}, TopN: 2}
+	runtime, err := CompileAdaptiveSubscriptionLanes(subscription, nodes, []NodeProbe{
+		{NodeID: "a", Reachable: true, RTT: 10 * time.Millisecond, ObservedAt: now},
+		{NodeID: "b", Reachable: true, RTT: 20 * time.Millisecond, ObservedAt: now},
+	}, 23080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := XrayConfigPayload{
+		Inbounds: runtime.Inbounds, Outbounds: runtime.Outbounds, Routing: &runtime.Routing,
+		Observatory: &runtime.Observatory, Metrics: runtime.Metrics,
+	}
+	if err := EnsureFailureFallback(&config, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Routing.Balancers) != 2 {
+		t.Fatalf("adaptive failure balancers = %#v", config.Routing.Balancers)
+	}
+	for _, rule := range config.Routing.Rules {
+		if len(rule.InboundTags) > 0 && rule.BalancerTag == "" {
+			t.Fatalf("lane rule was not rewritten to a failure balancer: %#v", rule)
+		}
+	}
+	assertNoCapturedPathReachesDirect(t, config)
+}
+
+func TestEnsureFailureFallbackRejectsEmptyRuntime(t *testing.T) {
+	if err := EnsureFailureFallback(&XrayConfigPayload{}, ""); err == nil {
+		t.Fatal("failure fallback accepted a runtime without proxy outbounds")
+	}
+}
+
+func TestEnsureFailureFallbackRejectsFreedomProxyOutbound(t *testing.T) {
+	config := XrayConfigPayload{
+		Inbounds:  []XrayInbound{{Tag: "proxy-in", Protocol: "dokodemo-door"}},
+		Outbounds: []XrayOutbound{{Tag: "node-a", Protocol: "freedom"}},
+	}
+	if err := EnsureFailureFallback(&config, ""); err == nil {
+		t.Fatal("failure fallback accepted a freedom proxy outbound that would leak to direct")
+	}
+}
+
+// assertNoCapturedPathReachesDirect walks the routing decision for every
+// dokodemo-door inbound and both transports. A captured packet must either be
+// black-holed directly or select a balancer whose selector only contains proxy
+// outbounds and whose fallback is the failure blackhole.
+func assertNoCapturedPathReachesDirect(t *testing.T, config XrayConfigPayload) {
+	t.Helper()
+	outboundByTag := make(map[string]XrayOutbound, len(config.Outbounds))
+	hasFailure := false
+	for _, outbound := range config.Outbounds {
+		outboundByTag[outbound.Tag] = outbound
+		if outbound.Tag == ProxyDirectOutboundTag || strings.EqualFold(outbound.Protocol, "freedom") {
+			t.Fatalf("outbound %q provides a direct path", outbound.Tag)
+		}
+		if outbound.Tag == ProxyFailureOutboundTag && strings.EqualFold(outbound.Protocol, "blackhole") {
+			hasFailure = true
+		}
+	}
+	if !hasFailure {
+		t.Fatal("config has no failure blackhole outbound")
+	}
+	if config.Routing == nil {
+		t.Fatal("config has no routing rules")
+	}
+	balancers := make(map[string]XrayBalancer, len(config.Routing.Balancers))
+	for _, balancer := range config.Routing.Balancers {
+		balancers[balancer.Tag] = balancer
+		if balancer.FallbackTag != ProxyFailureOutboundTag {
+			t.Fatalf("balancer %q fallback = %q", balancer.Tag, balancer.FallbackTag)
+		}
+	}
+	captured := 0
+	for _, inbound := range config.Inbounds {
+		if inbound.Protocol != "dokodemo-door" {
+			continue
+		}
+		captured++
+		for _, transport := range []string{"tcp", "udp"} {
+			matched := false
+			for _, rule := range config.Routing.Rules {
+				if len(rule.InboundTags) > 0 && !containsString(rule.InboundTags, inbound.Tag) {
+					continue
+				}
+				if rule.Network != "" && !strings.Contains(rule.Network, transport) {
+					continue
+				}
+				matched = true
+				if rule.BalancerTag != "" {
+					balancer, exists := balancers[rule.BalancerTag]
+					if !exists || len(balancer.Selector) == 0 {
+						t.Fatalf("inbound %q matches unresolved balancer %q", inbound.Tag, rule.BalancerTag)
+					}
+					for _, tag := range balancer.Selector {
+						outbound, exists := outboundByTag[tag]
+						if !exists || outbound.Tag == ProxyDirectOutboundTag || strings.EqualFold(outbound.Protocol, "freedom") {
+							t.Fatalf("balancer %q selects non-proxy outbound %q", balancer.Tag, tag)
+						}
+					}
+					break
+				}
+				if rule.OutboundTag == ProxyFailureOutboundTag {
+					break
+				}
+				outbound, exists := outboundByTag[rule.OutboundTag]
+				if !exists || outbound.Tag == ProxyDirectOutboundTag || strings.EqualFold(outbound.Protocol, "freedom") {
+					t.Fatalf("inbound %q routes to non-proxy outbound %q", inbound.Tag, rule.OutboundTag)
+				}
+				break
+			}
+			if !matched {
+				t.Fatalf("captured %s traffic for inbound %q has no terminal rule", transport, inbound.Tag)
+			}
+		}
+	}
+	if captured == 0 {
+		t.Fatal("test config has no capture inbound")
 	}
 }

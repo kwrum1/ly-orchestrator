@@ -59,8 +59,18 @@ func main() {
 		fmt.Print(artifacts[0].Content)
 	case "xray":
 		config := compiled.XrayRuntime.ConfigPayload
-		config.Outbounds = []proxy.XrayOutbound{{Tag: "node-netns", Protocol: "freedom"}}
-		if err := proxy.EnsureDirectFallback(&config, proxy.ProxyDirectProbeURL); err != nil {
+		// A freedom outbound is deliberately rejected by the fail-closed
+		// compiler; render a realistic proxy node instead so the netns harness
+		// exercises the same shape as production.
+		config.Outbounds = []proxy.XrayOutbound{{
+			Tag: "node-netns", Protocol: "vless",
+			Settings: map[string]any{"vnext": []any{map[string]any{
+				"address": "127.0.0.1", "port": 25001,
+				"users": []any{map[string]any{"id": "11111111-1111-1111-1111-111111111111", "encryption": "none"}},
+			}}},
+			StreamSettings: map[string]any{"network": "tcp"},
+		}}
+		if err := proxy.EnsureFailureFallback(&config, proxy.ProxyProbeURL); err != nil {
 			fail(err)
 		}
 		proxy.ApplyOutboundSocketMark(&config, compiled.ServiceNetwork.OutboundMark)

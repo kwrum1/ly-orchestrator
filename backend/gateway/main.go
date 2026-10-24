@@ -133,7 +133,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("initialize control API: %w", err)
 	}
-	server.StartAdaptiveProxyReconciler(context.Background(), 10*time.Second)
+	server.StartProxyReconciler(context.Background(), 10*time.Second)
 	// Probe dataplane capability at startup instead of trusting a pre-generated
 	// proof file. The observation warms the cache used by plan building; a
 	// failure is logged as a degradation and never blocks forwarding.

@@ -175,6 +175,13 @@ func (runtime *Runtime) invalidateHealth() {
 	}
 }
 
+// InvalidateHealth drops the short-lived per-service health cache. It is used
+// by reconcilers and tests that must observe a state change immediately
+// instead of waiting for the one-second cache TTL.
+func (runtime *Runtime) InvalidateHealth() {
+	runtime.invalidateHealth()
+}
+
 func NewArtifact(service ServiceName, path, content, reloadMode string) RenderedArtifact {
 	digest := sha256.Sum256([]byte(content))
 	return RenderedArtifact{

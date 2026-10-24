@@ -74,6 +74,9 @@ validate_prebuilt_vpp_apply "$vpp_apply_binary"
 validate_upgrade_base_manifest "$base_manifest" "$product"
 product_build_require_file "$repo_root/scripts/build-controller-shell.sh"
 product_build_require_file "$repo_root/packaging/nginx/ly-route-admin.conf"
+product_build_require_file "$repo_root/packaging/nginx/ly-route-proxy-failure.conf"
+product_build_require_file "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/proxy-failure"
+product_build_require_file "$repo_root/packaging/rootfs-overlay/usr/share/ly-route/proxy-failure/index.html"
 product_build_require_file "$repo_root/packaging/rootfs-overlay/etc/systemd/system/ly-route-control-api.service"
 if [ -n "$frontend_bundle" ]; then
   validate_frontend_bundle "$frontend_bundle" "$product"
@@ -154,6 +157,7 @@ chmod 0755 "$package_root/usr/lib/ly-route/vpp-apply"
 copy_product_frontend "$package_root/opt/ly-route/admin" "$frontend_bundle" "$product"
 cp "$PRODUCT_MANIFEST" "$package_root/etc/ly-route/product-manifest.json"
 cp "$repo_root/packaging/nginx/ly-route-admin.conf" "$package_root/etc/nginx/conf.d/ly-route-admin.conf"
+cp "$repo_root/packaging/nginx/ly-route-proxy-failure.conf" "$package_root/etc/nginx/conf.d/ly-route-proxy-failure.conf"
 if [ "$product" = gateway ]; then
   if [ "${LY_ROUTE_BUILD_TAR_ONLY:-0}" != 1 ]; then
     for geodata_file in geoip.dat geosite.dat china-list.txt manifest.json; do
@@ -169,10 +173,13 @@ if [ "$product" = gateway ]; then
 fi
 service="$package_root/etc/systemd/system/ly-route-control-api.service"
 cp "$repo_root/packaging/rootfs-overlay/etc/systemd/system/ly-route-control-api.service" "$service"
-for runtime_script in runtime-check.sh firstboot.sh recover-runtime.sh; do
+for runtime_script in runtime-check.sh firstboot.sh recover-runtime.sh proxy-failopen proxy-failure; do
   cp "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/$runtime_script" "$package_root/usr/lib/ly-route/$runtime_script"
   chmod 0755 "$package_root/usr/lib/ly-route/$runtime_script"
 done
+mkdir -p "$package_root/usr/share/ly-route/proxy-failure"
+cp "$repo_root/packaging/rootfs-overlay/usr/share/ly-route/proxy-failure/index.html" \
+  "$package_root/usr/share/ly-route/proxy-failure/index.html"
 if [ "$product" = gateway ]; then
   cp "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/ly-route-pppoe-plugin" \
     "$package_root/usr/lib/ly-route/ly-route-pppoe-plugin"

@@ -651,12 +651,18 @@ const (
 	ProxyCaptureTable  = "ly_route_proxy_capture"
 	ProxyCaptureChain  = "proxy_prerouting"
 
-	// ProxyDirectOutboundTag is the freedom outbound used as the explicit
-	// fail-open path when no proxy node is healthy. It must never carry the
-	// proxy egress fwmark, otherwise a failed proxy still disappears into the
-	// proxy underlay instead of using the normal WAN route.
+	// ProxyDirectOutboundTag is the legacy fail-open freedom outbound. It is
+	// deliberately removed by EnsureFailureFallback: a captured packet must
+	// never be able to reach the direct Internet path when the proxy is down.
 	ProxyDirectOutboundTag = "direct"
-	ProxyDirectProbeURL    = "https://www.gstatic.com/generate_204"
+	// ProxyFailureOutboundTag is the blackhole outbound every proxy balancer
+	// falls back to, and the terminal routing catch-all target.
+	ProxyFailureOutboundTag = "failure"
+	// ProxyProbeURL is the observatory probe target. The probe is performed
+	// through each proxy outbound, never on the direct path.
+	ProxyProbeURL = "https://www.gstatic.com/generate_204"
+	// DefaultXrayMetricsListen exposes observatory state for every proxy mode.
+	DefaultXrayMetricsListen = "127.0.0.1:11111"
 )
 
 // NftablesBypassDestinations returns the IPv4 prefixes that must stay on the
