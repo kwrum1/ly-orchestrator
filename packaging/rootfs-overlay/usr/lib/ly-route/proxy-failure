@@ -1,15 +1,19 @@
 #!/bin/sh
 # Ly Route proxy failure-page actuator.
 #
-# enter  Install a dedicated nftables failure generation and flush the normal
-#        proxy TPROXY chain. IPv4 TCP/80 arriving on the proxy ingress TAP is
-#        redirected to the local failure page, TCP/443 is reset, DNS and the
-#        service/LAN/reserved destinations stay direct, and every other
-#        captured TCP/UDP packet is dropped. The page is therefore served
-#        locally and traffic can never fall through to the direct Internet.
-# leave  Remove the failure generation. The caller must re-install the normal
-#        capture generation *before* calling leave when a proxy is healthy.
-# status Print "active" or "inactive"; exit 0 only when the page is active.
+# enter      Install a dedicated nftables failure generation and flush the
+#            normal proxy TPROXY chain. When the local page listener is ready,
+#            IPv4 TCP/80 arriving on the proxy ingress TAP is redirected to the
+#            fixed failure page, TCP/443 is reset, DNS and the service/LAN/
+#            reserved destinations stay direct, and every other captured
+#            TCP/UDP packet is dropped. If the page listener is not ready the
+#            guard is installed without the redirect (blackhole): traffic is
+#            still dropped, never sent to the direct Internet.
+# blackhole  Force the guard-only generation.
+# leave      Remove the failure generation. The caller must re-install the
+#            normal capture generation *before* calling leave when a proxy is
+#            healthy.
+# status     Print "page", "blackhole" or "inactive".
 #
 # Two tables are used on purpose. A filter chain and a NAT chain in the same
 # nftables table are not both traversed on this kernel: the NAT chain is
@@ -32,6 +36,7 @@ MODE=${1:-}
 [ "$#" -gt 0 ] && shift
 STATE=${LY_ROUTE_PROXY_FAILURE_STATE:-/var/lib/ly-route/proxy-failure.json}
 NFT=${LY_ROUTE_NFT:-/usr/sbin/nft}
+SS=${LY_ROUTE_SS:-ss}
 PAGE_PORT=${LY_ROUTE_PROXY_FAILURE_PAGE_PORT:-8081}
 
 CAPTURE_FAMILY=inet
@@ -43,7 +48,7 @@ GUARD_TABLE=ly_route_proxy_failure_guard
 log() { printf 'ly-route-proxy-failure: %s\n' "$*" >&2; }
 
 usage() {
-    printf 'usage: %s enter [ingress page-port cidr...] | leave | status\n' "$0" >&2
+    printf 'usage: %s enter [ingress page-port cidr...] | blackhole [ingress cidr...] | leave | status\n' "$0" >&2
     exit 2
 }
 
@@ -90,14 +95,32 @@ PY
     eval "$rendered"
 }
 
+page_listening() {
+    "$SS" -H -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$PAGE_PORT\$"
+}
+
+# wait_page waits briefly so a normal xray restart does not fall into blackhole
+# merely because nginx has not finished reloading yet.
+wait_page() {
+    attempt=0
+    limit=${LY_ROUTE_PAGE_WAIT_ATTEMPTS:-10}
+    while [ "$attempt" -lt "$limit" ]; do
+        page_listening && return 0
+        attempt=$((attempt + 1))
+        sleep 0.2
+    done
+    return 1
+}
+
 # render_rules emits a single atomic nftables batch. Installing the failure
 # tables and flushing the capture chain in one transaction leaves no window in
 # which captured traffic could use the direct path.
 render_rules() {
-    python3 - "$INGRESS" "$PAGE_PORT" "$BYPASS" "$CAPTURE_FLUSH" <<'PY'
+    page_mode=$1
+    python3 - "$INGRESS" "$PAGE_PORT" "$BYPASS" "$CAPTURE_FLUSH" "$page_mode" <<'PY'
 import ipaddress, sys
 
-ingress, port, bypass, capture_flush = sys.argv[1:5]
+ingress, port, bypass, capture_flush, page_mode = sys.argv[1:6]
 try:
     port = int(port)
 except ValueError:
@@ -127,7 +150,10 @@ lines = [
     "table inet ly_route_proxy_failure {",
     "  chain redirect_page {",
     "    type nat hook prerouting priority -140; policy accept;",
-    '    iifname "%s" meta mark 0x0 meta nfproto ipv4 tcp dport 80 counter redirect to :%d' % (ingress, port),
+]
+if page_mode == "page":
+    lines.append('    iifname "%s" meta mark 0x0 meta nfproto ipv4 tcp dport 80 counter redirect to :%d' % (ingress, port))
+lines += [
     "  }",
     "}",
     "table inet ly_route_proxy_failure_guard {",
@@ -169,6 +195,25 @@ enter() {
     else
         usage
     fi
+    apply_guard
+}
+
+blackhole() {
+    if [ "$#" -ge 1 ]; then
+        INGRESS=$1
+        shift
+        BYPASS=$*
+        BYPASS=${BYPASS:-}
+    elif [ "$#" -eq 0 ]; then
+        load_state || exit 1
+    else
+        usage
+    fi
+    apply_guard blackhole
+}
+
+apply_guard() {
+    forced=${1:-}
     if ! printf '%s' "$INGRESS" | grep -Eq '^[A-Za-z0-9_.:-]{1,15}$'; then
         log "refusing unsafe ingress interface"
         exit 1
@@ -185,7 +230,13 @@ enter() {
     if "$NFT" list chain "$CAPTURE_FAMILY" "$CAPTURE_TABLE" "$CAPTURE_CHAIN" >/dev/null 2>&1; then
         CAPTURE_FLUSH="flush chain $CAPTURE_FAMILY $CAPTURE_TABLE $CAPTURE_CHAIN"
     fi
-    RULES=$(render_rules) || {
+
+    page_mode=page
+    if [ "$forced" = "blackhole" ] || ! wait_page; then
+        page_mode=blackhole
+        [ "$forced" = "blackhole" ] || log "page listener on :$PAGE_PORT is not ready; installing blackhole guard"
+    fi
+    RULES=$(render_rules "$page_mode") || {
         log "failed to render failure rules"
         exit 1
     }
@@ -193,7 +244,11 @@ enter() {
         log "failed to install the failure generation"
         exit 1
     }
-    log "failure page active: $INGRESS tcp/80 -> :$PAGE_PORT, tcp/443 reset, other captured tcp/udp dropped"
+    if [ "$page_mode" = "page" ]; then
+        log "failure page active: $INGRESS tcp/80 -> :$PAGE_PORT, tcp/443 reset, other captured tcp/udp dropped"
+    else
+        log "failure blackhole active: $INGRESS captured tcp/udp dropped (page unavailable)"
+    fi
 }
 
 leave() {
@@ -211,8 +266,13 @@ leave() {
 }
 
 status() {
-    if "$NFT" list table "$CAPTURE_FAMILY" "$FAILURE_TABLE" >/dev/null 2>&1; then
-        printf 'active\n'
+    if "$NFT" list table "$CAPTURE_FAMILY" "$FAILURE_TABLE" >/dev/null 2>&1 &&
+        "$NFT" list table "$CAPTURE_FAMILY" "$FAILURE_TABLE" 2>/dev/null | grep -q 'redirect to'; then
+        printf 'page\n'
+        exit 0
+    fi
+    if "$NFT" list table "$CAPTURE_FAMILY" "$GUARD_TABLE" >/dev/null 2>&1; then
+        printf 'blackhole\n'
         exit 0
     fi
     printf 'inactive\n'
@@ -221,6 +281,7 @@ status() {
 
 case "$MODE" in
     enter) enter "$@" ;;
+    blackhole) blackhole "$@" ;;
     leave) leave "$@" ;;
     status) status ;;
     *) usage ;;

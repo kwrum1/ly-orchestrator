@@ -41,6 +41,9 @@ cleanup() {
     for pid in "$XRAY_PID" "$PAGE_PID" "$UPSTREAM_PID"; do
         [ -n "$pid" ] && kill "$pid" 2>/dev/null
     done
+    if [ -f "$TMP/nginx.pid" ]; then
+        kill "$(cat "$TMP/nginx.pid" 2>/dev/null)" 2>/dev/null
+    fi
     if [ "$KEEP" = "1" ]; then
         log "KEEP=1; namespaces and $TMP left in place"
         return
@@ -168,6 +171,8 @@ if mode == "http":
             print("DIRECT-UPSTREAM")
         else:
             print("UNEXPECTED-RESPONSE")
+    except socket.timeout:
+        print("TIMEOUT")
     except Exception as exc:
         print("ERROR", exc)
     finally:
@@ -224,6 +229,7 @@ PY
 
 if command -v nginx >/dev/null 2>&1; then
     cat >"$TMP/nginx.conf" <<EOF
+daemon off;
 worker_processes 1;
 pid $TMP/nginx.pid;
 error_log $TMP/nginx-error.log warn;
@@ -392,6 +398,33 @@ expect failure-dns-direct DNS-OK dns 203.0.113.10 53
 [ "$(upstream_dns_bytes)" -gt "$before_dns" ] || fail "failure mode did not keep DNS direct"
 [ "$(upstream_http_bytes)" -eq 0 ] || fail "failure mode leaked HTTP bytes to the upstream: $(upstream_http_bytes)"
 log "upstream bytes in failure mode: http=$(upstream_http_bytes) dns=$(upstream_dns_bytes)"
+
+log "== failure mode without the page server: blackhole, still no direct Internet =="
+kill "$PAGE_PID" 2>/dev/null || true
+PAGE_PID=
+if [ -f "$TMP/nginx.pid" ]; then
+    kill "$(cat "$TMP/nginx.pid" 2>/dev/null)" 2>/dev/null || true
+fi
+attempt=0
+while [ "$attempt" -lt 30 ]; do
+    if ! ip netns exec "$PROXY" ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$PAGE_PORT\$"; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+if ip netns exec "$PROXY" ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$PAGE_PORT\$"; then
+    fail "could not stop the page listener on :$PAGE_PORT"
+fi
+: >"$TMP/upstream.log"
+ip netns exec "$PROXY" env LY_ROUTE_PAGE_WAIT_ATTEMPTS=1 "$HELPER" enter "$INGRESS" "$PAGE_PORT" "10.200.0.0/24" "10.200.1.0/24"
+if ip netns exec "$PROXY" nft list table inet ly_route_proxy_failure | grep -q 'redirect to'; then
+    fail "page-down failure mode still redirects TCP/80 to a dead page server"
+fi
+expect blackhole-http TIMEOUT http 203.0.113.10 80
+expect blackhole-tls-reset RESET tls 203.0.113.10 443
+[ "$(upstream_http_bytes)" -eq 0 ] || fail "blackhole mode leaked HTTP bytes to the upstream"
+log "blackhole upstream bytes: http=$(upstream_http_bytes)"
 
 log "== recovery: re-install capture, then helper leave =="
 ip netns exec "$PROXY" nft -f "$TMP/capture.nft"

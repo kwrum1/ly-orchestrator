@@ -1,15 +1,19 @@
 #!/bin/sh
-# Keep the proxy dataplane fail-open across Xray stop, crash and reboot.
+# Keep the proxy dataplane fail closed across Xray stop, crash and reboot.
 #
 # on  (ExecStartPost): wait for the TPROXY listener, then re-apply the
-#     persisted nftables generation and remove the VPP fail-open bypasses.
-# off (ExecStopPost):  install VPP pre-NAT bypass rules for every skip-nat
-#     proxy policy *before* removing host capture, so VPP stops steering
-#     selected traffic into the proxy TAP as soon as Xray goes away.
-#
-# The VPP plugin keeps pre-NAT state; the bypass rules mirror each proxy
-# policy at priority-1 and use reserved ids 9000..9063. They are idempotent
-# and are removed again on a healthy start.
+#     persisted nftables generation, remove the VPP fail-open bypasses and
+#     remove any failure page/blackhole generation. If the listener never
+#     becomes ready, keep VPP steering to the ingress TAP active and publish
+#     the fixed local failure page (or a blackhole if the page cannot be
+#     served). Traffic must never fall through to the direct Internet while a
+#     proxy egress is configured.
+# off (ExecStopPost):  remove stale VPP bypass rules, keep VPP steering to the
+#     ingress TAP active, flush host capture and install the failure
+#     page/blackhole before traffic could escape. Only when no proxy egress is
+#     configured (no persisted failure state) does it fall back to the legacy
+#     VPP direct bypass, because then direct forwarding is the product
+#     behaviour.
 set -u
 
 MODE=${1:-}
@@ -18,6 +22,8 @@ VPPCTL=${LY_ROUTE_VPPCTL:-vppctl}
 CONF=${LY_ROUTE_NFT_CONF:-/etc/nftables.conf}
 XRAY_CONFIG=${LY_ROUTE_XRAY_CONFIG:-/etc/xray/config.json}
 PRE_NAT_SHOW=${LY_ROUTE_PRE_NAT_SHOW:-}
+FAILURE_HELPER=${LY_ROUTE_PROXY_FAILURE_HELPER:-/usr/lib/ly-route/proxy-failure}
+FAILURE_STATE=${LY_ROUTE_PROXY_FAILURE_STATE:-/var/lib/ly-route/proxy-failure.json}
 CAPTURE_FAMILY=inet
 CAPTURE_TABLE=ly_route_proxy_capture
 CAPTURE_CHAIN=proxy_prerouting
@@ -166,10 +172,74 @@ add_bypass() {
     rm -f "$tmp"
 }
 
+# A proxy egress is selected when the control API persisted its failure-page
+# state. Without it, direct forwarding is the intended behaviour.
+proxy_egress_selected() {
+    [ -f "$FAILURE_STATE" ]
+}
+
+failure_enter() {
+    if [ -x "$FAILURE_HELPER" ]; then
+        if "$FAILURE_HELPER" enter; then
+            return 0
+        fi
+        log "failure page helper failed; trying blackhole mode"
+        if "$FAILURE_HELPER" blackhole; then
+            return 0
+        fi
+    fi
+    log "failure helper unavailable; installing inline blackhole"
+    inline_blackhole
+}
+
+# inline_blackhole is the last line of defence: even if the packaged helper is
+# missing or broken, captured TCP/UDP must be dropped rather than forwarded.
+inline_blackhole() {
+    [ -f "$FAILURE_STATE" ] || return 1
+    ingress=$(python3 - "$FAILURE_STATE" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+sys.stdout.write(str(data.get("ingress_interface") or ""))
+PY
+) || return 1
+    case "$ingress" in
+        ""|*[!A-Za-z0-9_.:-]*) return 1 ;;
+    esac
+    "$NFT" -f - <<EOF || return 1
+add table inet ly_route_proxy_failure_guard
+flush table inet ly_route_proxy_failure_guard
+table inet ly_route_proxy_failure_guard {
+  chain fail_closed {
+    type filter hook prerouting priority -50; policy accept;
+    iifname != "$ingress" return
+    meta mark != 0 return
+    meta nfproto != ipv4 return
+    tcp dport 53 return
+    udp dport 53 return
+    ip daddr 127.0.0.0/8 return
+    ip daddr 169.254.0.0/16 return
+    ip daddr 224.0.0.0/4 return
+    ip daddr 240.0.0.0/4 return
+    meta l4proto != tcp meta l4proto != udp return
+    meta l4proto tcp tcp dport 443 counter reject with tcp reset
+    meta l4proto tcp counter drop
+    meta l4proto udp counter drop
+  }
+}
+EOF
+    flush_capture
+}
+
 case "$MODE" in
     on)
         if wait_listener; then
             if install_capture; then
+                if [ -x "$FAILURE_HELPER" ] && proxy_egress_selected; then
+                    "$FAILURE_HELPER" leave || log "failed to clear the failure page"
+                fi
                 delete_bypass
                 log "capture installed and proxy steering enabled"
                 exit 0
@@ -177,16 +247,38 @@ case "$MODE" in
         else
             log "TPROXY listener did not become ready"
         fi
-        # Never leave a live VPP steering path pointing at a listener that is
-        # not ready. Install the direct bypass and keep host capture empty.
+        if proxy_egress_selected; then
+            # Keep VPP steering to the ingress TAP; drop or page locally.
+            delete_bypass
+            if failure_enter; then
+                log "proxy unavailable: local failure page/blackhole active"
+            else
+                log "failure helper unavailable; keeping capture flushed (fail closed)"
+                flush_capture
+            fi
+            exit 0
+        fi
+        # No proxy egress is selected: direct forwarding is correct.
         add_bypass
         flush_capture
         exit 0
         ;;
     off)
+        if proxy_egress_selected; then
+            # Remove any legacy direct bypass so VPP keeps steering into the
+            # ingress TAP where the local page or the blackhole guard runs.
+            delete_bypass
+            if failure_enter; then
+                log "capture removed and local failure page/blackhole enabled"
+            else
+                log "failure helper unavailable; keeping capture flushed (fail closed)"
+                flush_capture
+            fi
+            exit 0
+        fi
         add_bypass
         flush_capture
-        log "capture removed and proxy steering bypassed"
+        log "capture removed and proxy steering bypassed (no proxy egress selected)"
         exit 0
         ;;
     *)
