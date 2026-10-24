@@ -216,6 +216,18 @@ if ! grep -q 'dnsmasq.service' "$repo_root/scripts/build-rootfs.sh"; then
   exit 1
 fi
 
+# firstboot runs inside a systemd startup transaction. Enabling or starting a
+# unit from there can queue a manager reload that waits for firstboot itself.
+# The serial getty must be enabled at image build time instead.
+if grep -Eq 'systemctl (enable|start) serial-getty' "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/firstboot.sh"; then
+  echo "firstboot calls systemctl enable/start for the serial getty; this deadlocks provisioning" >&2
+  exit 1
+fi
+if ! grep -q 'getty.target.wants/serial-getty@ttyS0.service' "$repo_root/scripts/build-rootfs.sh"; then
+  echo "rootfs builder does not statically enable the serial getty" >&2
+  exit 1
+fi
+
 # A factory image must not bind SmartDNS to an address that only exists after
 # a LAN apply; that makes DNS fail on clean boot and locks firstboot behind it.
 if grep -q 'bind 192.168.88.1:53' "$repo_root/scripts/build-rootfs.sh"; then

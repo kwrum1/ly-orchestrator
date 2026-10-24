@@ -80,8 +80,10 @@ if [ -f /etc/ssh/sshd_config ]; then
   sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
   sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
   sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-  systemctl enable ssh.service >/dev/null 2>&1 || true
-  systemctl try-restart ssh.service >/dev/null 2>&1 || true
+  # --no-reload avoids queueing a manager reload that would wait for this
+  # very firstboot job; --no-block never waits for the ssh start job.
+  systemctl enable --no-reload ssh.service >/dev/null 2>&1 || true
+  systemctl try-restart --no-block ssh.service >/dev/null 2>&1 || true
 fi
 
 # First boot is a one-time provisioning step. Re-running it must not reset
@@ -135,8 +137,9 @@ if command -v useradd >/dev/null 2>&1 && command -v chpasswd >/dev/null 2>&1; th
   printf 'admin:%s\n' "$console_admin_password" | chpasswd
 fi
 
-systemctl enable serial-getty@ttyS0.service >/dev/null 2>&1 || true
-systemctl start serial-getty@ttyS0.service >/dev/null 2>&1 || true
+# serial-getty@ttyS0 is enabled by the rootfs builder. Enabling it here would
+# queue a manager reload that waits for this firstboot job and deadlocks
+# provisioning (observed on a clean TCG boot: no network, no admin password).
 
 tls_dir=/etc/ly-route/tls
 mkdir -p "$tls_dir"
@@ -223,7 +226,7 @@ EOF
   fi
   # dnsmasq is ordered after this unit and tracks the VPP LAN tap itself.
   # Clearing a previous start failure keeps the next boot deterministic.
-  systemctl reset-failed dnsmasq.service 2>/dev/null || true
+  timeout 10 systemctl reset-failed dnsmasq.service 2>/dev/null || true
 
   if [ "${LY_ROUTE_VMXNET3_TAP_BRIDGE_ACCEPTANCE:-false}" = true ]; then
     python3 - "$installed_network" <<'PY' | while IFS='|' read -r name bridge host; do

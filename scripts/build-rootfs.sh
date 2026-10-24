@@ -326,7 +326,13 @@ enable_units() {
   target=$1
   wants="$target/etc/systemd/system/multi-user.target.wants"
   timer_wants="$target/etc/systemd/system/timers.target.wants"
-  mkdir -p "$wants" "$timer_wants" "$target/etc/systemd/system/network-online.target.wants"
+  mkdir -p "$wants" "$timer_wants" "$target/etc/systemd/system/network-online.target.wants" \
+    "$target/etc/systemd/system/getty.target.wants"
+  # Serial console getty is a firstboot prerequisite: the admin password
+  # banner is printed to ttyS0. Enable it statically so firstboot never has to
+  # call `systemctl enable` from inside its own startup transaction.
+  ln -sf /lib/systemd/system/serial-getty@.service \
+    "$target/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service"
   ln -sf /lib/systemd/system/systemd-networkd.service "$wants/systemd-networkd.service"
   ln -sf /lib/systemd/system/systemd-resolved.service "$wants/systemd-resolved.service"
   ln -sf /etc/systemd/system/ly-route-runtime-check.service "$wants/ly-route-runtime-check.service"
