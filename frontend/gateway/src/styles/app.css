@@ -241,14 +241,20 @@ input[type="file"]::file-selector-button:hover { border-color: var(--accent); co
 .egress-rate span { display: inline-flex; align-items: center; gap: 3px; }
 .port-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
 .port-grid-large { grid-template-columns: repeat(6, minmax(0, 1fr)); margin-bottom: 2px; }
-.port-card { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; grid-template-rows: auto auto; align-items: center; gap: 2px 8px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: #fff; text-align: left; }
+.port-card { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; grid-template-rows: auto auto auto; align-items: center; gap: 2px 8px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: #fff; text-align: left; }
 .port-card:hover { border-color: #c8d9ee; background: #fbfdff; }
 .port-card.static { cursor: default; }
-.port-icon { grid-row: 1 / 3; display: grid; place-items: center; width: 28px; height: 28px; border-radius: 7px; background: var(--surface-sunken); color: var(--text-secondary); }
+.port-icon { grid-row: 1 / 4; display: grid; place-items: center; width: 28px; height: 28px; border-radius: 7px; background: var(--surface-sunken); color: var(--text-secondary); }
 .port-name { display: flex; flex-direction: column; min-width: 0; font-size: 12px; font-weight: 600; }
 .port-name small { color: var(--text-tertiary); font-size: 10px; font-weight: 400; }
 .port-state { display: flex; align-items: center; gap: 4px; color: var(--text-tertiary); font-size: 10px; }
+.port-takeover { grid-column: 2 / -1; display: flex; align-items: center; min-width: 0; }
+.port-takeover .badge { font-size: 9px; padding: 1px 6px; }
 .port-rate { grid-column: 2 / -1; display: flex; gap: 10px; color: var(--text-tertiary); font-size: 10px; font-variant-numeric: tabular-nums; }
+.takeover-panel { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
+.takeover-panel p { flex: 1 1 320px; margin: 0; }
+.takeover-facts { display: flex; flex-wrap: wrap; gap: 12px; font-size: 11px; color: var(--text-secondary); }
+.takeover-facts span { display: inline-flex; align-items: center; gap: 5px; }
 .health-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .health-metric { padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface-sunken); }
 .health-metric > span { display: flex; align-items: center; gap: 5px; color: var(--text-secondary); font-size: 11px; }

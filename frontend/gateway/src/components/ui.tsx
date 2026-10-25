@@ -155,14 +155,12 @@ export function EmptyState({
 
 export function ErrorState({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
   const message = error instanceof Error ? error.message : String(error || "未知错误");
-  const requestId = (error as any)?.requestId;
   return (
     <div className="error-state">
       <AlertCircle size={20} />
       <div>
         <strong>数据读取失败</strong>
         <p>{message}</p>
-        {requestId && <code>request_id: {requestId}</code>}
       </div>
       {onRetry && <Button size="sm" onClick={onRetry}>重试</Button>}
     </div>
@@ -309,6 +307,13 @@ export function Modal({
 }) {
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  const busyRef = useRef(busy);
+  onCloseRef.current = onClose;
+  busyRef.current = busy;
+  // Focus and key handling must run only when the dialog opens/closes. Depending
+  // on the inline onClose prop re-ran this effect after every keystroke, which
+  // restored focus outside the dialog and then jumped it to the close button.
   useEffect(() => {
     if (!open) return;
     const previous = document.activeElement as HTMLElement | null;
@@ -316,14 +321,15 @@ export function Modal({
     const focusable = () => panel?.querySelectorAll<HTMLElement>(
       'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
     ) || [];
-    window.setTimeout(() => {
-      const first = panel?.querySelector<HTMLElement>("input, select, textarea, button");
+    const timer = window.setTimeout(() => {
+      if (panel?.contains(document.activeElement)) return;
+      const first = panel?.querySelector<HTMLElement>("input:not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled])");
       first?.focus();
     }, 30);
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) {
+      if (event.key === "Escape" && !busyRef.current) {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
       }
       if (event.key !== "Tab") return;
       const elements = Array.from(focusable()).filter((element) => element.offsetParent !== null);
@@ -341,11 +347,12 @@ export function Modal({
     document.addEventListener("keydown", onKeyDown);
     document.body.classList.add("modal-open");
     return () => {
+      window.clearTimeout(timer);
       document.removeEventListener("keydown", onKeyDown);
       document.body.classList.remove("modal-open");
       previous?.focus?.();
     };
-  }, [open, busy, onClose]);
+  }, [open]);
 
   if (!open) return null;
   return createPortal(
@@ -385,25 +392,31 @@ export function Drawer({
 }) {
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     if (!open) return;
     const previous = document.activeElement as HTMLElement | null;
     const panel = panelRef.current;
-    window.setTimeout(() => panel?.querySelector<HTMLElement>("input, select, textarea, button")?.focus(), 30);
+    const timer = window.setTimeout(() => {
+      if (panel?.contains(document.activeElement)) return;
+      panel?.querySelector<HTMLElement>("input:not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled])")?.focus();
+    }, 30);
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
       }
     };
     document.addEventListener("keydown", onKeyDown);
     document.body.classList.add("drawer-open");
     return () => {
+      window.clearTimeout(timer);
       document.removeEventListener("keydown", onKeyDown);
       document.body.classList.remove("drawer-open");
       previous?.focus?.();
     };
-  }, [open, onClose]);
+  }, [open]);
   if (!open) return null;
   return createPortal(
     <div className="drawer-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
@@ -517,7 +530,6 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         {items.map((item) => (
           <div className={`toast toast-${item.kind}`} key={item.id}>
             <span>{item.message}</span>
-            {item.requestId && <code>{item.requestId}</code>}
           </div>
         ))}
       </div>

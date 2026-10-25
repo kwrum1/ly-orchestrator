@@ -10,6 +10,7 @@ import { DataTable } from "../components/DataTable";
 import { Badge, Button, Field, Input, Modal, PageHeader, Select, Tabs, Textarea, useToast } from "../components/ui";
 import { useApply, useAuth, useConfirm } from "../state/providers";
 import { formatDateTime, splitLines, stateLabel, text } from "../lib/format";
+import { takeoverInfo } from "../lib/human";
 
 function leaseLabel(seconds: unknown) {
   const value = Number(seconds);
@@ -44,7 +45,14 @@ export function DhcpPage() {
   const [busy, setBusy] = useState(false);
 
   const lanInterfaces = (interfaces.data?.items || []).filter((item) => (item.gateway_role || item.role) === "lan");
-  const candidates = lanInterfaces.length ? lanInterfaces : (interfaces.data?.items || []).filter((item) => (item.gateway_role || item.role) !== "management");
+  const assignable = (item: any) => {
+    const kind = String(item?.kind || item?.type || "").toLowerCase();
+    if (kind === "lan_bridge" || kind === "bridge") return true;
+    if ((item?.gateway_role || item?.role) === "management") return false;
+    return takeoverInfo(item).kind !== "none";
+  };
+  const candidates = (lanInterfaces.length ? lanInterfaces : (interfaces.data?.items || []).filter((item) => (item.gateway_role || item.role) !== "management"))
+    .filter(assignable);
 
   const openServer = (item?: DhcpServer) => {
     setForm({
@@ -95,7 +103,7 @@ export function DhcpPage() {
         setEditor(undefined);
         void apply.apply();
       } catch (error: any) {
-        toast(error?.message || "保存 DHCP 服务失败", "error", error?.requestId);
+        toast(error?.message || "保存 DHCP 服务失败", "error");
       } finally {
         setBusy(false);
       }
@@ -113,7 +121,7 @@ export function DhcpPage() {
       setEditor(undefined);
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "保存静态分配失败", "error", error?.requestId);
+      toast(error?.message || "保存静态分配失败", "error");
     } finally {
       setBusy(false);
     }
@@ -129,7 +137,7 @@ export function DhcpPage() {
       await queryClient.invalidateQueries({ queryKey: ["resources", kind === "server" ? "dhcp-servers" : "dhcp-bindings"] });
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "删除失败", "error", error?.requestId);
+      toast(error?.message || "删除失败", "error");
     }
   };
 

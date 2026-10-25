@@ -21,7 +21,7 @@ export function AccountPage() {
       toast("密码已更新", "success");
       setCurrent(""); setNext(""); setConfirm("");
     } catch (error: any) {
-      toast(error?.message || "修改密码失败", "error", error?.requestId);
+      toast(error?.message || "修改密码失败", "error");
     } finally {
       setBusy(false);
     }

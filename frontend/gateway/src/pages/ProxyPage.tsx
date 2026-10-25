@@ -10,6 +10,7 @@ import { DataTable } from "../components/DataTable";
 import { Badge, Button, Card, Field, Input, Modal, PageHeader, Select, Tabs, Textarea, useToast } from "../components/ui";
 import { useApply, useAuth, useConfirm } from "../state/providers";
 import { stateLabel, text } from "../lib/format";
+import { sanitizeDetail } from "../lib/human";
 
 type Tab = "egress" | "nodes" | "subscriptions";
 
@@ -85,7 +86,7 @@ export function ProxyPage() {
       setEditor(undefined);
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "保存代理配置失败", "error", error?.requestId);
+      toast(error?.message || "保存代理配置失败", "error");
     } finally {
       setBusy(false);
     }
@@ -103,7 +104,7 @@ export function ProxyPage() {
       toast("已删除，正在应用", "success");
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "删除失败", "error", error?.requestId);
+      toast(error?.message || "删除失败", "error");
     }
   };
 
@@ -113,7 +114,7 @@ export function ProxyPage() {
       toast("订阅刷新已提交", "success");
       await queryClient.invalidateQueries({ queryKey: ["resources"] });
     } catch (error: any) {
-      toast(error?.message || "刷新订阅失败", "error", error?.requestId);
+      toast(error?.message || "刷新订阅失败", "error");
     }
   };
 
@@ -146,7 +147,7 @@ export function ProxyPage() {
     <div className="page">
       <PageHeader
         title="代理资源"
-        subtitle="Xray 出口、节点、订阅与运行态；仅转发 VPP 已选择的流量"
+        subtitle="Xray 出口、节点、订阅与设备状态"
         actions={<><Button size="sm" icon={<RefreshCw size={14} />} onClick={() => { egresses.refetch(); nodes.refetch(); subscriptions.refetch(); status.refetch(); logs.refetch(); }}>刷新</Button><Button size="sm" variant="primary" icon={<Plus size={14} />} onClick={() => open(tab)} disabled={session?.role === "readonly"}>{tab === "egress" ? "新增出口" : tab === "nodes" ? "新增节点" : "新增订阅"}</Button></>}
       />
       <div className="status-strip">
@@ -154,7 +155,7 @@ export function ProxyPage() {
         <span>出口 <b>{egressItems.length}</b></span>
         <span>节点 <b>{nodeItems.length}</b></span>
         <span>订阅 <b>{subscriptionItems.length}</b></span>
-        {status.data?.reason && <span className="muted">{status.data.reason}</span>}
+        {status.data?.reason && <span className="muted">{sanitizeDetail(status.data.reason, "服务状态暂时不可用")}</span>}
       </div>
       <Tabs value={tab} onChange={(value) => setTab(value as Tab)} items={[{ key: "egress", label: "代理出口", count: egressItems.length }, { key: "nodes", label: "节点", count: nodeItems.length }, { key: "subscriptions", label: "订阅", count: subscriptionItems.length }]} />
       <DataTable data={data} columns={columns} loading={egresses.isLoading || nodes.isLoading || subscriptions.isLoading} error={null} onRetry={() => { egresses.refetch(); nodes.refetch(); subscriptions.refetch(); }} emptyTitle="暂无代理配置" emptyDescription="代理出口需要承载 WAN 与节点/订阅。" emptyAction={<Button size="sm" variant="primary" onClick={() => open(tab)} disabled={session?.role === "readonly"}>新增</Button>} getRowId={(row) => row.id} />

@@ -13,6 +13,7 @@ import type {
   DnsUpstream,
   HealthResponse,
   InterfaceItem,
+  InterfaceBond,
   ItemEnvelope,
   ObjectGroup,
   OnlineUser,
@@ -162,6 +163,10 @@ export function useResource<T>(kind: string, path: string, options?: Partial<Use
 
 export function useInterfacesResource() {
   return useResource<InterfaceItem>("interfaces", API.resources.interfaces, { staleTime: 15_000 });
+}
+
+export function useInterfaceBonds() {
+  return useResource<InterfaceBond>("interface-bonds", API.resources.interfaceBonds, { staleTime: 15_000 });
 }
 
 export function useWanLinks() {

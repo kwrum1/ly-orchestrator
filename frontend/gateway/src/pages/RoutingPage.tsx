@@ -115,7 +115,7 @@ export function RoutingPage() {
       await queryClient.invalidateQueries({ queryKey: ["resources", "routes"] });
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "保存策略失败", "error", error?.requestId);
+      toast(error?.message || "保存策略失败", "error");
     } finally {
       setBusy(false);
     }
@@ -130,7 +130,7 @@ export function RoutingPage() {
       await queryClient.invalidateQueries({ queryKey: ["resources", "routes"] });
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "删除策略失败", "error", error?.requestId);
+      toast(error?.message || "删除策略失败", "error");
     }
   };
 
@@ -180,7 +180,7 @@ export function RoutingPage() {
         open={editor !== undefined}
         onClose={() => !busy && setEditor(undefined)}
         title={editor ? "编辑策略" : "新增策略"}
-        subtitle="策略按序号从小到大匹配；保存后需要应用运行态"
+        subtitle="策略按序号从小到大匹配；保存后需要应用配置"
         size="xl"
         busy={busy}
         footer={<><Button onClick={() => setEditor(undefined)} disabled={busy}>取消</Button><Button variant="primary" loading={busy} onClick={save}>保存并应用</Button></>}

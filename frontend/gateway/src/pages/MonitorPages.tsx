@@ -24,7 +24,7 @@ export function ConnectionsPage() {
     <div className="page">
       <PageHeader
         title="Top 连接"
-        subtitle="后端返回的 Top 连接；不推断策略或出口归属"
+        subtitle="按会话数排序的连接"
         actions={<Button size="sm" icon={<RefreshCw size={14} />} onClick={() => sessions.refetch()}>刷新</Button>}
       />
       <DataTable
@@ -34,7 +34,7 @@ export function ConnectionsPage() {
         error={sessions.isError ? sessions.error : null}
         onRetry={() => sessions.refetch()}
         emptyTitle="暂无连接数据"
-        emptyDescription="遥测采集器未返回 Top 连接；确认 VPP/邻居遥测可用。"
+        emptyDescription="暂无数据"
         getRowId={(row, index) => `${row.src_ip}-${row.dst_ip}-${index}`}
       />
     </div>
@@ -54,7 +54,7 @@ export function DomainsPage() {
     <div className="page">
       <PageHeader
         title="Top 域名"
-        subtitle="Top 域名与命中次数；数据来自 DNS 遥测"
+        subtitle="按查询次数排序的域名"
         actions={<Button size="sm" icon={<RefreshCw size={14} />} onClick={() => domains.refetch()}>刷新</Button>}
       />
       <DataTable
@@ -63,8 +63,8 @@ export function DomainsPage() {
         loading={domains.isLoading}
         error={domains.isError ? domains.error : null}
         onRetry={() => domains.refetch()}
-        emptyTitle="暂无域名遥测"
-        emptyDescription="DNS 遥测未返回数据；确认 SmartDNS 与 DNS 采集已配置。"
+        emptyTitle="暂无域名数据"
+        emptyDescription="暂无数据"
         getRowId={(row, index) => `${row.domain || row.name || index}`}
       />
     </div>

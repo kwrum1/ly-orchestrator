@@ -137,6 +137,44 @@ export interface InterfaceItem {
   host_interface?: string;
   mode_role?: AnyRecord;
   candidate_scopes?: string[];
+  // Runtime takeover contract. The dataplane branch may expose these under
+  // slightly different names; lib/human.ts accepts all of them.
+  takeover?: string | AnyRecord;
+  takeover_state?: string;
+  takeover_mode?: string;
+  hook?: string;
+  driver?: string;
+  dataplane_hook?: string;
+  dataplane_driver?: string;
+  bond?: string;
+  bond_id?: string;
+  member_of?: string;
+  kind?: string;
+  type?: string;
+  interface_id?: string;
+}
+
+export interface InterfaceBond {
+  id: string;
+  name?: string;
+  members?: string[];
+  mode?: string;
+  load_balance?: string;
+  speed?: string;
+  work_mode?: string;
+  gateway_role?: string;
+  link_state?: string;
+  runtime_state?: string;
+  [key: string]: any;
+}
+
+export interface DataplanePolicy {
+  /** True after the operator explicitly allowed performance-limited AF_PACKET fallback. */
+  af_packet_fallback?: boolean;
+  af_fallback?: boolean;
+  compatible_mode?: boolean;
+  ports?: string[];
+  [key: string]: any;
 }
 
 export interface WanLink {

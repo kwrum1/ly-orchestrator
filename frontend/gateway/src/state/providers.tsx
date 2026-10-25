@@ -13,9 +13,11 @@ import { API } from "../api/endpoints";
 import { ApiError, getJson, postJson } from "../api/client";
 import { queryClient } from "../api/queryClient";
 import { useRuntime, useSession } from "../api/hooks";
+import { setAfFallbackConsent } from "../api/dataplane";
 import type { RuntimeApply, SessionResponse, SessionUser } from "../api/types";
 import { Button, Modal, ToastProvider, useToast } from "../components/ui";
 import { formatDateTime } from "../lib/format";
+import { afFallbackPorts, applyFailureMessage, humanErrorMessage } from "../lib/human";
 
 interface AuthContextValue {
   session: SessionUser | null;
@@ -169,7 +171,7 @@ export function useConfirm() {
   return context.confirm;
 }
 
-export type ApplyPhase = "idle" | "applying" | "done" | "degraded" | "failed";
+export type ApplyPhase = "idle" | "applying" | "done" | "degraded" | "failed" | "consent";
 
 interface ApplyContextValue {
   phase: ApplyPhase;
@@ -178,7 +180,11 @@ interface ApplyContextValue {
   transactionId: string;
   startedAt: number;
   result: RuntimeApply | null;
+  afFallback: { ports: string[] } | null;
+  consentBusy: boolean;
   apply: () => Promise<RuntimeApply | null>;
+  consentAf: () => Promise<void>;
+  declineAf: () => void;
   dismiss: () => void;
 }
 
@@ -198,6 +204,8 @@ export function ApplyProvider({ children }: { children: ReactNode }) {
   const [transactionId, setTransactionId] = useState("");
   const [startedAt, setStartedAt] = useState(0);
   const [result, setResult] = useState<RuntimeApply | null>(null);
+  const [afFallback, setAfFallback] = useState<{ ports: string[] } | null>(null);
+  const [consentBusy, setConsentBusy] = useState(false);
   const runningRef = useRef(false);
   const pendingRef = useRef(false);
   const applyRef = useRef<(() => Promise<RuntimeApply | null>) | null>(null);
@@ -214,18 +222,25 @@ export function ApplyProvider({ children }: { children: ReactNode }) {
     setResult(next);
     const status = String(next.status || next.runtime_state || "").toLowerCase();
     const runtimeState = String(next.runtime_state || "").toLowerCase();
+    const ports = afFallbackPorts(next);
+    if (ports) {
+      setAfFallback({ ports });
+      setPhase("consent");
+      setMessage("部分网卡无法启用高性能接管，需要确认接管方式");
+      runningRef.current = false;
+      return;
+    }
     if (status.includes("fail") || runtimeState.includes("fail") || status === "dataplane_locked") {
+      const failure = applyFailureMessage(next);
       setPhase("failed");
-      setMessage(next.reason || "应用失败");
-      toast(next.reason || "运行态应用失败", "error");
+      setMessage(failure);
+      toast(failure, "error");
     } else if (status === "degraded" || runtimeState === "degraded") {
       setPhase("degraded");
-      setMessage(next.reason || "应用完成，但存在降级组件");
-      toast("应用完成，部分组件降级", "info");
+      setMessage("部分配置未生效，请检查设备状态");
     } else {
       setPhase("done");
-      setMessage("运行态应用成功");
-      toast("运行态应用成功", "success");
+      setMessage("配置已生效");
     }
     runningRef.current = false;
     queryClient.invalidateQueries({ queryKey: ["runtime"] });
@@ -259,7 +274,7 @@ export function ApplyProvider({ children }: { children: ReactNode }) {
       }
     }
     setPhase("failed");
-    setMessage("应用状态确认超时，请到运行态页面查看结果");
+    setMessage("应用状态确认超时，请稍后刷新查看");
     runningRef.current = false;
     triggerPending();
     return latest || null;
@@ -274,12 +289,16 @@ export function ApplyProvider({ children }: { children: ReactNode }) {
     }
     runningRef.current = true;
     setPhase("applying");
-    setMessage("正在应用运行态，请勿关闭页面");
+    setMessage("正在应用配置，请勿关闭页面");
     setStartedAt(Date.now());
     setResult(null);
     try {
       const response = await postJson<RuntimeApply>(API.runtime.apply, {}, 620_000);
       setTransactionId(response.transaction_id || "");
+      if (afFallbackPorts(response)) {
+        finish(response);
+        return response;
+      }
       if (response.status === "apply_in_progress") {
         setMessage("已有应用在执行，正在等待结果");
         return await poll(response);
@@ -295,15 +314,49 @@ export function ApplyProvider({ children }: { children: ReactNode }) {
       return await poll(response);
     } catch (error) {
       const apiError = error as ApiError;
+      if (afFallbackPorts(apiError)) {
+        finish({ status: "af_fallback_required", ...(apiError.body as any) } as RuntimeApply);
+        return null;
+      }
+      const failure = humanErrorMessage(apiError?.message, "应用请求失败，请稍后重试");
       setPhase("failed");
-      setMessage(apiError.message || "应用请求失败");
+      setMessage(failure);
       runningRef.current = false;
-      toast(apiError.message || "应用请求失败", "error", apiError.requestId);
+      toast(failure, "error");
       triggerPending();
       return null;
     }
   }, [finish, poll, toast, triggerPending]);
   applyRef.current = apply;
+
+  const consentAf = useCallback(async () => {
+    const ports = afFallback?.ports || [];
+    setConsentBusy(true);
+    try {
+      await setAfFallbackConsent(true, ports);
+      setAfFallback(null);
+      await queryClient.invalidateQueries({ queryKey: ["dataplane", "policy"] });
+      await queryClient.invalidateQueries({ queryKey: ["resources"] });
+      await queryClient.invalidateQueries({ queryKey: ["telemetry"] });
+      toast("已启用兼容模式，正在重新应用", "info");
+      runningRef.current = false;
+      await apply();
+    } catch (error) {
+      const failure = humanErrorMessage(error, "启用兼容模式失败");
+      setPhase("failed");
+      setMessage(failure);
+      toast(failure, "error");
+    } finally {
+      setConsentBusy(false);
+    }
+  }, [afFallback, apply, queryClient, toast]);
+
+  const declineAf = useCallback(() => {
+    setAfFallback(null);
+    setPhase("idle");
+    setMessage("");
+    toast("已保持高性能接管，未启用兼容模式", "info");
+  }, [toast]);
 
   const dismiss = useCallback(() => {
     if (runningRef.current) return;
@@ -315,15 +368,10 @@ export function ApplyProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const last = runtime.data?.last_apply;
-    if (last && phase === "idle") {
-      setResult(last);
-      setTransactionId(last.transaction_id || "");
-      const status = String(last.status || last.runtime_state || "").toLowerCase();
-      if (status.includes("fail")) setPhase("failed");
-      else if (status === "degraded") setPhase("degraded");
-      else if (terminalStatus(status)) setPhase("done");
-    }
-  }, [runtime.data, phase]);
+    if (!last) return;
+    setResult((current) => current || last);
+    setTransactionId((current) => current || last.transaction_id || "");
+  }, [runtime.data]);
 
   const value = useMemo(
     () => ({
@@ -333,10 +381,14 @@ export function ApplyProvider({ children }: { children: ReactNode }) {
       transactionId,
       startedAt,
       result,
+      afFallback,
+      consentBusy,
       apply,
+      consentAf,
+      declineAf,
       dismiss,
     }),
-    [phase, message, transactionId, startedAt, result, apply, dismiss]
+    [phase, message, transactionId, startedAt, result, afFallback, consentBusy, apply, consentAf, declineAf, dismiss]
   );
   return <ApplyContext.Provider value={value}>{children}</ApplyContext.Provider>;
 }
@@ -360,24 +412,61 @@ export function AppProviders({ children }: { children: ReactNode }) {
 }
 
 export function ApplyBanner() {
-  const { phase, message, transactionId, startedAt, result, dismiss } = useApply();
+  const { phase, message, startedAt, result, afFallback, consentBusy, consentAf, declineAf, dismiss } = useApply();
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     if (phase !== "applying") return;
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [phase]);
-  if (phase === "idle") return null;
-  const elapsed = startedAt ? Math.max(0, Math.round((now - startedAt) / 1000)) : 0;
-  const tone = phase === "failed" ? "danger" : phase === "degraded" ? "warning" : phase === "done" ? "success" : "info";
-  return (
-    <div className={`apply-banner apply-${tone}`}>
-      <div>
-        <strong>{phase === "applying" ? "正在应用运行态" : phase === "done" ? "运行态已应用" : phase === "degraded" ? "运行态部分降级" : "运行态应用失败"}</strong>
-        <span>{message}{transactionId ? ` · 事务 ${transactionId}` : ""}{startedAt ? ` · 已用 ${elapsed}s` : ""}</span>
-        {result?.applied_at && <em>完成于 {formatDateTime(result.applied_at)}</em>}
+  const modal = (
+    <Modal
+      open={Boolean(afFallback)}
+      onClose={() => !consentBusy && declineAf()}
+      title="该网卡无法启用高性能接管"
+      subtitle="可以改用兼容模式，但性能会受限"
+      size="sm"
+      busy={consentBusy}
+      footer={
+        <>
+          <Button onClick={declineAf} disabled={consentBusy}>暂不启用</Button>
+          <Button variant="primary" loading={consentBusy} onClick={() => void consentAf()}>启用兼容模式</Button>
+        </>
+      }
+    >
+      <div className="form-stack">
+        <p>以下网卡无法使用高性能接管方式。启用兼容模式后，这些网卡的吞吐会下降，CPU 占用会升高；其余网卡不受影响。</p>
+        <div className="notice-block">
+          <strong>受影响的网卡</strong>
+          <span>{afFallback?.ports.length ? afFallback.ports.join("、") : "当前网卡"}</span>
+        </div>
+        <p className="muted">启用后可以随时在“网卡设置”中关闭兼容模式。</p>
       </div>
-      {phase !== "applying" && <Button size="sm" variant="ghost" onClick={dismiss}>关闭</Button>}
-    </div>
+    </Modal>
+  );
+  if (phase === "idle") return modal;
+  const elapsed = startedAt ? Math.max(0, Math.round((now - startedAt) / 1000)) : 0;
+  const tone = phase === "failed" ? "danger" : phase === "degraded" || phase === "consent" ? "warning" : phase === "done" ? "success" : "info";
+  const title = phase === "applying"
+    ? "正在应用配置"
+    : phase === "done"
+      ? "配置已生效"
+      : phase === "degraded"
+        ? "部分配置未生效"
+        : phase === "consent"
+          ? "等待确认网卡接管方式"
+          : "配置应用失败";
+  return (
+    <>
+      {modal}
+      <div className={`apply-banner apply-${tone}`}>
+        <div>
+          <strong>{title}</strong>
+          <span>{message}{startedAt ? ` · 已用 ${elapsed}s` : ""}</span>
+          {result?.applied_at && <em>完成于 {formatDateTime(result.applied_at)}</em>}
+        </div>
+        {phase !== "applying" && <Button size="sm" variant="ghost" onClick={dismiss}>关闭</Button>}
+      </div>
+    </>
   );
 }

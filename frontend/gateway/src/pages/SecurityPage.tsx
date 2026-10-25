@@ -112,7 +112,7 @@ export function SecurityPage() {
       setEditor(undefined);
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "保存安全策略失败", "error", error?.requestId);
+      toast(error?.message || "保存安全策略失败", "error");
     } finally {
       setBusy(false);
     }
@@ -128,7 +128,7 @@ export function SecurityPage() {
       toast("已删除，正在应用", "success");
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "删除失败", "error", error?.requestId);
+      toast(error?.message || "删除失败", "error");
     }
   };
 

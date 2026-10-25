@@ -78,7 +78,7 @@ function ObjectGroupPage({ kind: initialKind, combined = false }: { kind: "domai
       setEditor(undefined);
       setFile(null);
     } catch (error: any) {
-      toast(error?.message || `保存${label}组失败`, "error", error?.requestId);
+      toast(error?.message || `保存${label}组失败`, "error");
     } finally {
       setBusy(false);
     }
@@ -92,7 +92,7 @@ function ObjectGroupPage({ kind: initialKind, combined = false }: { kind: "domai
       await queryClient.invalidateQueries({ queryKey: ["resources", "object-groups"] });
       toast("已删除", "success");
     } catch (error: any) {
-      toast(error?.message || "删除失败", "error", error?.requestId);
+      toast(error?.message || "删除失败", "error");
     }
   };
 
@@ -106,7 +106,7 @@ function ObjectGroupPage({ kind: initialKind, combined = false }: { kind: "domai
       link.click();
       URL.revokeObjectURL(url);
     } catch (error: any) {
-      toast(error?.message || "导出失败", "error", error?.requestId);
+      toast(error?.message || "导出失败", "error");
     }
   };
 

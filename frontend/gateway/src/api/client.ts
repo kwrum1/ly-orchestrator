@@ -1,3 +1,5 @@
+import { humanErrorMessage } from "../lib/human";
+
 export class ApiError extends Error {
   status: number;
   code: string;
@@ -31,9 +33,10 @@ function errorFromResponse(status: number, text: string, headerRequestId?: strin
   }
   const detail = body?.error;
   const requestId = detail?.request_id || headerRequestId || body?.request_id || undefined;
-  const message = detail?.message || (status === 502 || status === 503 || status === 504
+  const rawMessage = detail?.message || (status === 502 || status === 503 || status === 504
     ? "控制服务暂时不可用，请稍后重试"
     : `请求失败（HTTP ${status}）`);
+  const message = humanErrorMessage(rawMessage, "请求失败，请稍后重试");
   return new ApiError(message, status, detail?.code || "request_failed", requestId, body);
 }
 

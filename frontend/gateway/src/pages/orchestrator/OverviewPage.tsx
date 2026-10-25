@@ -18,6 +18,7 @@ import { useHealth, useRuntime, useTrafficTrend } from "../../api/hooks";
 import { useConversions, useOrchestratorDashboard, useOrchestratorOperation, useOrchestratorPolicy, useOrchestratorTopology, useUpgrades } from "../../api/orchestrator-hooks";
 import { Badge, Button, Card, EmptyState, Metric, PageHeader, ProgressBar } from "../../components/ui";
 import { formatBytes, formatDateTime, stateLabel, text } from "../../lib/format";
+import { sanitizeDetail } from "../../lib/human";
 
 export function OrchestratorOverviewPage() {
   const navigate = useNavigate();
@@ -48,7 +49,7 @@ export function OrchestratorOverviewPage() {
     <div className="page orch-overview">
       <PageHeader
         title="单机总览"
-        subtitle="本机 VPP 流量编排：拓扑、策略、透明编排与运行态"
+        subtitle="本机流量编排：拓扑、策略、透明编排与设备状态"
         actions={<><Button size="sm" icon={<RefreshCcw size={14} />} onClick={() => { topology.refetch(); policy.refetch(); runtime.refetch(); operation.refetch(); }}>刷新</Button><Button size="sm" variant="primary" icon={<Settings2 size={14} />} onClick={() => navigate("/topology")}>编辑拓扑</Button></>}
         meta={<><span className="meta-item"><i className={`status-dot status-dot-${health.data?.status === "ok" ? "success" : "warning"}`} />{health.data?.status === "ok" ? "运行正常" : "存在降级"}</span><span className="meta-item">版本 {text(version?.version || health.data?.version, "--")}</span><span className="meta-item"><Network size={13} />{topo ? "拓扑已配置" : "拓扑未配置"}</span><span className="meta-item"><Workflow size={13} />{stateLabel(op.state || "idle")}</span></>}
       />
@@ -80,27 +81,24 @@ export function OrchestratorOverviewPage() {
           <div className="inline-warning"><ShieldCheck size={14} /> 单机本地编排，不是多站点/跨网关集中控制器；没有站点注册、心跳或集中下发。</div>
         </Card>
 
-        <Card className="span-4" title="运行态" subtitle="组件与最近应用" actions={<Button size="sm" variant="text" onClick={() => navigate("/runtime")}>查看</Button>}>
+        <Card className="span-4" title="系统状态" subtitle="设备与最近应用" actions={<Button size="sm" variant="text" onClick={() => navigate("/runtime")}>查看</Button>}>
           <div className="health-metrics">
-            <div className="health-metric"><span><ServerCog size={14} /> 组件</span><strong>{components.length}</strong><small className="muted">{degraded.length ? `${degraded.length} 个降级` : "全部可用"}</small></div>
+            <div className="health-metric"><span><ServerCog size={14} /> 组件</span><strong>{components.length}</strong><small className="muted">{degraded.length ? `${degraded.length} 个异常` : "全部可用"}</small></div>
             <div className="health-metric"><span><Activity size={14} /> 最近应用</span><strong>{stateLabel(runtime.data?.last_apply?.status || "unknown")}</strong><small className="muted">{formatDateTime(runtime.data?.last_apply?.applied_at)}</small></div>
-            <div className="health-metric"><span><RefreshCcw size={14} /> 版本</span><strong>{text(health.data?.version, "--")}</strong><small className="muted">来自 /health</small></div>
-          </div>
-          <div className="component-list">
-            {components.slice(0, 5).map((component) => <div className="component-row" key={component.name}><span><i className={`status-dot status-dot-${component.available === false ? "warning" : "success"}`} />{component.name}</span><span className="muted">{stateLabel(component.state)}</span></div>)}
+            <div className="health-metric"><span><RefreshCcw size={14} /> 版本</span><strong>{text(health.data?.version, "--")}</strong><small className="muted">当前设备</small></div>
           </div>
         </Card>
       </div>
 
       <div className="overview-secondary-grid">
-        <Card className="span-7" title="流量边界" subtitle="WAN/LAN 双向累计字节" actions={<Button size="sm" variant="text" onClick={() => navigate("/telemetry")}>遥测</Button>}>
+        <Card className="span-7" title="流量边界" subtitle="WAN/LAN 双向累计字节" actions={<Button size="sm" variant="text" onClick={() => navigate("/telemetry")}>流量监控</Button>}>
           <div className="orch-boundary">
-            <div><span>WAN → LAN</span><strong>{formatBytes(boundary.wan?.wan_to_lan?.bytes)}</strong><small>{text(boundary.wan?.wan_to_lan?.rate_state, "rate unavailable")}</small></div>
-            <div><span>LAN → WAN</span><strong>{formatBytes(boundary.wan?.lan_to_wan?.bytes)}</strong><small>{text(boundary.wan?.lan_to_wan?.rate_state, "rate unavailable")}</small></div>
-            <div><span>LAN 边界</span><strong>{formatBytes(boundary.lan?.lan_to_wan?.bytes)}</strong><small>{text(boundary.lan?.lan_to_wan?.rate_state, "rate unavailable")}</small></div>
-            <div><span>采样出口</span><strong>{latestTrend.length}</strong><small>logical egresses</small></div>
+            <div><span>WAN → LAN</span><strong>{formatBytes(boundary.wan?.wan_to_lan?.bytes)}</strong><small>{sanitizeDetail(boundary.wan?.wan_to_lan?.rate_state, "暂无速率")}</small></div>
+            <div><span>LAN → WAN</span><strong>{formatBytes(boundary.wan?.lan_to_wan?.bytes)}</strong><small>{sanitizeDetail(boundary.wan?.lan_to_wan?.rate_state, "暂无速率")}</small></div>
+            <div><span>LAN 边界</span><strong>{formatBytes(boundary.lan?.lan_to_wan?.bytes)}</strong><small>{sanitizeDetail(boundary.lan?.lan_to_wan?.rate_state, "暂无速率")}</small></div>
+            <div><span>采样出口</span><strong>{latestTrend.length}</strong><small>个出口</small></div>
           </div>
-          {dashboard.data?.data?.degraded && <div className="inline-warning">{text(dashboard.data?.data?.degraded_reason, "遥测降级")}</div>}
+          {dashboard.data?.data?.degraded && <div className="inline-warning">{sanitizeDetail(dashboard.data?.data?.degraded_reason, "部分流量数据暂不可用")}</div>}
         </Card>
 
         <Card className="span-5" title="策略与透明编排" subtitle="策略保存即同步透明编排" actions={<Button size="sm" variant="text" onClick={() => navigate("/policy")}>策略</Button>}>
@@ -119,13 +117,13 @@ export function OrchestratorOverviewPage() {
       </div>
 
       <div className="overview-bottom-grid">
-        <Card className="span-7" title="升级与转换" subtitle="Orchestrator 独立版本；转换 apply 当前为 501" actions={<Button size="sm" variant="text" onClick={() => navigate("/upgrades")}>升级</Button>}>
+        <Card className="span-7" title="升级与转换" subtitle="独立版本；真实镜像转换暂不可用" actions={<Button size="sm" variant="text" onClick={() => navigate("/upgrades")}>升级</Button>}>
           <dl className="fact-list">
             <div><dt>当前版本</dt><dd>{text(version?.version, "--")} · {text(version?.suite, "--")}/{text(version?.arch, "--")}</dd></div>
             <div><dt>升级支持</dt><dd>{version?.upgrade_supported ? "支持" : "不支持"}</dd></div>
             <div><dt>升级任务</dt><dd>{upgrades.data?.items?.length || 0}</dd></div>
             <div><dt>转换任务</dt><dd>{conversions.data?.items?.length || 0}</dd></div>
-            <div><dt>真实镜像转换</dt><dd><Badge tone="warning">未实现（apply 501）</Badge></dd></div>
+            <div><dt>真实镜像转换</dt><dd><Badge tone="warning">暂不可用</Badge></dd></div>
           </dl>
           <div className="button-row"><Button size="sm" onClick={() => navigate("/upgrades")} icon={<RefreshCcw size={14} />}>升级 / 回滚</Button><Button size="sm" onClick={() => navigate("/conversions")} icon={<ArrowLeftRight size={14} />}>产品转换</Button></div>
         </Card>
@@ -134,9 +132,9 @@ export function OrchestratorOverviewPage() {
           <ul className="boundary-list">
             <li>单机本地拓扑；无多站点/节点纳管。</li>
             <li>透明编排是 L3 服务链，不是 L2 桥接。</li>
-            <li>转换仅支持校验、准备、回滚；真实镜像转换 apply 返回 501。</li>
-            <li>遥测依赖 VPP；不可用时显示 degraded 原因。</li>
-            <li>升级安装/回滚为 202 异步任务，需轮询。</li>
+            <li>转换仅支持校验、准备、回滚；真实镜像转换暂不可用。</li>
+            <li>流量数据依赖数据面；不可用时显示提示。</li>
+            <li>升级安装/回滚为异步任务，需要等待完成。</li>
           </ul>
           <Button size="sm" variant="secondary" onClick={() => navigate("/conversions")}>查看转换边界</Button>
         </Card>

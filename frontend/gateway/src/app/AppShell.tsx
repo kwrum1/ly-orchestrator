@@ -18,10 +18,10 @@ import {
 import { ALL_PAGES, COMMAND_ACTIONS, NAV_GROUPS, type NavGroup, type NavPage } from "./nav";
 import { CURRENT_PRODUCT } from "../product";
 import { useAuth, useApply, useConfirm } from "../state/providers";
-import { useHealth, useRuntime } from "../api/hooks";
+import { useHealth } from "../api/hooks";
 import { Badge, Button, Drawer, Field, IconButton, Input, Modal, useToast } from "../components/ui";
 import { ApplyBanner } from "../state/providers";
-import { classNames, formatDateTime, stateLabel } from "../lib/format";
+import { classNames, stateLabel } from "../lib/format";
 
 interface AppShellProps {
   navGroups?: NavGroup[];
@@ -44,7 +44,6 @@ export function AppShell({
   const { toast } = useToast();
   const confirm = useConfirm();
   const health = useHealth();
-  const runtime = useRuntime();
   const apply = useApply();
 
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("lyroute.sidebar.collapsed") === "1");
@@ -105,9 +104,7 @@ export function AppShell({
 
   const degraded = (health.data?.dependencies || []).filter((item) => item.available === false);
   const healthTone = health.isError ? "danger" : degraded.length ? "warning" : health.data?.status === "ok" ? "success" : "warning";
-  const healthText = health.isLoading ? "读取中" : health.isError ? "状态未知" : degraded.length ? `降级 ${degraded.length}` : "运行正常";
-  const runtimeComponents = runtime.data?.components || [];
-  const runtimeDegraded = runtimeComponents.filter((component) => component.available === false || component.state === "degraded");
+  const healthText = health.isLoading ? "读取中" : health.isError ? "状态未知" : degraded.length ? "存在异常" : "运行正常";
 
   const submitPassword = async () => {
     if (newPassword.length < 8) {
@@ -241,8 +238,8 @@ export function AppShell({
           ))}
         </nav>
         <div className="sidebar-foot">
-          <span className={classNames("status-dot", runtimeDegraded.length ? "status-dot-warning" : "status-dot-success")} />
-          {!collapsed && <span>{runtimeDegraded.length ? `${runtimeDegraded.length} 个组件降级` : "组件正常"}</span>}
+          <span className={classNames("status-dot", degraded.length || health.isError ? "status-dot-warning" : "status-dot-success")} />
+          {!collapsed && <span>{degraded.length || health.isError ? "设备状态异常" : "设备正常"}</span>}
         </div>
       </aside>
 
@@ -259,7 +256,7 @@ export function AppShell({
         open={healthOpen}
         onClose={() => setHealthOpen(false)}
         title="设备健康"
-        subtitle={`采样于 ${formatDateTime(health.data?.request_id ? new Date() : new Date())}`}
+        subtitle="设备状态与版本"
         width="sm"
       >
         <div className="health-summary">
@@ -273,24 +270,11 @@ export function AppShell({
             <div className="health-row" key={item.name}>
               <div>
                 <strong>{item.name}</strong>
-                {item.reason && <p>{item.reason}</p>}
+                {item.available === false && <p>该服务当前不可用</p>}
               </div>
               <Badge tone={item.available === false ? "danger" : "success"} dot>{stateLabel(item.state)}</Badge>
             </div>
           ))}
-        </div>
-        <h3 className="section-title">运行态组件</h3>
-        <div className="health-list">
-          {runtimeComponents.map((component) => (
-            <div className="health-row" key={component.name}>
-              <div>
-                <strong>{component.name}</strong>
-                {component.reason && <p>{component.reason}</p>}
-              </div>
-              <Badge tone={component.available === false ? "warning" : "success"} dot>{stateLabel(component.state)}</Badge>
-            </div>
-          ))}
-          {!runtimeComponents.length && <p className="muted">暂无运行态组件数据。</p>}
         </div>
       </Drawer>
 
@@ -303,7 +287,7 @@ export function AppShell({
       >
         <div className="command-input">
           <Search size={16} />
-          <input autoFocus value={commandQuery} onChange={(event) => setCommandQuery(event.target.value)} placeholder="输入页面名，例如：策略、WAN、运行态" />
+          <input autoFocus value={commandQuery} onChange={(event) => setCommandQuery(event.target.value)} placeholder="输入页面名，例如：策略、WAN、接口" />
         </div>
         <div className="command-list">
           {commands.pages.map((page) => (

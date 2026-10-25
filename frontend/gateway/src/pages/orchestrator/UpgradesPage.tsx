@@ -10,6 +10,7 @@ import { DataTable } from "../../components/DataTable";
 import { Badge, Button, Card, Field, PageHeader, useToast } from "../../components/ui";
 import { useAuth, useConfirm } from "../../state/providers";
 import { formatBytes, formatDateTime, stateLabel, text } from "../../lib/format";
+import { sanitizeDetail } from "../../lib/human";
 
 function tone(state: string) {
   if (["installed", "staged"].includes(state)) return "success";
@@ -40,7 +41,7 @@ export function OrchestratorUpgradesPage() {
       setFile(null);
       await queryClient.invalidateQueries({ queryKey: ["orchestrator", "upgrades"] });
     } catch (error: any) {
-      toast(error?.message || "升级包上传失败", "error", error?.requestId);
+      toast(error?.message || "升级包上传失败", "error");
     } finally {
       setBusy("");
     }
@@ -54,7 +55,7 @@ export function OrchestratorUpgradesPage() {
       toast("升级已接受（202），正在异步执行", "success");
       await queryClient.invalidateQueries({ queryKey: ["orchestrator", "upgrades"] });
     } catch (error: any) {
-      toast(error?.message || "启动升级失败", "error", error?.requestId);
+      toast(error?.message || "启动升级失败", "error");
     } finally {
       setBusy("");
     }
@@ -68,20 +69,19 @@ export function OrchestratorUpgradesPage() {
       toast("回滚已接受（202），正在异步执行", "success");
       await queryClient.invalidateQueries({ queryKey: ["orchestrator", "upgrades"] });
     } catch (error: any) {
-      toast(error?.message || "启动回滚失败", "error", error?.requestId);
+      toast(error?.message || "启动回滚失败", "error");
     } finally {
       setBusy("");
     }
   };
 
   const columns: ColumnDef<UpgradeTask, any>[] = [
-    { id: "id", header: "任务", accessorFn: (row) => row.id, cell: ({ row }) => <span className="mono">{row.original.id.slice(0, 12)}</span>, meta: { width: 120 } },
     { id: "version", header: "版本", accessorFn: (row) => `${row.from_version || "?"} → ${row.to_version || "?"}`, cell: ({ getValue }) => text(getValue()), meta: { width: 190 } },
     { id: "state", header: "状态", accessorFn: (row) => row.state, cell: ({ getValue }) => <Badge tone={tone(String(getValue()))} dot>{stateLabel(getValue())}</Badge>, meta: { width: 110 } },
     { id: "package", header: "升级包", accessorFn: (row) => row.package_name, cell: ({ row }) => <span className="mono truncate" title={row.original.package_name}>{text(row.original.package_name)}</span>, meta: { width: 220 } },
     { id: "size", header: "大小", accessorFn: (row) => row.package_size, cell: ({ getValue }) => formatBytes(getValue()), meta: { width: 90, align: "right" } },
     { id: "updated", header: "更新时间", accessorFn: (row) => row.updated_at, cell: ({ getValue }) => <span className="muted">{formatDateTime(getValue())}</span>, meta: { width: 160 } },
-    { id: "reason", header: "原因", accessorFn: (row) => row.reason, cell: ({ getValue }) => <span className="muted truncate" title={text(getValue())}>{text(getValue(), "")}</span> },
+    { id: "reason", header: "原因", accessorFn: (row) => row.reason, cell: ({ getValue }) => <span className="muted truncate" title={sanitizeDetail(getValue(), "")}>{sanitizeDetail(getValue(), "")}</span> },
     { id: "actions", header: "操作", cell: ({ row }) => <div className="row-actions">{row.original.state === "staged" && <Button size="sm" variant="text" icon={<ArrowUpCircle size={13} />} onClick={() => install(row.original)} disabled={session?.role === "readonly" || Boolean(busy)}>安装</Button>}{["installed", "failed", "rollback_failed"].includes(row.original.state) && <Button size="sm" variant="text" icon={<RotateCcw size={13} />} onClick={() => rollback(row.original)} disabled={session?.role === "readonly" || Boolean(busy)}>回滚</Button>}</div>, meta: { width: 90, align: "right", hideable: false } },
   ];
 
@@ -89,7 +89,7 @@ export function OrchestratorUpgradesPage() {
     <div className="page">
       <PageHeader
         title="升级 / 回滚"
-        subtitle="Orchestrator 独立版本；安装/回滚返回 202 后异步执行，需要轮询任务"
+        subtitle="独立版本；安装和回滚为异步任务，需要等待完成"
         actions={<Button size="sm" icon={<RefreshCcw size={14} />} onClick={() => upgrades.refetch()}>刷新</Button>}
       />
 

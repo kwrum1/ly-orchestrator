@@ -113,7 +113,7 @@ export function PortMappingPage() {
       setEditor(undefined);
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "保存 NAT 规则失败", "error", error?.requestId);
+      toast(error?.message || "保存 NAT 规则失败", "error");
     } finally {
       setBusy(false);
     }
@@ -129,7 +129,7 @@ export function PortMappingPage() {
       await queryClient.invalidateQueries({ queryKey: ["resources", kind === "port" ? "port-maps" : "static-nat"] });
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "删除失败", "error", error?.requestId);
+      toast(error?.message || "删除失败", "error");
     }
   };
 

@@ -20,8 +20,8 @@ function ProductMark({ size = 54 }: { size?: number }) {
 
 export function LoginPage({ onLoggedIn, forceChange = false, initialUsername = "", product = "gateway" }: { onLoggedIn?: () => void; forceChange?: boolean; initialUsername?: string; product?: "gateway" | "orchestrator" }) {
   const config = product === "orchestrator"
-    ? { brand: "流量编排控制台", title: "登录编排控制台", subtitle: "单机 VPP 流量编排：本地拓扑、策略、服务链与遥测。", footer: "Ly Route Orchestrator", hint: "单机本地编排，不是多站点控制器" }
-    : { brand: "出口网关控制台", title: "登录管理界面", subtitle: "使用设备管理员账号访问路由、策略与运行态。", footer: "Ly Route Gateway", hint: "仅通过 HTTPS 访问管理界面" };
+    ? { brand: "流量编排控制台", title: "登录编排控制台", subtitle: "单机流量编排：本地拓扑、策略与服务链。", footer: "Ly Route Orchestrator", hint: "单机本地编排，不是多站点控制器" }
+    : { brand: "出口网关控制台", title: "登录管理界面", subtitle: "使用设备管理员账号访问路由、策略与设备状态。", footer: "Ly Route Gateway", hint: "仅通过 HTTPS 访问管理界面" };
   const { login } = useAuth();
   const [username, setUsername] = useState(initialUsername);
   const [password, setPassword] = useState("");

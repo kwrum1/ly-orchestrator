@@ -4,6 +4,7 @@ import { useDashboardTelemetry, useOnlineUsers, useTrafficTrend } from "../api/h
 import { Badge, Button, Card, Metric, PageHeader, Skeleton, EmptyState } from "../components/ui";
 import { TrafficChart, latestValue, seriesColor, totalLatest } from "../components/TrafficChart";
 import { formatRate, formatTime } from "../lib/format";
+import { sanitizeDetail } from "../lib/human";
 
 const WINDOWS = [
   { key: "realtime", label: "实时" },
@@ -51,7 +52,7 @@ export function TrafficPage() {
         <Metric label="当前下行" value={trend.isLoading ? "读取中" : formatRate(down)} hint="接收速率" tone="blue" icon={<ArrowDownRight size={15} />} />
         <Metric label="当前上行" value={trend.isLoading ? "读取中" : formatRate(up)} hint="发送速率" tone="violet" icon={<ArrowUpRight size={15} />} />
         <Metric label="活动连接" value={dashboard.isLoading ? "--" : activeSessions.toLocaleString("zh-CN")} hint="当前会话" tone="amber" />
-        <Metric label="在线用户" value={online.isLoading ? "--" : onlineCount} hint="DHCP / 邻居" tone="green" />
+        <Metric label="在线用户" value={online.isLoading ? "--" : onlineCount} hint="已分配地址" tone="green" />
         <Metric label="采样峰值" value={formatRate(peak)} hint={`更新时间 ${formatTime(trend.dataUpdatedAt ? new Date(trend.dataUpdatedAt).toISOString() : "")}`} tone="plain" />
       </div>
 
@@ -79,15 +80,15 @@ export function TrafficPage() {
             </button>
           ))}
         </div>
-        {trend.data?.degraded && <div className="inline-warning">{trend.data.degraded_reason || "流量采集降级，数据可能不完整。"}</div>}
+        {trend.data?.degraded && <div className="inline-warning">{sanitizeDetail(trend.data.degraded_reason, "部分流量数据暂不可用，图表可能不完整。")}</div>}
         <div className="traffic-pair">
           <section className="traffic-block">
             <header><div><h3>上行趋势</h3><span>出口发送流量</span></div><strong>{formatRate(up)}</strong></header>
-            {trend.isLoading ? <Skeleton rows={4} /> : series.length ? <TrafficChart series={series} direction="upload" hidden={hidden} height={255} /> : <EmptyState title="暂无上行采样" description="WAN 遥测未返回采样。" icon={<Activity size={22} />} />}
+            {trend.isLoading ? <Skeleton rows={4} /> : series.length ? <TrafficChart series={series} direction="upload" hidden={hidden} height={255} /> : <EmptyState title="暂无上行采样" description="暂无流量数据。" icon={<Activity size={22} />} />}
           </section>
           <section className="traffic-block">
             <header><div><h3>下行趋势</h3><span>出口接收流量</span></div><strong>{formatRate(down)}</strong></header>
-            {trend.isLoading ? <Skeleton rows={4} /> : series.length ? <TrafficChart series={series} direction="download" hidden={hidden} height={255} /> : <EmptyState title="暂无下行采样" description="WAN 遥测未返回采样。" icon={<Activity size={22} />} />}
+            {trend.isLoading ? <Skeleton rows={4} /> : series.length ? <TrafficChart series={series} direction="download" hidden={hidden} height={255} /> : <EmptyState title="暂无下行采样" description="暂无流量数据。" icon={<Activity size={22} />} />}
           </section>
         </div>
       </Card>

@@ -113,6 +113,50 @@ export function roleLabel(value: unknown): string {
   return ({ lan: "LAN", wan: "WAN", internal: "内部", external: "外部", management: "管理口" } as Record<string, string>)[String(value)] || text(value);
 }
 
+export function auditActionLabel(value: unknown): string {
+  const raw = String(value || "").toLowerCase();
+  return ({
+    create: "创建",
+    update: "修改",
+    patch: "修改",
+    delete: "删除",
+    remove: "删除",
+    apply: "应用",
+    login: "登录",
+    logout: "退出",
+    reserve: "保留",
+    refresh: "刷新",
+    install: "安装",
+    rollback: "回滚",
+    reset: "初始化",
+  } as Record<string, string>)[raw] || text(value, "事件");
+}
+
+export function auditResourceLabel(value: unknown): string {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const known: Record<string, string> = {
+    "/api/v1/interface-bonds": "接口聚合",
+    "/api/v1/interfaces": "网卡设置",
+    "/api/v1/gateway/wan-links": "WAN 线路",
+    "/api/v1/gateway/wan-groups": "WAN 群组",
+    "/api/v1/gateway/policies/routes": "策略路由",
+    "/api/v1/gateway/nat/port-maps": "端口映射",
+    "/api/v1/gateway/nat/static": "静态 NAT",
+    "/api/v1/dns/policies": "DNS 策略",
+    "/api/v1/dns/upstreams": "DNS 上游",
+    "/api/v1/dhcp/servers": "DHCP 服务",
+    "/api/v1/dhcp/static-bindings": "DHCP 静态分配",
+    "/api/v1/objects/groups": "对象管理",
+    "/api/v1/proxy/egresses": "代理资源",
+    "/api/v1/runtime/apply": "配置应用",
+  };
+  if (known[raw]) return known[raw];
+  if (!raw.startsWith("/api/")) return raw;
+  const tail = raw.replace(/^\/api\/v1\//, "").split("/").filter(Boolean).slice(0, 2).join("/");
+  return tail || "系统";
+}
+
 export function wanTypeLabel(value: unknown): string {
   const raw = String(value || "").toLowerCase();
   return ({ static: "固定 IPv4", static4: "固定 IPv4", static6: "固定 IPv6", dhcp4: "DHCP IPv4", dhcpv4: "DHCP IPv4", dhcp6: "DHCP IPv6", dhcpv6_pd: "DHCPv6-PD", pppoe: "PPPoE", proxy: "代理线路" } as Record<string, string>)[raw] || text(value);
@@ -148,6 +192,8 @@ export function stateLabel(value: unknown): string {
     unavailable: "不可用",
     failed: "失败",
     apply_failed: "应用失败",
+    dataplane_locked: "数据面未就绪",
+    af_fallback_required: "需要确认兼容模式",
     desired_not_applied: "待应用",
     pending: "待处理",
     stale: "数据过期",

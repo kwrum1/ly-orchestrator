@@ -15,7 +15,6 @@ import {
   MemoryStick,
   RefreshCw,
   Router,
-  ServerCog,
   Users,
   Wifi,
 } from "lucide-react";
@@ -27,7 +26,6 @@ import {
   useInterfacesTelemetry,
   useOnlineUsers,
   useProxyEgresses,
-  useRuntime,
   useSummary,
   useTopDomains,
   useTopSessions,
@@ -38,7 +36,9 @@ import {
 import type { LogicalEgressSeries } from "../api/types";
 import { Badge, Button, Card, EmptyState, ErrorState, Metric, PageHeader, ProgressBar, Skeleton } from "../components/ui";
 import { Sparkline, TrafficChart, latestValue, seriesColor, totalLatest } from "../components/TrafficChart";
-import { formatDateTime, formatDuration, formatRate, formatTime, isOnlineUser, percent, stateLabel, text, timeAgo } from "../lib/format";
+import { formatDateTime, formatDuration, formatRate, formatTime, isOnlineUser, percent, roleLabel, stateLabel, text, timeAgo } from "../lib/format";
+import { auditActionLabel, auditResourceLabel } from "../lib/format";
+import { sanitizeDetail } from "../lib/human";
 import { useAuth } from "../state/providers";
 
 const WINDOWS = [
@@ -92,7 +92,6 @@ export function OverviewPage() {
   const online = useOnlineUsers();
   const sessions = useTopSessions();
   const domains = useTopDomains();
-  const runtime = useRuntime();
   const audit = useAudit();
   const interfaces = useInterfacesTelemetry();
   const interfacesResource = useInterfacesResource();
@@ -122,14 +121,18 @@ export function OverviewPage() {
   const activeSessions = Number(dashboard.data?.data?.sessions ?? 0);
   const system = summary.data?.system || {};
   const load = system.load_average || {};
-  const components = runtime.data?.components || [];
-  const degradedComponents = components.filter((item) => item.available === false || item.state === "degraded");
+  const deviceHealthy = !health.isError && health.data?.status === "ok" && !(health.data?.dependencies || []).some((item) => item.available === false);
   const interfaceItems = Array.isArray(interfaces.data?.data) ? interfaces.data?.data as any[] : [];
   const desiredInterfaces = interfacesResource.data?.items || [];
   const mergedInterfaces = desiredInterfaces.length ? desiredInterfaces.map((item) => {
     const telemetry = interfaceItems.find((candidate) => candidate.id === item.id || candidate.name === item.name);
     return { ...item, ...telemetry };
   }) : interfaceItems;
+  const physicalInterfaces = mergedInterfaces.filter((item: any) => {
+    const kind = String(item.kind || item.type || "").toLowerCase();
+    if (kind === "lan_bridge" || kind === "bridge" || kind === "vlan") return false;
+    return !(item.display_name && !item.system_name && !item.mac && !item.speed);
+  });
 
   const auditEvents = useMemo(() => {
     const payload = audit.data;
@@ -142,7 +145,7 @@ export function OverviewPage() {
   const topDomains = (domains.data?.data?.items || []).slice(0, 6);
 
   const refreshAll = () => {
-    [health, summary, dashboard, trend, online, sessions, domains, runtime, audit, interfaces, interfacesResource].forEach((query) => query.refetch());
+    [health, summary, dashboard, trend, online, sessions, domains, audit, interfaces, interfacesResource].forEach((query) => query.refetch());
   };
 
   return (
@@ -151,10 +154,7 @@ export function OverviewPage() {
         title="总览"
         subtitle={`${system.platform || "Ly Route Gateway"} · 系统时间 ${formatDateTime(system.system_time)}`}
         actions={
-          <>
-            <Button size="sm" icon={<RefreshCw size={14} />} onClick={refreshAll}>刷新</Button>
-            <Button size="sm" variant="primary" icon={<ServerCog size={14} />} onClick={() => navigate("/system/runtime")}>运行态</Button>
-          </>
+          <Button size="sm" icon={<RefreshCw size={14} />} onClick={refreshAll}>刷新</Button>
         }
         meta={
           <>
@@ -195,7 +195,7 @@ export function OverviewPage() {
         <Metric
           label="在线用户"
           value={online.isLoading ? "--" : onlineCount}
-          hint="DHCP / 邻居"
+          hint="已分配地址"
           tone="green"
           icon={<Users size={15} />}
         />
@@ -249,10 +249,10 @@ export function OverviewPage() {
                 <em>{item.kind === "wan_group" ? "WAN 群组" : item.kind === "proxy" ? "代理" : "WAN"}</em>
               </button>
             ))}
-            {!series.length && <span className="muted">{displayEgresses.length ? "遥测未返回出口" : "暂无 WAN 出口"}</span>}
+            {!series.length && <span className="muted">{displayEgresses.length ? "暂无流量数据" : "暂无 WAN 出口"}</span>}
           </div>
-          {!series.length && displayEgresses.length > 0 && <div className="inline-warning">已配置 {displayEgresses.length} 条 WAN，流量遥测暂不可用；图表不展示推测数据。</div>}
-          {trend.isLoading ? <Skeleton rows={5} /> : series.length ? <TrafficChart series={series} direction="total" hidden={hidden} height={270} /> : <EmptyState title="暂无流量采样" description="WAN 已配置但遥测未返回采样；请检查 VPP/遥测状态。" icon={<Activity size={22} />} />}
+          {!series.length && displayEgresses.length > 0 && <div className="inline-warning">已配置 {displayEgresses.length} 条 WAN，流量数据暂不可用；图表不展示推测数据。</div>}
+          {trend.isLoading ? <Skeleton rows={5} /> : series.length ? <TrafficChart series={series} direction="total" hidden={hidden} height={270} /> : <EmptyState title="暂无流量采样" description="暂无流量数据，请稍后刷新。" icon={<Activity size={22} />} />}
         </Card>
 
         <Card className="span-4" title="WAN 出口" subtitle="逻辑出口与当前速率" actions={<Button size="sm" variant="text" onClick={() => navigate("/traffic")}>查看全部</Button>}>
@@ -289,10 +289,10 @@ export function OverviewPage() {
           actions={<Button size="sm" variant="text" onClick={() => navigate("/interfaces")}>接口设置</Button>}
         >
           <div className="port-grid">
-            {mergedInterfaces.slice(0, 8).map((item) => (
+            {physicalInterfaces.slice(0, 8).map((item) => (
               <button type="button" className="port-card" key={item.id || item.name} onClick={() => navigate("/interfaces")}>
                 <span className="port-icon"><Cable size={16} /></span>
-                <span className="port-name">{item.name || item.id}<small>{item.gateway_role ? stateLabel(item.gateway_role) : item.work_mode || "--"}</small></span>
+                <span className="port-name">{item.name || item.id}<small>{item.gateway_role ? roleLabel(item.gateway_role) : "未配置"}</small></span>
                 <span className="port-state">
                   <i className={`status-dot status-dot-${item.link_state === "up" ? "success" : "danger"}`} />
                   {item.speed || "--"}
@@ -303,11 +303,11 @@ export function OverviewPage() {
                 </span>
               </button>
             ))}
-            {!mergedInterfaces.length && <EmptyState title="暂无接口数据" description="接口遥测暂不可用。" icon={<Cable size={22} />} />}
+            {!physicalInterfaces.length && <EmptyState title="暂无接口数据" description="接口数据暂不可用。" icon={<Cable size={22} />} />}
           </div>
         </Card>
 
-        <Card className="span-5" title="系统健康" subtitle="资源使用与运行态组件" actions={<Badge tone={degradedComponents.length ? "warning" : "success"} dot>{degradedComponents.length ? `${degradedComponents.length} 个降级` : "正常"}</Badge>}>
+        <Card className="span-5" title="系统健康" subtitle="资源使用与设备状态" actions={<Badge tone={deviceHealthy ? "success" : "warning"} dot>{deviceHealthy ? "正常" : "异常"}</Badge>}>
           <div className="health-metrics">
             <div className="health-metric">
               <span><Cpu size={14} /> CPU</span>
@@ -326,13 +326,10 @@ export function OverviewPage() {
             </div>
           </div>
           <div className="component-list">
-            {components.slice(0, 6).map((component) => (
-              <div className="component-row" key={component.name}>
-                <span><i className={`status-dot status-dot-${component.available === false || component.state === "degraded" ? "warning" : "success"}`} />{component.name}</span>
-                <span className="muted">{stateLabel(component.state)}</span>
-              </div>
-            ))}
-            {!components.length && <p className="muted">运行态组件尚未读取。</p>}
+            <div className="component-row">
+              <span><i className={`status-dot status-dot-${deviceHealthy ? "success" : "warning"}`} />设备状态</span>
+              <span className="muted">{deviceHealthy ? "运行正常" : "存在异常"}</span>
+            </div>
           </div>
         </Card>
       </div>
@@ -388,14 +385,14 @@ export function OverviewPage() {
           )}
         </Card>
 
-        <Card className="span-5" title="最近事件" subtitle="审计与配置动作" actions={<Button size="sm" variant="text" onClick={() => navigate("/system/runtime")}>查看运行态</Button>}>
+        <Card className="span-5" title="最近事件" subtitle="审计与配置动作">
           <div className="event-list">
             {auditEvents.map((event, index) => (
               <div className="event-row" key={`${event.id || index}`}>
                 <i className={`event-dot event-${String(event.status || "").toLowerCase()}`} />
                 <div>
-                  <strong>{event.action || "事件"}<span className="muted"> · {event.actor || "system"}</span></strong>
-                  <small>{event.resource || ""}{event.error ? ` · ${event.error}` : ""}</small>
+                  <strong>{auditActionLabel(event.action)}<span className="muted"> · {event.actor || "system"}</span></strong>
+                  <small>{auditResourceLabel(event.resource)}{event.error ? ` · ${sanitizeDetail(event.error, "操作未完成")}` : ""}</small>
                 </div>
                 <time>{timeAgo(event.timestamp)}</time>
               </div>

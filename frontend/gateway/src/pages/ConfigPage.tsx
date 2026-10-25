@@ -1,15 +1,13 @@
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { Clock3, Download, HardDrive, RotateCcw, Save, ServerCog, ShieldAlert, Trash2, Upload } from "lucide-react";
+import { Clock3, Download, HardDrive, RotateCcw, Save, ShieldAlert, Trash2, Upload } from "lucide-react";
 import { API } from "../api/endpoints";
 import { getJson, postJson } from "../api/client";
 import { useHealth, useInterfacesResource, useManagementNetwork, useSummary } from "../api/hooks";
 import { Badge, Button, Card, Field, Input, Modal, PageHeader, Select, useToast } from "../components/ui";
 import { useApply, useAuth, useConfirm } from "../state/providers";
-import { formatDateTime, formatDuration, stateLabel, text } from "../lib/format";
+import { formatDateTime, formatDuration, text } from "../lib/format";
 
 export function ConfigPage() {
-  const navigate = useNavigate();
   const { toast } = useToast();
   const confirm = useConfirm();
   const apply = useApply();
@@ -70,7 +68,7 @@ export function ConfigPage() {
       await management.refetch();
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "保存管理口失败", "error", error?.requestId);
+      toast(error?.message || "保存管理口失败", "error");
     } finally {
       setBusy(false);
     }
@@ -88,7 +86,7 @@ export function ConfigPage() {
       URL.revokeObjectURL(url);
       toast("配置已导出", "success");
     } catch (error: any) {
-      toast(error?.message || "导出配置失败", "error", error?.requestId);
+      toast(error?.message || "导出配置失败", "error");
     }
   };
 
@@ -100,19 +98,19 @@ export function ConfigPage() {
       await loadSnapshots();
       toast("快照已创建", "success");
     } catch (error: any) {
-      toast(error?.message || "创建快照失败", "error", error?.requestId);
+      toast(error?.message || "创建快照失败", "error");
     }
   };
 
   const restoreSnapshot = async (snapshot: any) => {
-    const ok = await confirm({ title: `恢复快照 ${snapshot.name || snapshot.id}？`, message: "当前期望配置会被替换；恢复后需要应用运行态。", confirmLabel: "恢复", danger: true });
+    const ok = await confirm({ title: `恢复快照 ${snapshot.name || snapshot.id}？`, message: "当前配置会被替换；恢复后需要应用配置。", confirmLabel: "恢复", danger: true });
     if (!ok) return;
     try {
       await postJson(API.config.snapshot(snapshot.id), {});
       toast("快照已恢复，正在应用", "success");
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "恢复快照失败", "error", error?.requestId);
+      toast(error?.message || "恢复快照失败", "error");
     }
   };
 
@@ -126,7 +124,7 @@ export function ConfigPage() {
       setResetText("");
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "配置初始化失败", "error", error?.requestId);
+      toast(error?.message || "配置初始化失败", "error");
     } finally {
       setBusy(false);
     }
@@ -193,7 +191,6 @@ export function ConfigPage() {
       <PageHeader
         title="配置管理"
         subtitle="管理口、系统状态、配置备份与恢复"
-        actions={<Button size="sm" variant="primary" icon={<ServerCog size={14} />} onClick={() => navigate("/system/runtime")}>运行态</Button>}
       />
 
       <div className="config-grid">
@@ -207,7 +204,7 @@ export function ConfigPage() {
           <div className="card-actions-bottom"><Button variant="primary" loading={busy} onClick={saveManagement} disabled={session?.role === "readonly"}>保存管理口</Button></div>
         </Card>
 
-        <Card title="系统信息" subtitle="来自 /dashboard/summary">
+        <Card title="系统信息" subtitle="设备版本与资源">
           <dl className="fact-list">
             <div><dt>版本</dt><dd>{text(health.data?.version, "--")}</dd></div>
             <div><dt>运行时长</dt><dd>{formatDuration(system.uptime_seconds)}</dd></div>
@@ -215,14 +212,14 @@ export function ConfigPage() {
             <div><dt>硬件平台</dt><dd>{text(system.platform, "--")}</dd></div>
             <div><dt>CPU / 内存</dt><dd>{system.cpu_busy_percent ?? "--"}% / {system.memory_used_percent ?? "--"}%</dd></div>
           </dl>
-          <div className="inline-warning">系统时间当前仅支持读取；后端没有提供时间写入 API，因此不提供“同步时间”假按钮。</div>
+          <div className="inline-warning">系统时间仅供查看，暂不支持在此修改。</div>
         </Card>
 
         <Card title="配置备份" subtitle="导出/导入期望配置 JSON；导入先预检，再确认替换">
           <div className="button-row">
             <Button icon={<Download size={14} />} onClick={exportConfig}>导出配置</Button>
             <Button icon={<Upload size={14} />} onClick={() => { setImportOpen(true); setImportError(""); setImportPreflight(null); setImportPackage(null); }} disabled={session?.role === "readonly"}>导入配置</Button>
-            <Button icon={<Save size={14} />} onClick={() => navigate("/system/runtime")}>查看运行态</Button>
+            <Button icon={<Save size={14} />} onClick={() => void apply.apply()}>应用配置</Button>
           </div>
           <div className="snapshot-create">
             <Input value={snapshotName} onChange={(event) => setSnapshotName(event.target.value)} placeholder="快照名称" />
@@ -232,7 +229,7 @@ export function ConfigPage() {
             {snapshots.slice(0, 6).map((snapshot) => (
               <div className="snapshot-row" key={snapshot.id}>
                 <div><strong>{text(snapshot.name || snapshot.id)}</strong><small>{formatDateTime(snapshot.created_at || snapshot.timestamp)}</small></div>
-                <Badge tone="neutral">{text(snapshot.reason || snapshot.kind || "snapshot")}</Badge>
+                <Badge tone="neutral">{text(snapshot.kind, "快照")}</Badge>
                 <Button size="sm" variant="ghost" icon={<RotateCcw size={13} />} onClick={() => restoreSnapshot(snapshot)} disabled={session?.role === "readonly"}>恢复</Button>
               </div>
             ))}
@@ -243,7 +240,7 @@ export function ConfigPage() {
         <Card title="危险操作" subtitle="配置初始化会清空期望配置并保留管理员账号/管理口">
           <div className="danger-zone">
             <ShieldAlert size={18} />
-            <div><strong>配置初始化</strong><p>会创建回滚快照并恢复默认配置；操作后需要应用运行态。</p></div>
+            <div><strong>配置初始化</strong><p>会创建回滚快照并恢复默认配置；操作后需要应用配置。</p></div>
             <Button variant="danger" icon={<Trash2 size={14} />} onClick={() => setResetOpen(true)} disabled={session?.role === "readonly"}>配置初始化</Button>
           </div>
         </Card>
@@ -270,13 +267,11 @@ export function ConfigPage() {
           {importPreflight && (
             <div className="notice-block">
               <strong>预检通过</strong>
-              <span>状态：{text(importPreflight.status, "dry_run")} · 安全应用：{importPreflight.safe_to_apply ? "是" : "否"}</span>
-              <span>包哈希：<code>{text(importPreflight.package_hash)}</code></span>
-              <span>差异哈希：<code>{text(importPreflight.diff_hash)}</code></span>
+              <span>状态：{text(importPreflight.status, "已预检")} · 可安全应用：{importPreflight.safe_to_apply ? "是" : "否"}</span>
               <span>确认有效期至：{formatDateTime(importPreflight.confirmation_expires_at)}</span>
             </div>
           )}
-          <div className="inline-warning">导入会替换当前期望配置；成功后会触发运行态应用。仅接受当前产品导出的包，密钥材料会被后端拒绝。</div>
+          <div className="inline-warning">导入会替换当前配置；成功后会立即应用。仅接受当前产品导出的包，密钥材料会被拒绝。</div>
         </div>
       </Modal>
 

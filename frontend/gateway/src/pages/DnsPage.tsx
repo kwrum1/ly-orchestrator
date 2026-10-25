@@ -110,7 +110,7 @@ export function DnsPage() {
       await queryClient.invalidateQueries({ queryKey: ["resources", "dns-upstreams"] });
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "保存 DNS 策略失败", "error", error?.requestId);
+      toast(error?.message || "保存 DNS 策略失败", "error");
     } finally {
       setBusy(false);
     }
@@ -125,7 +125,7 @@ export function DnsPage() {
       await queryClient.invalidateQueries({ queryKey: ["resources", "dns-policies"] });
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "删除失败", "error", error?.requestId);
+      toast(error?.message || "删除失败", "error");
     }
   };
 

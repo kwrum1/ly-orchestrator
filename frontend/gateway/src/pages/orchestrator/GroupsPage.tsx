@@ -136,7 +136,7 @@ export function OrchestratorGroupsPage() {
     } catch (error: any) {
       const message = error?.message || "保存编排组失败";
       setFormError(message);
-      toast(message, "error", error?.requestId);
+      toast(message, "error");
     } finally {
       setBusy(false);
     }
@@ -149,7 +149,7 @@ export function OrchestratorGroupsPage() {
       toast("编排组已删除", "success");
       await queryClient.invalidateQueries({ queryKey: ["orchestrator"] });
     } catch (error: any) {
-      toast(error?.message || "删除编排组失败", "error", error?.requestId);
+      toast(error?.message || "删除编排组失败", "error");
     }
   };
 

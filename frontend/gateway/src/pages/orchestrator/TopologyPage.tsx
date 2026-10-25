@@ -143,12 +143,12 @@ export function OrchestratorTopologyPage() {
         })),
       };
       const result = await putJson<any>(API.orchestrator.topology, payload, 30_000);
-      toast(`拓扑已保存${result?.checksum ? ` · checksum ${String(result.checksum).slice(0, 12)}` : ""}`, "success");
+      toast("拓扑已保存", "success");
       await queryClient.invalidateQueries({ queryKey: ["orchestrator"] });
       await queryClient.invalidateQueries({ queryKey: ["resources", "interfaces"] });
     } catch (failed: any) {
       setError(failed?.message || "保存拓扑失败");
-      toast(failed?.message || "保存拓扑失败", "error", failed?.requestId);
+      toast(failed?.message || "保存拓扑失败", "error");
     } finally {
       setBusy(false);
     }

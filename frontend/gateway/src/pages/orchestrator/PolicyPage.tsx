@@ -85,7 +85,7 @@ export function OrchestratorPolicyPage() {
       toast("流量编排策略已保存", "success");
       await queryClient.invalidateQueries({ queryKey: ["orchestrator"] });
     } catch (error: any) {
-      toast(error?.message || "保存策略失败", "error", error?.requestId);
+      toast(error?.message || "保存策略失败", "error");
     } finally {
       setBusy(false);
     }

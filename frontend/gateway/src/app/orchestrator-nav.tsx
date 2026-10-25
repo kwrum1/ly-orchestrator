@@ -22,7 +22,7 @@ export const ORCHESTRATOR_NAV_GROUPS: NavGroup[] = [
     key: "overview",
     label: "概览",
     pages: [
-      { key: "orch-overview", path: "/", label: "单机总览", icon: <LayoutDashboard size={16} />, description: "本机拓扑、策略、运行态与边界" },
+      { key: "orch-overview", path: "/", label: "单机总览", icon: <LayoutDashboard size={16} />, description: "本机拓扑、策略与边界" },
     ],
   },
   {
@@ -39,8 +39,8 @@ export const ORCHESTRATOR_NAV_GROUPS: NavGroup[] = [
     key: "observability",
     label: "运行与观测",
     pages: [
-      { key: "orch-telemetry", path: "/telemetry", label: "遥测", icon: <ChartNoAxesCombined size={16} />, description: "边界流量、策略命中与连接" },
-      { key: "orch-runtime", path: "/runtime", label: "运行态", icon: <Activity size={16} />, description: "组件、预览、应用与最近事务" },
+      { key: "orch-telemetry", path: "/telemetry", label: "流量监控", icon: <ChartNoAxesCombined size={16} />, description: "边界流量、策略命中与连接" },
+      { key: "orch-runtime", path: "/runtime", label: "系统状态", icon: <Activity size={16} />, description: "组件、预览、应用与最近记录" },
     ],
   },
   {
@@ -58,7 +58,7 @@ export const ORCHESTRATOR_NAV_GROUPS: NavGroup[] = [
 export const ORCHESTRATOR_ALL_PAGES = ORCHESTRATOR_NAV_GROUPS.flatMap((group) => group.pages);
 
 export const ORCHESTRATOR_COMMAND_ACTIONS = [
-  { key: "apply", label: "应用运行态", description: "提交当前拓扑/策略并执行运行态计划", icon: <ServerCog size={16} /> },
+  { key: "apply", label: "应用配置", description: "提交当前拓扑/策略并执行应用计划", icon: <ServerCog size={16} /> },
   { key: "refresh", label: "刷新当前页面", description: "重新读取当前页数据", icon: <RefreshCcw size={16} /> },
 ];
 

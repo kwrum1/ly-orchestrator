@@ -59,7 +59,7 @@ export function OrchestratorTransparentPage() {
       toast("服务链已应用", "success");
     } catch (failed: any) {
       setError(failed?.status === 404 ? "当前运行时未注册独立的 service-chains 端点（404）；透明编排由拓扑/策略保存同步应用。" : failed?.message || "服务链应用失败");
-      toast(failed?.message || "服务链应用失败", "error", failed?.requestId);
+      toast(failed?.message || "服务链应用失败", "error");
     } finally {
       setBusy("");
     }
@@ -69,7 +69,7 @@ export function OrchestratorTransparentPage() {
     <div className="page">
       <PageHeader
         title="透明编排"
-        subtitle="单机 VPP 服务链：编译 LAN-exit 路径、应用与当前操作；拓扑/策略 PUT 会自动下发透明编排"
+        subtitle="单机服务链：编译 LAN 出口路径、应用与当前操作；拓扑/策略保存后自动下发透明编排"
         actions={<><Button size="sm" icon={<RefreshCw size={14} />} onClick={() => { operation.refetch(); topology.refetch(); }}>刷新</Button><Button size="sm" icon={<Zap size={14} />} loading={busy === "compile"} onClick={compile} disabled={!topology.data?.item}>编译</Button><Button size="sm" variant="primary" icon={<Play size={14} />} loading={busy === "apply"} onClick={apply} disabled={session?.role === "readonly" || !topology.data?.item}>应用服务链</Button></>}
       />
 

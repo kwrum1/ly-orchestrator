@@ -29,6 +29,7 @@ export const API = {
     interfaces: "/api/v1/interfaces",
     interface: (id: string) => `/api/v1/interfaces/${encodeURIComponent(id)}`,
     interfaceBonds: "/api/v1/interface-bonds",
+    interfaceBond: (id: string) => `/api/v1/interface-bonds/${encodeURIComponent(id)}`,
     wanLinks: "/api/v1/gateway/wan-links",
     wanLink: (id: string) => `/api/v1/gateway/wan-links/${encodeURIComponent(id)}`,
     wanGroups: "/api/v1/gateway/wan-groups",
@@ -81,6 +82,12 @@ export const API = {
     status: "/api/v1/runtime/status",
     preview: "/api/v1/runtime/preview",
     apply: "/api/v1/runtime/apply",
+  },
+  dataplane: {
+    // Integration point: the dataplane branch adds a GET/PUT policy setting for
+    // explicit AF_PACKET compatibility consent. If the final route differs,
+    // change it here only; the rest of the UI goes through api/dataplane.ts.
+    policy: "/api/v1/dataplane/policy",
   },
   config: {
     apply: "/api/v1/config/apply",

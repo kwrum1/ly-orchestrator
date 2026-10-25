@@ -10,7 +10,8 @@ import type { InterfaceItem, ProxyEgress, WanLink } from "../api/types";
 import { DataTable } from "../components/DataTable";
 import { Badge, Button, Card, Field, Input, Modal, PageHeader, Select, Switch, Tabs, Textarea, useToast } from "../components/ui";
 import { useApply, useAuth, useConfirm } from "../state/providers";
-import { formatBytes, formatDateTime, formatRate, roleLabel, stateLabel, text, wanTypeLabel } from "../lib/format";
+import { auditActionLabel, auditResourceLabel, formatBytes, formatDateTime, formatRate, roleLabel, stateLabel, text, wanTypeLabel } from "../lib/format";
+import { sanitizeDetail, takeoverInfo } from "../lib/human";
 
 type EditorState = { kind: "lan" | "wan"; item?: any } | null;
 
@@ -83,6 +84,12 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
 
   const allInterfaces = interfaces.data?.items || [];
   const lanItems = allInterfaces.filter((item) => (item.gateway_role || item.role) === "lan");
+  // A port that failed takeover is not assignable to a line. Management and
+  // logical LAN objects are also excluded from the interface selectors.
+  const assignableInterfaces = allInterfaces.filter((item) =>
+    (item.gateway_role || item.role) !== "management" &&
+    takeoverInfo(item).kind !== "none"
+  );
   const wanItems = wanLinks.data?.items || [];
   const proxyItems = proxyEgresses.data?.items || [];
   const pppoePeers = pppoePeersOf(pppoe.data);
@@ -178,7 +185,7 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
         await queryClient.invalidateQueries({ queryKey: ["resources", "interfaces"] });
         void apply.apply();
       } catch (error: any) {
-        toast(error?.message || "保存 LAN 失败", "error", error?.requestId);
+        toast(error?.message || "保存 LAN 失败", "error");
       } finally {
         setBusy(false);
       }
@@ -284,7 +291,7 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
       await queryClient.invalidateQueries({ queryKey: ["resources", "proxy-egresses"] });
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "保存 WAN 失败", "error", error?.requestId);
+      toast(error?.message || "保存 WAN 失败", "error");
     } finally {
       setBusy(false);
     }
@@ -302,7 +309,7 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
       await queryClient.invalidateQueries({ queryKey: ["resources"] });
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "删除失败", "error", error?.requestId);
+      toast(error?.message || "删除失败", "error");
     }
   };
 
@@ -367,14 +374,14 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
       />
 
       <Card
-        title="PPPoE 生产路径"
-        subtitle={text(pppoe.data?.reason || pppoe.data?.error, "来自 /gateway/pppoe/status")}
+        title="PPPoE 线路"
+        subtitle="PPPoE 连接与地址状态"
         actions={<Badge tone={pppoePeers.length && pppoeConnected === pppoePeers.length ? "success" : "warning"} dot>{pppoePeers.length ? `${pppoeSummary}` : "未配置"}</Badge>}
       >
         {pppoePeers.length ? (
           <div className="mini-table-wrap">
             <table className="data-table">
-              <thead><tr><th>Peer</th><th>接口</th><th>地址</th><th>状态</th><th>VPP 路由交接</th></tr></thead>
+              <thead><tr><th>Peer</th><th>接口</th><th>地址</th><th>状态</th><th>路由交接</th></tr></thead>
               <tbody>
                 {pppoePeers.map((peer: any, index: number) => (
                   <tr key={peer.peer_id || peer.id || index}>
@@ -388,7 +395,7 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
               </tbody>
             </table>
           </div>
-        ) : <p className="muted">{text(pppoe.data?.reason || pppoe.data?.error, "暂无 PPPoE peer。")}</p>}
+        ) : <p className="muted">未配置 PPPoE</p>}
       </Card>
 
       {tab === "lan" && (
@@ -423,10 +430,10 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
           columns={[
             { id: "time", header: "时间", accessorFn: (row) => row.timestamp, cell: ({ getValue }) => <span className="muted">{formatDateTime(getValue())}</span>, meta: { width: 170 } },
             { id: "actor", header: "操作者", accessorFn: (row) => row.actor, cell: ({ getValue }) => text(getValue()), meta: { width: 110 } },
-            { id: "resource", header: "对象", accessorFn: (row) => row.resource, cell: ({ getValue }) => <span className="mono">{text(getValue())}</span>, meta: { width: 260 } },
-            { id: "action", header: "动作", accessorFn: (row) => row.action, cell: ({ getValue }) => text(getValue()), meta: { width: 100 } },
-            { id: "status", header: "结果", accessorFn: (row) => row.status, cell: ({ getValue }) => <Badge tone={String(getValue()) === "success" ? "success" : "danger"}>{text(getValue())}</Badge>, meta: { width: 90 } },
-            { id: "error", header: "说明", accessorFn: (row) => row.error, cell: ({ getValue }) => <span className="muted">{text(getValue(), "")}</span> },
+            { id: "resource", header: "对象", accessorFn: (row) => row.resource, cell: ({ getValue }) => <span>{auditResourceLabel(getValue())}</span>, meta: { width: 260 } },
+            { id: "action", header: "动作", accessorFn: (row) => row.action, cell: ({ getValue }) => auditActionLabel(getValue()), meta: { width: 100 } },
+            { id: "status", header: "结果", accessorFn: (row) => row.status, cell: ({ getValue }) => <Badge tone={String(getValue()) === "success" ? "success" : "danger"}>{String(getValue()) === "success" ? "成功" : "失败"}</Badge>, meta: { width: 90 } },
+            { id: "error", header: "说明", accessorFn: (row) => row.error, cell: ({ getValue }) => <span className="muted">{sanitizeDetail(getValue(), "")}</span> },
           ]}
           loading={audit.isLoading}
           error={audit.isError ? audit.error : null}
@@ -441,7 +448,7 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
         open={Boolean(editor)}
         onClose={() => !busy && setEditor(null)}
         title={editor?.kind === "wan" ? (editor?.item ? "编辑 WAN" : "新增 WAN") : (editor?.item ? "编辑 LAN" : "新增 LAN")}
-        subtitle={editor?.kind === "wan" ? "保存后写入期望状态，并触发运行态应用" : "接口角色必须已在网卡设置中标记为 LAN"}
+        subtitle={editor?.kind === "wan" ? "保存后立即应用" : "接口角色必须已在网卡设置中标记为 LAN"}
         size={editor?.kind === "wan" ? "lg" : "md"}
         busy={busy}
         footer={<><Button onClick={() => setEditor(null)} disabled={busy}>取消</Button><Button variant="primary" loading={busy} onClick={() => save()}>保存并应用</Button></>}
@@ -453,7 +460,7 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
             {form.kind === "lan_bridge" ? (
               <Field label="LAN 桥成员" required className="span-2" hint="选择至少两张 LAN 网卡；保存后作为逻辑桥接口">
                 <div className="check-grid">
-                  {allInterfaces.filter((item) => (item.gateway_role || item.role) !== "management").map((item) => (
+                  {assignableInterfaces.map((item) => (
                     <label className="check-card" key={item.id}>
                       <input
                         type="checkbox"
@@ -474,7 +481,7 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
               <Field label="网卡" required>
                 <Select value={form.interfaceId || ""} onChange={(event) => setForm({ ...form, interfaceId: event.target.value })}>
                   <option value="">请选择 LAN 网卡</option>
-                  {allInterfaces.filter((item) => (item.gateway_role || item.role) !== "management").map((item) => <option key={item.id} value={item.id}>{item.name || item.id} · {item.speed || "--"}</option>)}
+                  {assignableInterfaces.map((item) => <option key={item.id} value={item.id}>{item.name || item.id} · {item.speed || "--"}</option>)}
                 </Select>
               </Field>
             )}
@@ -491,7 +498,7 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
             <Field label="网卡" required>
               <Select value={form.interfaceId || ""} onChange={(event) => setForm({ ...form, interfaceId: event.target.value })}>
                 <option value="">请选择 WAN 网卡</option>
-                {allInterfaces.filter((item) => (item.gateway_role || item.role) !== "management").map((item) => <option key={item.id} value={item.id}>{item.name || item.id} · {item.speed || "--"}</option>)}
+                {assignableInterfaces.map((item) => <option key={item.id} value={item.id}>{item.name || item.id} · {item.speed || "--"}</option>)}
               </Select>
             </Field>
             <Field label="线路类型" required>

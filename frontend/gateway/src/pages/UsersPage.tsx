@@ -44,7 +44,7 @@ export function UsersPage() {
       toast(editor ? "用户已更新" : "用户已创建", "success");
       setEditor(undefined);
     } catch (error: any) {
-      toast(error?.message || "保存用户失败", "error", error?.requestId);
+      toast(error?.message || "保存用户失败", "error");
     } finally {
       setBusy(false);
     }
@@ -58,7 +58,7 @@ export function UsersPage() {
       await queryClient.invalidateQueries({ queryKey: ["resources", "auth-users"] });
       toast("用户已删除", "success");
     } catch (error: any) {
-      toast(error?.message || "删除用户失败", "error", error?.requestId);
+      toast(error?.message || "删除用户失败", "error");
     }
   };
 
@@ -84,7 +84,7 @@ export function UsersPage() {
           <Field label="角色"><Select value={form.role || "readonly"} onChange={(event) => setForm({ ...form, role: event.target.value })}><option value="readonly">只读</option><option value="admin">管理员</option></Select></Field>
           <Field label={editor ? "新密码（留空不修改）" : "密码"} required={!editor} hint="至少 8 位，不能包含用户名"><Input type="password" autoComplete="new-password" value={form.password || ""} onChange={(event) => setForm({ ...form, password: event.target.value })} /></Field>
           <Field label="确认密码" required={!editor}><Input type="password" autoComplete="new-password" value={form.confirm || ""} onChange={(event) => setForm({ ...form, confirm: event.target.value })} /></Field>
-          <div className="inline-warning"><KeyRound size={14} /> 只读账号不能修改配置，但仍可查看页面与运行态。</div>
+          <div className="inline-warning"><KeyRound size={14} /> 只读账号不能修改配置，但仍可查看页面与设备状态。</div>
         </div>
       </Modal>
     </div>

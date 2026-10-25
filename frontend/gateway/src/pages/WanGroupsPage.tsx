@@ -95,7 +95,7 @@ export function WanGroupsPage() {
       await queryClient.invalidateQueries({ queryKey: ["resources", "wan-groups"] });
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "保存 WAN 群组失败", "error", error?.requestId);
+      toast(error?.message || "保存 WAN 群组失败", "error");
     } finally {
       setBusy(false);
     }
@@ -110,7 +110,7 @@ export function WanGroupsPage() {
       await queryClient.invalidateQueries({ queryKey: ["resources", "wan-groups"] });
       void apply.apply();
     } catch (error: any) {
-      toast(error?.message || "删除失败", "error", error?.requestId);
+      toast(error?.message || "删除失败", "error");
     }
   };
 

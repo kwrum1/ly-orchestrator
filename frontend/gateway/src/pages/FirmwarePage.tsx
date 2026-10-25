@@ -6,6 +6,7 @@ import { useFirmwareStatus } from "../api/hooks";
 import { Badge, Button, Card, Field, Input, Modal, PageHeader, useToast } from "../components/ui";
 import { useAuth, useConfirm } from "../state/providers";
 import { formatBytes, formatDateTime, stateLabel, text } from "../lib/format";
+import { sanitizeDetail } from "../lib/human";
 
 function basename(value: unknown) {
   const raw = text(value, "");
@@ -33,7 +34,7 @@ export function FirmwarePage() {
       await status.refetch();
       return result;
     } catch (error: any) {
-      toast(error?.message || "固件上传失败", "error", error?.requestId);
+      toast(error?.message || "固件上传失败", "error");
     } finally {
       setBusy("");
     }
@@ -47,7 +48,7 @@ export function FirmwarePage() {
       toast("升级已启动，控制服务将重启", "success");
       await status.refetch();
     } catch (error: any) {
-      toast(error?.message || "固件升级启动失败", "error", error?.requestId);
+      toast(error?.message || "固件升级启动失败", "error");
     } finally {
       setBusy("");
     }
@@ -67,18 +68,18 @@ export function FirmwarePage() {
         actions={<Button size="sm" icon={<RefreshCw size={14} />} onClick={() => status.refetch()}>刷新状态</Button>}
       />
       <div className="config-grid">
-        <Card title="升级状态" subtitle="来自 /firmware/update/status" actions={<Badge tone={data.installing ? "warning" : staged ? "success" : "neutral"} dot>{data.installing ? "安装中" : staged ? "已校验" : stateLabel(state)}</Badge>}>
+        <Card title="升级状态" subtitle="升级包与安装状态" actions={<Badge tone={data.installing ? "warning" : staged ? "success" : "neutral"} dot>{data.installing ? "安装中" : staged ? "已校验" : stateLabel(state)}</Badge>}>
           <dl className="fact-list">
             <div><dt>状态</dt><dd>{data.installing ? "安装中" : staged ? "已校验，可安装" : stateLabel(state)}</dd></div>
             <div><dt>包名</dt><dd className="mono" title={text(data.image_path, "")}>{text(imageName, "--")}</dd></div>
             <div><dt>校验</dt><dd className="mono">{data.image_hash ? String(data.image_hash).slice(0, 16) : "--"}</dd></div>
             <div><dt>大小</dt><dd>{data.image_size ? formatBytes(data.image_size) : "--"}</dd></div>
-            <div><dt>安装状态</dt><dd>{data.install_status ? `${stateLabel(data.install_status)}（${data.install_status}）` : data.installing ? "执行中" : "--"}</dd></div>
+            <div><dt>安装状态</dt><dd>{data.install_status ? stateLabel(data.install_status) : data.installing ? "执行中" : "--"}</dd></div>
             <div><dt>暂存时间</dt><dd>{formatDateTime(data.staged_at)}</dd></div>
             <div><dt>重启</dt><dd>{data.reboot ? "需要" : "不自动重启"}</dd></div>
           </dl>
-          {data.reason && <div className="inline-warning">{data.reason}</div>}
-          {data.installing && <div className="inline-warning">后端未返回安装百分比；仅展示真实 install_status，不以推测进度代替。</div>}
+          {data.reason && <div className="inline-warning">{sanitizeDetail(data.reason, "升级状态暂时不可用")}</div>}
+          {data.installing && <div className="inline-warning">安装进行中，请勿断电。</div>}
         </Card>
 
         <Card title="上传升级包" subtitle="接受 .tar.zst / .zst；上传后会校验">

@@ -119,7 +119,7 @@ export function ClientsPage() {
     <div className="page">
       <PageHeader
         title="在线用户"
-        subtitle="DHCP 租约与邻居表合成的在线终端；点击 IP 查看会话"
+        subtitle="局域网内在线终端；点击 IP 查看会话"
         actions={<Button size="sm" icon={<RefreshCw size={14} />} onClick={() => { online.refetch(); sessions.refetch(); }}>刷新</Button>}
       />
       <Toolbar
@@ -129,7 +129,7 @@ export function ClientsPage() {
             <Badge tone="neutral">{filteredUsers.length} 个用户</Badge>
           </>
         }
-        right={<span className="muted"><Users size={14} /> 数据来自 DHCP 租约 + 邻居</span>}
+        right={<span className="muted"><Users size={14} /> 已分配地址的在线终端</span>}
       />
       <DataTable
         data={filteredUsers}
@@ -138,7 +138,7 @@ export function ClientsPage() {
         error={online.isError ? online.error : null}
         onRetry={() => online.refetch()}
         emptyTitle="暂无在线用户"
-        emptyDescription="DHCP 租约或邻居表为空；确认 LAN/DHCP 与遥测已配置。"
+        emptyDescription="暂无在线设备"
         getRowId={(row, index) => `${userIP(row)}-${index}`}
       />
 
@@ -200,7 +200,7 @@ export function ClientsPage() {
               <span>{Math.min(page, totalPages)} / {totalPages}</span>
               <Button size="sm" variant="ghost" disabled={page >= totalPages} onClick={() => setPage((value) => Math.min(totalPages, value + 1))}>下一页</Button>
             </div>
-            <p className="drawer-note">会话字段来自控制面遥测；后端不返回策略/出口归属时，页面不展示推断结果。</p>
+            <p className="drawer-note">会话信息由设备提供；不展示推断的策略或出口归属。</p>
           </>
         )}
       </Drawer>
