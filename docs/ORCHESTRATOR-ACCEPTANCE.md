@@ -1,6 +1,6 @@
 # Orchestrator acceptance on ESXi (AF_PACKET mode)
 
-## Fix run `3e0ca15` — release-blocking regressions resolved (2026-10-25)
+## Fix run — release-blocking regressions resolved (2026-10-25)
 
 Run `20261025-fix-release-orch-regressions` on branch
 `fix/release-orch-regressions`, built from the branch HEAD. This re-runs the
@@ -21,7 +21,7 @@ Commits on `fix/release-orch-regressions` (not pushed):
 
 - `af7f1a6` — `fix(orchestrator): keep runtime status on the transparent datapath`
 - `3e0ca15` — `fix(packaging): pin the accepted 11-page Orchestrator UI bundle`
-- the acceptance-documentation commit on top of `3e0ca15` (this file); the
+- the acceptance-documentation commits on top of `3e0ca15` (this file); the
   final image is built from the resulting branch HEAD so the artifact
   manifest's `source_commit` matches it
 
@@ -29,7 +29,7 @@ Commits on `fix/release-orch-regressions` (not pushed):
 
 | # | Requirement | Verdict | Evidence |
 |---|---|---|---|
-| 1 | Deploy the rebuilt release; manifest product `orchestrator`, `source_commit=3e0ca1556134` | **PASS** | `build/*`, `final/identity-and-vpp.txt` |
+| 1 | Deploy the rebuilt release; manifest product `orchestrator`, `source_commit` = built branch HEAD | **PASS** | `build/*`, `final/identity-and-vpp.txt` |
 | 2 | `health` ok; password change/login; Orchestrator profile | **PASS** | `phase-a.log`, `health*.json`, `login*.json`, `product.json` |
 | 3 | AF datapath: VPP owns both NICs, apply committed, `/runtime/status` running + generation; stable across ≥5 polls and after a control-api restart | **PASS** | `phase-b.log`, `functional/*`, `status-stability/*`, `final/api-runtime-status-{1..5}.json` |
 | 4 | Control-api restart and VPP restart keep the same generation and forwarding | **PASS** | `restart-persistence-test.log`, `persistence/*` |
@@ -98,11 +98,15 @@ Artifact SHA-256 values are recorded in the evidence directory:
 `0787685e8117c87e2e87a932c5e2f54e389ba668621c92bff65af00466199d35` in the
 rootfs, the upgrade package and the deployed image.
 
-Deployed VM: `lyacc-orch-3e0ca15` on `data (1)`, 4 vCPU / 4 GB, management
-`10.1.18.245`, three vmxnet3 NICs (`VM Network`, `lyacc-orch-pg`,
-`lyacc-orch-b-pg`). The old VM `lyacc-orch-506cc4c` was powered off (not
-deleted) because it shares the isolated data portgroups and duplicated
-datapath traffic. Gateway VMs, `dist-arch-v1-*`, `palog`, `DNS-8`, `vCLS` and
+Deployment: one fresh VM on datastore `data (1)` with 4 vCPU / 4 GB and three
+vmxnet3 NICs (`VM Network` management, `lyacc-orch-pg` WAN,
+`lyacc-orch-b-pg` LAN), created by
+`/root/work/ly-route-acceptance-esxi/esxi/deploy-esxi-vm.sh`. The exact VM
+name, management address, MACs and deployment log are recorded in the
+evidence directory (`deploy.log`, `build/git.txt`). Previous acceptance VMs
+connected to the same isolated data portgroups were powered off (not deleted)
+for the run so they could not duplicate datapath traffic. Gateway VMs,
+`dist-arch-v1-*`, `palog`, `DNS-8`, `vCLS` and
 `/root/work/ly-route-acceptance-v1` were not touched.
 
 ### Verification commands
