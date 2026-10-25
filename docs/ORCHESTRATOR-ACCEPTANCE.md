@@ -1,3 +1,11 @@
+# Orchestrator 验收
+
+> **UI 包更新（2026-10-26）**：编排器 UI 已按能力优先契约重建，来源为 `fix/gateway-ui-ux` @
+> `0a8fd90e63ac5a515794821b0092fe9984f5fe8c`，`app.js` sha256 为
+> `0e9c31abb8db54440e41de158be9cf69d6e6302e9a8a395eb2d5e693a8f47d82`。
+> 本文下文出现的 `0787685e…` 属于该次更新之前的**历史**发布记录，不是当前发布口径；
+> 当前发布口径以 `packaging/build-profiles/orchestrator.json` 的 `frontend_app_sha256` 为准。
+
 # Orchestrator acceptance on ESXi (AF_PACKET mode)
 
 ## Release candidate `1262522` — acceptance on ESXi `10.1.18.124` (2026-10-26)
