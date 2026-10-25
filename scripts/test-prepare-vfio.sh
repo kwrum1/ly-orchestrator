@@ -22,7 +22,15 @@ EOF
 cat > "$tmp/bin/bind-helper" <<'EOF'
 #!/usr/bin/env sh
 set -eu
-[ "$1" = bind ] || exit 1
+case "$1" in
+  unbind)
+    root=$LY_ROUTE_SYSFS_ROOT
+    rm -f "$root/bus/pci/devices/$2/driver"
+    exit 0
+    ;;
+  bind) ;;
+  *) exit 1 ;;
+esac
 case "${FAKE_BIND_RESULT:-ok}" in
   fail) exit 1 ;;
   leave) exit 0 ;;
@@ -73,7 +81,9 @@ run_prepare() {
     LY_ROUTE_DATAPLANE_INVENTORY="$fixture/inventory.json" \
     LY_ROUTE_VPP_STARTUP_CONFIG="$fixture/startup.conf" \
     LY_ROUTE_DPDK_OWNERSHIP_STATE="$fixture/ownership.json" \
+    LY_ROUTE_DATAPLANE_ACTIVE_STATE="$fixture/active.json" \
     LY_ROUTE_PCI_BIND_HELPER="$tmp/bin/bind-helper" \
+    LY_ROUTE_VFIO_BOOTSTRAP="${LY_ROUTE_VFIO_BOOTSTRAP:-apply}" \
     sh "$script"
 }
 
@@ -156,5 +166,41 @@ fixture=$(setup_fixture none no)
 rm -f "$fixture/inventory.json"
 run_prepare "$fixture" > "$fixture/log" 2>&1
 grep -q 'VPP ownership preflight skipped: no operator interface inventory or installer NIC mapping' "$fixture/log"
+
+# Boot mode must only re-bind previously verified DPDK ports. An unverified
+# candidate stays on its kernel driver and a stale managed block is removed.
+fixture=$(setup_fixture boot-skip no)
+printf '\n# BEGIN LY ROUTE DPDK\ndpdk {\n  dev 0000:03:00.0\n}\n# END LY ROUTE DPDK\n' >> "$fixture/startup.conf"
+LY_ROUTE_VFIO_BOOTSTRAP=boot run_prepare "$fixture" > "$fixture/log" 2>&1
+grep -q 'no verified DPDK owner; Linux retains NIC drivers' "$fixture/log"
+[ "$(basename "$(readlink -f "$fixture/sys/bus/pci/devices/0000:03:00.0/driver")")" = igb ]
+if grep -q 'BEGIN LY ROUTE DPDK' "$fixture/startup.conf"; then
+  echo 'stale DPDK block survived boot preflight' >&2
+  exit 1
+fi
+
+# A null/empty data_interfaces list must not raise TypeError or block startup.
+fixture=$(setup_fixture null-inventory no)
+printf '%s\n' '{"schema_version":1,"management":{"linux_interface":"enp1s0","pci":"0000:01:00.0"},"data_interfaces":null}' > "$fixture/inventory.json"
+run_prepare "$fixture" > "$fixture/log" 2>&1
+grep -q 'no DPDK data interface; Linux retains NIC drivers' "$fixture/log"
+
+# A failed takeover candidate must return the port to its kernel driver and
+# remove its startup entry, leaving no stale/duplicate dev line.
+fixture=$(setup_fixture release no)
+run_prepare "$fixture" > "$fixture/log" 2>&1
+PATH="$tmp/bin:$PATH" \
+  LY_ROUTE_SYSFS_ROOT="$fixture/sys" \
+  LY_ROUTE_DPDK_OWNERSHIP_STATE="$fixture/ownership.json" \
+  LY_ROUTE_VPP_STARTUP_CONFIG="$fixture/startup.conf" \
+  LY_ROUTE_PCI_BIND_HELPER="$tmp/bin/bind-helper" \
+  sh "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/release-dpdk-port.sh" 0000:03:00.0 > "$fixture/release.log" 2>&1
+grep -q 'DPDK released: 0000:03:00.0 uio_pci_generic -> igb' "$fixture/release.log"
+[ "$(basename "$(readlink -f "$fixture/sys/bus/pci/devices/0000:03:00.0/driver")")" = igb ]
+if grep -q 'dev 0000:03:00.0' "$fixture/startup.conf"; then
+  echo 'stale dev entry survived release' >&2
+  exit 1
+fi
+[ ! -e "$fixture/ownership.json" ]
 
 printf 'ownership preflight scenarios passed\n'

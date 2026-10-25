@@ -156,6 +156,63 @@ func TestCommittedCapabilityReportRecordsTransport(t *testing.T) {
 	}
 }
 
+func TestSelectNativePathApprovesNonIntelDPDKAttach(t *testing.T) {
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	proof := candidateProof(now, DataplaneTierDPDK, NativeHookDPDK, NativeModeDPDKUIO, 75)
+	proof.IOMMUGroup = "none"
+	proof.IOMMUProtected = false
+	proof.VFIOAvailable = false
+	proof.UIOPCIAvailable = true
+	proof.Transport = "uio"
+	proof.KernelDriver = "vmxnet3"
+	proof.LinkState = "up"
+	proof.HardwareLink = "up"
+	proof.DriverModel = "VMware vmxnet3"
+	path, err := SelectNativePath(NativePathRequest{
+		ManagementInterface: "eth0",
+		Now:                 now,
+		Assignments: []NativeAssignment{{
+			LinuxInterface: "eth1",
+			Explicit:       true,
+			Candidates:     []CapabilityProof{proof},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("non-Intel VPP DPDK attach was rejected: %v", err)
+	}
+	if path.Tier != DataplaneTierDPDK || len(path.Attachments) != 1 {
+		t.Fatalf("path = %#v", path)
+	}
+}
+
+func TestSelectNativePathRejectsDPDKAttachWithDownLink(t *testing.T) {
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	proof := candidateProof(now, DataplaneTierDPDK, NativeHookDPDK, NativeModeDPDKUIO, 75)
+	proof.IOMMUGroup = "none"
+	proof.IOMMUProtected = false
+	proof.VFIOAvailable = false
+	proof.UIOPCIAvailable = true
+	proof.Transport = "uio"
+	proof.KernelDriver = "vmxnet3"
+	proof.LinkState = "down"
+	_, err := SelectNativePath(NativePathRequest{
+		ManagementInterface: "eth0",
+		Now:                 now,
+		Assignments: []NativeAssignment{{
+			LinuxInterface: "eth1",
+			Explicit:       true,
+			Candidates:     []CapabilityProof{proof},
+		}},
+	})
+	locked, ok := err.(*DataplaneLockedError)
+	if !ok {
+		t.Fatalf("error = %T %v, want dataplane_locked for a down DPDK link", err, err)
+	}
+	if !candidateReasonContains(locked.Candidates, "link state is down") {
+		t.Fatalf("candidate reasons = %#v", locked.Candidates)
+	}
+}
+
 func candidateReasonContains(evaluations []CandidateEvaluation, expected string) bool {
 	for _, evaluation := range evaluations {
 		for _, reason := range evaluation.Reasons {

@@ -28,11 +28,12 @@ case "$*" in
   'show plugin') printf '%s\n' "$VPPCTL_PLUGINS" ;;
   'show cli') printf '%s\n' 'show dpdk interface' ;;
   'show hardware-interfaces')
-    printf '%s 1 up %s\n  Intel e1000\n    pci: device 8086:1539 address %s numa 0\n' \
-      "${VPPCTL_VPP_INTERFACE:-GigabitEthernet3/0/0}" "${VPPCTL_VPP_INTERFACE:-GigabitEthernet3/0/0}" "${VPPCTL_ACTIVE_PCI:-}"
+    printf '%s 1 up %s\n  %s\n    pci: device 8086:1539 address %s numa 0\n    carrier %s\n' \
+      "${VPPCTL_VPP_INTERFACE:-GigabitEthernet3/0/0}" "${VPPCTL_VPP_INTERFACE:-GigabitEthernet3/0/0}" \
+      "${VPPCTL_DRIVER_MODEL:-Intel e1000}" "${VPPCTL_ACTIVE_PCI:-}" "${VPPCTL_HARDWARE_LINK:-up}"
     ;;
   show\ hardware-interfaces\ *)
-    printf '%s PCI %s\n  Intel e1000\n' "$3" "${VPPCTL_ACTIVE_PCI:-}" ;;
+    printf '%s PCI %s\n  %s\n    carrier %s\n' "$3" "${VPPCTL_ACTIVE_PCI:-}" "${VPPCTL_DRIVER_MODEL:-Intel e1000}" "${VPPCTL_HARDWARE_LINK:-up}" ;;
   'show threads') printf '%s\n' "${VPPCTL_THREADS:-vpp_main}" ;;
   'show dpdk interface hqos placement') printf '%s\n' "${VPPCTL_HQOS_PLACEMENT:-}" ;;
   create\ interface\ af_xdp*)
@@ -43,7 +44,7 @@ case "$*" in
     esac
     ;;
   create\ interface\ rdma*) [ "${VPPCTL_RDMA_SUCCESS:-0}" = 1 ] ;;
-  show\ interface\ *) printf '%s up\n' "$3" ;;
+  show\ interface\ *) printf '%s %s\n' "$3" "${VPPCTL_LINK_STATE:-up}" ;;
   *) exit 0 ;;
 esac
 EOF
@@ -138,6 +139,7 @@ EOF
 setup_inventory_uio_fixture() {
   scenario=$1
   interface_name=$2
+  kernel_driver=${3:-igb}
   scenario_dir="$tmp/$scenario"
   device="$scenario_dir/sys/devices/pci0000:00/0000:03:00.0"
   driver="$scenario_dir/sys/bus/pci/drivers/uio_pci_generic"
@@ -147,7 +149,7 @@ setup_inventory_uio_fixture() {
   ln -s "$driver" "$device/driver"
   printf '%s\n' 64 > "$scenario_dir/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
   cat > "$scenario_dir/inventory.json" <<EOF
-{"schema_version":1,"source":"test","management":{"linux_interface":"eth0","pci":"0000:01:00.0"},"data_interfaces":[{"linux_interface":"$interface_name","pci":"0000:03:00.0","mac":"00:11:22:33:44:55","kernel_driver":"igb","role":"data"}]}
+{"schema_version":1,"source":"test","management":{"linux_interface":"eth0","pci":"0000:01:00.0"},"data_interfaces":[{"linux_interface":"$interface_name","pci":"0000:03:00.0","mac":"00:11:22:33:44:55","kernel_driver":"$kernel_driver","role":"data"}]}
 EOF
   chmod 0600 "$scenario_dir/inventory.json"
 }
@@ -206,6 +208,33 @@ grep -q '"high_performance":true' "$tmp/dpdk-uio/proof.json"
 grep -q '"acceptance_only":false' "$tmp/dpdk-uio/proof.json"
 grep -q '"vpp_interface":"GigabitEthernet3/0/0"' "$tmp/dpdk-uio/proof.json"
 grep -q '"kernel_driver":"igb"' "$tmp/dpdk-uio/proof.json"
+
+# Any NIC model is valid when VPP attaches it and reports up. vmxnet3 is the
+# hardware-breadth regression that must never be gated on Intel e1000/igb.
+setup_inventory_uio_fixture dpdk-vmxnet3 eth1 vmxnet3
+VPPCTL_ACTIVE_PCI=0000:03:00.0 VPPCTL_DRIVER_MODEL='VMware vmxnet3' \
+  run_check dpdk-vmxnet3 eth0 eth1 dpdk_plugin.so 0
+grep -q '"dataplane_state": "dpdk_ready"' "$tmp/dpdk-vmxnet3/readiness.json"
+grep -q '"driver_model":"VMware vmxnet3"' "$tmp/dpdk-vmxnet3/proof.json"
+grep -q '"high_performance":true' "$tmp/dpdk-vmxnet3/proof.json"
+
+# A down VPP interface is recorded but is not treated as an up native attach.
+setup_inventory_uio_fixture dpdk-down eth1 vmxnet3
+VPPCTL_ACTIVE_PCI=0000:03:00.0 VPPCTL_DRIVER_MODEL='VMware vmxnet3' \
+  VPPCTL_LINK_STATE=down VPPCTL_HARDWARE_LINK=down \
+  run_check dpdk-down eth0 eth1 dpdk_plugin.so 0
+grep -q '"link_state":"down"' "$tmp/dpdk-down/proof.json"
+grep -q '"hardware_link":"down"' "$tmp/dpdk-down/proof.json"
+
+# An empty probe for the same realizable interfaces must not erase an existing
+# valid proof.
+mkdir -p "$tmp/preserved/sys/class/net/eth1" "$tmp/preserved/sys"
+cat > "$tmp/preserved/proof.json" <<'EOF'
+{"management_interface":"eth0","proofs":[{"linux_interface":"eth1","candidates":[{"tier":"vpp_native","hook":"af_xdp","mode":"zero_copy","source":"runtime_probe","runtime_verified":true,"native":true,"high_performance":true,"observed_at":"2026-10-25T12:00:00Z","valid_until":"2030-10-25T12:00:00Z","performance_score":100,"mac_address":"00:11:22:33:44:55"}]}]}
+EOF
+chmod 0600 "$tmp/preserved/proof.json"
+run_check preserved eth0 eth1 unrelated_plugin.so 0
+grep -q '"hook":"af_xdp"' "$tmp/preserved/proof.json"
 
 setup_active_dpdk_fixture dpdk-active eth1
 VPPCTL_ACTIVE_PCI=0000:03:00.0 run_check dpdk-active eth0 eth1 dpdk_plugin.so 0

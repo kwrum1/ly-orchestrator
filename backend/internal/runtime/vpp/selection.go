@@ -82,6 +82,8 @@ type CapabilityProof struct {
 	Transport           string      `json:"transport,omitempty"`
 	VPPInterface        string      `json:"vpp_interface,omitempty"`
 	LinkState           string      `json:"link_state,omitempty"`
+	HardwareLink        string      `json:"hardware_link,omitempty"`
+	DriverModel         string      `json:"driver_model,omitempty"`
 	MACAddress          string      `json:"mac_address,omitempty"`
 	Source              ProofSource `json:"source"`
 	RuntimeVerified     bool        `json:"runtime_verified"`

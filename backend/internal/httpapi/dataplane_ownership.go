@@ -137,6 +137,142 @@ func dataInterfaceOnKernelDriver(name string) bool {
 	return current != "" && current != "." && current != "vfio-pci" && current != "uio_pci_generic"
 }
 
+type dpdkTakeoverFailure struct {
+	LinuxInterface string
+	PCIAddress     string
+	Reason         string
+}
+
+// verifyDPDKTakeovers checks the destructive candidates after VPP has started.
+// A takeover is only verified when the VPP interface for the PCI exists and its
+// show-interface state is up. The hardware model is deliberately not a gate:
+// any NIC that VPP attaches and brings up is a valid native path.
+func (server *Server) verifyDPDKTakeovers(ctx context.Context, interfaces []string) []dpdkTakeoverFailure {
+	inventory, err := dataplane.LoadInventory(dataplaneInventoryPath())
+	if err != nil {
+		return []dpdkTakeoverFailure{{Reason: "dataplane inventory is unreadable: " + err.Error()}}
+	}
+	byInterface := map[string]dataplane.InventoryInterface{}
+	for _, item := range inventory.DataInterfaces {
+		byInterface[strings.TrimSpace(item.LinuxInterface)] = item
+	}
+	vppctl := envOrDefault("LY_ROUTE_VPPCTL", "vppctl")
+	hardwareOutput, hardwareErr := exec.CommandContext(ctx, vppctl, "show", "hardware-interfaces").Output()
+	if hardwareErr != nil {
+		return []dpdkTakeoverFailure{{Reason: "vppctl show hardware-interfaces failed: " + hardwareErr.Error()}}
+	}
+	failures := []dpdkTakeoverFailure{}
+	for _, name := range interfaces {
+		name = strings.TrimSpace(name)
+		item, ok := byInterface[name]
+		if !ok || strings.TrimSpace(item.PCIAddress) == "" {
+			continue
+		}
+		pci := strings.TrimSpace(item.PCIAddress)
+		driverPath := filepath.Join(sysfsRoot(), "bus/pci/devices", pci, "driver")
+		driver, driverErr := filepath.EvalSymlinks(driverPath)
+		if driverErr != nil {
+			continue
+		}
+		current := filepath.Base(driver)
+		if current != "vfio-pci" && current != "uio_pci_generic" {
+			continue
+		}
+		vppInterface := findVPPInterfaceByPCI(string(hardwareOutput), pci)
+		if vppInterface == "" {
+			failures = append(failures, dpdkTakeoverFailure{LinuxInterface: name, PCIAddress: pci, Reason: "VPP did not create an interface for the PCI device"})
+			continue
+		}
+		interfaceOutput, interfaceErr := exec.CommandContext(ctx, vppctl, "show", "interface", vppInterface).Output()
+		if interfaceErr != nil {
+			failures = append(failures, dpdkTakeoverFailure{LinuxInterface: name, PCIAddress: pci, Reason: "VPP interface readback failed: " + interfaceErr.Error()})
+			continue
+		}
+		state := vppInterfaceState(string(interfaceOutput), vppInterface)
+		if state != "up" {
+			failures = append(failures, dpdkTakeoverFailure{LinuxInterface: name, PCIAddress: pci, Reason: "VPP interface " + vppInterface + " state is " + nonEmpty(state, "unknown") + ", not up"})
+			continue
+		}
+	}
+	return failures
+}
+
+func findVPPInterfaceByPCI(output, pci string) string {
+	padded := pci
+	if dot := strings.LastIndexByte(pci, '.'); dot >= 0 && len(pci)-dot == 2 {
+		padded = pci[:dot+1] + "0" + pci[dot+1:]
+	}
+	current := ""
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if line != "" && line[0] != ' ' && line[0] != '\t' && trimmed != "" {
+			current = strings.Fields(trimmed)[0]
+			continue
+		}
+		if strings.Contains(line, "address "+pci) || strings.Contains(line, "address "+padded) {
+			return current
+		}
+	}
+	return ""
+}
+
+func vppInterfaceState(output, name string) string {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != name {
+			continue
+		}
+		for _, field := range fields {
+			if field == "up" || field == "down" {
+				return field
+			}
+		}
+	}
+	return ""
+}
+
+func (server *Server) releaseFailedDPDKTakeovers(ctx context.Context, failures []dpdkTakeoverFailure) bool {
+	if len(failures) == 0 {
+		return false
+	}
+	command := envOrDefault("LY_ROUTE_DPDK_RELEASE_COMMAND", "/usr/lib/ly-route/release-dpdk-port.sh")
+	released := false
+	for _, failure := range failures {
+		if strings.TrimSpace(failure.PCIAddress) == "" {
+			log.Printf("dataplane takeover rejected: %s: %s", failure.LinuxInterface, failure.Reason)
+			continue
+		}
+		output, err := exec.CommandContext(ctx, command, failure.PCIAddress).CombinedOutput()
+		if err != nil {
+			log.Printf("dataplane takeover release failed for %s (%s): %v: %s", failure.LinuxInterface, failure.PCIAddress, err, strings.TrimSpace(string(output)))
+			continue
+		}
+		log.Printf("dataplane takeover rejected: %s (%s): %s; restored kernel driver", failure.LinuxInterface, failure.PCIAddress, failure.Reason)
+		released = true
+	}
+	return released
+}
+
+func (server *Server) restartVPPAndWait(ctx context.Context) bool {
+	restart := envOrDefault("LY_ROUTE_VPP_RESTART_COMMAND", "systemctl restart vpp.service")
+	if output, err := exec.CommandContext(ctx, "/bin/sh", "-c", restart).CombinedOutput(); err != nil {
+		log.Printf("dataplane ownership VPP restart failed: %v: %s", err, strings.TrimSpace(string(output)))
+		return false
+	}
+	vppctl := envOrDefault("LY_ROUTE_VPPCTL", "vppctl")
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if err := exec.CommandContext(ctx, vppctl, "show", "version").Run(); err == nil {
+			return true
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			log.Printf("dataplane ownership bootstrap: VPP did not become ready within 30s")
+			return false
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 // bootstrapDataplaneOwnership performs the same ownership preflight the boot
 // service runs, but on demand before an apply. It exists because an operator
 // can configure interfaces through the product API on a freshly installed
@@ -176,21 +312,26 @@ func (server *Server) bootstrapDataplaneOwnership(ctx context.Context) bool {
 		log.Printf("dataplane ownership bootstrap failed: %v: %s", err, strings.TrimSpace(string(output)))
 		return false
 	}
-	restart := envOrDefault("LY_ROUTE_VPP_RESTART_COMMAND", "systemctl restart vpp.service")
-	if output, err := exec.CommandContext(ctx, "/bin/sh", "-c", restart).CombinedOutput(); err != nil {
-		log.Printf("dataplane ownership VPP restart failed: %v: %s", err, strings.TrimSpace(string(output)))
-		return false
-	}
-	vppctl := envOrDefault("LY_ROUTE_VPPCTL", "vppctl")
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		if err := exec.CommandContext(ctx, vppctl, "show", "version").Run(); err == nil {
-			return true
+	if !server.restartVPPAndWait(ctx) {
+		// The candidate VPP start failed. Return every candidate port to its
+		// kernel driver so the AF fallback can still be probed.
+		failures := []dpdkTakeoverFailure{}
+		for _, name := range interfaces {
+			if item, ok := readInventoryInterface(name); ok {
+				failures = append(failures, dpdkTakeoverFailure{LinuxInterface: name, PCIAddress: item.PCIAddress, Reason: "VPP failed to start with the candidate DPDK devices"})
+			}
 		}
-		if ctx.Err() != nil || time.Now().After(deadline) {
-			log.Printf("dataplane ownership bootstrap: VPP did not become ready within 30s")
-			return false
-		}
-		time.Sleep(500 * time.Millisecond)
+		_ = server.releaseFailedDPDKTakeovers(ctx, failures)
+		_ = server.restartVPPAndWait(ctx)
+		return true
 	}
+	failures := server.verifyDPDKTakeovers(ctx, interfaces)
+	if len(failures) > 0 {
+		if server.releaseFailedDPDKTakeovers(ctx, failures) {
+			if !server.restartVPPAndWait(ctx) {
+				return false
+			}
+		}
+	}
+	return true
 }
