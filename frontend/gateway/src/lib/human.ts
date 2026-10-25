@@ -165,6 +165,10 @@ export function takeoverInfo(item: any): TakeoverInfo {
 
 /** Link state is deliberately a separate, neutral secondary label. */
 export function linkInfo(item: any): LinkInfo {
+  const down = normalized(item?.link_state) === "down";
+  // Physical disconnection is the strongest signal: a pending verification is
+  // not actionable until the cable is back, so say 网线未连接 first.
+  if (down) return { label: "网线未连接", down: true, pending: false };
   const verification = normalized(item?.verification);
   if (verification === "pending_link") {
     return { label: "等待链路", down: false, pending: true };
@@ -172,8 +176,6 @@ export function linkInfo(item: any): LinkInfo {
   if (verification === "failed") {
     return { label: "验证未通过", down: false, pending: false };
   }
-  const down = normalized(item?.link_state) === "down";
-  if (down) return { label: "网线未连接", down: true, pending: false };
   const mbps = Number(item?.link_speed_mbps);
   if (Number.isFinite(mbps) && mbps > 0) {
     return {
