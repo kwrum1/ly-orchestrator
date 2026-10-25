@@ -21,7 +21,7 @@ func gatewayDiffHasDelete(name string, diff vpp.GatewayDiff) bool {
 	case "qos":
 		return len(diff.QoS.DeleteQoS) > 0
 	case "nat44":
-		return len(diff.NAT44.DeleteStaticMappings) > 0
+		return len(diff.NAT44.DeleteStaticMappings) > 0 || len(diff.NAT44.DeletePoolAddresses) > 0
 	case "port-maps":
 		return len(diff.PortMaps.DeletePortMappings) > 0
 	default:
@@ -44,7 +44,11 @@ func gatewayDiffHasApply(name string, diff vpp.GatewayDiff) bool {
 	case "qos":
 		return len(diff.QoS.QoS) > 0
 	case "nat44":
-		return len(diff.NAT44.StaticMappings) > 0
+		// The static WAN pool is part of NAT44 initialization even when no
+		// static/port mapping changed this generation. Re-running the
+		// idempotent initialize keeps every WAN's own outside address bound
+		// after a WAN-group membership/config change.
+		return len(diff.NAT44.StaticMappings) > 0 || len(diff.NAT44.PoolAddresses) > 0
 	case "port-maps":
 		return len(diff.PortMaps.PortMappings) > 0
 	default:

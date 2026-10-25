@@ -127,7 +127,8 @@ func TestNAT44InitializeAddsOutsideWANPoolAddress(t *testing.T) {
 		t.Fatal("NAT44 initialize operation is missing")
 	}
 	for _, required := range []string{
-		"?nat44 add interface address lyroute-enp0s3",
+		"?nat44 add interface address lyroute-enp0s3 del",
+		"?nat44 add address 100.77.0.2 tenant-vrf 0",
 		"show nat44 addresses",
 		"?set interface nat44 in lyroute-enp0s4",
 		"set interface nat44 out lyroute-enp0s3 output-feature",
@@ -165,6 +166,7 @@ func TestApplyNAT44AddsOutsideWANPoolAddress(t *testing.T) {
 		Behavior:            nat.BehaviorEndpointDependent,
 		IngressVPPInterface: "lyroute-enp0s4",
 		WANIngressInterface: "lyroute-enp0s3",
+		PoolAddresses:       []NAT44PoolAddress{{Interface: "lyroute-enp0s3", Address: "100.77.0.2"}},
 		PortMappings:        []nat.PortMapping{mapping},
 	}, Snapshot{})
 	if err != nil {
@@ -181,7 +183,8 @@ func TestApplyNAT44AddsOutsideWANPoolAddress(t *testing.T) {
 		t.Fatal("NAT44 initialize operation was not applied")
 	}
 	for _, required := range []string{
-		"?nat44 add interface address lyroute-enp0s3",
+		"?nat44 add interface address lyroute-enp0s3 del",
+		"?nat44 add address 100.77.0.2 tenant-vrf 0",
 		"show nat44 addresses",
 	} {
 		if !strings.Contains(initialize, required) {

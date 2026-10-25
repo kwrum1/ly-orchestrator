@@ -379,13 +379,21 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 		// only when the pool address belongs to the packet's inside FIB
 		// (snat_address_t.fib_index == rx_fib_index). An address added with
 		// "nat44 add interface address" keeps fib_index ~0, so with more than
-		// one WAN VPP always picked the last pool address regardless of the
-		// routed WAN. Bind static WAN addresses to the inside (default) VRF so
-		// the WAN-group active member really selects its own address; keep the
+		// one WAN VPP ignored the routed WAN and picked a pool entry by hash
+		// order. Bind static WAN addresses to the inside (default) VRF so the
+		// WAN-group active member really selects its own address; keep the
 		// interface form for runtime-addressed WANs (DHCP/PPPoE).
+		staticPool := nat44PoolAddressMap(nat44PoolAddresses(plan.AddressAssignments))
 		for _, wan := range natOutsideInterfaces(plan) {
 			if plan.NAT.Behavior == nat.BehaviorFullCone {
 				initializeCommands = append(initializeCommands, "?nat44 ei add interface address "+wan)
+				continue
+			}
+			if address, ok := staticPool[wan]; ok {
+				initializeCommands = append(initializeCommands,
+					"?nat44 add interface address "+wan+" del",
+					"?nat44 add address "+address+" tenant-vrf 0",
+				)
 				continue
 			}
 			initializeCommands = append(initializeCommands, "?nat44 add interface address "+wan)
