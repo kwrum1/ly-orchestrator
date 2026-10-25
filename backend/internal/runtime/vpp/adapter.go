@@ -241,11 +241,13 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 	nativePath, err := SelectNativePath(plan.NativePath)
 	if err != nil {
 		var locked *DataplaneLockedError
-		if !plan.AllowUnprovenOperations || !errors.As(err, &locked) {
+		var afRequired *AFFallbackRequiredError
+		if !plan.AllowUnprovenOperations || !(errors.As(err, &locked) || errors.As(err, &afRequired)) {
 			return nil, err
 		}
 		// Reconciliation of a desired or persisted plan must still be able to
-		// derive cleanup commands after the live tier proof expired. This is
+		// derive cleanup commands after the live tier proof expired, or when a
+		// persisted pre-consent plan only carries an AF_PACKET proof. This is
 		// never used for an apply: only reconciliation helpers set the flag.
 		declarative := plan.NativePath
 		declarative.AllowUnproven = true
@@ -355,18 +357,32 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 	}
 	if planRequiresNAT(plan) {
 		initializeCommands := natInitializeCommands(plan.NAT.Behavior)
+		lan := gatewayLANVPPInterface(plan)
 		// NAT44-ED needs the LAN interface on the inside of the NAT domain.
 		// Without it, return traffic and LAN-to-public-address hairpin traffic
-		// never enter the NAT44 input feature.  The WAN side is configured by
-		// the per-mapping commands below.
-		if plan.NAT.Behavior != nat.BehaviorFullCone {
-			if lan := gatewayLANVPPInterface(plan); lan != "" {
-				initializeCommands = append(initializeCommands, "set interface nat44 in "+lan)
+		// never enter the NAT44 input feature. Every WAN outside interface is
+		// bound explicitly so a WAN-group member is usable before (and without)
+		// any port mapping.
+		if plan.NAT.Behavior != nat.BehaviorFullCone && lan != "" {
+			for _, wan := range natOutsideInterfaces(plan) {
+				initializeCommands = append(initializeCommands,
+					"?set interface nat44 in "+lan,
+					"?set interface nat44 in "+wan+" output-feature del",
+					"?set interface nat44 out "+wan+" del",
+					"?set interface nat44 out "+wan+" output-feature del",
+					"set interface nat44 out "+wan+" output-feature",
+				)
 			}
 		}
 		// NAT44 requires the outside interface address in the translation
-		// pool. Without it VPP answers "out of ports" and drops every
-		// LAN->WAN flow even though the inside/outside bindings are correct.
+		// pool. VPP selects the outside address from the packet's TX interface
+		// only when the pool address belongs to the packet's inside FIB
+		// (snat_address_t.fib_index == rx_fib_index). An address added with
+		// "nat44 add interface address" keeps fib_index ~0, so with more than
+		// one WAN VPP always picked the last pool address regardless of the
+		// routed WAN. Bind static WAN addresses to the inside (default) VRF so
+		// the WAN-group active member really selects its own address; keep the
+		// interface form for runtime-addressed WANs (DHCP/PPPoE).
 		for _, wan := range natOutsideInterfaces(plan) {
 			if plan.NAT.Behavior == nat.BehaviorFullCone {
 				initializeCommands = append(initializeCommands, "?nat44 ei add interface address "+wan)
@@ -1061,6 +1077,11 @@ func planRequiresNAT(plan Plan) bool {
 	if len(plan.NAT.StaticMappings) > 0 || len(plan.NAT.PortMappings) > 0 || len(plan.DNSServiceNetworks) > 0 {
 		return true
 	}
+	for _, policy := range plan.Policy.RoutePolicies {
+		if strings.EqualFold(strings.TrimSpace(policy.Action), "nat") {
+			return true
+		}
+	}
 	for _, steering := range plan.Proxy.VPPSteering {
 		if steering.TargetKind == "vpp.proxy-service.network" {
 			return true
@@ -1089,11 +1110,12 @@ func natOutsideInterfaces(plan Plan) []string {
 	for _, mapping := range plan.NAT.PortMappings {
 		add(mapping.WANInterface)
 	}
-	if len(result) == 0 {
-		for _, assignment := range plan.AddressAssignments {
-			if strings.EqualFold(strings.TrimSpace(assignment.Role), "wan") {
-				add(assignment.VPPInterface)
-			}
+	// Every configured WAN is an outside interface, not only the WANs that
+	// currently own a port mapping. A WAN-group backup must already have its
+	// address in the translation pool when it becomes the active member.
+	for _, assignment := range plan.AddressAssignments {
+		if strings.EqualFold(strings.TrimSpace(assignment.Role), "wan") {
+			add(assignment.VPPInterface)
 		}
 	}
 	return result
@@ -1139,11 +1161,16 @@ func natStaticMappingCommandsForBehavior(behavior nat.Behavior, mapping nat.Stat
 		// (WAN). Marking the WAN as an input/inside interface as well is wrong
 		// and prevents hairpin traffic from being routed back out the LAN.
 		commands = append(commands,
+			// The combined "in <lan> out <wan>" form clears the
+			// output-feature flag on every other outside WAN, so a
+			// multi-WAN apply left only the last mapping able to translate
+			// policy-routed traffic. Bind the LAN inside once and re-arm
+			// this WAN's output-feature flag independently.
 			fmt.Sprintf("?set interface nat44 in %s output-feature del", mapping.WANInterface),
+			fmt.Sprintf("?set interface nat44 out %s del", mapping.WANInterface),
 			fmt.Sprintf("?set interface nat44 out %s output-feature del", mapping.WANInterface),
-			fmt.Sprintf("?set interface nat44 in lyroute-$LY_ROUTE_LAN_INTERFACE out %s output-feature del", mapping.WANInterface),
-			fmt.Sprintf("set interface nat44 in lyroute-$LY_ROUTE_LAN_INTERFACE out %s output-feature", mapping.WANInterface),
-			fmt.Sprintf("?set interface nat44 out %s output-feature", mapping.WANInterface),
+			"?set interface nat44 in lyroute-$LY_ROUTE_LAN_INTERFACE",
+			fmt.Sprintf("set interface nat44 out %s output-feature", mapping.WANInterface),
 		)
 	}
 	commands = append(commands,
@@ -1181,11 +1208,16 @@ func natPortMappingCommandsForBehavior(behavior nat.Behavior, mapping nat.PortMa
 	commands := []string{}
 	if mapping.WANInterface != "" {
 		commands = append(commands,
+			// The combined "in <lan> out <wan>" form clears the
+			// output-feature flag on every other outside WAN, so a
+			// multi-WAN apply left only the last mapping able to translate
+			// policy-routed traffic. Bind the LAN inside once and re-arm
+			// this WAN's output-feature flag independently.
 			fmt.Sprintf("?set interface nat44 in %s output-feature del", mapping.WANInterface),
+			fmt.Sprintf("?set interface nat44 out %s del", mapping.WANInterface),
 			fmt.Sprintf("?set interface nat44 out %s output-feature del", mapping.WANInterface),
-			fmt.Sprintf("?set interface nat44 in lyroute-$LY_ROUTE_LAN_INTERFACE out %s output-feature del", mapping.WANInterface),
-			fmt.Sprintf("set interface nat44 in lyroute-$LY_ROUTE_LAN_INTERFACE out %s output-feature", mapping.WANInterface),
-			fmt.Sprintf("?set interface nat44 out %s output-feature", mapping.WANInterface),
+			"?set interface nat44 in lyroute-$LY_ROUTE_LAN_INTERFACE",
+			fmt.Sprintf("set interface nat44 out %s output-feature", mapping.WANInterface),
 		)
 	}
 	if mapping.Hairpin {

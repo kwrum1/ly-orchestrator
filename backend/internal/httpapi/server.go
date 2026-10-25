@@ -2837,7 +2837,10 @@ func (server *Server) handleDesiredCollection(resourceType string) http.HandlerF
 			if resourceType == "traffic_control" {
 				items = server.decorateTrafficControlRuntimeStates(r.Context(), items)
 			}
-			if resourceType == "dns_upstream" || resourceType == "dns_policy" {
+			if resourceType == "dns_upstream" {
+				items = server.decorateDNSUpstreamRuntimeStates(r.Context(), server.decorateDNSRuntimeCapabilities(r.Context(), items))
+			}
+			if resourceType == "dns_policy" {
 				items = server.decorateDNSRuntimeCapabilities(r.Context(), items)
 			}
 			if resourceType == "wan_link" {
@@ -2941,7 +2944,10 @@ func (server *Server) handleDesiredItem(resourceType string) http.HandlerFunc {
 			if resourceType == "traffic_control" {
 				item = server.decorateTrafficControlRuntimeState(r.Context(), item)
 			}
-			if resourceType == "dns_upstream" || resourceType == "dns_policy" {
+			if resourceType == "dns_upstream" {
+				item = server.decorateDNSUpstreamRuntimeStates(r.Context(), server.decorateDNSRuntimeCapabilities(r.Context(), []map[string]any{item}))[0]
+			}
+			if resourceType == "dns_policy" {
 				item = server.decorateDNSRuntimeCapabilities(r.Context(), []map[string]any{item})[0]
 			}
 			if resourceType == "wan_link" {
@@ -5324,12 +5330,8 @@ func (server *Server) executeRuntimeApply(w http.ResponseWriter, r *http.Request
 	server.publishRuntimeResult(lease, RuntimeApplyResult{Status: "committed", RuntimeState: "running", TransactionID: transactionID, Receipt: receipt, Readback: readback, GatewayPlan: &plan.GatewayPlan, GatewayEvidence: execution.GatewayResult.Evidence, AppliedAt: receipt.AppliedAt})
 	components := server.runtimeStatusComponents(applyCtx, appliedArtifacts, len(plan.VppOperations) > 0)
 	components = applyCapabilityFailures(components, capabilityFailures, transactionID, server.now().UTC())
-	if pathUsesAFPacket(plan.SelectedNativePath) {
-		components = append(components, RuntimeComponentState{
-			Name:   "af_packet_fallback",
-			State:  "degraded",
-			Reason: vpp.AFPacketDegradedReason,
-		})
+	if component, ok := afPacketRuntimeComponent(plan.SelectedNativePath); ok {
+		components = append(components, component)
 	}
 	state := runtimeState(components)
 	statusCode := http.StatusOK
@@ -7448,7 +7450,7 @@ func waitForPPPoEIPv6Convergence(ctx context.Context, wanID string, lanInterface
 	if statusDir == "" {
 		statusDir = "/run/ly-route/pppoe"
 	}
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := pppoeIPv6ConvergenceDeadline(ctx)
 	var lastReason string
 	var lastReconcile time.Time
 	for time.Now().Before(deadline) {
@@ -7507,7 +7509,35 @@ func waitForPPPoEIPv6Convergence(ctx context.Context, wanID string, lanInterface
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
-	return fmt.Errorf("WAN %s IPv6 prefix delegation did not converge: %s", wanID, lastReason)
+	return fmt.Errorf("WAN %s IPv6 prefix delegation did not converge within %s: %s", wanID, pppoeIPv6ConvergenceTimeout(), lastReason)
+}
+
+// pppoeIPv6ConvergenceTimeout bounds the hot-apply wait for a delegated
+// prefix. A fresh dial has to finish PPPoE discovery, LCP, IPv6CP and the
+// first DHCPv6-PD exchange; a flat 30s window raced the client's retry timer.
+// The wait stays bounded and is capped well below the apply deadline.
+func pppoeIPv6ConvergenceTimeout() time.Duration {
+	seconds := 180
+	if raw := strings.TrimSpace(os.Getenv("LY_ROUTE_PPPOE_PD_TIMEOUT_SECONDS")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			seconds = parsed
+		}
+	}
+	if seconds < 30 {
+		seconds = 30
+	}
+	if seconds > 600 {
+		seconds = 600
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func pppoeIPv6ConvergenceDeadline(ctx context.Context) time.Time {
+	deadline := time.Now().Add(pppoeIPv6ConvergenceTimeout())
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	return deadline
 }
 
 func runLiveVPP(ctx context.Context, args ...string) (string, error) {
@@ -8303,6 +8333,24 @@ func pathUsesAFPacket(path vpp.NativePath) bool {
 		}
 	}
 	return false
+}
+
+// afPacketRuntimeComponent reports the AF_PACKET transport as a running
+// component with a performance note. AF_PACKET is only selectable after an
+// explicit consent (the env acceptance switch or the persisted dataplane
+// policy), so it forwards traffic as configured and must not turn an otherwise
+// committed gateway generation into a degraded runtime. Unconsented AF_PACKET
+// is rejected during path selection, so it can never reach this component.
+func afPacketRuntimeComponent(path vpp.NativePath) (RuntimeComponentState, bool) {
+	if !pathUsesAFPacket(path) {
+		return RuntimeComponentState{}, false
+	}
+	return RuntimeComponentState{
+		Name:      "af_packet_fallback",
+		State:     "running",
+		Available: true,
+		Reason:    vpp.AFPacketDegradedReason,
+	}, true
 }
 
 func runtimeState(components []RuntimeComponentState) string {

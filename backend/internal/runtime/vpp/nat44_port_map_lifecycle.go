@@ -85,13 +85,25 @@ func (a Adapter) ApplyNAT44(ctx context.Context, plan NAT44Plan, prior Snapshot,
 		// mapping while NAT44 has no input interface. Synthetic adapter tests
 		// without an ingress interface intentionally skip this step.
 		initialize := natInitializeCommands(plan.Behavior)
+		lan := strings.TrimSpace(plan.IngressVPPInterface)
+		outside := nat44OutsideInterfaces(plan)
 		if plan.Behavior != nat.BehaviorFullCone {
-			initialize = append(initialize, "set interface nat44 in "+strings.TrimSpace(plan.IngressVPPInterface))
+			for _, wan := range outside {
+				initialize = append(initialize,
+					"?set interface nat44 in "+lan,
+					"?set interface nat44 in "+wan+" output-feature del",
+					"?set interface nat44 out "+wan+" del",
+					"?set interface nat44 out "+wan+" output-feature del",
+					"set interface nat44 out "+wan+" output-feature",
+				)
+			}
 		}
 		// NAT44 translates through the outside interface address. Without
 		// it in the pool VPP reports "out of ports" and drops every LAN->WAN
-		// flow even though the inside/outside bindings are correct.
-		for _, wan := range nat44OutsideInterfaces(plan) {
+		// flow even though the inside/outside bindings are correct. Static
+		// addresses are bound to the inside VRF so the TX interface selects
+		// the matching WAN; runtime-addressed WANs keep the interface form.
+		for _, wan := range outside {
 			if plan.Behavior == nat.BehaviorFullCone {
 				initialize = append(initialize, "?nat44 ei add interface address "+wan)
 				continue
