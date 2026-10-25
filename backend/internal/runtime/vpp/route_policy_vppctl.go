@@ -250,7 +250,15 @@ func routePolicySupportsNativePreNAT(policy trafficpolicy.RoutePolicy) bool {
 	if action == "" {
 		action = "route"
 	}
-	if action == "deny" || policy.Path == nil {
+	if action == "deny" {
+		return false
+	}
+	// A WAN-group policy has no single WANPath: its private FIB resolves
+	// through the group table. The native pre-NAT classifier is the only
+	// classifier that runs before NAT rewrites the LAN source, so a group
+	// policy must use it. Falling back to ABF makes the source match
+	// impossible after NAT and the WAN group never carries LAN traffic.
+	if policy.Path == nil && strings.TrimSpace(policy.Egress) == "" {
 		return false
 	}
 	// A proxy-service handoff keeps the full ABF policy/attach lifecycle even

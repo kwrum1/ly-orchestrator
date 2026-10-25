@@ -29,7 +29,37 @@ const (
 
 var allDHCP6Servers = netip.MustParseAddr("ff02::1:2")
 
-const delegatedPrefixRetryInterval = 30 * time.Second
+const (
+	// delegatedPrefixRetryInterval bounds renewal/rebind retries for a lease
+	// that already exists.
+	delegatedPrefixRetryInterval = 30 * time.Second
+	// delegatedPrefixInitialRetryInterval is the first retry after a fresh
+	// session could not acquire a prefix yet (the DHCPv6-PD responder may join
+	// the new ppp interface a moment later). A flat 30s retry raced the
+	// product's bounded hot-apply window on every fresh dial.
+	delegatedPrefixInitialRetryInterval    = 2 * time.Second
+	delegatedPrefixMaxInitialRetryInterval = 8 * time.Second
+)
+
+// delegatedPrefixRetryDelay keeps acquisition retries bounded and quick while
+// converging, and never shortens the renewal backoff of an established lease.
+func delegatedPrefixRetryDelay(hasLease bool, consecutiveFailures int) time.Duration {
+	if hasLease {
+		return delegatedPrefixRetryInterval
+	}
+	if consecutiveFailures < 1 {
+		consecutiveFailures = 1
+	}
+	shift := consecutiveFailures - 1
+	if shift > 4 {
+		shift = 4
+	}
+	delay := delegatedPrefixInitialRetryInterval << shift
+	if delay > delegatedPrefixMaxInitialRetryInterval {
+		delay = delegatedPrefixMaxInitialRetryInterval
+	}
+	return delay
+}
 
 type DelegatedPrefixLease struct {
 	Prefix            netip.Prefix
@@ -165,6 +195,7 @@ func (client *Client) ServeWithDelegatedPrefixRecovery(ctx context.Context, sess
 
 func (client *Client) serveWithDelegatedPrefix(ctx context.Context, session Session, lease DelegatedPrefixLease, update func(context.Context, DelegatedPrefixLease) error) error {
 	nextRenew := time.Time{}
+	consecutiveFailures := 0
 	if lease.valid() {
 		nextRenew = lease.renewAt()
 	} else if session.IPv6Ready {
@@ -187,12 +218,14 @@ func (client *Client) serveWithDelegatedPrefix(ctx context.Context, session Sess
 					}
 				}
 				lease = updated
+				consecutiveFailures = 0
 				nextRenew = lease.renewAt()
 			} else {
 				if lease.valid() && !time.Now().Before(lease.expiresAt()) {
 					return fmt.Errorf("DHCPv6-PD lease expired: %w", err)
 				}
-				nextRenew = time.Now().Add(delegatedPrefixRetryInterval)
+				consecutiveFailures++
+				nextRenew = time.Now().Add(delegatedPrefixRetryDelay(lease.valid(), consecutiveFailures))
 			}
 			continue
 		}

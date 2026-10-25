@@ -29,7 +29,7 @@ const lanLocalPreNATRuleID = 64999
 // reliable source when management and data ports are configured separately.
 func (channel vppctlChannel) preNATRoutePolicyCommands(ctx context.Context, operation Operation, spec routePolicyVPPCTLSpec) ([]string, bool, error) {
 	policy := spec.policy
-	if !spec.apply || policy.Action == "deny" || policy.Path == nil {
+	if !spec.apply || policy.Action == "deny" {
 		return nil, false, nil
 	}
 	results, err := channel.runServiceChainCommands(ctx, operation, "show interface address "+spec.ingress)

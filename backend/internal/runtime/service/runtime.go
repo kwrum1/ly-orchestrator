@@ -1383,9 +1383,11 @@ func RenderGatewayNftablesCapture(plan proxy.NftablesCapturePlan, dns DNSInterce
 				if address.Is6() {
 					family = "ip6"
 				}
-				// Only the LCP copy is a duplicate. SmartDNS listens on this
-				// same gateway address, and its LAN / DNS service TAP input
-				// must not match this rule.
+				// The LCP tap and the VPP host-stack punt tap both
+				// deliver a duplicate of the LAN query. SmartDNS only
+				// binds the loopback stub, so the kernel copy must be
+				// dropped instead of refusing it with ICMP unreachable
+				// while the VPP DNS adapter is still resolving.
 				builder.WriteString(fmt.Sprintf("    iifname %q %s daddr %s udp dport 53 counter drop\n", interfaceName, family, address))
 				builder.WriteString(fmt.Sprintf("    iifname %q %s daddr %s tcp dport 53 counter drop\n", interfaceName, family, address))
 			}

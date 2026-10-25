@@ -498,7 +498,9 @@ func (state *State) setPreNAT(fields []string) {
 		}
 	case "add":
 		state.PreNAT.Enabled = true
-		rule := PreNATRule{}
+		// Each add command describes one source/destination prefix pair, so
+		// the classifier readback reports one prefix per rule.
+		rule := PreNATRule{Prefixes: 1}
 		for index := 4; index < len(fields); index++ {
 			key := fields[index]
 			if key == "bypass" || key == "skip-nat" {

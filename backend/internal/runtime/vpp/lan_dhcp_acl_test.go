@@ -129,7 +129,8 @@ func TestNAT44InitializeAddsOutsideWANPoolAddress(t *testing.T) {
 	for _, required := range []string{
 		"?nat44 add interface address lyroute-enp0s3",
 		"show nat44 addresses",
-		"set interface nat44 in lyroute-enp0s4",
+		"?set interface nat44 in lyroute-enp0s4",
+		"set interface nat44 out lyroute-enp0s3 output-feature",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("NAT44 initialize is missing %q:\n%s", required, text)

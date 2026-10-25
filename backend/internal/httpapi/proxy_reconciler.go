@@ -769,7 +769,7 @@ func (server *Server) restoreProxyCapture(ctx context.Context, egress proxy.Egre
 }
 
 func (server *Server) applyProxyCapture(ctx context.Context, capture proxy.NftablesCapturePlan, assignments []vpp.AddressAssignment) (string, error) {
-	artifacts, err := serviceRuntime.RenderGatewayNftablesCapture(capture, dnsLCPGuardPlan(assignments))
+	artifacts, err := serviceRuntime.RenderGatewayNftablesCapture(capture, dnsLCPGuardPlan(assignments, nil))
 	if err != nil {
 		return "", err
 	}

@@ -567,6 +567,42 @@ def operation_with_name_and_commands(operation, name, commands):
     staged["vppctl_commands"] = commands
     return staged
 
+def strip_native_route_abf(operations):
+    """Drop ACL/ABF mutations for policies the pre-NAT classifier owns.
+
+    Older generations persisted both the native pre-NAT classifier and a
+    legacy ACL/ABF representation. Replaying the ABF for a native policy left
+    an orphaned tagged ACL that blocked deletion of the route. Proxy service
+    handoffs and deny policies keep the legacy representation.
+    """
+    staged = []
+    for operation in operations:
+        if operation_name(operation) != "vpp.route-policy":
+            staged.append(operation)
+            continue
+        payload = operation.get("Payload") or operation.get("payload") or {}
+        path = payload_value(payload, "path", {})
+        path_interface = ""
+        if isinstance(path, dict):
+            path_interface = str(path.get("vpp_interface", "")).strip().lower()
+        egress = str(payload_value(payload, "egress", "")).strip()
+        native_policy = (str(payload_value(payload, "action", "")).strip().lower() != "deny"
+                         and not path_interface.startswith("lypxin")
+                         and (path_interface != "" or egress != ""))
+        if not native_policy:
+            staged.append(operation)
+            continue
+        commands = []
+        for raw in commands_from_operation(operation):
+            command = command_without_optional_prefix(raw)
+            if (command.startswith("set acl-plugin acl ") or
+                    command.startswith("abf policy add ") or
+                    command.startswith("abf attach ip4 policy ")):
+                continue
+            commands.append(raw)
+        staged.append(operation_with_name_and_commands(operation, operation_name(operation), commands))
+    return staged
+
 def stage_route_policy_operations(operations):
     route_indexes = [index for index, operation in enumerate(operations)
                      if operation_name(operation) == "vpp.route-policy"]
@@ -587,10 +623,29 @@ def stage_route_policy_operations(operations):
                 selected.append(raw)
         return selected
 
-    def activation_commands(commands):
+    def activation_commands(operation):
+        commands = commands_from_operation(operation)
+        payload = operation.get("Payload") or operation.get("payload") or {}
+        path = payload_value(payload, "path", {})
+        path_interface = ""
+        if isinstance(path, dict):
+            path_interface = str(path.get("vpp_interface", "")).strip().lower()
+        egress = str(payload_value(payload, "egress", "")).strip()
+        # Policies installed through the native pre-NAT classifier own no
+        # ACL/ABF object. Replaying the legacy ACL/ABF commands for them
+        # created an orphaned ABF whose tagged ACL later blocked route
+        # deletion. Only proxy service handoffs (which keep the legacy
+        # readback) and deny policies still need the ACL/ABF activation.
+        native_policy = (str(payload_value(payload, "action", "")).strip().lower() != "deny"
+                         and not path_interface.startswith("lypxin")
+                         and (path_interface != "" or egress != ""))
         selected = []
         for raw in commands:
             command = command_without_optional_prefix(raw)
+            if native_policy and (command.startswith("set acl-plugin acl ") or
+                                  command.startswith("abf policy add ") or
+                                  command.startswith("abf attach ip4 policy ")):
+                continue
             if (command.startswith("set acl-plugin acl ") or command.startswith("abf policy add ") or
                     command.startswith("abf attach ip4 policy ") or command.startswith("show acl-plugin acl index ") or
                     command.startswith("show abf policy ") or command == "show interface" or
@@ -604,7 +659,7 @@ def stage_route_policy_operations(operations):
     for operation in routes:
         staged.append(operation_with_name_and_commands(operation, "vpp.route-table.populate", populate_commands(commands_from_operation(operation))))
     for operation in routes:
-        staged.append(operation_with_name_and_commands(operation, "vpp.route-policy", activation_commands(commands_from_operation(operation))))
+        staged.append(operation_with_name_and_commands(operation, "vpp.route-policy", activation_commands(operation)))
     route_index_set = set(route_indexes)
     for index, operation in enumerate(operations):
         if index < first_route or index in route_index_set:
@@ -997,6 +1052,20 @@ def operation_lan_interface(operations):
             match = re.search(r"abf attach ip4 policy \d+ priority \d+ (\S+)", command)
             if match:
                 return match.group(1)
+    # Native policies no longer carry the legacy ABF attachment, so also read
+    # the LAN interface from the NAT44 inside binding or the LAN LCP create.
+    for operation in operations:
+        for command in commands_from_operation(operation):
+            command = command_without_optional_prefix(command)
+            match = re.search(r"^set interface nat44 in (\S+)$", command)
+            if match:
+                return match.group(1)
+    for operation in operations:
+        for command in commands_from_operation(operation):
+            command = command_without_optional_prefix(command)
+            match = re.search(r"^lcp create (\S+) host-if \S+$", command)
+            if match:
+                return match.group(1)
     return ""
 
 def install_pre_nat_routes(vppctl, operations, receipt):
@@ -1038,7 +1107,15 @@ def install_pre_nat_routes(vppctl, operations, receipt):
         if str(payload_value(payload, "action", "")).strip().lower() == "deny":
             continue
         path = payload_value(payload, "path", {})
-        if not isinstance(path, dict) or not str(path.get("vpp_interface", "")).strip():
+        if not isinstance(path, dict):
+            continue
+        path_interface = str(path.get("vpp_interface", "")).strip()
+        # A WAN-group policy deliberately has no single WAN path: its private
+        # FIB resolves through the group table. It still needs the native
+        # pre-NAT classifier, otherwise the policy is only installed as a
+        # post-NAT ABF whose LAN source match can never succeed.
+        egress = str(payload_value(payload, "egress", "")).strip()
+        if not path_interface and not egress:
             continue
         resource = operation_resource(operation)
         if not resource:
@@ -1052,7 +1129,7 @@ def install_pre_nat_routes(vppctl, operations, receipt):
         protocols = selector_protocols(payload_value(match, "protocols", []))
         source_ports = selector_ports(payload_value(match, "source_ports", []))
         dest_ports = selector_ports(payload_value(match, "dest_ports", []))
-        skip_nat = str(path.get("vpp_interface", "")).lower().startswith("lypxin")
+        skip_nat = path_interface.lower().startswith("lypxin")
         for source in sources:
             for destination in destinations:
                 for protocol in protocols:
@@ -1170,7 +1247,7 @@ if not isinstance(operations, list):
 if underlay_only:
     operations = [operation for operation in operations if operation_name(operation) == "vpp.dataplane.attach"]
 
-operations = stage_route_policy_operations(operations)
+operations = strip_native_route_abf(stage_route_policy_operations(operations))
 
 command_map = {"operations": {}}
 if os.path.exists(command_map_path):

@@ -136,7 +136,7 @@ type NativePathRequest struct {
 	// AF_PACKET compatibility mode. It participates in the serialized plan so
 	// enabling/disabling the fallback changes the runtime plan hash.
 	AFPacketConsent    bool `json:"af_packet_consent,omitempty"`
-	AcceptanceAFPacket bool `json:"-"`
+	AcceptanceAFPacket bool `json:"acceptance_af_packet,omitempty"`
 	// AllowUnproven derives the attachment list from declarative assignment
 	// data without re-validating live capability proofs. Reconciliation of a
 	// persisted prior generation needs operation identities and commands, not

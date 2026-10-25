@@ -206,16 +206,16 @@ func TestBuildOperationsIncludesNAT44Mappings(t *testing.T) {
 	if !hasOperation(operations, "vpp.nat44-ed.static-mapping") {
 		t.Fatalf("operations missing nat44 mapping: %#v", operations)
 	}
-	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "set interface nat44 in lyroute-eth1 out wan0 output-feature del")
-	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "set interface nat44 in lyroute-eth1 out wan0 output-feature")
+	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "?set interface nat44 in lyroute-eth1")
+	assertOperationCommand(t, operations, "vpp.nat44-ed.static-mapping", "set interface nat44 out wan0 output-feature")
 	var mappingCommands []string
 	for _, operation := range operations {
 		if operation.Name == "vpp.nat44-ed.static-mapping" {
 			mappingCommands = append(mappingCommands, operation.VPPCtlCommands...)
 		}
 	}
-	if !strings.Contains(strings.Join(mappingCommands, "\n"), "set interface nat44 in lyroute-eth1 out wan0 output-feature") {
-		t.Fatal("hairpin port map must bind LAN input to the WAN output interface")
+	if !strings.Contains(strings.Join(mappingCommands, "\n"), "set interface nat44 out wan0 output-feature") {
+		t.Fatal("port map must keep the WAN output-feature binding")
 	}
 	assertOperationCommand(t, operations, "vpp.nat44.initialize", "nat44 plugin enable")
 	assertOperationCommand(t, operations, "vpp.nat44.initialize", "set interface nat44 in lyroute-eth1")
