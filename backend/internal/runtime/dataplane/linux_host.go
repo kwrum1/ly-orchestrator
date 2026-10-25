@@ -16,8 +16,8 @@ import (
 	"ly-route/backend/internal/runtime/vpp"
 )
 
-const managedDPDKStart = "# BEGIN LY-ROUTE MANAGED DPDK"
-const managedDPDKEnd = "# END LY-ROUTE MANAGED DPDK"
+const managedDPDKStart = "# BEGIN LY ROUTE DPDK"
+const managedDPDKEnd = "# END LY ROUTE DPDK"
 
 type CommandRunner interface {
 	Run(context.Context, string, ...string) ([]byte, error)
@@ -480,11 +480,16 @@ func RenderDPDKStartup(current []byte, attachments []vpp.NativeAttachment) ([]by
 	block.WriteString("\n" + managedDPDKStart + "\ndpdk {\n  uio-driver " + driver + "\n")
 	seen := map[string]bool{}
 	for _, attachment := range dpdkAttachments {
-		if !safePCI(attachment.PCIAddress) || !safeVPPName(attachment.VPPInterface) || seen[attachment.PCIAddress] {
+		if !safePCI(attachment.PCIAddress) || seen[attachment.PCIAddress] {
 			return nil, fmt.Errorf("invalid or duplicate DPDK startup attachment")
 		}
 		seen[attachment.PCIAddress] = true
-		fmt.Fprintf(&block, "  dev %s {\n    name %s\n    no-rx-interrupts\n  }\n", attachment.PCIAddress, attachment.VPPInterface)
+		// Do not assign an explicit VPP name: the PCI slot name VPP derives
+		// (for example GigabitEthernet4/0/0) is stable across restarts and is
+		// the name the capability probe and address assignments already use.
+		// A configured name also made VPP reject an otherwise valid device
+		// start on the J1900 i211/UIO path.
+		fmt.Fprintf(&block, "  dev %s\n", attachment.PCIAddress)
 	}
 	if len(seen) == 0 {
 		return nil, errors.New("DPDK startup requires at least one device")
@@ -634,17 +639,4 @@ func safePCI(value string) bool {
 func isDPDKAttachment(attachment vpp.NativeAttachment) bool {
 	return attachment.Tier == vpp.DataplaneTierDPDK || attachment.Hook == vpp.NativeHookDPDK ||
 		attachment.Mode == vpp.NativeModeDPDKVFIO || attachment.Mode == vpp.NativeModeDPDKUIO
-}
-
-func safeVPPName(value string) bool {
-	if value == "" {
-		return false
-	}
-	for _, char := range value {
-		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '_' || char == '-' || char == '.' || char == ':' || char == '/' {
-			continue
-		}
-		return false
-	}
-	return true
 }

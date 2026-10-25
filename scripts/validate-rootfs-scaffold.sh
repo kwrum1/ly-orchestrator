@@ -20,6 +20,7 @@ $repo_root/scripts/rootfs-runtime-smoke.sh
 $repo_root/packaging/runtime-boundaries/gateway.sh
 $repo_root/scripts/test-firstboot-env-migration.sh
 $repo_root/scripts/test-vpp-native-selection.sh
+$repo_root/scripts/test-prepare-vfio.sh
 $repo_root/scripts/test-vpp-tuning.sh
 $repo_root/scripts/test-dns-ipset-sync.sh
 $repo_root/packaging/rootfs-overlay/etc/systemd/network/10-ethernet-dhcp.network
@@ -85,6 +86,7 @@ bash -n "$repo_root/scripts/build-runtime-debs.sh"
 sh -n "$repo_root/scripts/rootfs-runtime-smoke.sh"
 sh -n "$repo_root/scripts/test-firstboot-env-migration.sh"
 sh -n "$repo_root/scripts/test-vpp-native-selection.sh"
+sh -n "$repo_root/scripts/test-prepare-vfio.sh"
 sh -n "$repo_root/scripts/test-vpp-tuning.sh"
 sh -n "$repo_root/scripts/test-dns-ipset-sync.sh"
 sh -n "$repo_root/scripts/validate-rootfs-scaffold.sh"

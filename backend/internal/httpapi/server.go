@@ -5710,6 +5710,9 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		gatewayPolicy.SecurityACLs = nil
 	}
 	selectedPath, selectionErr := vpp.SelectNativePath(nativePath)
+	if selectionErr == nil {
+		alignAddressAssignmentsWithPath(addressAssignments, selectedPath)
+	}
 	canonicalGatewayPlan := vpp.Plan{RequestID: requestID, NativePath: nativePath, DataplanePrepared: dataplanePrepared, AddressAssignments: addressAssignments, Proxy: compiledProxy, Flow: gatewayFlow, NAT: compiledNAT, Policy: gatewayPolicy, RetiredRoutePolicyIDs: retiredRoutePolicyIDs, Security: securityGeneration, DNSInterception: dnsInterceptionEnabled, DNSServiceNetworks: dnsServiceNetworks}
 	operations, err := vpp.BuildOperations(canonicalGatewayPlan)
 	mark("build-operations")
@@ -8265,6 +8268,22 @@ func isPolicyReadbackOperation(name string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func alignAddressAssignmentsWithPath(assignments []vpp.AddressAssignment, path vpp.NativePath) {
+	selected := make(map[string]string, len(path.Attachments))
+	for _, attachment := range path.Attachments {
+		name := strings.TrimSpace(attachment.LinuxInterface)
+		if name == "" || strings.TrimSpace(attachment.VPPInterface) == "" {
+			continue
+		}
+		selected[name] = strings.TrimSpace(attachment.VPPInterface)
+	}
+	for index := range assignments {
+		if vppInterface := selected[strings.TrimSpace(assignments[index].LinuxInterface)]; vppInterface != "" {
+			assignments[index].VPPInterface = vppInterface
+		}
 	}
 }
 

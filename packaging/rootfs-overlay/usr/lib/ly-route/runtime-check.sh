@@ -217,8 +217,8 @@ find_vpp_interface_for_pci() {
 
 vpp_link_state() {
   vpp_link_interface=$1
-  vppctl show interface "$vpp_link_interface" 2>/dev/null | awk '
-    NR == 1 {
+  vppctl show interface "$vpp_link_interface" 2>/dev/null | awk -v name="$vpp_link_interface" '
+    $1 == name {
       for (i = 1; i <= NF; i++) {
         if ($i == "up" || $i == "down") { print $i; exit }
       }

@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -194,11 +193,4 @@ func (server *Server) bootstrapDataplaneOwnership(ctx context.Context) bool {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-}
-
-func dataplaneOwnershipBootstrapReason(err error) string {
-	if err == nil {
-		return ""
-	}
-	return fmt.Sprintf("dataplane ownership bootstrap: %v", err)
 }
