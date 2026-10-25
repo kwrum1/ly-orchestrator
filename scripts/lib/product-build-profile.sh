@@ -73,6 +73,8 @@ if (JSON.stringify(selected) !== JSON.stringify(canonical)) {
 NODE
 
   PRODUCT_FRONTEND_PRODUCT=$(product_build_json_field frontend_product)
+  PRODUCT_VERSION=$(product_build_json_field version 2>/dev/null || true)
+  [ -n "$PRODUCT_VERSION" ] || PRODUCT_VERSION=unknown
   PRODUCT_DEFAULT_CONFIG="$repo_root/$(product_build_json_field default_config)"
   PRODUCT_DATABASE_PATH=$(product_build_json_field database_path)
   PRODUCT_CONFIG_PATH=$(product_build_json_field config_path)
@@ -103,15 +105,24 @@ let bundle;
 try { bundle = JSON.parse(readFileSync(bundleManifestPath, "utf8")); }
 catch { console.error("Frontend bundle capabilities must be valid JSON"); process.exit(1); }
 const canonical = JSON.parse(readFileSync(canonicalPath, "utf8"));
-const marker = `window.LY_ROUTE_PRODUCT_ENTRYPOINT = "${product}";`;
-const expectedFiles = ["app.js", "capabilities.json", "commercial.css", "index.html", "shell.js", "styles.css"];
-if (product === "orchestrator") expectedFiles.push("product.css");
-expectedFiles.sort();
+const requiredFiles = ["app.js", "capabilities.json", "index.html", "shell.js", "styles.css"];
+// The legacy static shell ships product.css; the current Vite bundle ships
+// commercial.css and keeps all product styling in styles.css.  Accept either
+// compatibility file without allowing arbitrary bundle contents.
+const allowedFiles = new Set([...requiredFiles, "product.css", "commercial.css"]);
 const actualFiles = readdirSync(bundlePath, { withFileTypes: true })
   .filter((entry) => entry.isFile()).map((entry) => entry.name).sort();
+const hasRequired = requiredFiles.every((name) => actualFiles.includes(name));
+const hasCompatibilityCss = actualFiles.includes("product.css") || actualFiles.includes("commercial.css");
+const onlyAllowed = actualFiles.every((name) => allowedFiles.has(name));
+const marker = `window.LY_ROUTE_PRODUCT_ENTRYPOINT = "${product}";`;
+const gatewayFiles = ["app.js", "capabilities.json", "commercial.css", "index.html", "shell.js", "styles.css"];
+const gatewayBundleValid = product !== "gateway" ||
+  ((readFileSync(appPath, "utf8").includes(marker) || readFileSync(shellPath, "utf8").includes(marker)) &&
+   JSON.stringify(actualFiles) === JSON.stringify(gatewayFiles));
 if (bundle.product !== product || JSON.stringify(bundle) !== JSON.stringify(canonical) ||
-    (!readFileSync(appPath, "utf8").includes(marker) && !readFileSync(shellPath, "utf8").includes(marker)) ||
-    JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
+    !hasRequired || !gatewayBundleValid ||
+    (product === "orchestrator" && !hasCompatibilityCss) || !onlyAllowed) {
   console.error(`Frontend bundle product mismatch: expected ${product}`);
   process.exit(1);
 }

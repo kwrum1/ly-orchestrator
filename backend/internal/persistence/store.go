@@ -90,6 +90,19 @@ CREATE TABLE IF NOT EXISTS encrypted_secrets (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (resource_type, resource_id, field_name)
 );
+
+CREATE TABLE IF NOT EXISTS product_tasks (
+  id TEXT PRIMARY KEY,
+  product_id TEXT NOT NULL CHECK (product_id IN ('gateway', 'orchestrator')),
+  task_type TEXT NOT NULL CHECK (task_type IN ('upgrade', 'conversion')),
+  state TEXT NOT NULL,
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS product_tasks_product_type_created_idx
+  ON product_tasks(product_id, task_type, created_at);
 `
 
 var ErrNotFound = errors.New("persistence record not found")

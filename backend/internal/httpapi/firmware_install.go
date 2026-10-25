@@ -42,17 +42,32 @@ test -x "$tmp/usr/lib/ly-route/vpp-apply"
 # A control-plane-only payload would silently roll the device back to the old
 # dataplane.  Require both the native VPP PPPoE plugin and the explicit
 # manifest claim; a manifest claim without the file is not installable.
+# A product-conversion package is recognized explicitly: it may instead
+# declare that the existing dataplane is preserved and verified.  This is not
+# a silent "includes_dataplane=true" shortcut.
 case "$(uname -m)" in
   aarch64|arm64) dataplane_plugin_rel="usr/lib/aarch64-linux-gnu/vpp_plugins/pppoeclient_plugin.so" ;;
   *) dataplane_plugin_rel="usr/lib/x86_64-linux-gnu/vpp_plugins/pppoeclient_plugin.so" ;;
 esac
 dataplane_plugin="$tmp/$dataplane_plugin_rel"
-if [ ! -f "$dataplane_plugin" ] ||
-   ! grep -q '"includes_dataplane"[[:space:]]*:[[:space:]]*true' "$tmp/manifest.json"; then
-  echo "refusing upgrade: payload does not include the VPP/PPPoE dataplane" >&2
+dataplane_ok=false
+if [ -f "$dataplane_plugin" ] &&
+   grep -q '"includes_dataplane"[[:space:]]*:[[:space:]]*true' "$tmp/manifest.json"; then
+  dataplane_ok=true
+fi
+if [ "$dataplane_ok" != true ] &&
+   grep -q '"package_type"[[:space:]]*:[[:space:]]*"ly-route-conversion"' "$tmp/manifest.json" &&
+   grep -q '"preserve"[[:space:]]*:[[:space:]]*true' "$tmp/manifest.json" &&
+   grep -q '"verify_packages"[[:space:]]*:[[:space:]]*\[' "$tmp/manifest.json"; then
+  dataplane_ok=true
+fi
+if [ "$dataplane_ok" != true ]; then
+  echo "refusing upgrade: payload does not include or preserve the VPP dataplane" >&2
   exit 1
 fi
-test -f "$tmp/usr/lib/ly-route/ly-route-pppoe-plugin"
+if [ -f "$dataplane_plugin" ]; then
+  test -f "$tmp/usr/lib/ly-route/ly-route-pppoe-plugin"
+fi
 
 record_firmware_audit() {
   status=$1
@@ -88,6 +103,7 @@ if [ -e "$target_dir" ]; then
 fi
 if [ -e /opt/ly-route/admin ]; then cp -a /opt/ly-route/admin "$backup/admin"; fi
 if [ -e /etc/nginx/conf.d/ly-route-admin.conf ]; then cp -a /etc/nginx/conf.d/ly-route-admin.conf "$backup/ly-route-admin.conf"; fi
+if [ -e /etc/ly-route/version.env ]; then cp -a /etc/ly-route/version.env "$backup/version.env"; fi
 if [ -e /etc/systemd/system/ly-route-firstboot.service ]; then cp -a /etc/systemd/system/ly-route-firstboot.service "$backup/ly-route-firstboot.service"; fi
 if [ -e "/$dataplane_plugin_rel" ]; then
   cp -a "/$dataplane_plugin_rel" "$backup/plugin"
@@ -116,7 +132,6 @@ done
 if [ -e /usr/share/ly-route/proxy-failure ]; then
   cp -a /usr/share/ly-route/proxy-failure "$backup/proxy-page"
 fi
-
 restore_backup() {
   echo "upgrade failed; restoring $backup" >&2
   if [ -e "$backup/target" ]; then
@@ -142,6 +157,9 @@ restore_backup() {
   fi
   if [ -e "$backup/ly-route-admin.conf" ]; then
     cp -a "$backup/ly-route-admin.conf" /etc/nginx/conf.d/ly-route-admin.conf
+  fi
+  if [ -e "$backup/version.env" ]; then
+    cp -a "$backup/version.env" /etc/ly-route/version.env
   fi
   if [ -e "$backup/ly-route-firstboot.service" ]; then
     cp -a "$backup/ly-route-firstboot.service" /etc/systemd/system/ly-route-firstboot.service
@@ -197,8 +215,10 @@ restore_backup() {
 install -d -m 0755 "$target_dir"
 install -m 0755 "$tmp/usr/lib/ly-route/ly-route-control" "$target_dir/ly-route-control"
 install -m 0755 "$tmp/usr/lib/ly-route/vpp-apply" "$target_dir/vpp-apply"
-install -D -m 0755 "$dataplane_plugin" "/$dataplane_plugin_rel"
-install -m 0755 "$tmp/usr/lib/ly-route/ly-route-pppoe-plugin" "$target_dir/ly-route-pppoe-plugin"
+if [ -f "$dataplane_plugin" ]; then
+  install -D -m 0755 "$dataplane_plugin" "/$dataplane_plugin_rel"
+  install -m 0755 "$tmp/usr/lib/ly-route/ly-route-pppoe-plugin" "$target_dir/ly-route-pppoe-plugin"
+fi
 if [ -f "$tmp/usr/lib/ly-route/recover-runtime.sh" ]; then
   install -m 0755 "$tmp/usr/lib/ly-route/recover-runtime.sh" "$target_dir/recover-runtime.sh"
 fi
@@ -237,6 +257,9 @@ if [ -d "$tmp/opt/ly-route/admin" ]; then
 fi
 if [ -f "$tmp/etc/nginx/conf.d/ly-route-admin.conf" ]; then
   install -D -m 0644 "$tmp/etc/nginx/conf.d/ly-route-admin.conf" /etc/nginx/conf.d/ly-route-admin.conf
+fi
+if [ -f "$tmp/etc/ly-route/version.env" ]; then
+  install -D -m 0644 "$tmp/etc/ly-route/version.env" /etc/ly-route/version.env
 fi
 timeout 5s systemctl daemon-reload || true
 restart_base=$(timeout 3s systemctl show ly-route-control-api.service -p NRestarts --value 2>/dev/null || echo 0)
@@ -308,7 +331,6 @@ if [ "$healthy" != 1 ]; then
 fi
 remove_upgrade_dropin
 record_firmware_audit success "upgrade installed" "$backup"
-
 if [ "$reboot_requested" = true ]; then
   # Request a graceful reboot; never force it while the new control API has
   # just been verified.

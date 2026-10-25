@@ -101,6 +101,14 @@ validate_product_payload() {
     "$extract_dir/etc/systemd/system/ly-route-control-api.service" >/dev/null
 
   if [ "$artifact_type" = upgrade ]; then
+    if [ "$product" = orchestrator ]; then
+      case "$arch" in
+        amd64) plugin_multiarch=x86_64-linux-gnu ;;
+        arm64) plugin_multiarch=aarch64-linux-gnu ;;
+        *) fail "unsupported plugin architecture: $arch" ;;
+      esac
+      test -f "$extract_dir/usr/lib/$plugin_multiarch/vpp_plugins/ly_route_orchestrator_plugin.so"
+    fi
     return 0
   fi
 
@@ -164,7 +172,11 @@ const expectedChecksums = [
   "usr/lib/ly-route/vpp-apply",
   "usr/share/ly-route/artifact-manifest.json",
 ];
-if (JSON.stringify(Object.keys(manifest.checksums).sort()) !== JSON.stringify(expectedChecksums)) {
+if (product === "orchestrator") {
+  const multiarch = arch === "arm64" ? "aarch64-linux-gnu" : "x86_64-linux-gnu";
+  expectedChecksums.push(`usr/lib/${multiarch}/vpp_plugins/ly_route_orchestrator_plugin.so`);
+}
+if (JSON.stringify(Object.keys(manifest.checksums).sort()) !== JSON.stringify(expectedChecksums.sort())) {
   throw new Error(`upgrade checksum allowlist mismatch for ${product}/${arch}`);
 }
 NODE
@@ -184,6 +196,10 @@ cat >"$tmp/vpp-apply" <<'EOF'
 exit 0
 EOF
 chmod 0755 "$tmp/vpp-apply"
+cat >"$tmp/orchestrator-plugin" <<'EOF'
+fixture plugin
+EOF
+chmod 0644 "$tmp/orchestrator-plugin"
 
 common_rootfs_env="SOURCE_DATE_EPOCH=0 GITHUB_SHA=fixture-commit LY_ROUTE_BUILD_TAR_ONLY=1 LY_ROUTE_ROOTFS_ALLOW_TAR_ONLY=1"
 common_upgrade_env="SOURCE_DATE_EPOCH=0 GITHUB_SHA=fixture-commit LY_ROUTE_BUILD_TAR_ONLY=1"
@@ -236,9 +252,9 @@ for product in gateway orchestrator; do
     upgrade_a="$tmp/upgrade-a-$product-$arch"
     upgrade_b="$tmp/upgrade-b-$product-$arch"
     env $common_upgrade_env LY_ROUTE_CONTROL_BINARY="$tmp/control-$product" LY_ROUTE_CONTROL_PRODUCT="$product" LY_ROUTE_VPP_APPLY_BINARY="$tmp/vpp-apply" \
-      "$upgrade_builder" --product "$product" --arch "$arch" --frontend-bundle "$tmp/bundle-$product" --base-manifest "$repo_root/packaging/product-profiles/$product.json" --out "$upgrade_a" >/dev/null
+      LY_ROUTE_VPP_ORCHESTRATOR_PLUGIN_BINARY="$tmp/orchestrator-plugin" "$upgrade_builder" --product "$product" --arch "$arch" --frontend-bundle "$tmp/bundle-$product" --base-manifest "$repo_root/packaging/product-profiles/$product.json" --out "$upgrade_a" >/dev/null
     env $common_upgrade_env LY_ROUTE_CONTROL_BINARY="$tmp/control-$product" LY_ROUTE_CONTROL_PRODUCT="$product" LY_ROUTE_VPP_APPLY_BINARY="$tmp/vpp-apply" \
-      "$upgrade_builder" --product "$product" --arch "$arch" --frontend-bundle "$tmp/bundle-$product" --base-manifest "$repo_root/packaging/product-profiles/$product.json" --out "$upgrade_b" >/dev/null
+      LY_ROUTE_VPP_ORCHESTRATOR_PLUGIN_BINARY="$tmp/orchestrator-plugin" "$upgrade_builder" --product "$product" --arch "$arch" --frontend-bundle "$tmp/bundle-$product" --base-manifest "$repo_root/packaging/product-profiles/$product.json" --out "$upgrade_b" >/dev/null
     cmp "$upgrade_a/$upgrade_name" "$upgrade_b/$upgrade_name"
     cmp "$upgrade_a/$upgrade_name.sha256" "$upgrade_b/$upgrade_name.sha256"
     validate_product_payload upgrade "$product" "$arch" "$upgrade_a/$upgrade_name" "$tmp/extract-upgrade"

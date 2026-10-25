@@ -2,12 +2,16 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
+	controlapi "ly-route/backend/internal/api"
+	"ly-route/backend/internal/orchestrator"
 	"ly-route/backend/internal/orchestratorapi"
 	"ly-route/backend/internal/product"
 	"ly-route/backend/internal/runtime/apply"
+	serviceRuntime "ly-route/backend/internal/runtime/service"
 )
 
 func (server *Server) orchestratorTransparentRuntimeComponents(ctx context.Context) ([]RuntimeComponentState, bool) {
@@ -49,6 +53,34 @@ func (server *Server) orchestratorTransparentRuntimeComponents(ctx context.Conte
 		{Name: "persistence", State: "running", Available: server.store != nil, Reason: persistenceRuntimeReason(server.store != nil)},
 	}
 	return server.applyRuntimeEvidence(components), true
+}
+
+// orchestratorRuntimeCapability makes /health reflect the committed
+// transparent dataplane, not just vpp.service activity.  A restarted VPP loads
+// the plugin in the locked state while the unit remains active; without this
+// check the appliance reports a false green even though orchestration traffic
+// is black-holed.
+func (server *Server) orchestratorRuntimeCapability(ctx context.Context) *controlapi.CapabilityState {
+	if server.profile.ID() != product.Orchestrator().ID() || server.orchestratorRepository == nil {
+		return nil
+	}
+	if _, _, err := server.orchestratorRepository.Snapshot(ctx); errors.Is(err, orchestrator.ErrTopologyNotFound) {
+		return nil
+	} else if err != nil {
+		return &controlapi.CapabilityState{Name: "orchestrator_runtime", Available: false, State: controlapi.CapabilityDegraded, Reason: serviceRuntime.Redact("read orchestrator topology: " + err.Error())}
+	}
+	provider, ok := server.orchestratorRuntime.(orchestratorapi.TransparentRuntimeEvidenceProvider)
+	if !ok {
+		return &controlapi.CapabilityState{Name: "orchestrator_runtime", Available: false, State: controlapi.CapabilityDegraded, Reason: "transparent orchestrator runtime evidence is not configured"}
+	}
+	evidence, err := provider.TransparentRuntimeEvidence(ctx)
+	if err != nil {
+		return &controlapi.CapabilityState{Name: "orchestrator_runtime", Available: false, State: controlapi.CapabilityDegraded, Reason: serviceRuntime.Redact(err.Error())}
+	}
+	if evidence.State != "running" {
+		return &controlapi.CapabilityState{Name: "orchestrator_runtime", Available: false, State: controlapi.CapabilityDegraded, Reason: serviceRuntime.Redact("transparent orchestrator state is " + evidence.State)}
+	}
+	return &controlapi.CapabilityState{Name: "orchestrator_runtime", Available: true, State: controlapi.CapabilityAvailable}
 }
 
 func persistenceRuntimeReason(available bool) string {

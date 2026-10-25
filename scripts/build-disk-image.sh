@@ -249,7 +249,8 @@ const valid = artifact.schema_version === 1 && artifact.artifact_type === "rootf
 const app = readFileSync(appPath, "utf8");
 const shell = readFileSync(appPath.replace(/\/app\.js$/, "/shell.js"), "utf8");
 const service = readFileSync(servicePath, "utf8");
-if (!valid || (!app.includes(`window.LY_ROUTE_PRODUCT_ENTRYPOINT = "${product}";`) &&
+if (!valid || (product === "gateway" &&
+    !app.includes(`window.LY_ROUTE_PRODUCT_ENTRYPOINT = "${product}";`) &&
     !shell.includes(`window.LY_ROUTE_PRODUCT_ENTRYPOINT = "${product}";`)) ||
     !service.includes(`Environment=LY_ROUTE_DB_PATH=${profile.database_path}`) ||
     !service.includes(`Environment=LY_ROUTE_CONFIG_PATH=${profile.config_path}`)) {

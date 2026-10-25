@@ -108,6 +108,7 @@ func (handler *Handler) handlePolicy(writer http.ResponseWriter, request *http.R
 			writePolicyRepositoryError(writer, err)
 			return
 		}
+		handler.recordAudit(request, PolicyPath, "update", "success", checksum)
 		writeJSON(writer, http.StatusOK, map[string]any{"item": stored.View(), "checksum": checksum})
 	case http.MethodDelete:
 		topology, _, topologyErr := handler.repository.Snapshot(request.Context())
@@ -136,6 +137,7 @@ func (handler *Handler) handlePolicy(writer http.ResponseWriter, request *http.R
 			writeAPIError(writer, http.StatusInternalServerError, err)
 			return
 		}
+		handler.recordAudit(request, PolicyPath, "delete", "success", "")
 		writer.WriteHeader(http.StatusNoContent)
 	}
 }

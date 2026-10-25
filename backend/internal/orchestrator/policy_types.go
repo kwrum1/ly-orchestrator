@@ -18,6 +18,7 @@ var (
 	ErrInvalidPolicyMatch     = errors.New("invalid policy match")
 	ErrInvalidPolicyAction    = errors.New("invalid policy action")
 	ErrDeletedPolicyReference = errors.New("policy references a missing object")
+	ErrGroupInUse             = errors.New("orchestration group is referenced by policy")
 	ErrPolicyLoop             = errors.New("policy can traverse an orchestration group more than once")
 	ErrEmptyPolicyDefault     = errors.New("policy default behavior is required")
 	ErrInvalidPolicyFlow      = errors.New("invalid policy flow")

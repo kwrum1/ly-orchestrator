@@ -32,6 +32,7 @@ import (
 	"ly-route/backend/internal/orchestratorapi"
 	"ly-route/backend/internal/persistence"
 	"ly-route/backend/internal/product"
+	"ly-route/backend/internal/productupdate"
 	"ly-route/backend/internal/runtime/apply"
 	"ly-route/backend/internal/runtime/dns"
 	"ly-route/backend/internal/runtime/flow"
@@ -185,6 +186,12 @@ type Server struct {
 	firmwareStageDir              string
 	firmwareStatus                FirmwareUpdateStatus
 	firmwareInstallStart          func(firmwareInstallInvocation) error
+	orchestratorUpgradeDir        string
+	orchestratorInstallStart      func(orchestratorUpgradeInvocation) error
+	conversionServiceState        productupdate.ServiceStateController
+	productTaskMu                 sync.Mutex
+	operationMu                   sync.Mutex
+	operation                     orchestratorapi.OperationState
 	dnsSyncToken                  string
 	proxyFailurePage              proxyFailureActuator
 	proxyFailure                  *proxyFailureTracker
@@ -456,6 +463,30 @@ func WithFirmwareStageDir(path string) Option {
 	}
 }
 
+func WithOrchestratorUpgradeDir(path string) Option {
+	return func(server *Server) {
+		if strings.TrimSpace(path) != "" {
+			server.orchestratorUpgradeDir = path
+		}
+	}
+}
+
+func WithOrchestratorInstallStart(start func(orchestratorUpgradeInvocation) error) Option {
+	return func(server *Server) {
+		if start != nil {
+			server.orchestratorInstallStart = start
+		}
+	}
+}
+
+func WithConversionServiceState(controller productupdate.ServiceStateController) Option {
+	return func(server *Server) {
+		if controller != nil {
+			server.conversionServiceState = controller
+		}
+	}
+}
+
 func New(options ...Option) *Server {
 	return newServer(product.Gateway(), options...)
 }
@@ -505,9 +536,12 @@ func newServer(profile product.Profile, options ...Option) *Server {
 			}
 			return exec.Command(invocation.Name, invocation.Args...).Start()
 		},
-		subscriptionFetch: proxy.FetchSubscription,
-		dnsSyncToken:      loadDNSSyncToken(),
-		proxyEgress:       proxy.NewProxyEgress("proxy-egress-default", "xray-tproxy-outbound"),
+		orchestratorUpgradeDir:   envOrDefault("LY_ROUTE_ORCHESTRATOR_UPGRADE_DIR", "/var/lib/ly-route/orchestrator/upgrades"),
+		orchestratorInstallStart: startOrchestratorUpgradeUnit,
+		conversionServiceState:   productupdate.SystemctlController{},
+		subscriptionFetch:        proxy.FetchSubscription,
+		dnsSyncToken:             loadDNSSyncToken(),
+		proxyEgress:              proxy.NewProxyEgress("proxy-egress-default", "xray-tproxy-outbound"),
 		flowIntent: flow.NewIntent("default", []flow.Rule{
 			flow.NewRule("classify-default", flow.RuleGranularity, flow.Classify("best-effort")),
 		}),
@@ -544,10 +578,15 @@ func (server *Server) Handler() http.Handler {
 			item := server.managementNetworkState(ctx, false)
 			return normalizeManagementMode(stringField(item, "mode")) == "shared_lan" && stringField(item, "interface_id") == interfaceID
 		})
+		handler.SetUpdateService(newOrchestratorUpdateService(server))
+		handler.SetOperationTracker(server)
 		handler.RegisterRoutes(mux)
 		if _, transparent := server.orchestratorRuntime.(orchestratorapi.TransparentRuntime); !transparent {
 			handler.StartServiceChainReconciler(context.Background(), server.orchestratorReconcileInterval)
 		}
+	}
+	if server.profile.ID() == product.Gateway().ID() {
+		server.registerGatewayConversionRoutes(mux)
 	}
 	for _, route := range productRoutes() {
 		if server.profile.Allows(route.capability) {
@@ -569,10 +608,37 @@ func (access orchestratorSessionAccess) Authorize(request *http.Request, permiss
 	if !ok {
 		return orchestratorapi.ErrAuthenticationRequired
 	}
-	if permission == orchestratorapi.PermissionAdminWrite && (session.Role != "admin" || session.PasswordChangeRequired) {
-		return orchestratorapi.ErrAdminRequired
+	if permission == orchestratorapi.PermissionAdminWrite {
+		if session.PasswordChangeRequired {
+			return orchestratorapi.ErrPasswordChangeRequired
+		}
+		if session.Role != "admin" {
+			return orchestratorapi.ErrAdminRequired
+		}
 	}
 	return nil
+}
+
+func (access orchestratorSessionAccess) RecordAudit(request *http.Request, resource, action, status, detail string) {
+	if access.server == nil {
+		return
+	}
+	actor, role, ok := access.Actor(request)
+	if !ok {
+		actor, role = "anonymous", "system"
+	}
+	access.server.recordAuditWithTransaction(actor, role, resource, action, status, detail, requestID(request))
+}
+
+func (access orchestratorSessionAccess) Actor(request *http.Request) (string, string, bool) {
+	if access.server == nil {
+		return "", "", false
+	}
+	session, ok := access.server.sessionFromRequest(request)
+	if !ok {
+		return "", "", false
+	}
+	return session.Username, session.Role, true
 }
 
 func (server *Server) handleDNSPolicies(w http.ResponseWriter, r *http.Request) {
@@ -1626,6 +1692,9 @@ func (server *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
 	dependencies := server.capabilities(ctx)
+	if capability := server.orchestratorRuntimeCapability(ctx); capability != nil {
+		dependencies = append(dependencies, *capability)
+	}
 	status := "ok"
 	degraded := false
 	for _, dependency := range dependencies {
@@ -1640,7 +1709,7 @@ func (server *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func requiredCapability(name string) bool {
 	switch name {
-	case "vpp", "smartdns", "dnsmasq", "xray", "nftables", "linux_routing", "persistence":
+	case "vpp", "smartdns", "dnsmasq", "xray", "nftables", "linux_routing", "persistence", "orchestrator_runtime":
 		return true
 	default:
 		return false
@@ -4993,6 +5062,10 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	defer server.runtimeApplyMu.Unlock()
+	if server.profile.ID() == product.Orchestrator().ID() {
+		server.BeginOperation("runtime-apply", "orchestrator runtime")
+		defer server.EndOperation()
+	}
 	// A gateway apply owns daemon and VPP transitions that can outlive a reverse
 	// proxy's request timeout. Keep the transaction bounded, but do not cancel a
 	// valid commit just because the browser or nginx closed its HTTP request.
@@ -5003,6 +5076,28 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 	// reported by the plan as a degradation and never aborts the apply: the
 	// previous generation keeps forwarding until a real eligibility failure.
 	_ = server.refreshDataplaneCapability(applyCtx)
+	if server.profile.ID() == product.Orchestrator().ID() {
+		if err := server.applyPersistedOrchestratorState(applyCtx, transactionID); err != nil {
+			cause := "orchestrator apply: " + err.Error()
+			result := degradedRuntimeResult(transactionID, cause, server.now().UTC())
+			result.Status = "apply_failed"
+			server.setRuntimeEvidence(result)
+			server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", cause, r)
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": cause, "transaction_id": transactionID, "request_id": requestID(r)})
+			return
+		}
+		components, _ := server.orchestratorTransparentRuntimeComponents(applyCtx)
+		state := runtimeState(components)
+		status := "committed"
+		code := http.StatusOK
+		if state != "running" {
+			status = "degraded"
+			code = http.StatusAccepted
+		}
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "success", "", r)
+		writeJSON(w, code, map[string]any{"status": status, "runtime_state": state, "transaction_id": transactionID, "components": components, "request_id": requestID(r)})
+		return
+	}
 	plan, err := server.buildRuntimePlan(applyCtx, transactionID)
 	if err != nil {
 		result := degradedRuntimeResult(transactionID, err.Error(), server.now().UTC())
@@ -8555,7 +8650,7 @@ func (server *Server) handleConfigImport(w http.ResponseWriter, r *http.Request)
 		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
 		return
 	}
-	if err := server.preflightConfigPackage(req.Payload, req.PackageManifest); err != nil {
+	if err := server.preflightConfigPackage(r.Context(), req.Payload, req.PackageManifest); err != nil {
 		code := "invalid_import_package"
 		if errors.Is(err, ErrConfigProductMismatch) {
 			code = "product_mismatch"
@@ -8572,10 +8667,16 @@ func (server *Server) handleConfigImport(w http.ResponseWriter, r *http.Request)
 		writeError(w, r, http.StatusUnprocessableEntity, "invalid_import_package", err.Error())
 		return
 	}
+	orchestratorDocuments, err := server.orchestratorConfigDocuments(r.Context(), req.Payload, server.now().UTC())
+	if err != nil {
+		writeError(w, r, http.StatusUnprocessableEntity, "invalid_import_package", err.Error())
+		return
+	}
+	documents = append(documents, orchestratorDocuments...)
 	packageHash := hashConfigPayload(req.Payload)
 	diffHash := hashObject(map[string]any{"current": "desired_config", "incoming": packageHash})
 	if !req.Confirm {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "dry_run", "safe_to_apply": true, "rollback_snapshot_required": true, "package_hash": packageHash, "diff_hash": diffHash, "confirmation_token": newRequestID(), "confirmation_actor": session.Username, "confirmation_expires_at": server.now().UTC().Add(15 * time.Minute), "request_id": requestID(r)})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "dry_run", "safe_to_apply": true, "rollback_snapshot_required": true, "package_hash": packageHash, "diff_hash": diffHash, "confirmation_package_hash": packageHash, "confirmation_diff_hash": diffHash, "confirmation_token": newRequestID(), "confirmation_actor": session.Username, "confirmation_expires_at": server.now().UTC().Add(15 * time.Minute), "request_id": requestID(r)})
 		return
 	}
 	if err := server.validateImportConfirmation(req, session.Username, packageHash, diffHash); err != nil {
@@ -8846,6 +8947,41 @@ func (server *Server) handleConfigSnapshots(w http.ResponseWriter, r *http.Reque
 }
 
 func (server *Server) handleConfigSnapshotRestore(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		if _, ok := server.sessionFromRequest(r); !ok {
+			writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		if server.store == nil {
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+			return
+		}
+		id, _ := splitPathRemainder("/api/v1/config/snapshots/", r.URL.Path)
+		if id == "" {
+			writeError(w, r, http.StatusNotFound, "snapshot_not_found", "snapshot id is required")
+			return
+		}
+		snapshot, err := server.store.RuntimeSnapshot(r.Context(), id)
+		if errors.Is(err, persistence.ErrNotFound) {
+			writeError(w, r, http.StatusNotFound, "snapshot_not_found", "snapshot not found")
+			return
+		}
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "snapshot_read_failed", "snapshot could not be read")
+			return
+		}
+		if err := persistence.VerifyPayload(snapshot.Payload, snapshot.PayloadHash); err != nil {
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_snapshot", "snapshot integrity verification failed")
+			return
+		}
+		var payload ConfigPackagePayload
+		if err := json.Unmarshal(snapshot.Payload, &payload); err != nil {
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_snapshot", "snapshot payload is invalid")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"snapshot": snapshotResponse(snapshot, server.profile.ID()), "payload": payload, "request_id": requestID(r)})
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
 		return
@@ -8970,7 +9106,20 @@ func (server *Server) exportDesiredConfig(ctx context.Context) (ConfigPackagePay
 			return ConfigPackagePayload{}, err
 		}
 	}
-	return ConfigPackagePayload{SchemaVersion: ConfigPackageSchemaVersion, ContentType: configContentType, Product: server.profile.ID(), DeviceMode: server.profile.ID().String(), Resources: resources, Excluded: []string{"rendered_config", "runtime_state", "audit_logs", "secrets", "snapshots"}}, nil
+	if server.profile.ID() == product.Orchestrator().ID() {
+		orchestratorResources, err := server.orchestratorConfigResources(ctx)
+		if err != nil {
+			return ConfigPackagePayload{}, err
+		}
+		for resourceType, items := range orchestratorResources {
+			resources[resourceType] = items
+		}
+	}
+	excluded := []string{"rendered_config", "runtime_state", "audit_logs", "secrets", "snapshots"}
+	if server.profile.ID() == product.Orchestrator().ID() {
+		excluded = append(excluded, "orchestrator_service_chain_intents")
+	}
+	return ConfigPackagePayload{SchemaVersion: ConfigPackageSchemaVersion, ContentType: configContentType, Product: server.profile.ID(), DeviceMode: server.profile.ID().String(), Resources: resources, Excluded: excluded}, nil
 }
 
 func (server *Server) createConfigSnapshot(ctx context.Context, id, source string) (persistence.RuntimeSnapshot, error) {
@@ -8997,6 +9146,9 @@ func (server *Server) restoreConfigSnapshot(ctx context.Context, snapshot persis
 	if err := json.Unmarshal(snapshot.Payload, &payload); err != nil {
 		return err
 	}
+	if err := server.ensureOrchestratorConfigResources(ctx, &payload); err != nil {
+		return err
+	}
 	if err := payload.ValidateFor(server.profile); err != nil {
 		return err
 	}
@@ -9004,6 +9156,11 @@ func (server *Server) restoreConfigSnapshot(ctx context.Context, snapshot persis
 	if err != nil {
 		return err
 	}
+	orchestratorDocuments, err := server.orchestratorConfigDocuments(ctx, payload, server.now().UTC())
+	if err != nil {
+		return err
+	}
+	documents = append(documents, orchestratorDocuments...)
 	return server.store.ReplaceConfigsForTypes(ctx, managedConfigResourceTypes(server.profile), documents)
 }
 
@@ -9017,11 +9174,24 @@ func managedConfigResourceTypes(profile product.Profile) []string {
 	if resourceAllowed(profile, "proxy_egress") {
 		types = append(types, "proxy_egress")
 	}
+	if profile.ID() == product.Orchestrator().ID() {
+		types = append(types, orchestratorTopologyConfigResource, orchestratorPolicyConfigResource)
+	}
 	return types
 }
 
 func defaultConfigSnapshot(profile product.Profile) (persistence.RuntimeSnapshot, error) {
-	payload := ConfigPackagePayload{SchemaVersion: ConfigPackageSchemaVersion, ContentType: configContentType, Product: profile.ID(), DeviceMode: profile.ID().String(), Resources: map[string][]json.RawMessage{}, Excluded: []string{"rendered_config", "runtime_state", "audit_logs", "secrets", "snapshots"}}
+	resources := map[string][]json.RawMessage{}
+	if profile.ID() == product.Orchestrator().ID() {
+		// A factory snapshot represents empty orchestrator state explicitly so
+		// restore removes topology and policy instead of preserving them.
+		resources[orchestratorTopologyConfigResource] = []json.RawMessage{}
+		resources[orchestratorPolicyConfigResource] = []json.RawMessage{}
+	}
+	payload := ConfigPackagePayload{SchemaVersion: ConfigPackageSchemaVersion, ContentType: configContentType, Product: profile.ID(), DeviceMode: profile.ID().String(), Resources: resources, Excluded: []string{"rendered_config", "runtime_state", "audit_logs", "secrets", "snapshots"}}
+	if profile.ID() == product.Orchestrator().ID() {
+		payload.Excluded = append(payload.Excluded, "orchestrator_service_chain_intents")
+	}
 	raw, hash, err := persistence.MarshalPayload(payload)
 	if err != nil {
 		return persistence.RuntimeSnapshot{}, fmt.Errorf("marshal default config snapshot: %w", err)
@@ -9038,6 +9208,11 @@ func configDocumentsFromImport(payload ConfigPackagePayload, updatedAt time.Time
 	}
 	var documents []persistence.ConfigDocument
 	for resourceType, items := range payload.Resources {
+		if isOrchestratorConfigResource(resourceType) {
+			// Orchestrator topology and policy are compiled and persisted by
+			// orchestratorConfigDocuments so their pair is validated first.
+			continue
+		}
 		for _, item := range items {
 			var object map[string]any
 			if err := json.Unmarshal(item, &object); err != nil {
@@ -9228,6 +9403,13 @@ func (server *Server) telemetryPayload(ctx context.Context, kind string) (any, [
 		}
 	}
 	server.runtimeMu.Unlock()
+	if server.profile.ID() == product.Orchestrator().ID() && kind == "dashboard" {
+		if freshComponents, handled := server.orchestratorTransparentRuntimeComponents(ctx); handled {
+			components = freshComponents
+			runtimeStateValue = runtimeState(components)
+			lastApply = server.lastRuntimeApply()
+		}
+	}
 	capabilities := []controlapi.CapabilityState{{Name: "local_telemetry", Available: true, State: controlapi.CapabilityAvailable}}
 	if payload, capability, handled := server.orchestratorTelemetryPayload(ctx, kind, runtimeStateValue, components, lastApply); handled {
 		return payload, append(capabilities, capability)
@@ -9916,6 +10098,10 @@ func (server *Server) sessionFromRequest(r *http.Request) (Session, bool) {
 }
 
 func (server *Server) recordAudit(actor, role, resource, action, status, eventError string, r *http.Request) {
+	server.recordAuditWithTransaction(actor, role, resource, action, status, eventError, requestID(r))
+}
+
+func (server *Server) recordAuditWithTransaction(actor, role, resource, action, status, eventError, transactionID string) {
 	eventError = auditSafeText(eventError)
 	server.auditMu.Lock()
 	defer server.auditMu.Unlock()
@@ -9928,11 +10114,11 @@ func (server *Server) recordAudit(actor, role, resource, action, status, eventEr
 		Action:    action,
 		Status:    status,
 		Error:     eventError,
-		RequestID: requestID(r),
+		RequestID: transactionID,
 	}
 	server.audit = append(server.audit, event)
 	if server.store != nil {
-		_ = server.store.SaveAuditEvents(r.Context(), []persistence.AuditEvent{{
+		_ = server.store.SaveAuditEvents(context.WithoutCancel(context.Background()), []persistence.AuditEvent{{
 			ID:            event.ID,
 			Timestamp:     event.Timestamp,
 			Actor:         event.Actor,
@@ -9941,7 +10127,7 @@ func (server *Server) recordAudit(actor, role, resource, action, status, eventEr
 			Action:        event.Action,
 			Status:        event.Status,
 			Error:         event.Error,
-			TransactionID: event.RequestID,
+			TransactionID: transactionID,
 		}})
 	}
 }

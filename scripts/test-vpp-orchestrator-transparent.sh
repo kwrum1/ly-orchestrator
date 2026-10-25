@@ -16,6 +16,8 @@ socket="/run/vpp/orch-transparent-$suffix.sock"
 tmp="$repo_root/.sisyphus/full-acceptance/evidence/o-transparent-$suffix"
 control_pid=""
 capture_pid=""
+server443_pid=""
+server4443_pid=""
 
 cleanup() {
   set +e
@@ -23,6 +25,10 @@ cleanup() {
   [ -z "$control_pid" ] || wait "$control_pid" 2>/dev/null
   [ -z "$capture_pid" ] || kill -INT "$capture_pid" 2>/dev/null
   [ -z "$capture_pid" ] || wait "$capture_pid" 2>/dev/null
+  [ -z "$server443_pid" ] || kill "$server443_pid" 2>/dev/null
+  [ -z "$server443_pid" ] || wait "$server443_pid" 2>/dev/null
+  [ -z "$server4443_pid" ] || kill "$server4443_pid" 2>/dev/null
+  [ -z "$server4443_pid" ] || wait "$server4443_pid" 2>/dev/null
   ip netns del "$client" 2>/dev/null
   ip netns del "$server" 2>/dev/null
   ip netns del "$service" 2>/dev/null
@@ -75,6 +81,10 @@ ip link set inline-b-lan netns "$service"
 
 ip -n "$client" addr add 10.0.0.2/24 dev client0
 ip -n "$server" addr add 10.0.0.3/24 dev server0
+ip netns exec "$server" python3 -m http.server 443 --bind 10.0.0.3 >"$tmp/server-443.log" 2>&1 &
+server443_pid=$!
+ip netns exec "$server" python3 -m http.server 4443 --bind 10.0.0.3 >"$tmp/server-4443.log" 2>&1 &
+server4443_pid=$!
 ip -n "$client" link set client0 up
 ip -n "$client" link set client1 up
 ip -n "$server" link set server0 up
@@ -248,6 +258,42 @@ set -e
 [ "$drop_rc" -ne 0 ]
 vppctl show ly-route orchestrator >"$tmp/drop-status.txt"
 grep -E 'policy drop-all .*packets [1-9][0-9]*' "$tmp/drop-status.txt"
+
+# Port rules are written in the request orientation.  The node must canonicalize
+# WAN ingress before matching, otherwise the service port is seen as sport.
+configure_boundary
+vppctl set ly-route orchestrator candidate rule id via-dport443 group-position 10 sequence 10 action via target inline-a family ip4 src 0.0.0.0/0 dst 0.0.0.0/0 proto 6 sport 0-65535 dport 443-443
+vppctl set ly-route orchestrator candidate rule id drop-4443-range group-position 10 sequence 20 action drop target none family ip4 src 0.0.0.0/0 dst 0.0.0.0/0 proto 6 sport 0-65535 dport 4443-4444
+vppctl set ly-route orchestrator candidate default direct
+vppctl set ly-route orchestrator commit generation port-policy-1
+ip netns exec "$client" curl -fsS --max-time 4 -o /dev/null http://10.0.0.3:443/ >"$tmp/port-via-dport443.txt"
+set +e
+ip netns exec "$client" curl -sS --connect-timeout 1 --max-time 2 -o /dev/null http://10.0.0.3:4443/ >"$tmp/port-drop-4443.txt" 2>&1
+port_drop_rc=$?
+set -e
+[ "$port_drop_rc" -ne 0 ]
+vppctl show ly-route orchestrator >"$tmp/port-policy-status.txt"
+grep -E 'policy via-dport443 .*packets [1-9][0-9]*' "$tmp/port-policy-status.txt"
+grep -E 'policy drop-4443-range .*packets [1-9][0-9]*' "$tmp/port-policy-status.txt"
+grep -E 'flow family ip4 src 10\.0\.0\.2 dst 10\.0\.0\.3 proto 6 .*dport 443 .*groups inline-a' "$tmp/port-policy-status.txt"
+
+configure_boundary
+vppctl set ly-route orchestrator candidate rule id via-sport443 group-position 10 sequence 10 action via target inline-a family ip4 src 0.0.0.0/0 dst 0.0.0.0/0 proto 6 sport 443-443 dport 0-65535
+vppctl set ly-route orchestrator candidate default direct
+vppctl set ly-route orchestrator commit generation port-sport-1
+ip netns exec "$client" curl -fsS --max-time 4 --local-port 443 -o /dev/null http://10.0.0.3:80/ >"$tmp/port-via-sport443.txt"
+vppctl show ly-route orchestrator >"$tmp/port-sport-status.txt"
+grep -E 'policy via-sport443 .*packets [1-9][0-9]*' "$tmp/port-sport-status.txt"
+grep -E 'flow family ip4 src 10\.0\.0\.2 dst 10\.0\.0\.3 proto 6 sport 443 dport 80 .*groups inline-a' "$tmp/port-sport-status.txt"
+
+configure_boundary
+vppctl set ly-route orchestrator candidate rule id tcp-all-via group-position 10 sequence 10 action via target inline-a family ip4 src 0.0.0.0/0 dst 0.0.0.0/0 proto 6 sport 0-65535 dport 0-65535
+vppctl set ly-route orchestrator candidate default direct
+vppctl set ly-route orchestrator commit generation port-noport-1
+ip netns exec "$client" curl -fsS --max-time 4 -o /dev/null http://10.0.0.3:80/ >"$tmp/port-noport.txt"
+vppctl show ly-route orchestrator >"$tmp/port-noport-status.txt"
+grep -E 'policy tcp-all-via .*packets [1-9][0-9]*' "$tmp/port-noport-status.txt"
+grep -E 'flow family ip4 src 10\.0\.0\.2 dst 10\.0\.0\.3 proto 6 .*dport 80 .*groups inline-a' "$tmp/port-noport-status.txt"
 
 # Production closure: save only topology and the whole policy through the
 # product API. No per-flow apply endpoint or hidden L3 next hop is supplied.
@@ -472,6 +518,7 @@ mkdir -p "$canonical"
 for evidence in \
   direct.txt via.txt via-service.txt bypass.txt bypass-status.txt recovery.txt recovery-status.txt \
   via-ipv6.txt via-ipv6-service.txt via-vlan.txt via-vlan-service.txt via-two-a-service.txt via-two-b-service.txt via-two-status.txt drop.txt drop-status.txt \
+  port-via-dport443.txt port-drop-4443.txt port-policy-status.txt port-via-sport443.txt port-sport-status.txt port-noport.txt port-noport-status.txt \
   api-topology.json api-policy.json api-bond-readback.txt api-bond-member-failover.txt api-bond-member-failover-readback.txt \
   api-bond-member-recovery.txt api-policy-hits.json api-top-connections.json api-dashboard.json api-online-users.json \
   api-traffic-trend.json api-runtime-status.json api-runtime-drift.json api-dashboard-drift.json api-policy-reconcile.json api-runtime-recovered.json api-vpp-readback.txt api-after-restart.txt api-bond-after-restart.txt \

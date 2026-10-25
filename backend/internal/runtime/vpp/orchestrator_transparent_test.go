@@ -66,3 +66,34 @@ func transparentTestTopology() orchestrator.TopologyView {
 		Groups: []orchestrator.GroupView{{Name: "firewall", Ports: []orchestrator.DirectedPortView{{Interface: "fw-wan", Direction: orchestrator.DirectionWANFacing}, {Interface: "fw-lan", Direction: orchestrator.DirectionLANFacing}}}},
 	}
 }
+
+func TestBuildTransparentOrchestratorCommandsKeepsPortDirectionAndRanges(t *testing.T) {
+	policy := orchestrator.PolicyView{
+		SchemaVersion: 1,
+		Groups: []orchestrator.PolicyGroupView{{ID: "route", Position: 10, Rules: []orchestrator.PolicyRuleView{
+			{ID: "via-dport-range", Sequence: 10, Match: orchestrator.PolicyMatchInput{Sources: []string{"any"}, Destinations: []string{"any"}, Protocol: orchestrator.ProtocolTCP, DestinationPorts: []orchestrator.PortRangeInput{{Start: 443, End: 444}}}, Action: orchestrator.ActionInput{Kind: orchestrator.ActionVia, Group: "firewall"}},
+			{ID: "drop-dport-range", Sequence: 20, Match: orchestrator.PolicyMatchInput{Sources: []string{"any"}, Destinations: []string{"any"}, Protocol: orchestrator.ProtocolTCP, DestinationPorts: []orchestrator.PortRangeInput{{Start: 4443, End: 4444}}}, Action: orchestrator.ActionInput{Kind: orchestrator.ActionDrop}},
+			{ID: "via-sport", Sequence: 30, Match: orchestrator.PolicyMatchInput{Sources: []string{"any"}, Destinations: []string{"any"}, Protocol: orchestrator.ProtocolTCP, SourcePorts: []orchestrator.PortRangeInput{{Start: 443, End: 443}}}, Action: orchestrator.ActionInput{Kind: orchestrator.ActionVia, Group: "firewall"}},
+			{ID: "tcp-all", Sequence: 40, Match: orchestrator.PolicyMatchInput{Sources: []string{"any"}, Destinations: []string{"any"}, Protocol: orchestrator.ProtocolTCP}, Action: orchestrator.ActionInput{Kind: orchestrator.ActionVia, Group: "firewall"}},
+		}}},
+		Default: orchestrator.ActionInput{Kind: orchestrator.ActionDirect},
+	}
+	commands, err := BuildTransparentOrchestratorCommands(TransparentOrchestratorConfig{Generation: "port-contract", Topology: transparentTestTopology(), Policy: &policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(commands, "\n")
+	for _, expected := range []string{
+		"id via-dport-range group-position 10 sequence 10 action via target firewall family ip4 src 0.0.0.0/0 dst 0.0.0.0/0 proto 6 sport 0-65535 dport 443-444",
+		"id drop-dport-range group-position 10 sequence 20 action drop target none family ip4 src 0.0.0.0/0 dst 0.0.0.0/0 proto 6 sport 0-65535 dport 4443-4444",
+		"id via-sport group-position 10 sequence 30 action via target firewall family ip4 src 0.0.0.0/0 dst 0.0.0.0/0 proto 6 sport 443-443 dport 0-65535",
+		"id tcp-all group-position 10 sequence 40 action via target firewall family ip4 src 0.0.0.0/0 dst 0.0.0.0/0 proto 6 sport 0-65535 dport 0-65535",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("commands missing %q:\n%s", expected, joined)
+		}
+	}
+	if strings.Count(joined, "id tcp-all ") != 2 {
+		t.Fatalf("non-port TCP rule should produce one IPv4 and one IPv6 variant, got:\n%s", joined)
+	}
+}

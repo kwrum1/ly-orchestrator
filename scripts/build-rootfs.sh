@@ -290,9 +290,11 @@ configure_product() {
   mkdir -p "$target/etc/ly-route" "$target/usr/share/ly-route" "$target/var/lib/ly-route/$product"
   cp "$PRODUCT_MANIFEST" "$target/etc/ly-route/product-manifest.json"
   cp "$PRODUCT_DEFAULT_CONFIG" "$target/etc/ly-route/default-config.json"
+  printf 'LY_ROUTE_VERSION=%s\n' "$PRODUCT_VERSION" >"$target/etc/ly-route/version.env"
   cat >"$target/etc/ly-route/runtime.env" <<EOF
 LY_ROUTE_ENABLE_SERVICE_RUNTIME=true
 LY_ROUTE_PRODUCT=$product
+LY_ROUTE_VERSION=$PRODUCT_VERSION
 LY_ROUTE_COMMERCIAL_RUNTIME_REQUIRED=false
 LY_ROUTE_REQUIRED_COMMANDS=$PRODUCT_REQUIRED_COMMANDS
 LY_ROUTE_REQUIRED_UNITS=$PRODUCT_REQUIRED_UNITS

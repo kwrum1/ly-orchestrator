@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"ly-route/backend/internal/orchestrator"
+	"ly-route/backend/internal/productupdate"
+	"ly-route/backend/internal/runtime/vpp"
 )
 
 type topologyResponse struct {
@@ -70,6 +73,8 @@ func codeForError(err error) string {
 		return "interface_already_owned"
 	case errors.Is(err, orchestrator.ErrDuplicateGroup):
 		return "duplicate_group"
+	case errors.Is(err, orchestrator.ErrGroupInUse):
+		return "group_in_use"
 	case errors.Is(err, orchestrator.ErrTopologyNotFound):
 		return "topology_not_found"
 	case errors.Is(err, orchestrator.ErrTopologyConflict):
@@ -78,11 +83,37 @@ func codeForError(err error) string {
 		return "group_not_found"
 	case errors.Is(err, ErrAuthenticationRequired):
 		return "unauthorized"
+	case errors.Is(err, ErrPasswordChangeRequired):
+		return "password_change_required"
 	case errors.Is(err, ErrAdminRequired):
 		return "forbidden"
 	case errors.Is(err, orchestrator.ErrInvalidName), errors.Is(err, orchestrator.ErrInvalidInterface), errors.Is(err, orchestrator.ErrInvalidBond):
 		return "invalid_topology"
+	case errors.Is(err, ErrTaskNotFound):
+		return "task_not_found"
+	case errors.Is(err, ErrTaskConflict):
+		return "task_conflict"
+	case errors.Is(err, ErrUpgradeUnsupported):
+		return "upgrade_unsupported"
+	case errors.Is(err, ErrInvalidUpgradePackage):
+		return "invalid_upgrade_package"
+	case errors.Is(err, ErrConversionExecutionBlocked):
+		return "conversion_execution_blocked"
+	case errors.Is(err, productupdate.ErrInvalidConversionManifest):
+		return "invalid_conversion_manifest"
+	case errors.Is(err, productupdate.ErrConversionNotApplicable):
+		return "conversion_not_applicable"
 	default:
+		var locked *vpp.DataplaneLockedError
+		if errors.As(err, &locked) {
+			return "prerequisite_unmet"
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "unknown field") {
+			return "unknown_field"
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "invalid json") {
+			return "invalid_json"
+		}
 		return "internal_error"
 	}
 }

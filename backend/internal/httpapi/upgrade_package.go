@@ -39,6 +39,8 @@ type upgradePackageManifest struct {
 	PackageType       string            `json:"package_type"`
 	Version           string            `json:"version,omitempty"`
 	Product           product.ID        `json:"product"`
+	FromVersion       string            `json:"from_version,omitempty"`
+	ToVersion         string            `json:"to_version,omitempty"`
 	Suite             string            `json:"suite,omitempty"`
 	Arch              string            `json:"arch,omitempty"`
 	Commit            string            `json:"commit,omitempty"`
@@ -47,33 +49,42 @@ type upgradePackageManifest struct {
 	IncludesDataplane bool              `json:"includes_dataplane,omitempty"`
 	Dataplane         map[string]string `json:"dataplane,omitempty"`
 	Services          []string          `json:"services,omitempty"`
+	Conversion        json.RawMessage   `json:"conversion,omitempty"`
 	Checksums         map[string]string `json:"checksums"`
 }
 
 func validateUpgradePackage(packagePath string, expectedProduct product.ID) error {
+	_, err := inspectUpgradePackage(packagePath, expectedProduct)
+	return err
+}
+
+func inspectUpgradePackage(packagePath string, expectedProduct product.ID) (upgradePackageManifest, error) {
 	tmp, err := os.MkdirTemp(filepath.Dir(packagePath), "validate-*")
 	if err != nil {
-		return fmt.Errorf("create validation directory: %w", err)
+		return upgradePackageManifest{}, fmt.Errorf("create validation directory: %w", err)
 	}
 	defer os.RemoveAll(tmp)
 	if err := extractUpgradePackage(packagePath, tmp); err != nil {
-		return err
+		return upgradePackageManifest{}, err
 	}
 	body, err := os.ReadFile(filepath.Join(tmp, "manifest.json"))
 	if err != nil {
-		return fmt.Errorf("manifest.json is required: %w", err)
+		return upgradePackageManifest{}, fmt.Errorf("manifest.json is required: %w", err)
 	}
 	manifest, err := parseUpgradeManifest(body)
 	if err != nil {
-		return err
+		return upgradePackageManifest{}, err
 	}
 	if manifest.Product != expectedProduct {
-		return &UpgradeProductMismatchError{Package: manifest.Product, Server: expectedProduct}
+		return upgradePackageManifest{}, &UpgradeProductMismatchError{Package: manifest.Product, Server: expectedProduct}
 	}
 	if err := verifyUpgradeChecksums(tmp, manifest); err != nil {
-		return err
+		return upgradePackageManifest{}, err
 	}
-	return preflightUpgradeControl(tmp)
+	if err := preflightUpgradeControl(tmp); err != nil {
+		return upgradePackageManifest{}, err
+	}
+	return manifest, nil
 }
 
 // preflightUpgradeControl catches structurally invalid or knowingly broken

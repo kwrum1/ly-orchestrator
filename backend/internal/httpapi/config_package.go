@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -52,6 +54,28 @@ type ConfigImportRequest struct {
 	Payload                 ConfigPackagePayload  `json:"payload"`
 }
 
+func (request *ConfigImportRequest) UnmarshalJSON(data []byte) error {
+	type requestAlias ConfigImportRequest
+	var wire struct {
+		*requestAlias
+		ConfirmationPackageHashAlias string `json:"confirmation_package_hash,omitempty"`
+		ConfirmationDiffHashAlias    string `json:"confirmation_diff_hash,omitempty"`
+	}
+	wire.requestAlias = (*requestAlias)(request)
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return err
+	}
+	if request.ConfirmationPackageHash == "" {
+		request.ConfirmationPackageHash = wire.ConfirmationPackageHashAlias
+	}
+	if request.ConfirmationDiffHash == "" {
+		request.ConfirmationDiffHash = wire.ConfirmationDiffHashAlias
+	}
+	return nil
+}
+
 type ConfigProductMismatchError struct {
 	Package product.ID
 	Server  product.ID
@@ -84,7 +108,7 @@ func (payload ConfigPackagePayload) ValidateFor(profile product.Profile) error {
 }
 
 func resourceAllowed(profile product.Profile, resourceType string) bool {
-	if resourceType != "proxy_egress" {
+	if resourceType != "proxy_egress" && !isOrchestratorConfigResource(resourceType) {
 		if _, ok := desiredResourceDefs[resourceType]; !ok {
 			return false
 		}
@@ -129,7 +153,7 @@ func manifestForPayload(payload ConfigPackagePayload) ConfigPackageManifest {
 	return ConfigPackageManifest{SchemaVersion: ConfigPackageSchemaVersion, ContentType: configContentType, Product: payload.Product, Included: []string{"desired_config"}, Excluded: payload.Excluded, SecretPolicy: "excluded", PackageHash: hashConfigPayload(payload)}
 }
 
-func (server *Server) preflightConfigPackage(payload ConfigPackagePayload, manifest ConfigPackageManifest) error {
+func (server *Server) preflightConfigPackage(ctx context.Context, payload ConfigPackagePayload, manifest ConfigPackageManifest) error {
 	if err := payload.ValidateFor(server.profile); err != nil {
 		return err
 	}
@@ -147,6 +171,9 @@ func (server *Server) preflightConfigPackage(payload ConfigPackagePayload, manif
 	}
 	if manifest.SecretPolicy != "excluded" {
 		return fmt.Errorf("%w: secret_policy must be excluded", ErrInvalidConfigPackage)
+	}
+	if err := server.validateOrchestratorConfigPackage(ctx, payload); err != nil {
+		return err
 	}
 	return nil
 }

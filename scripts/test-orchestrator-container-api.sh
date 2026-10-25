@@ -157,6 +157,46 @@ PY
 
 start_dut
 login
+curl --fail --silent --show-error -b "$tmp/cookies" \
+  "http://127.0.0.1:$port/api/v1/orchestrator/upgrades" > "$tmp/evidence/upgrades.json"
+python3 - "$tmp/evidence/upgrades.json" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1]))
+assert x['version']['product']=='orchestrator'
+assert x['version']['upgrade_supported'] is True
+assert x['items']==[]
+PY
+python3 - "$repo_root/packaging/fixtures/product-conversion/gateway-to-orchestrator.json" "$tmp/conversion-validate.json" <<'PY'
+import json,sys
+manifest=json.load(open(sys.argv[1]))
+manifest['from_product']='orchestrator'
+manifest['to_product']='gateway'
+json.dump({'manifest':manifest,'prepare':False},open(sys.argv[2],'w'))
+PY
+curl --fail --silent --show-error -b "$tmp/cookies" -H 'Content-Type: application/json' \
+  --data-binary @"$tmp/conversion-validate.json" \
+  "http://127.0.0.1:$port/api/v1/orchestrator/conversions/validate" > "$tmp/evidence/conversion-validate.json"
+python3 - "$tmp/evidence/conversion-validate.json" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1]))
+assert x['validation']['valid'] is True
+assert x['validation']['plan']['dataplane_mode']=='preserve'
+PY
+curl --fail --silent --show-error -b "$tmp/cookies" \
+  "http://127.0.0.1:$port/api/v1/capabilities" > "$tmp/evidence/capabilities.json"
+curl --fail --silent --show-error -b "$tmp/cookies" \
+  "http://127.0.0.1:$port/api/v1/telemetry/dashboard" > "$tmp/evidence/telemetry-dashboard.json"
+curl --fail --silent --show-error -b "$tmp/cookies" \
+  "http://127.0.0.1:$port/api/v1/telemetry/policy-hits" > "$tmp/evidence/telemetry-policy-hits.json"
+python3 - "$tmp/evidence/capabilities.json" "$tmp/evidence/telemetry-dashboard.json" <<'PY'
+import json,sys
+capabilities=json.load(open(sys.argv[1]))
+names={item.get('name') for item in capabilities.get('items',[])}
+for forbidden in ('smartdns','kea','xray','pppoe','linux_routing'):
+    assert forbidden not in names, forbidden
+dashboard=json.load(open(sys.argv[2]))
+assert dashboard.get('data',{}).get('device_mode')=='orchestrator'
+PY
 curl --fail-with-body --silent --show-error -b "$tmp/cookies" -H 'Content-Type: application/json' -X PUT \
   --data-binary @"$repo_root/backend/internal/orchestratorapi/testdata/topology-v1.json" \
   "http://127.0.0.1:$port/api/v1/orchestrator/topology" > "$tmp/evidence/topology-put.json" || {
@@ -203,8 +243,44 @@ assert x['package_manifest']['product']=='orchestrator'
 assert x['payload']['product']=='orchestrator'
 resources=x['payload']['resources']
 assert any(item['id']=='office-runtime' for item in resources['object_group'])
+assert len(resources['orchestrator_topology'])==1
+assert resources['orchestrator_topology'][0]['management_interface']=='eth0'
+assert len(resources['orchestrator_policy'])==1
+assert resources['orchestrator_policy'][0]['policy_groups'][0]['id']=='route'
 for forbidden in ('wan_link','wan_group','nat_static','port_map','dns_policy','dns_upstream','dhcp_server','proxy_node','proxy_subscription'):
     assert forbidden not in resources
+PY
+python3 - "$tmp/evidence/config-export.json" "$tmp/import-preflight-request.json" <<'PY'
+import json,sys
+pkg=json.load(open(sys.argv[1]))
+json.dump({'dry_run':True,'confirm':False,'package_manifest':pkg['package_manifest'],'payload':pkg['payload']},open(sys.argv[2],'w'))
+PY
+curl --fail --silent --show-error -b "$tmp/cookies" -H 'Content-Type: application/json' \
+  --data-binary @"$tmp/import-preflight-request.json" \
+  "http://127.0.0.1:$port/api/v1/config/import" > "$tmp/evidence/import-preflight.json"
+python3 - "$tmp/evidence/config-export.json" "$tmp/evidence/import-preflight.json" "$tmp/import-confirm-request.json" <<'PY'
+import json,sys
+pkg=json.load(open(sys.argv[1])); pre=json.load(open(sys.argv[2]))
+assert pre['status']=='dry_run'
+json.dump({
+  'confirm':True,
+  'package_manifest':pkg['package_manifest'],
+  'payload':pkg['payload'],
+  'confirmation_token':pre['confirmation_token'],
+  'confirmation_actor':pre['confirmation_actor'],
+  'package_hash':pre['package_hash'],
+  'diff_hash':pre['diff_hash'],
+  'confirmation_expires_at':pre['confirmation_expires_at'],
+},open(sys.argv[3],'w'))
+PY
+curl --fail-with-body --silent --show-error -b "$tmp/cookies" -H 'Content-Type: application/json' \
+  --data-binary @"$tmp/import-confirm-request.json" \
+  "http://127.0.0.1:$port/api/v1/config/import" > "$tmp/evidence/import-confirm.json"
+python3 - "$tmp/evidence/import-confirm.json" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1]))
+assert x['status']=='persisted'
+assert x['rollback_snapshot_id']
 PY
 curl --fail --silent --show-error -b "$tmp/cookies" -H 'Content-Type: application/json' -X POST \
   --data '{"name":"runtime-before-restart"}' \
@@ -221,6 +297,15 @@ import json,sys
 x=json.load(open(sys.argv[1]))
 assert x['status']=='restored'
 assert x['snapshot']['id']==sys.argv[2]
+PY
+curl --fail --silent --show-error -b "$tmp/cookies" \
+  "http://127.0.0.1:$port/api/v1/config/export" > "$tmp/evidence/config-export-after-restore.json"
+python3 - "$tmp/evidence/config-export-after-restore.json" <<'PY'
+import json,sys
+resources=json.load(open(sys.argv[1]))['payload']['resources']
+assert len(resources['orchestrator_topology'])==1
+assert len(resources['orchestrator_policy'])==1
+assert resources['orchestrator_policy'][0]['policy_groups'][0]['rules'][0]['action']=={'kind':'via','group':'inline-east'}
 PY
 
 docker rm -f "$name" >/dev/null

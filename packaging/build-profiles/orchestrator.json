@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "product": "orchestrator",
+  "version": "26.06+lyroute1",
   "control_profile": "packaging/product-profiles/orchestrator.json",
   "frontend_product": "orchestrator",
   "default_config": "packaging/build-profiles/orchestrator-default-config.json",
