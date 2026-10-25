@@ -107,6 +107,31 @@ func TestRuntimeApplyRejectsWithTheInFlightTransaction(t *testing.T) {
 	}
 }
 
+func TestRuntimeApplyRejectsReconcilerWithoutPhantomTransaction(t *testing.T) {
+	server := New(WithAuthConfig(AuthConfig{AdminUsername: "admin", AdminPassword: "secret"}))
+	cookie := loginAdmin(t, server)
+
+	lease, acquired := server.beginApply("proxy reconcile", "", time.Minute)
+	if !acquired {
+		t.Fatal("could not acquire the apply gate for the test")
+	}
+	defer lease.release()
+
+	response := authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/runtime/apply", `{}`, cookie)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("concurrent apply status = %d, want 202: %s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, required := range []string{`"status":"apply_in_progress"`, `"kind":"proxy reconcile"`, `"retry_after_seconds":2`} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("reconciler rejection missing %q: %s", required, body)
+		}
+	}
+	if strings.Contains(body, `"transaction_id"`) {
+		t.Fatalf("reconciler rejection invented a phantom transaction: %s", body)
+	}
+}
+
 func TestProxyReconcilerSkipsWhileOperatorApplyOwnsGate(t *testing.T) {
 	server := New(WithAuthConfig(AuthConfig{AdminUsername: "admin", AdminPassword: "secret"}))
 	lease, acquired := server.beginApply("runtime-apply", "runtime-operator", time.Minute)

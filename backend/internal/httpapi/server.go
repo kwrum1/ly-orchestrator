@@ -5094,12 +5094,21 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 		// never-executed ID would make the client poll a transaction that can
 		// never commit. Clients can poll runtime/status for the real receipt.
 		inFlight := server.applyState()
-		holderTransactionID := inFlight.TransactionID
-		if holderTransactionID == "" {
-			holderTransactionID = transactionID
+		response := map[string]any{
+			"status": "apply_in_progress", "runtime_state": "degraded",
+			"reason":              "another runtime apply is in progress",
+			"in_flight_apply":     inFlight,
+			"retry_after_seconds": 2,
+			"request_id":          requestID(r),
+		}
+		// Only report a transaction ID when the holder is itself an apply. A
+		// periodic proxy reconcile has no transaction to poll; returning a
+		// fresh ID for it would recreate the phantom-transaction deadlock.
+		if inFlight.TransactionID != "" {
+			response["transaction_id"] = inFlight.TransactionID
 		}
 		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "denied", "another runtime apply is in progress", r)
-		writeJSON(w, http.StatusAccepted, map[string]any{"status": "apply_in_progress", "runtime_state": "degraded", "reason": "another runtime apply is in progress", "transaction_id": holderTransactionID, "in_flight_apply": inFlight, "request_id": requestID(r)})
+		writeJSON(w, http.StatusAccepted, response)
 		return
 	}
 	defer lease.release()
@@ -8452,18 +8461,18 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		// transaction that actually owns the gate so a poller follows real
 		// evidence instead of a phantom ID.
 		inFlight := server.applyState()
-		holderTransactionID := inFlight.TransactionID
-		if holderTransactionID == "" {
-			holderTransactionID = transactionID
-		}
-		writeJSON(w, http.StatusAccepted, map[string]any{
+		response := map[string]any{
 			"status": "apply_in_progress", "runtime_state": "applying",
-			"reason":          "another configuration apply is in progress",
-			"transaction_id":  holderTransactionID,
-			"in_flight_apply": inFlight,
-			"query":           configApplyAsyncQueryPath + "?transaction_id=" + url.QueryEscape(holderTransactionID),
-			"request_id":      requestID(r),
-		})
+			"reason":              "another configuration apply is in progress",
+			"in_flight_apply":     inFlight,
+			"retry_after_seconds": 2,
+			"request_id":          requestID(r),
+		}
+		if inFlight.TransactionID != "" {
+			response["transaction_id"] = inFlight.TransactionID
+			response["query"] = configApplyAsyncQueryPath + "?transaction_id=" + url.QueryEscape(inFlight.TransactionID)
+		}
+		writeJSON(w, http.StatusAccepted, response)
 		return
 	}
 	defer lease.release()
