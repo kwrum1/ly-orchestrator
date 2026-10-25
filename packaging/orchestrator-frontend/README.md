@@ -9,20 +9,20 @@ bundle, independently of the legacy controller-shell generator.
 | Field | Value |
 |---|---|
 | Product | `orchestrator` |
-| Source commit | `08af368d79cea85300849258decec26933f845fa` (`feat/orchestrator-ui-align`) |
+| Source commit | `1113170be5c057aeeefb8283e898a7d098bb4e79` (`feat/orchestrator-ui-align`) |
 | Source tree | `frontend/gateway` (React/Vite), `LY_ROUTE_PRODUCT=orchestrator` |
 | Build command | `cd frontend/gateway && LY_ROUTE_PRODUCT=orchestrator pnpm build` |
-| Built at | 2026-10-24T09:35:26Z |
+| Built at | 2026-10-25T20:12:36Z |
 | Pages | 11 (单机总览, 单机拓扑, 编排组, 流量编排, 透明编排, 遥测, 运行态, 配置与快照, 升级 / 回滚, 产品转换, 用户管理) |
-| `app.js` SHA-256 | `0787685e8117c87e2e87a932c5e2f54e389ba668621c92bff65af00466199d35` |
+| `app.js` SHA-256 | `b3e4027e232226541aa77f6225da69005b5279850db7ce73d9c7a5be5ebd0dea` |
 
 `manifest.json` records the SHA-256 of every bundled file. The pin that the
 build enforces lives in `packaging/build-profiles/orchestrator.json`:
 
 ```json
 "frontend_bundle": "packaging/orchestrator-frontend/bundle",
-"frontend_app_sha256": "0787685e8117c87e2e87a932c5e2f54e389ba668621c92bff65af00466199d35",
-"frontend_bundle_source": "08af368d79cea85300849258decec26933f845fa"
+"frontend_app_sha256": "b3e4027e232226541aa77f6225da69005b5279850db7ce73d9c7a5be5ebd0dea",
+"frontend_bundle_source": "1113170be5c057aeeefb8283e898a7d098bb4e79"
 ```
 
 `scripts/lib/product-build-profile.sh` verifies the copied `app.js` against
