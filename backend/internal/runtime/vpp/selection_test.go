@@ -233,7 +233,7 @@ func TestNativePath_vmxnet3AFPacketAcceptanceRequiresLinuxMAC(t *testing.T) {
 	}
 	request := NativePathRequest{ManagementInterface: "eth0", AcceptanceAFPacket: true, Now: now, Assignments: []NativeAssignment{{LinuxInterface: "eth1", Explicit: true, Candidates: []CapabilityProof{proof}}}}
 	path, err := SelectNativePath(request)
-	assertDataplaneLocked(t, path, err, "common_dataplane_tier")
+	assertDataplaneLocked(t, path, err, "runtime_capability_proof")
 	var locked *DataplaneLockedError
 	if !errors.As(err, &locked) || len(locked.Candidates) != 1 || locked.Candidates[0].Eligible {
 		t.Fatalf("candidates = %#v, want rejected AF_PACKET candidate", locked)

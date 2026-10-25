@@ -356,29 +356,32 @@ func committedCapabilityReport(path string) (CapabilityReport, bool) {
 			mode = NativeModeZeroCopy
 		}
 		dpdk := tier == DataplaneTierDPDK
+		afCompatibility := hook == NativeHookAFPacket && mode == NativeModeAFPacket || hook == NativeHookTapBridge && mode == NativeModeTapBridge
 		proof := CapabilityProof{
 			Tier:            tier,
 			Hook:            hook,
 			Mode:            mode,
+			Transport:       dpdkTransportForMode(mode),
 			VPPInterface:    strings.TrimSpace(attachment.VPPInterface),
 			MACAddress:      strings.TrimSpace(attachment.MACAddress),
 			Source:          ProofSourceActiveRuntimeReadback,
 			RuntimeVerified: true,
 			Native:          !dpdk,
-			HighPerformance: true,
+			HighPerformance: !afCompatibility,
+			AcceptanceOnly:  afCompatibility,
 			// The committed generation is authoritative until the next
 			// transaction replaces it, so the reconstructable proof is not
 			// stamped with a short lease.
-			ObservedAt:         now.Add(-time.Minute),
-			ValidUntil:         now.Add(365 * 24 * time.Hour),
-			PerformanceScore:   100,
-			PCIAddress:         strings.TrimSpace(attachment.PCIAddress),
-			KernelDriver:       strings.TrimSpace(attachment.KernelDriver),
-			IOMMUGroup:         strings.TrimSpace(attachment.IOMMUGroup),
-			IOMMUProtected:     dpdk && mode == NativeModeDPDKVFIO,
-			VFIOAvailable:      dpdk && mode == NativeModeDPDKVFIO,
-			UIOPCIAvailable:    dpdk && mode == NativeModeDPDKUIO,
-			HugepagesAvailable: dpdk,
+			ObservedAt:          now.Add(-time.Minute),
+			ValidUntil:          now.Add(365 * 24 * time.Hour),
+			PerformanceScore:    100,
+			PCIAddress:          strings.TrimSpace(attachment.PCIAddress),
+			KernelDriver:        strings.TrimSpace(attachment.KernelDriver),
+			IOMMUGroup:          strings.TrimSpace(attachment.IOMMUGroup),
+			IOMMUProtected:      dpdk && mode == NativeModeDPDKVFIO,
+			VFIOAvailable:       dpdk && mode == NativeModeDPDKVFIO,
+			UIOPCIAvailable:     dpdk && mode == NativeModeDPDKUIO,
+			HugepagesAvailable:  dpdk,
 			DPDKPluginAvailable: dpdk,
 		}
 		report.Proofs = append(report.Proofs, InterfaceProof{

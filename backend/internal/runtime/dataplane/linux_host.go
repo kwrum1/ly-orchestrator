@@ -16,8 +16,8 @@ import (
 	"ly-route/backend/internal/runtime/vpp"
 )
 
-const managedDPDKStart = "# BEGIN LY-ROUTE MANAGED DPDK"
-const managedDPDKEnd = "# END LY-ROUTE MANAGED DPDK"
+const managedDPDKStart = "# BEGIN LY ROUTE DPDK"
+const managedDPDKEnd = "# END LY ROUTE DPDK"
 
 type CommandRunner interface {
 	Run(context.Context, string, ...string) ([]byte, error)
@@ -35,6 +35,9 @@ type LinuxHost struct {
 	StateDir      string
 	Runner        CommandRunner
 	VPPCTL        string
+	// SysfsWriter is injectable for tests. Production leaves it nil so writes
+	// go straight to the kernel's sysfs attributes.
+	SysfsWriter func(path string, value string) error
 }
 
 func NewLinuxHost() *LinuxHost {
@@ -52,6 +55,9 @@ func (host *LinuxHost) Snapshot(_ context.Context, request Request) (Snapshot, e
 	snapshot := Snapshot{TransactionID: request.TransactionID, StartupConfig: config}
 	seenPCI := map[string]bool{}
 	for _, attachment := range request.Path.Attachments {
+		if !isDPDKAttachment(attachment) {
+			continue
+		}
 		state, stateErr := host.deviceState(attachment)
 		if stateErr != nil {
 			return Snapshot{}, stateErr
@@ -74,45 +80,82 @@ func (host *LinuxHost) StopVPP(ctx context.Context) error {
 }
 
 func (host *LinuxHost) ConfigureDPDK(ctx context.Context, path vpp.NativePath, snapshot Snapshot) error {
-	driver, err := dpdkBindingDriver(path.Attachments)
-	if err != nil {
-		return err
-	}
-	return host.configurePCI(ctx, path, snapshot, driver)
+	return host.configurePCI(ctx, path, snapshot)
 }
 
-func (host *LinuxHost) configurePCI(ctx context.Context, path vpp.NativePath, snapshot Snapshot, targetDriver string) error {
-	module := targetDriver
-	if targetDriver == "vfio-pci" {
-		module = "vfio-pci"
-	}
-	if _, err := host.run(ctx, "modprobe", module); err != nil {
-		return fmt.Errorf("load %s: %w", module, err)
+func (host *LinuxHost) configurePCI(ctx context.Context, path vpp.NativePath, snapshot Snapshot) error {
+	loaded := map[string]bool{}
+	for _, attachment := range path.Attachments {
+		if !isDPDKAttachment(attachment) {
+			continue
+		}
+		targetDriver, err := dpdkDriverForMode(attachment.Mode)
+		if err != nil {
+			return err
+		}
+		if loaded[targetDriver] {
+			continue
+		}
+		if _, err := host.run(ctx, "modprobe", targetDriver); err != nil {
+			return fmt.Errorf("load %s: %w", targetDriver, err)
+		}
+		loaded[targetDriver] = true
 	}
 	states := map[string]DeviceState{}
 	for _, state := range snapshot.Devices {
 		states[state.LinuxInterface] = state
 	}
 	for _, attachment := range path.Attachments {
+		if !isDPDKAttachment(attachment) {
+			continue
+		}
+		targetDriver, err := dpdkDriverForMode(attachment.Mode)
+		if err != nil {
+			return err
+		}
 		state, found := states[attachment.LinuxInterface]
 		if !found || state.PCIAddress != attachment.PCIAddress {
 			return fmt.Errorf("snapshot identity mismatch for %q", attachment.LinuxInterface)
 		}
-		if _, err := host.run(ctx, "ip", "link", "set", "dev", state.LinuxInterface, "down"); err != nil {
-			return err
-		}
-		if state.KernelDriver != targetDriver {
-			if err := host.writeSysfs(filepath.Join("bus/pci/drivers", state.KernelDriver, "unbind"), state.PCIAddress); err != nil {
+		if _, err := os.Stat(host.sysfs(filepath.Join("class/net", state.LinuxInterface))); err == nil {
+			if _, err := host.run(ctx, "ip", "link", "set", "dev", state.LinuxInterface, "down"); err != nil {
 				return err
 			}
 		}
-		if err := host.writeSysfs(filepath.Join("bus/pci/devices", state.PCIAddress, "driver_override"), targetDriver); err != nil {
-			return err
+		currentDriver := state.BoundDriver
+		if currentDriver == "" {
+			currentDriver = host.currentDriver(state.PCIAddress)
 		}
-		if state.KernelDriver != targetDriver {
+		created := state.OwnedByProduct
+		if currentDriver != targetDriver {
+			// Record the intent before mutating the device. If the bind fails or
+			// the process dies mid-way, rollback still knows which kernel driver
+			// the product must restore.
+			if err := host.recordOwnership(state, targetDriver, true); err != nil {
+				return fmt.Errorf("record ownership for %s: %w", state.PCIAddress, err)
+			}
+			if currentDriver != "" {
+				if err := host.writeSysfs(filepath.Join("bus/pci/drivers", currentDriver, "unbind"), state.PCIAddress); err != nil {
+					return err
+				}
+			}
+			if err := host.writeSysfs(filepath.Join("bus/pci/devices", state.PCIAddress, "driver_override"), targetDriver); err != nil {
+				return err
+			}
 			if err := host.writeSysfs(filepath.Join("bus/pci/drivers", targetDriver, "bind"), state.PCIAddress); err != nil {
 				return err
 			}
+			created = true
+		} else if err := host.writeSysfs(filepath.Join("bus/pci/devices", state.PCIAddress, "driver_override"), targetDriver); err != nil {
+			return err
+		}
+		if bound := host.currentDriver(state.PCIAddress); bound != targetDriver {
+			return fmt.Errorf("PCI device %s did not bind to %s", state.PCIAddress, targetDriver)
+		}
+		state.BoundDriver = targetDriver
+		state.OwnedByProduct = created
+		if err := host.recordOwnership(state, targetDriver, created); err != nil {
+			return fmt.Errorf("record ownership for %s: %w", state.PCIAddress, err)
 		}
 	}
 	config, err := RenderDPDKStartup(snapshot.StartupConfig, path.Attachments)
@@ -139,11 +182,14 @@ func (host *LinuxHost) VerifyDPDK(ctx context.Context, path vpp.NativePath) erro
 	if _, err := host.run(ctx, "systemctl", "is-active", "--quiet", "vpp.service"); err != nil {
 		return err
 	}
-	expectedDriver, err := dpdkBindingDriver(path.Attachments)
-	if err != nil {
-		return err
-	}
 	for _, attachment := range path.Attachments {
+		if !isDPDKAttachment(attachment) {
+			continue
+		}
+		expectedDriver, err := dpdkDriverForMode(attachment.Mode)
+		if err != nil {
+			return err
+		}
 		driver, err := filepath.EvalSymlinks(host.sysfs(filepath.Join("bus/pci/devices", attachment.PCIAddress, "driver")))
 		if err != nil || filepath.Base(driver) != expectedDriver {
 			return fmt.Errorf("PCI device %s is not bound to %s", attachment.PCIAddress, expectedDriver)
@@ -208,24 +254,42 @@ func (host *LinuxHost) Restore(ctx context.Context, snapshot Snapshot) error {
 	if err := atomicWrite(host.startupConfig(), snapshot.StartupConfig, 0o640); err != nil {
 		restoreErrors = append(restoreErrors, err)
 	}
+	restored := map[string]bool{}
 	for _, state := range snapshot.Devices {
-		currentDriver, _ := filepath.EvalSymlinks(host.sysfs(filepath.Join("bus/pci/devices", state.PCIAddress, "driver")))
-		if current := filepath.Base(currentDriver); current != "" && current != "." && current != state.KernelDriver {
+		record, recorded := host.ownershipRecord(state.PCIAddress)
+		if !recorded || !record.CreatedByProduct {
+			// The operator (or a previous system image) owned this binding.
+			// Rollback must not confiscate a device the product did not take.
+			continue
+		}
+		current := host.currentDriver(state.PCIAddress)
+		if current != "" && current != state.KernelDriver {
 			if err := host.writeSysfs(filepath.Join("bus/pci/drivers", current, "unbind"), state.PCIAddress); err != nil {
 				restoreErrors = append(restoreErrors, err)
+				continue
 			}
 		}
 		if err := host.writeSysfs(filepath.Join("bus/pci/devices", state.PCIAddress, "driver_override"), state.KernelDriver); err != nil {
 			restoreErrors = append(restoreErrors, err)
+			continue
 		}
-		if filepath.Base(currentDriver) != state.KernelDriver {
+		if host.currentDriver(state.PCIAddress) != state.KernelDriver {
 			if err := host.writeSysfs(filepath.Join("bus/pci/drivers", state.KernelDriver, "bind"), state.PCIAddress); err != nil {
 				restoreErrors = append(restoreErrors, err)
+				continue
 			}
 		}
+		if host.currentDriver(state.PCIAddress) != state.KernelDriver {
+			restoreErrors = append(restoreErrors, fmt.Errorf("PCI device %s did not return to %s", state.PCIAddress, state.KernelDriver))
+			continue
+		}
+		if err := host.releaseOwnership(state.PCIAddress); err != nil {
+			restoreErrors = append(restoreErrors, err)
+		}
+		restored[state.PCIAddress] = true
 	}
 	for _, state := range snapshot.Devices {
-		if !state.LinkUp {
+		if !restored[state.PCIAddress] || !state.LinkUp {
 			continue
 		}
 		if err := host.waitForLinuxInterface(ctx, state); err != nil {
@@ -324,24 +388,73 @@ func (host *LinuxHost) deviceState(attachment vpp.NativeAttachment) (DeviceState
 	if !safeToken(name) || !safePCI(attachment.PCIAddress) || !safeToken(attachment.KernelDriver) {
 		return DeviceState{}, fmt.Errorf("unsafe DPDK attachment identity")
 	}
-	device, err := filepath.EvalSymlinks(host.sysfs(filepath.Join("class/net", name, "device")))
-	if err != nil || filepath.Base(device) != attachment.PCIAddress {
-		return DeviceState{}, fmt.Errorf("interface %s does not resolve to PCI %s", name, attachment.PCIAddress)
+	targetDriver, err := dpdkDriverForMode(attachment.Mode)
+	if err != nil {
+		return DeviceState{}, err
 	}
-	driver, err := filepath.EvalSymlinks(filepath.Join(device, "driver"))
-	if err != nil || filepath.Base(driver) != attachment.KernelDriver {
-		return DeviceState{}, fmt.Errorf("interface %s driver changed since capability proof", name)
+	devicePath := host.sysfs(filepath.Join("class/net", name, "device"))
+	linkUp := false
+	if _, statErr := os.Stat(devicePath); statErr == nil {
+		device, err := filepath.EvalSymlinks(devicePath)
+		if err != nil || filepath.Base(device) != attachment.PCIAddress {
+			return DeviceState{}, fmt.Errorf("interface %s does not resolve to PCI %s", name, attachment.PCIAddress)
+		}
+		operstate, _ := os.ReadFile(host.sysfs(filepath.Join("class/net", name, "operstate")))
+		linkUp = strings.TrimSpace(string(operstate)) == "up"
+		devicePath = host.sysfs(filepath.Join("bus/pci/devices", attachment.PCIAddress))
+	} else {
+		// prepare-vfio.sh may have taken the NIC before the dataplane
+		// transaction started. The Linux netdev is intentionally gone, but the
+		// PCI device and the ownership record remain.
+		devicePath = host.sysfs(filepath.Join("bus/pci/devices", attachment.PCIAddress))
+		if _, err := os.Stat(devicePath); err != nil {
+			return DeviceState{}, fmt.Errorf("interface %s and PCI device %s are both absent", name, attachment.PCIAddress)
+		}
+		linkUp = true
 	}
-	iommu, err := filepath.EvalSymlinks(filepath.Join(device, "iommu_group"))
+	currentDriver := host.currentDriver(attachment.PCIAddress)
+	switch {
+	case currentDriver == attachment.KernelDriver:
+		// The NIC is still kernel-owned; ConfigureDPDK will bind it.
+	case currentDriver == targetDriver:
+		// Already owned by the selected DPDK driver (boot preflight or replay).
+	default:
+		return DeviceState{}, fmt.Errorf("interface %s driver is %q, expected kernel driver %q or DPDK driver %q", name, currentDriver, attachment.KernelDriver, targetDriver)
+	}
 	if attachment.Mode == vpp.NativeModeDPDKUIO {
 		if attachment.IOMMUGroup != "none" {
 			return DeviceState{}, fmt.Errorf("interface %s has invalid UIO isolation identity", name)
 		}
-	} else if err != nil || filepath.Base(iommu) != attachment.IOMMUGroup {
-		return DeviceState{}, fmt.Errorf("interface %s IOMMU group changed since capability proof", name)
+	} else {
+		iommu, err := filepath.EvalSymlinks(filepath.Join(devicePath, "iommu_group"))
+		if err != nil || filepath.Base(iommu) != attachment.IOMMUGroup {
+			return DeviceState{}, fmt.Errorf("interface %s IOMMU group changed since capability proof", name)
+		}
 	}
-	operstate, _ := os.ReadFile(host.sysfs(filepath.Join("class/net", name, "operstate")))
-	return DeviceState{LinuxInterface: name, PCIAddress: attachment.PCIAddress, KernelDriver: attachment.KernelDriver, LinkUp: strings.TrimSpace(string(operstate)) == "up"}, nil
+	ownedByProduct := false
+	if record, ok := host.ownershipRecord(attachment.PCIAddress); ok && record.CreatedByProduct {
+		ownedByProduct = true
+	}
+	return DeviceState{
+		LinuxInterface: name,
+		PCIAddress:     attachment.PCIAddress,
+		KernelDriver:   attachment.KernelDriver,
+		BoundDriver:    currentDriver,
+		OwnedByProduct: ownedByProduct,
+		LinkUp:         linkUp,
+	}, nil
+}
+
+func (host *LinuxHost) currentDriver(pci string) string {
+	driver, err := filepath.EvalSymlinks(host.sysfs(filepath.Join("bus/pci/devices", pci, "driver")))
+	if err != nil {
+		return ""
+	}
+	name := filepath.Base(driver)
+	if name == "." || name == string(filepath.Separator) {
+		return ""
+	}
+	return name
 }
 
 func RenderDPDKStartup(current []byte, attachments []vpp.NativeAttachment) ([]byte, error) {
@@ -353,19 +466,30 @@ func RenderDPDKStartup(current []byte, attachments []vpp.NativeAttachment) ([]by
 		}
 		text = text[:start] + text[start+end+len(managedDPDKEnd):]
 	}
-	driver, err := dpdkBindingDriver(attachments)
+	dpdkAttachments := make([]vpp.NativeAttachment, 0, len(attachments))
+	for _, attachment := range attachments {
+		if isDPDKAttachment(attachment) {
+			dpdkAttachments = append(dpdkAttachments, attachment)
+		}
+	}
+	driver, err := dpdkBindingDriver(dpdkAttachments)
 	if err != nil {
 		return nil, err
 	}
 	var block strings.Builder
 	block.WriteString("\n" + managedDPDKStart + "\ndpdk {\n  uio-driver " + driver + "\n")
 	seen := map[string]bool{}
-	for _, attachment := range attachments {
-		if !safePCI(attachment.PCIAddress) || !safeToken(attachment.VPPInterface) || seen[attachment.PCIAddress] {
+	for _, attachment := range dpdkAttachments {
+		if !safePCI(attachment.PCIAddress) || seen[attachment.PCIAddress] {
 			return nil, fmt.Errorf("invalid or duplicate DPDK startup attachment")
 		}
 		seen[attachment.PCIAddress] = true
-		fmt.Fprintf(&block, "  dev %s {\n    name %s\n    no-rx-interrupts\n  }\n", attachment.PCIAddress, attachment.VPPInterface)
+		// Do not assign an explicit VPP name: the PCI slot name VPP derives
+		// (for example GigabitEthernet4/0/0) is stable across restarts and is
+		// the name the capability probe and address assignments already use.
+		// A configured name also made VPP reject an otherwise valid device
+		// start on the J1900 i211/UIO path.
+		fmt.Fprintf(&block, "  dev %s\n", attachment.PCIAddress)
 	}
 	if len(seen) == 0 {
 		return nil, errors.New("DPDK startup requires at least one device")
@@ -378,6 +502,9 @@ func RenderDPDKStartup(current []byte, attachments []vpp.NativeAttachment) ([]by
 func dpdkBindingDriver(attachments []vpp.NativeAttachment) (string, error) {
 	driver := ""
 	for _, attachment := range attachments {
+		if !isDPDKAttachment(attachment) {
+			continue
+		}
 		candidate := ""
 		switch attachment.Mode {
 		case vpp.NativeModeDPDKVFIO:
@@ -388,7 +515,10 @@ func dpdkBindingDriver(attachments []vpp.NativeAttachment) (string, error) {
 			return "", fmt.Errorf("unsupported DPDK binding mode %q", attachment.Mode)
 		}
 		if driver != "" && driver != candidate {
-			return "", errors.New("mixed DPDK PCI binding drivers are not supported")
+			// VPP exposes one global uio-driver. "auto" lets DPDK use the driver
+			// each device is already bound to, so a device-wide path can mix
+			// IOMMU-protected VFIO ports with no-IOMMU UIO ports.
+			return "auto", nil
 		}
 		driver = candidate
 	}
@@ -447,7 +577,11 @@ func (host *LinuxHost) run(ctx context.Context, name string, args ...string) ([]
 	return output, nil
 }
 func (host *LinuxHost) writeSysfs(path, value string) error {
-	return os.WriteFile(host.sysfs(path), []byte(value), 0o200)
+	path = host.sysfs(path)
+	if host.SysfsWriter != nil {
+		return host.SysfsWriter(path, value)
+	}
+	return os.WriteFile(path, []byte(value), 0o200)
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
@@ -500,4 +634,9 @@ func safePCI(value string) bool {
 		}
 	}
 	return true
+}
+
+func isDPDKAttachment(attachment vpp.NativeAttachment) bool {
+	return attachment.Tier == vpp.DataplaneTierDPDK || attachment.Hook == vpp.NativeHookDPDK ||
+		attachment.Mode == vpp.NativeModeDPDKVFIO || attachment.Mode == vpp.NativeModeDPDKUIO
 }

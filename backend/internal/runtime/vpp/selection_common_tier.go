@@ -19,10 +19,11 @@ func selectCommonDataplanePath(request NativePathRequest) (NativePath, error) {
 		return strings.TrimSpace(assignments[i].LinuxInterface) < strings.TrimSpace(assignments[j].LinuxInterface)
 	})
 
-	type eligibleByTier map[DataplaneTier][]CapabilityProof
-	eligible := make(map[string]eligibleByTier, len(assignments))
 	evaluations := make([]CandidateEvaluation, 0)
+	selected := make([]CapabilityProof, 0, len(assignments))
+	afRequired := make([]string, 0)
 	seen := make(map[string]struct{}, len(assignments))
+	hardFailures := false
 	for _, assignment := range assignments {
 		name := strings.TrimSpace(assignment.LinuxInterface)
 		_, duplicate := seen[name]
@@ -34,110 +35,135 @@ func selectCommonDataplanePath(request NativePathRequest) (NativePath, error) {
 			prerequisite("explicit_assignment", name, assignment.Explicit, "automatic interface assignment is forbidden"),
 			prerequisite("management_excluded", name, management != "" && (request.ManagementShared || name != management), "management interface is permanently excluded"),
 		)
-		eligible[name] = eligibleByTier{}
-		for _, proof := range assignment.Candidates {
+
+		var best *CapabilityProof
+		afCandidateSeen := false
+		afCandidateOnlyNeedsConsent := false
+		afConsent := request.AFPacketConsent || assignment.AFPacketConsent
+		for index := range assignment.Candidates {
+			proof := assignment.Candidates[index]
 			tier := proofTier(proof)
-			reasons := candidateRejectionReasons(proof, request.Now, tier, request.AcceptanceAFPacket)
+			reasons := candidateRejectionReasons(proof, request.Now, tier, request.AcceptanceAFPacket, afConsent)
 			evaluation := CandidateEvaluation{LinuxInterface: name, Tier: tier, Hook: proof.Hook, Mode: proof.Mode, PerformanceScore: proof.PerformanceScore, Eligible: len(reasons) == 0, Reasons: reasons}
 			evaluations = append(evaluations, evaluation)
-			if evaluation.Eligible {
-				eligible[name][tier] = append(eligible[name][tier], proof)
+			if isAFPacketCompatibilityProof(proof) {
+				afCandidateSeen = true
+				if len(reasons) == 1 && reasons[0] == afConsentRequiredReason {
+					afCandidateOnlyNeedsConsent = true
+				}
+			}
+			if !evaluation.Eligible {
+				continue
+			}
+			if best == nil || candidatePreferred(proof, *best) {
+				candidate := proof
+				best = &candidate
 			}
 		}
+		if best == nil {
+			if afCandidateSeen && afCandidateOnlyNeedsConsent {
+				afRequired = append(afRequired, name)
+			} else {
+				hardFailures = true
+				results = append(results, prerequisite("runtime_capability_proof", name, false, "no usable high-performance or consented compatibility path was proven for this interface"))
+			}
+			continue
+		}
+		selected = append(selected, *best)
+		results = append(results, prerequisite("interface_realized", name, true, ""))
 	}
 
+	if len(afRequired) > 0 {
+		return NativePath{}, &AFFallbackRequiredError{Interfaces: afRequired, Reason: AFPacketDegradedReason}
+	}
 	for _, result := range results {
 		if !result.Passed {
 			return NativePath{}, &DataplaneLockedError{Prerequisites: results, Candidates: evaluations}
 		}
 	}
-
-	selectedTier := DataplaneTier("")
-	for _, tier := range []DataplaneTier{DataplaneTierNative, DataplaneTierDPDK} {
-		allEligible := true
-		for _, assignment := range assignments {
-			if len(eligible[strings.TrimSpace(assignment.LinuxInterface)][tier]) == 0 {
-				allEligible = false
-				break
-			}
-		}
-		if allEligible {
-			selectedTier = tier
-			break
-		}
-	}
-	if selectedTier == "" {
-		results = append(results, prerequisite("common_dataplane_tier", "", false, "no single high-performance tier is eligible on every active data interface"))
+	if hardFailures || len(selected) == 0 {
 		return NativePath{}, &DataplaneLockedError{Prerequisites: results, Candidates: evaluations}
 	}
-	selectedDPDKMode := NativeMode("")
-	if selectedTier == DataplaneTierDPDK {
-		for _, mode := range []NativeMode{NativeModeDPDKVFIO, NativeModeDPDKUIO} {
-			common := true
-			for _, assignment := range assignments {
-				found := false
-				for _, proof := range eligible[strings.TrimSpace(assignment.LinuxInterface)][selectedTier] {
-					if proof.Mode == mode {
-						found = true
-						break
-					}
-				}
-				if !found {
-					common = false
-					break
-				}
-			}
-			if common {
-				selectedDPDKMode = mode
-				break
-			}
+
+	tier := DataplaneTierNative
+	degraded := false
+	degradations := []Degradation{smartQoSRetiredDegradation()}
+	for _, proof := range selected {
+		if proofTier(proof) == DataplaneTierDPDK {
+			tier = DataplaneTierDPDK
 		}
-		if selectedDPDKMode == "" {
-			results = append(results, prerequisite("common_dpdk_binding_driver", "", false, "no single DPDK PCI binding driver is eligible on every active data interface"))
-			return NativePath{}, &DataplaneLockedError{Prerequisites: results, Candidates: evaluations}
+		if isAFPacketCompatibilityProof(proof) {
+			degraded = true
 		}
 	}
-
-	attachments := make([]NativeAttachment, 0, len(assignments))
-	for _, assignment := range assignments {
-		name := strings.TrimSpace(assignment.LinuxInterface)
-		candidates := eligible[name][selectedTier]
-		if selectedTier == DataplaneTierDPDK {
-			filtered := make([]CapabilityProof, 0, len(candidates))
-			for _, candidate := range candidates {
-				if candidate.Mode == selectedDPDKMode {
-					filtered = append(filtered, candidate)
-				}
-			}
-			candidates = filtered
-		}
-		sort.SliceStable(candidates, func(i, j int) bool {
-			if candidates[i].PerformanceScore != candidates[j].PerformanceScore {
-				return candidates[i].PerformanceScore > candidates[j].PerformanceScore
-			}
-			if candidates[i].Hook != candidates[j].Hook {
-				return candidates[i].Hook < candidates[j].Hook
-			}
-			return candidates[i].Mode < candidates[j].Mode
-		})
-		selected := candidates[0]
+	if degraded {
+		degradations = append(degradations, Degradation{Name: "af_packet_fallback", Reason: AFPacketDegradedReason, Impact: "performance"})
+	}
+	attachments := make([]NativeAttachment, 0, len(selected))
+	for index, proof := range selected {
 		attachments = append(attachments, proveNativeAttachment(NativeAttachment{
-			LinuxInterface: name,
-			VPPInterface:   selectedVPPInterface(selected, name),
-			MACAddress:     strings.TrimSpace(selected.MACAddress),
-			Tier:           selectedTier,
-			Hook:           selected.Hook,
-			Mode:           selected.Mode,
-			PCIAddress:     strings.TrimSpace(selected.PCIAddress),
-			KernelDriver:   strings.TrimSpace(selected.KernelDriver),
-			IOMMUGroup:     strings.TrimSpace(selected.IOMMUGroup),
+			LinuxInterface: strings.TrimSpace(assignments[index].LinuxInterface),
+			VPPInterface:   selectedVPPInterface(proof, strings.TrimSpace(assignments[index].LinuxInterface)),
+			MACAddress:     strings.TrimSpace(proof.MACAddress),
+			Tier:           proofTier(proof),
+			Hook:           proof.Hook,
+			Mode:           proof.Mode,
+			PCIAddress:     strings.TrimSpace(proof.PCIAddress),
+			KernelDriver:   strings.TrimSpace(proof.KernelDriver),
+			IOMMUGroup:     strings.TrimSpace(proof.IOMMUGroup),
 		}))
 	}
 	results = append(results, prerequisite("common_dataplane_tier", "", true, ""))
-	// Smart QoS never participates in tier selection. Its absence is reported
-	// as a QoS degradation only, so a plugin-free image still reaches a
-	// committed forwarding generation.
-	return NativePath{Tier: selectedTier, SmartQoS: false, Attachments: attachments, Prerequisites: results, Candidates: evaluations, Degradations: []Degradation{smartQoSRetiredDegradation()}}, nil
+	return NativePath{Tier: tier, Degraded: degraded, SmartQoS: false, Attachments: attachments, Prerequisites: results, Candidates: evaluations, Degradations: degradations}, nil
+}
+
+// candidatePreferred implements the product's ordered fallback. Breadth wins:
+// an interface uses the first usable transport in this order regardless of a
+// lower-ranked candidate's benchmark score.
+func candidatePreferred(candidate, current CapabilityProof) bool {
+	candidateRank := candidatePreference(candidate)
+	currentRank := candidatePreference(current)
+	if candidateRank != currentRank {
+		return candidateRank < currentRank
+	}
+	if candidate.PerformanceScore != current.PerformanceScore {
+		return candidate.PerformanceScore > current.PerformanceScore
+	}
+	if candidate.Hook != current.Hook {
+		return candidate.Hook < current.Hook
+	}
+	return candidate.Mode < current.Mode
+}
+
+func candidatePreference(proof CapabilityProof) int {
+	if proofTier(proof) == DataplaneTierDPDK || proof.Hook == NativeHookDPDK {
+		switch proof.Mode {
+		case NativeModeDPDKVFIO:
+			return 0
+		case NativeModeDPDKUIO:
+			return 1
+		default:
+			return 100
+		}
+	}
+	switch {
+	case proof.Hook == NativeHookAFXDP && proof.Mode == NativeModeZeroCopy:
+		return 2
+	case proof.Hook == NativeHookAFXDP && proof.Mode == NativeModeCopy:
+		return 3
+	case proof.Hook == NativeHookRDMA && proof.Mode == NativeModeRDMADV:
+		return 4
+	case isAFPacketCompatibilityProof(proof):
+		return 5
+	default:
+		return 100
+	}
+}
+
+func isAFPacketCompatibilityProof(proof CapabilityProof) bool {
+	return proof.AcceptanceOnly &&
+		(proof.Hook == NativeHookAFPacket && proof.Mode == NativeModeAFPacket ||
+			proof.Hook == NativeHookTapBridge && proof.Mode == NativeModeTapBridge)
 }
 
 func proofTier(proof CapabilityProof) DataplaneTier {
@@ -150,6 +176,28 @@ func proofTier(proof CapabilityProof) DataplaneTier {
 	return DataplaneTierNative
 }
 
+// dpdkTransportForMode maps the DPDK binding mode to the operator-facing
+// transport name. The proof records it explicitly so reports can say whether
+// the NIC was taken over through IOMMU-protected VFIO or the no-IOMMU UIO
+// fallback without re-deriving the binding from the mode.
+func dpdkTransportForMode(mode NativeMode) string {
+	switch mode {
+	case NativeModeDPDKVFIO:
+		return "vfio"
+	case NativeModeDPDKUIO:
+		return "uio"
+	default:
+		return ""
+	}
+}
+
+func proofTransport(proof CapabilityProof) string {
+	if value := strings.ToLower(strings.TrimSpace(proof.Transport)); value != "" {
+		return value
+	}
+	return dpdkTransportForMode(proof.Mode)
+}
+
 func selectedVPPInterface(proof CapabilityProof, linuxInterface string) string {
 	if value := strings.TrimSpace(proof.VPPInterface); value != "" {
 		return value
@@ -157,9 +205,11 @@ func selectedVPPInterface(proof CapabilityProof, linuxInterface string) string {
 	return "lyroute-" + linuxInterface
 }
 
-func candidateRejectionReasons(proof CapabilityProof, now time.Time, tier DataplaneTier, acceptanceAFPacket bool) []string {
+const afConsentRequiredReason = "AF_PACKET compatibility mode requires explicit operator consent"
+
+func candidateRejectionReasons(proof CapabilityProof, now time.Time, tier DataplaneTier, acceptanceAFPacket, afConsent bool) []string {
 	reasons := make([]string, 0)
-	acceptancePath := acceptanceAFPacketProof(acceptanceAFPacket, proof)
+	acceptancePath := acceptanceAFPacketProof(acceptanceAFPacket || afConsent, proof)
 	runtimeProof := isRuntimeCapabilityProof(proof) && proof.RuntimeVerified && !proof.ObservedAt.IsZero()
 	if !runtimeProof {
 		reasons = append(reasons, "runtime capability proof is required")
@@ -171,6 +221,18 @@ func candidateRejectionReasons(proof CapabilityProof, now time.Time, tier Datapl
 	if !runtimeProof || lifetime <= 0 {
 		reasons = append(reasons, "runtime capability proof validity must end after observation")
 	}
+	if isAFPacketCompatibilityProof(proof) {
+		if !afConsent && !acceptanceAFPacket {
+			reasons = append(reasons, afConsentRequiredReason)
+		}
+		if !hardwareAddressSafe(proof.MACAddress) {
+			reasons = append(reasons, "AF_PACKET candidate has no safe Linux interface MAC address")
+		}
+		// AF_PACKET is a consented compatibility fallback. It is never
+		// high-performance, and it is never a silent bypass: the selection path
+		// marks the resulting generation degraded.
+		return reasons
+	}
 	if !acceptedNativePerformance(proof) && !acceptancePath {
 		reasons = append(reasons, "proof does not establish high-performance mode")
 	}
@@ -179,12 +241,14 @@ func candidateRejectionReasons(proof CapabilityProof, now time.Time, tier Datapl
 		if (!approvedNativeMode(proof.Hook, proof.Mode) && !acceptancePath) || !proof.Native {
 			reasons = append(reasons, "candidate is not an approved VPP-native high-performance path")
 		}
-		if acceptancePath && !hardwareAddressSafe(proof.MACAddress) {
-			reasons = append(reasons, "AF_PACKET candidate has no safe Linux interface MAC address")
-		}
 	case DataplaneTierDPDK:
 		if proof.Hook != NativeHookDPDK || proof.Mode != NativeModeDPDKVFIO && proof.Mode != NativeModeDPDKUIO || proof.Native {
 			reasons = append(reasons, "candidate is not an approved VPP DPDK PCI path")
+		}
+		if expectedTransport := dpdkTransportForMode(proof.Mode); expectedTransport != "" {
+			if recorded := strings.ToLower(strings.TrimSpace(proof.Transport)); recorded != "" && recorded != expectedTransport {
+				reasons = append(reasons, "DPDK transport does not match the PCI binding mode")
+			}
 		}
 		if !pciAddressSafe(proof.PCIAddress) {
 			reasons = append(reasons, "DPDK candidate has no safe PCI address")
@@ -203,6 +267,9 @@ func candidateRejectionReasons(proof CapabilityProof, now time.Time, tier Datapl
 		case NativeModeDPDKUIO:
 			if !proof.UIOPCIAvailable {
 				reasons = append(reasons, "uio_pci_generic is unavailable")
+			}
+			if strings.TrimSpace(proof.IOMMUGroup) != "none" {
+				reasons = append(reasons, "UIO candidate unexpectedly reports an IOMMU group")
 			}
 		}
 		if !proof.HugepagesAvailable {

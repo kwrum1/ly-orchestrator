@@ -129,7 +129,7 @@ func (transaction *productionGatewayWithDataplane) Run(ctx context.Context, plan
 	if err != nil {
 		return GatewayTransactionResult{}, err
 	}
-	if path.Tier == vpp.DataplaneTierNative {
+	if path.Tier == vpp.DataplaneTierNative || pathHasNativeAttachment(path) {
 		if err := transaction.attachNativeUnderlay(ctx, plan); err != nil {
 			return GatewayTransactionResult{}, fmt.Errorf("attach native VPP underlay: %w", err)
 		}
@@ -170,4 +170,14 @@ func (transaction *productionGatewayWithDataplane) Rollback(ctx context.Context,
 	}
 	_, dataplaneErr := transaction.dataplane.Rollback(ctx, plan.Request.TransactionID)
 	return errors.Join(innerErr, dataplaneErr)
+}
+
+func pathHasNativeAttachment(path vpp.NativePath) bool {
+	for _, attachment := range path.Attachments {
+		if attachment.Tier != vpp.DataplaneTierDPDK && attachment.Hook != vpp.NativeHookDPDK &&
+			attachment.Mode != vpp.NativeModeDPDKVFIO && attachment.Mode != vpp.NativeModeDPDKUIO {
+			return true
+		}
+	}
+	return false
 }

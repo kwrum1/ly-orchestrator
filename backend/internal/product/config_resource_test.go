@@ -4,7 +4,7 @@ import "testing"
 
 func TestProfileConfigResourcesSeparateProducts(t *testing.T) {
 	// Given
-	shared := []string{"interface", "management_network", "interface_bond", "object_group", "security_acl", "security_ip_mac_binding", "security_threat_intel", "security_attack_rule", "traffic_control"}
+	shared := []string{"interface", "management_network", "interface_bond", "object_group", "dataplane_policy", "security_acl", "security_ip_mac_binding", "security_threat_intel", "security_attack_rule", "traffic_control"}
 	gatewayOnly := []string{
 		"system_mode", "wan_link", "wan_group", "route_policy", "nat_static", "port_map",
 		"proxy_egress", "proxy_group", "proxy_node", "proxy_subscription",

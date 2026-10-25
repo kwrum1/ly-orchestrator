@@ -24,6 +24,8 @@ umask 077
 : "${LY_ROUTE_VMNET_AF_PACKET_ACCEPTANCE:=false}"
 : "${LY_ROUTE_DATAPLANE_ACTIVE_STATE:=/var/lib/ly-route/dataplane/active.json}"
 : "${LY_ROUTE_ACTIVE_DPDK_READER:=/usr/lib/ly-route/active-dpdk-state.py}"
+: "${LY_ROUTE_DATAPLANE_INVENTORY:=/etc/ly-route/dataplane-inventory.json}"
+: "${LY_ROUTE_DPDK_OWNERSHIP_STATE:=/var/lib/ly-route/dataplane/ownership.json}"
 
 split_csv() {
   printf '%s' "$1" | tr ',' ' '
@@ -135,41 +137,149 @@ probe_native_candidate() {
   printf '%s\n' "$probe_score"
 }
 
+inventory_identity() {
+  probe_interface=$1
+  [ -r "$LY_ROUTE_DATAPLANE_INVENTORY" ] || return 1
+  python3 - "$LY_ROUTE_DATAPLANE_INVENTORY" "$probe_interface" <<'PY'
+import json
+import re
+import sys
+
+token = re.compile(r"^[A-Za-z0-9_.:-]+$")
+pci_pattern = re.compile(r"^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$")
+path, interface = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as source:
+        document = json.load(source)
+except (OSError, ValueError):
+    raise SystemExit(1)
+for item in document.get("data_interfaces", []):
+    if not isinstance(item, dict):
+        continue
+    if str(item.get("linux_interface", "")).strip() != interface:
+        continue
+    pci = str(item.get("pci", "")).strip()
+    driver = str(item.get("kernel_driver", "")).strip()
+    mac = str(item.get("mac", "")).strip().lower()
+    if not pci_pattern.fullmatch(pci) or not token.fullmatch(driver):
+        raise SystemExit(1)
+    print("|".join((pci, driver, mac)))
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+ownership_identity() {
+  probe_interface=$1
+  [ -r "$LY_ROUTE_DPDK_OWNERSHIP_STATE" ] || return 1
+  python3 - "$LY_ROUTE_DPDK_OWNERSHIP_STATE" "$probe_interface" <<'PY'
+import json
+import re
+import sys
+
+token = re.compile(r"^[A-Za-z0-9_.:-]+$")
+pci_pattern = re.compile(r"^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$")
+path, interface = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as source:
+        document = json.load(source)
+except (OSError, ValueError):
+    raise SystemExit(1)
+for item in document.get("devices", []):
+    if not isinstance(item, dict):
+        continue
+    if str(item.get("linux_interface", "")).strip() != interface:
+        continue
+    pci = str(item.get("pci_address", "")).strip()
+    driver = str(item.get("kernel_driver", "")).strip()
+    mac = str(item.get("mac_address", "")).strip().lower()
+    if not pci_pattern.fullmatch(pci) or not token.fullmatch(driver):
+        raise SystemExit(1)
+    print("|".join((pci, driver, mac)))
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+find_vpp_interface_for_pci() {
+  find_pci=$1
+  find_pci_padded=${find_pci%.*}.0${find_pci##*.}
+  vppctl show hardware-interfaces 2>/dev/null | awk -v pci="$find_pci" -v padded="$find_pci_padded" '
+    /^[^[:space:]]/ { name = $1 }
+    {
+      if (index($0, "address " pci) || index($0, "address " padded)) {
+        print name
+        exit
+      }
+    }
+  '
+}
+
+vpp_link_state() {
+  vpp_link_interface=$1
+  vppctl show interface "$vpp_link_interface" 2>/dev/null | awk -v name="$vpp_link_interface" '
+    $1 == name {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "up" || $i == "down") { print $i; exit }
+      }
+    }
+  '
+}
+
 probe_dpdk_interface() {
+  # Recognize a live VPP DPDK attachment. The NIC is intentionally no longer
+  # visible in /sys/class/net: the product moved it to vfio-pci or
+  # uio_pci_generic before VPP started. The persisted inventory (or the
+  # ownership record written by prepare-vfio.sh) supplies the Linux name to PCI
+  # mapping, and VPP's own hardware readback proves the attach really exists.
   probe_interface=$1
   dpdk_pci_address=
   dpdk_kernel_driver=
   dpdk_iommu_group=
   dpdk_mode=
+  dpdk_transport=
+  dpdk_vpp_interface=
+  dpdk_link_state=
   dpdk_iommu_protected=false
   dpdk_vfio_available=false
   dpdk_uio_available=false
-  device_path="$LY_ROUTE_SYSFS_ROOT/class/net/$probe_interface/device"
-  [ -e "$device_path" ] || return 1
-  resolved_device=$(readlink -f "$device_path" 2>/dev/null) || return 1
-  dpdk_pci_address=$(basename "$resolved_device")
-  case "$dpdk_pci_address" in
-    ????\:??\:??.?) ;;
+  identity=$(inventory_identity "$probe_interface" 2>/dev/null) || identity=$(ownership_identity "$probe_interface" 2>/dev/null) || return 1
+  old_ifs=$IFS
+  IFS='|'
+  set -- $identity
+  IFS=$old_ifs
+  [ "$#" -eq 3 ] || return 1
+  dpdk_pci_address=$1
+  dpdk_kernel_driver=$2
+  expected_mac=$3
+  device_path="$LY_ROUTE_SYSFS_ROOT/bus/pci/devices/$dpdk_pci_address"
+  [ -d "$device_path" ] || return 1
+  driver_path="$device_path/driver"
+  [ -e "$driver_path" ] || return 1
+  current_driver=$(basename "$(readlink -f "$driver_path" 2>/dev/null)")
+  case "$current_driver" in
+    vfio-pci)
+      iommu_path="$device_path/iommu_group"
+      [ -e "$iommu_path" ] || return 1
+      dpdk_iommu_group=$(basename "$(readlink -f "$iommu_path" 2>/dev/null)")
+      case "$dpdk_iommu_group" in ''|*[!0-9]*) return 1 ;; esac
+      [ -d "$LY_ROUTE_SYSFS_ROOT/module/vfio_pci" ] || return 1
+      dpdk_mode=vfio_pci
+      dpdk_transport=vfio
+      dpdk_iommu_protected=true
+      dpdk_vfio_available=true
+      ;;
+    uio_pci_generic)
+      [ -d "$LY_ROUTE_SYSFS_ROOT/module/uio_pci_generic" ] || return 1
+      dpdk_iommu_group=none
+      dpdk_mode=uio_pci_generic
+      dpdk_transport=uio
+      dpdk_uio_available=true
+      ;;
     *) return 1 ;;
   esac
-  driver_path="$resolved_device/driver"
-  [ -e "$driver_path" ] || return 1
-  dpdk_kernel_driver=$(basename "$(readlink -f "$driver_path" 2>/dev/null)")
   [ -n "$dpdk_kernel_driver" ] || return 1
-  iommu_path="$resolved_device/iommu_group"
-  if [ -e "$iommu_path" ] && [ -d "$LY_ROUTE_SYSFS_ROOT/module/vfio_pci" ]; then
-    dpdk_iommu_group=$(basename "$(readlink -f "$iommu_path" 2>/dev/null)")
-    case "$dpdk_iommu_group" in ''|*[!0-9]*) return 1 ;; esac
-    dpdk_mode=vfio_pci
-    dpdk_iommu_protected=true
-    dpdk_vfio_available=true
-  elif [ -d "$LY_ROUTE_SYSFS_ROOT/module/uio_pci_generic" ]; then
-    dpdk_iommu_group=none
-    dpdk_mode=uio_pci_generic
-    dpdk_uio_available=true
-  else
-    return 1
-  fi
+  [ -n "$expected_mac" ] || true
   hugepages_file="$LY_ROUTE_SYSFS_ROOT/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
   [ -r "$hugepages_file" ] || return 1
   hugepages=$(cat "$hugepages_file" 2>/dev/null) || return 1
@@ -177,6 +287,16 @@ probe_dpdk_interface() {
   [ "$hugepages" -gt 0 ] || return 1
   plugin_output=$(vppctl show plugin 2>/dev/null) || return 1
   printf '%s\n' "$plugin_output" | grep -q 'dpdk_plugin.so' || return 1
+  dpdk_vpp_interface=$(find_vpp_interface_for_pci "$dpdk_pci_address")
+  [ -n "$dpdk_vpp_interface" ] || return 1
+  hardware_output=$(vppctl show hardware-interfaces "$dpdk_vpp_interface" 2>/dev/null) || return 1
+  printf '%s\n' "$hardware_output" | grep -q "$dpdk_vpp_interface" || return 1
+  printf '%s\n' "$hardware_output" | grep -q "$dpdk_pci_address" || return 1
+  printf '%s\n' "$hardware_output" | grep -Eiq 'intel e1000|e1000|igb' || return 1
+  interface_output=$(vppctl show interface "$dpdk_vpp_interface" 2>/dev/null) || return 1
+  printf '%s\n' "$interface_output" | grep -q "$dpdk_vpp_interface" || return 1
+  dpdk_link_state=$(vpp_link_state "$dpdk_vpp_interface")
+  [ -n "$dpdk_link_state" ] || return 1
   return 0
 }
 
@@ -195,6 +315,9 @@ probe_active_dpdk_interface() {
   dpdk_iommu_group=$3
   active_vpp_interface=$4
   dpdk_mode=$5
+  dpdk_transport=
+  dpdk_vpp_interface=$active_vpp_interface
+  dpdk_link_state=
   device_path="$LY_ROUTE_SYSFS_ROOT/bus/pci/devices/$dpdk_pci_address"
   [ -d "$device_path" ] || return 1
   driver_path="$device_path/driver"
@@ -210,6 +333,7 @@ probe_active_dpdk_interface() {
       [ -e "$iommu_path" ] || return 1
       [ "$(basename "$(readlink -f "$iommu_path" 2>/dev/null)")" = "$dpdk_iommu_group" ] || return 1
       [ -d "$LY_ROUTE_SYSFS_ROOT/module/vfio_pci" ] || return 1
+      dpdk_transport=vfio
       dpdk_iommu_protected=true
       dpdk_vfio_available=true
       ;;
@@ -217,6 +341,7 @@ probe_active_dpdk_interface() {
       [ "$current_driver" = uio_pci_generic ] || return 1
       [ "$dpdk_iommu_group" = none ] || return 1
       [ -d "$LY_ROUTE_SYSFS_ROOT/module/uio_pci_generic" ] || return 1
+      dpdk_transport=uio
       dpdk_uio_available=true
       ;;
     *) return 1 ;;
@@ -231,8 +356,11 @@ probe_active_dpdk_interface() {
   hardware_output=$(vppctl show hardware-interfaces "$active_vpp_interface" 2>/dev/null) || return 1
   printf '%s\n' "$hardware_output" | grep -q "$active_vpp_interface" || return 1
   printf '%s\n' "$hardware_output" | grep -q "$dpdk_pci_address" || return 1
+  printf '%s\n' "$hardware_output" | grep -Eiq 'intel e1000|e1000|igb' || return 1
   interface_output=$(vppctl show interface "$active_vpp_interface" 2>/dev/null) || return 1
   printf '%s\n' "$interface_output" | grep -q "$active_vpp_interface" || return 1
+  dpdk_link_state=$(vpp_link_state "$active_vpp_interface")
+  [ -n "$dpdk_link_state" ] || return 1
   return 0
 }
 
@@ -297,8 +425,6 @@ dataplane_state=dataplane_locked
 dataplane_failures=
 proof_items=
 proof_first=1
-all_native=true
-all_dpdk=true
 if [ "$LY_ROUTE_PRODUCT" = orchestrator ]; then
   orchestrator_plugin_available=false
   if command -v vppctl >/dev/null 2>&1 &&
@@ -450,82 +576,101 @@ for interface_name in $(split_csv "$LY_ROUTE_VPP_DATA_INTERFACES"); do
     continue
   fi
   native_candidate=
-  vmxnet3_af_packet_candidate=
+  af_packet_candidate=
   dpdk_candidate=
+  candidate_failures=
+  any_dpdk=false
   interface_mac=$(cat "$LY_ROUTE_SYSFS_ROOT/class/net/$interface_name/address" 2>/dev/null || true)
+  interface_netdev=false
+  [ -e "$LY_ROUTE_SYSFS_ROOT/class/net/$interface_name" ] && interface_netdev=true
+  append_native_candidate() {
+    if [ -n "$native_candidate" ]; then native_candidate="$native_candidate,$1"; else native_candidate=$1; fi
+  }
+  add_candidate_failure() {
+    failure_item="{\"hook\":\"$1\",\"mode\":\"$2\",\"reason\":\"$(json_escape "$3")\"}"
+    if [ -n "$candidate_failures" ]; then candidate_failures="$candidate_failures,$failure_item"; else candidate_failures=$failure_item; fi
+  }
   if command -v vppctl >/dev/null 2>&1 && plugin_output=$(vppctl show plugin 2>/dev/null); then
     interface_driver=none
     interface_device="$LY_ROUTE_SYSFS_ROOT/class/net/$interface_name/device"
     if [ -e "$interface_device/driver" ]; then
       interface_driver=$(basename "$(readlink -f "$interface_device/driver" 2>/dev/null)")
     fi
-    vmnet_af_packet_acceptable=false
-    if [ "$LY_ROUTE_VMXNET3_AF_PACKET_ACCEPTANCE" = true ] && [ "$interface_driver" = vmxnet3 ]; then
-      vmnet_af_packet_acceptable=true
-    fi
-    if [ "$LY_ROUTE_VMNET_AF_PACKET_ACCEPTANCE" = true ]; then
-      case "$interface_driver" in
-        e1000|vmxnet3) vmnet_af_packet_acceptable=true ;;
-      esac
-    fi
-    if [ "$vmnet_af_packet_acceptable" = true ] &&
-       printf '%s\n' "$plugin_output" | grep -q 'af_packet_plugin.so' &&
-       ip link set dev "$interface_name" promisc on >/dev/null 2>&1 &&
-       native_score=$(probe_native_candidate "$interface_name" af_packet linux_packet_socket); then
-      vmxnet3_af_packet_candidate="{\"tier\":\"vpp_native\",\"hook\":\"af_packet\",\"mode\":\"linux_packet_socket\",\"source\":\"runtime_probe\",\"runtime_verified\":true,\"native\":true,\"high_performance\":false,\"acceptance_only\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$native_score,\"kernel_driver\":\"$interface_driver\",\"mac_address\":\"$(json_escape "$interface_mac")\"}"
-      native_candidate=$vmxnet3_af_packet_candidate
-    fi
-    # VMXNET3 is validated through AF_PACKET only. Its unsupported native
-    # candidates must not be probed or selected; physical NICs retain the
-    # normal native-path detection below.
-    if [ "$LY_ROUTE_VMXNET3_AF_PACKET_ACCEPTANCE" != true ] || [ "$interface_driver" != vmxnet3 ]; then
-      for native_spec in 'rdma rdma_dv rdma_plugin.so' 'af_xdp zero_copy af_xdp_plugin.so' 'af_xdp copy af_xdp_plugin.so'; do
+    # Ordered per-interface fallback after DPDK: AF_XDP zero-copy, AF_XDP copy,
+    # RDMA. DPDK is probed first below because a VPP-owned NIC has no Linux
+    # netdev for these hooks to attach to.
+    if [ "$interface_netdev" = true ]; then
+      for native_spec in 'af_xdp zero_copy af_xdp_plugin.so' 'af_xdp copy af_xdp_plugin.so' 'rdma rdma_dv rdma_plugin.so'; do
         set -- $native_spec
         native_hook=$1
         native_mode=$2
         native_plugin=$3
-        if printf '%s\n' "$plugin_output" | grep -q "$native_plugin"; then
-          if native_score=$(probe_native_candidate "$interface_name" "$native_hook" "$native_mode"); then
-            candidate="{\"tier\":\"vpp_native\",\"hook\":\"$native_hook\",\"mode\":\"$native_mode\",\"source\":\"runtime_probe\",\"runtime_verified\":true,\"native\":true,\"high_performance\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$native_score,\"mac_address\":\"$(json_escape "$interface_mac")\"}"
-            if [ -n "$native_candidate" ]; then native_candidate="$native_candidate,$candidate"; else native_candidate=$candidate; fi
-          fi
+        if ! printf '%s\n' "$plugin_output" | grep -q "$native_plugin"; then
+          add_candidate_failure "$native_hook" "$native_mode" "VPP plugin $native_plugin is not loaded"
+          continue
+        fi
+        if native_score=$(probe_native_candidate "$interface_name" "$native_hook" "$native_mode"); then
+          candidate="{\"tier\":\"vpp_native\",\"hook\":\"$native_hook\",\"mode\":\"$native_mode\",\"source\":\"runtime_probe\",\"runtime_verified\":true,\"native\":true,\"high_performance\":true,\"acceptance_only\":false,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$native_score,\"kernel_driver\":\"$interface_driver\",\"mac_address\":\"$(json_escape "$interface_mac")\"}"
+          append_native_candidate "$candidate"
+        else
+          add_candidate_failure "$native_hook" "$native_mode" "VPP $native_hook attach probe failed"
         fi
       done
+    else
+      add_candidate_failure af_xdp zero_copy "Linux netdev is owned by a DPDK binding"
+      add_candidate_failure af_xdp copy "Linux netdev is owned by a DPDK binding"
+      add_candidate_failure rdma rdma_dv "Linux netdev is owned by a DPDK binding"
+    fi
+    # AF_PACKET is always probed as the documented last resort. It is emitted
+    # with acceptance_only=true and high_performance=false; approval requires
+    # the persisted operator consent, never a silent downgrade.
+    if [ "$interface_netdev" = true ] && printf '%s\n' "$plugin_output" | grep -q 'af_packet_plugin.so'; then
+      if ip link set dev "$interface_name" promisc on >/dev/null 2>&1 &&
+         native_score=$(probe_native_candidate "$interface_name" af_packet linux_packet_socket); then
+        af_packet_candidate="{\"tier\":\"vpp_native\",\"hook\":\"af_packet\",\"mode\":\"linux_packet_socket\",\"source\":\"runtime_probe\",\"runtime_verified\":true,\"native\":true,\"high_performance\":false,\"acceptance_only\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$native_score,\"kernel_driver\":\"$interface_driver\",\"mac_address\":\"$(json_escape "$interface_mac")\"}"
+      else
+        add_candidate_failure af_packet linux_packet_socket "VPP AF_PACKET attach probe failed"
+      fi
+    elif [ "$interface_netdev" = true ]; then
+      add_candidate_failure af_packet linux_packet_socket "VPP af_packet_plugin.so is not loaded"
     fi
   fi
-  if [ -z "$native_candidate" ]; then all_native=false; fi
+
   dpdk_source=runtime_probe
   if command -v vppctl >/dev/null 2>&1 && probe_active_dpdk_interface "$interface_name"; then
     dpdk_source=active_runtime_readback
     dpdk_score=80
     [ "$dpdk_mode" = uio_pci_generic ] && dpdk_score=75
-    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true}"
+    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"transport\":\"$dpdk_transport\",\"vpp_interface\":\"$(json_escape "$dpdk_vpp_interface")\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"acceptance_only\":false,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true,\"link_state\":\"$dpdk_link_state\"}"
+    any_dpdk=true
   elif command -v vppctl >/dev/null 2>&1 && probe_dpdk_interface "$interface_name"; then
     dpdk_score=80
     [ "$dpdk_mode" = uio_pci_generic ] && dpdk_score=75
-    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true}"
+    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"transport\":\"$dpdk_transport\",\"vpp_interface\":\"$(json_escape "$dpdk_vpp_interface")\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"acceptance_only\":false,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true,\"link_state\":\"$dpdk_link_state\"}"
+    any_dpdk=true
   else
-    all_dpdk=false
+    add_candidate_failure dpdk vfio_pci "no live VPP DPDK attach (VFIO) with matching PCI, driver and link readback"
+    add_candidate_failure dpdk uio_pci_generic "no live VPP DPDK attach (UIO) with matching PCI, driver and link readback"
   fi
-  if [ -z "$native_candidate" ] && [ -z "$dpdk_candidate" ]; then
+
+  candidates=$dpdk_candidate
+  if [ -n "$candidates" ] && [ -n "$native_candidate" ]; then candidates="$candidates,$native_candidate"; elif [ -z "$candidates" ]; then candidates=$native_candidate; fi
+  if [ -n "$candidates" ] && [ -n "$af_packet_candidate" ]; then candidates="$candidates,$af_packet_candidate"; elif [ -z "$candidates" ]; then candidates=$af_packet_candidate; fi
+  if [ -z "$candidates" ]; then
     dataplane_failures=$(append_missing "$dataplane_failures" "runtime_capability_proof:$interface_name")
     continue
   fi
-  candidates=$native_candidate
-  if [ -n "$candidates" ] && [ -n "$dpdk_candidate" ]; then candidates="$candidates,$dpdk_candidate"; elif [ -n "$dpdk_candidate" ]; then candidates=$dpdk_candidate; fi
   if [ "$proof_first" -eq 0 ]; then
     proof_items="$proof_items,"
   fi
   proof_first=0
-  proof_items="$proof_items{\"linux_interface\":\"$(json_escape "$interface_name")\",\"candidates\":[$candidates]}"
+  proof_items="$proof_items{\"linux_interface\":\"$(json_escape "$interface_name")\",\"candidates\":[$candidates],\"failures\":[$candidate_failures]}"
 done
 if [ -z "$dataplane_failures" ]; then
-  if [ "$all_native" = true ]; then
-    dataplane_state=native_ready
-  elif [ "$all_dpdk" = true ]; then
+  if [ "$any_dpdk" = true ]; then
     dataplane_state=dpdk_ready
   else
-    dataplane_failures=$(append_missing "$dataplane_failures" common_dataplane_tier)
+    dataplane_state=native_ready
   fi
 fi
 mkdir -p "$(dirname "$LY_ROUTE_VPP_CAPABILITY_PROOF")"

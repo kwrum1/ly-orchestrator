@@ -15,7 +15,13 @@ var ErrTransactionFailed = errors.New("dataplane transaction failed")
 type DeviceState struct {
 	LinuxInterface string `json:"linux_interface"`
 	PCIAddress     string `json:"pci_address"`
-	KernelDriver   string `json:"kernel_driver"`
+	// KernelDriver is the Linux driver the device must return to on rollback.
+	KernelDriver string `json:"kernel_driver"`
+	// BoundDriver is the driver the device was actually bound to when the
+	// snapshot was taken. It differs from KernelDriver when the boot ownership
+	// preflight already handed the NIC to VPP.
+	BoundDriver    string `json:"bound_driver,omitempty"`
+	OwnedByProduct bool   `json:"owned_by_product,omitempty"`
 	LinkUp         bool   `json:"link_up"`
 }
 
