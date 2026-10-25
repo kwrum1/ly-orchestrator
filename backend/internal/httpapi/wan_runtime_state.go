@@ -3,7 +3,6 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
-	"ly-route/backend/internal/runtime/apply"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,15 +62,7 @@ func (server *Server) decorateWANLinkRuntimeStates(ctx context.Context, items []
 // not leave WAN links permanently pending. A failed or unreconciled
 // transaction never promotes anything.
 func wanLinkTransactionCommitted(result RuntimeApplyResult) bool {
-	if result.TransactionID == "" || result.Receipt.TransactionID != result.TransactionID || result.Receipt.Status != apply.ReceiptApplied {
-		return false
-	}
-	switch result.Status {
-	case RuntimeStatusCommitted, "degraded":
-		return true
-	default:
-		return false
-	}
+	return runtimeTransactionCommitted(result)
 }
 
 // wanLinkAppliedAfterCommit is deliberately conservative: PPPoE keeps its own

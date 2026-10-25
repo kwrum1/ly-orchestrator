@@ -77,6 +77,13 @@ type StopController interface {
 	Stop(context.Context, ServiceName, []RenderedArtifact) error
 }
 
+// ServiceRestarter recovers a daemon that was stopped as a side effect of a
+// dataplane transition (for example VPP restart with PartOf=). It is separate
+// from ProcessController so existing test doubles do not need to implement it.
+type ServiceRestarter interface {
+	Restart(context.Context, ServiceName) error
+}
+
 type LogController interface {
 	Logs(context.Context, ServiceName, int) (string, error)
 }
@@ -2151,6 +2158,17 @@ type FilesystemController struct {
 
 func (controller FilesystemController) ReloadOrRestart(ctx context.Context, service ServiceName, artifacts []RenderedArtifact) error {
 	return controller.applyWithRecovery(ctx, service, artifacts)
+}
+
+// Restart starts a stopped/failed daemon without touching its rendered files.
+// reset-failed clears systemd start-limit state after a VPP-induced failure.
+func (controller FilesystemController) Restart(ctx context.Context, service ServiceName) error {
+	if controller.Runner == nil {
+		return fmt.Errorf("%s restart requires a daemon command runner", service)
+	}
+	unit := serviceUnit(service)
+	_ = controller.Runner.Run(ctx, "systemctl", "reset-failed", unit)
+	return controller.Runner.Run(ctx, "systemctl", "start", unit)
 }
 
 func (controller FilesystemController) Status(ctx context.Context, service ServiceName) (Health, error) {

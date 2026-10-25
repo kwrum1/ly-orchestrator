@@ -42,10 +42,7 @@ func (server *Server) decorateWANGroupRuntimeStates(ctx context.Context, items [
 
 func (server *Server) appliedWANGroupIDs(ctx context.Context) map[string]struct{} {
 	result := server.runtimeEvidence()
-	if result.Status != RuntimeStatusCommitted || result.RuntimeState != RuntimeStateRunning || result.GatewayPlan == nil {
-		return nil
-	}
-	if result.TransactionID == "" || result.Receipt.Status != apply.ReceiptApplied || result.Receipt.TransactionID != result.TransactionID {
+	if !runtimeTransactionCommitted(result) || result.GatewayPlan == nil {
 		return nil
 	}
 	for _, evidence := range result.GatewayEvidence {
@@ -66,10 +63,7 @@ func (server *Server) appliedWANGroupIDs(ctx context.Context) map[string]struct{
 
 func (server *Server) appliedRoutePolicyIDs(ctx context.Context) map[string]struct{} {
 	result := server.runtimeEvidence()
-	if result.Status != RuntimeStatusCommitted || result.RuntimeState != RuntimeStateRunning {
-		return nil
-	}
-	if result.TransactionID == "" || result.Receipt.Status != apply.ReceiptApplied || result.Receipt.TransactionID != result.TransactionID {
+	if !runtimeTransactionCommitted(result) {
 		return nil
 	}
 

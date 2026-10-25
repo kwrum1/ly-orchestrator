@@ -119,6 +119,24 @@ func (server *Server) statusHealthComponents(ctx context.Context) []RuntimeCompo
 	return components
 }
 
+// runtimeTransactionCommitted reports whether the last runtime transaction
+// actually settled for the current desired generation. A component-level
+// degradation (for example AF_PACKET compatibility) does not make the gateway
+// resource graph less applied; resource readback must not remain
+// desired_not_applied just because runtime_state is degraded. Failed,
+// unreconciled and mismatched receipts still never promote anything.
+func runtimeTransactionCommitted(result RuntimeApplyResult) bool {
+	if result.TransactionID == "" || result.Receipt.TransactionID != result.TransactionID || result.Receipt.Status != apply.ReceiptApplied {
+		return false
+	}
+	switch result.Status {
+	case RuntimeStatusCommitted, "degraded":
+		return true
+	default:
+		return false
+	}
+}
+
 func (server *Server) runtimeEvidence() RuntimeApplyResult {
 	server.runtimeMu.Lock()
 	defer server.runtimeMu.Unlock()

@@ -2,8 +2,6 @@ package httpapi
 
 import (
 	"context"
-
-	"ly-route/backend/internal/runtime/apply"
 )
 
 // decorateDHCPRuntimeStates mirrors the UI's committed-state rule at the API
@@ -12,10 +10,7 @@ import (
 // the browser's separate runtime query is slow or unavailable.
 func (server *Server) decorateDHCPRuntimeStates(ctx context.Context, items []map[string]any) []map[string]any {
 	result := server.runtimeEvidence()
-	committed := result.Status == RuntimeStatusCommitted &&
-		result.RuntimeState == RuntimeStateRunning &&
-		result.Receipt.Status == apply.ReceiptApplied
-	if !committed {
+	if !runtimeTransactionCommitted(result) {
 		return items
 	}
 	dnsmasqRunning := false
