@@ -70,6 +70,44 @@ func TestNAT44InitializeIsIdempotentForUnchangedWANPool(t *testing.T) {
 	}
 }
 
+func TestApplyNAT44InitializesPoolWithoutPortMappings(t *testing.T) {
+	client := &nat44LifecycleClient{replies: map[string]Reply{
+		"vpp.nat44-ed.snapshot": {Payload: NAT44Readback{Behavior: nat.BehaviorEndpointDependent}},
+	}}
+	_, err := (Adapter{Client: client}).ApplyNAT44(context.Background(), NAT44Plan{
+		TransactionID:       "txn-pool-only",
+		Behavior:            nat.BehaviorEndpointDependent,
+		IngressVPPInterface: "lyroute-enp0s4",
+		PoolAddresses: []NAT44PoolAddress{
+			{Interface: "lyroute-enp0s3", Address: "100.77.0.2"},
+			{Interface: "lyroute-enp0s5", Address: "100.78.0.2"},
+		},
+	}, Snapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialize := ""
+	for _, operation := range client.operations {
+		if operation.Name == "vpp.nat44.initialize" {
+			initialize = strings.Join(operation.VPPCtlCommands, "\n")
+			break
+		}
+	}
+	if initialize == "" {
+		t.Fatal("pool-only NAT44 plan did not initialize the translation pool")
+	}
+	for _, required := range []string{
+		"?nat44 add address 100.77.0.2 tenant-vrf 0",
+		"?nat44 add address 100.78.0.2 tenant-vrf 0",
+		"set interface nat44 out lyroute-enp0s3 output-feature",
+		"set interface nat44 out lyroute-enp0s5 output-feature",
+	} {
+		if !strings.Contains(initialize, required) {
+			t.Fatalf("pool-only initialization is missing %q:\n%s", required, initialize)
+		}
+	}
+}
+
 func TestRestoreNAT44PoolRollsBackIntroducedAddressAndRestoresPrior(t *testing.T) {
 	client := &nat44LifecycleClient{}
 	channel, err := client.OpenChannel(context.Background())
