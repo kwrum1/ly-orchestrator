@@ -29,9 +29,29 @@ Run:
 ```bash
 ./datapath-test.sh              # ICMP both ways, policy allow/drop, counters, throughput (informational)
 ./restart-persistence-test.sh   # VPP restart and control-api restart re-readback
+./failclosed-test.sh            # stop VPP: honest apply_failed/degraded, no commit, no leak, recovery
 ORCH_BASE=$ORCH_API ORCH_OUT=$ORCH_OUT/ui node ui-sweep.mjs
 ```
 
 Policy rules are canonicalised to the client→server direction, where LAN
 ingress is the request direction. Placing the client on the WAN side requires
 mirroring source and destination in the rule.
+
+## Fail-closed check
+
+`failclosed-test.sh` deliberately stops VPP and asserts that
+`POST /api/v1/runtime/apply` reports `apply_failed` / `runtime_state=degraded`
+(not a handler-level `dataplane_locked`), that `/api/v1/runtime/status` is
+degraded, that no transparent transaction journal remains, that traffic does
+not leak through the appliance, and that the same generation returns after
+VPP is restarted. It also calls `/api/v1/config/apply` while broken to confirm
+the Gateway-line non-fatal capability probe (no 423 `dataplane_locked`).
+
+## UI bundles
+
+`ui-sweep.mjs` targets the accepted 11-page Vite bundle (`08af368`, absolute
+`/app.js` / `/styles.css`, per-page URLs). `ui-sweep-release.mjs` targets the
+12-page source-tree controller-shell bundle that `build-rootfs.sh` produces by
+default (`frontend/orchestrator`, sidebar `[data-page]` navigation, no
+per-page URLs). Run the one that matches the bundle served by the image under
+test; the 506cc4c release image serves the controller-shell bundle.

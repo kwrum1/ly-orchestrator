@@ -1,4 +1,242 @@
-# Orchestrator transparent acceptance on ESXi (AF_PACKET mode)
+# Orchestrator acceptance on ESXi (AF_PACKET mode)
+
+## Release build 506cc4c — merged Gateway + Orchestrator line (2026-10-25)
+
+Run `20261025T0730Z-release`. This is the re-run of the Orchestrator acceptance
+against the single release line `feat/release-integration` @ `506cc4cc6361`
+(merge of the Gateway line `42da508` and the Orchestrator backend `e2c16ef`
+plus `feat/orch-acceptance`). The build under test is
+`/root/work/dist-release-orchestrator-506cc4cc6361` (rootfs, upgrade package,
+disk image; SHA256SUMS re-verified independently). Data path is the same
+explicit AF_PACKET acceptance mode (`hook=af_packet`,
+`mode=linux_packet_socket`, `acceptance_only=true`,
+`high_performance=false`). No performance claim is made.
+
+### Verdict
+
+| # | Requirement | Verdict | Evidence |
+|---|---|---|---|
+| 1 | Deploy release build; image/manifest `506cc4cc6361`, product `orchestrator` | **PASS** | `identity-*.txt`, `build-verification.txt` |
+| 2 | `health` ok; password change/login; product profile correct | **PASS** | `health*.json`, `login*.json`, `password-change*.json`, `product.json` |
+| 3 | AF datapath: VPP owns both NICs, `runtime/apply` committed, `runtime/status` running + generation | **FAIL (status)** | `af-env-and-proof.json`, `api-runtime-apply.json`, `api-runtime-status.json`, `persistence/status-after-api.json` |
+| 4 | Control-api restart and VPP restart keep the same generation and forwarding | **PASS** | `persistence/*`, `failclosed/fc-generation-*.txt` |
+| 5 | Bidirectional reachability, policy allow TCP/8080, policy drop TCP/9000, reverse direction | **PASS** | `functional/*`, `final-functional.txt` |
+| 6 | Fail-closed: broken dataplane reports `apply_failed`/`degraded`, no generation committed, no direct leak, recovers | **PASS** | `failclosed/*` |
+| 7 | UI 11/11 pages in real Chromium, zero 404s, clean console | **FAIL as specified** | `ui/result.json`, `ui-release/result.json`, `ui-accepted-bundle-diagnostic/result.json` |
+| 8 | Evidence + acceptance document update, committed (not pushed) | **PASS** | this document, `/root/work/orch-acceptance/evidence/20261025T0730Z-release/` |
+
+Item 3 is a real regression in the merged line: the commit itself succeeds and
+the datapath is correct, but `GET /api/v1/runtime/status` immediately after the
+apply reports `degraded` (and adds gateway-only `smartdns`, `dnsmasq`, `xray`,
+`pppoe` components) instead of `running` with the transparent generation. A
+control-api restart makes the same endpoint report `running` with the generation
+again. Root cause and exact evidence are in `analysis-status-regression.md`.
+
+Item 7 is a release-packaging regression, not a backend regression: the image
+ships the 12-page source-tree controller-shell UI (`app.js` sha256
+`018563a2…`) instead of the accepted 11-page Vite bundle (`08af368`,
+`app.js` sha256 `0787685e…`) used by the e2c16ef acceptance. The shipped UI
+passes 12/12 of its own pages, and the accepted 11-page bundle passes 11/11 when
+overlaid as a diagnostic, but the 11 required pages are **not present in the
+built image**. The e2c16ef image itself shipped an 11-page bundle
+(`app.js` `dba17962…`), so the release build script dropped the UI overlay; see
+`analysis-ui-bundle.md`.
+
+### 1. Build identity and deployment
+
+`sha256sum -c SHA256SUMS` in the release directory: all four artifacts OK.
+The disk-image manifest and the in-image artifact manifest both report
+`source_commit=506cc4cc6361`, `product=orchestrator`,
+`frontend_product=orchestrator`, `database_path=/var/lib/ly-route/orchestrator/ly-route.db`.
+The running control binary answers the `--version` preflight with
+`506cc4cc6361` (the 506cc4c fix); `/health` reports the product version
+`26.06+lyroute1`.
+
+| Artifact | SHA-256 |
+|---|---|
+| control binary | `3d1017aa92f18e0022477012c28e95ff11d504e18b48da18030e27f89568a7d0` |
+| VPP orchestrator plugin | `29a5617266f5109002b55fa100644bc6c67562dbe41c151978d7a3a5a668236a` |
+| UI `app.js` (shipped) | `018563a2fa6c73664b7c28fc6a526aa2d83edc83915ebfadbca4b9094d2ed5f6` |
+| UI `index.html` (shipped) | `b9adcc2d4f01561871f4307427ff7dd6ddf90c0bde48eacbdfb2e4dcd63914c3` |
+
+The upgrade package declares `commit=506cc4cc6361`, `product=orchestrator`,
+`includes_dataplane=false`, and carries the Orchestrator VPP plugin plus the
+control binary/UI/runtime scripts (verified from its `manifest.json` and
+`checksums.sha256`; see `build-verification.txt`). The upgrade path itself was
+not exercised in this run.
+
+Deployed VM: `lyacc-orch-506cc4c` on datastore `data (1)`, 4 vCPU / 4 GB, three
+vmxnet3 NICs (`VM Network` mgmt `10.1.18.244`, `lyacc-orch-pg` WAN,
+`lyacc-orch-b-pg` LAN). Existing VM `lyacc-orch-e2c16ef` was gracefully powered
+off and kept; peer `lyacc-orch-peer` was powered on. No forbidden VM, port
+group or datastore was touched.
+
+### 2. Health, authentication, product profile
+
+`GET /api/v1/health` → `{"status":"ok","version":"26.06+lyroute1","degraded":false}`
+with `vpp` and `persistence` available. `GET /api/v1/product` → `orchestrator`
+with the orchestrator capability set. The first login with the generated
+first-boot password returned `password_change_required=true`; the password was
+changed through `POST /api/v1/auth/change-password`, the old credential was
+rejected with 401, and a fresh login/session succeeded. Evidence:
+`identity-*.txt`, `health*.json`, `login*.json`, `password-change*.json`,
+`auth-initial-password-rejected.json`, `product.json`.
+
+### 3. AF_PACKET datapath and apply status
+
+The runtime proof file records both data NICs as `tier=vpp_native`,
+`hook=af_packet`, `mode=linux_packet_socket`, `acceptance_only=true`,
+`high_performance=false`, driver `vmxnet3`:
+
+```
+ens224  00:50:56:aa:bd:02    ens256  00:50:56:aa:bd:03
+```
+
+After the topology/policy PUT and `POST /api/v1/runtime/apply`, VPP owns both
+NICs (`lyroute-ens224`, `lyroute-ens256`, Linux PACKET socket interface v3) and
+the transparent generation is
+`fd3afd6b162faed4fe22188ab88cf55295ef096e4c742dad35d7bee9441b28e0`
+(same digest as the e2c16ef acceptance for the same topology/policy):
+
+```
+state running
+generation fd3afd6b162faed4fe22188ab88cf55295ef096e4c742dad35d7bee9441b28e0
+boundary wan lyroute-ens224 lan lyroute-ens256
+policy drop-9000 group-position 10 sequence 10 action drop packets 0 bytes 0
+```
+
+`POST /api/v1/runtime/apply` returned `committed` / `running` with transaction
+`runtime-e715b30f8a2f4b42f4cd03aaa0f8576c` and vpp/persistence components
+`running` + `available` (with the generation in the vpp reason).
+
+**Regression:** the immediately following `GET /api/v1/runtime/status` returned
+`status=degraded` and a component list of `smartdns`, `dnsmasq`, `xray`,
+`pppoe` (all degraded because those gateway services do not exist on the
+Orchestrator product), plus `vpp` and `persistence` running. After
+`systemctl restart ly-route-control-api`, the same endpoint returned
+`status=running` with exactly `vpp` + `persistence` and the generation reason
+(`persistence/status-after-api.json`). This is a status-reporting regression in
+the merged Gateway line, not a datapath failure.
+
+### 4. Restart persistence
+
+`systemctl restart vpp`: VPP comes back locked, the transparent recovery loop
+re-attaches both AF_PACKET interfaces and re-commits in ~2 s with the **same**
+generation; ICMP across the path succeeds immediately afterwards.
+`systemctl restart ly-route-control-api`: startup reconcile re-applies the
+persisted topology/policy, the generation is unchanged, and forwarding
+continues. Evidence: `persistence/restart-persistence-test.log`,
+`persistence/status-*.json`, `persistence/vpp-after-*.txt`,
+`persistence/ping-after-*.txt`, `failclosed/fc-generation-*.txt`.
+
+### 5. Functional results
+
+Peer: `netns lan` = 10.99.0.3/24 (client), `netns wan` = 10.99.0.2/24 (server),
+plus a reverse listener on 10.99.0.3:8082.
+
+| Check | Result |
+|---|---|
+| ICMP LAN→WAN | 5/5, RTT 8.8–27.4 ms |
+| ICMP WAN→LAN | 5/5, RTT 9.7–15.8 ms |
+| TCP/8080 (default direct) | HTTP 200, 1 553 704 B in 20 s (slow AF_PACKET path) |
+| TCP/9000 (drop rule, listener up) | timeout, `curl rc=28`; VPP policy counter `packets 3 bytes 222`; node `packets dropped by orchestration policy` 6 |
+| Reverse TCP 8082 | HTTP 200 |
+| Informational 2 MiB download | 2 097 152 B / 23.47 s = 89 357 B/s (≈0.71 Mbit/s, not a claim) |
+
+Interface counters moved on both legs and the final functional re-check after
+the fail-closed/restart cycle still passes. Evidence: `functional/*`,
+`final-functional.txt`.
+
+### 6. Fail-closed status semantics
+
+The dataplane was broken by stopping VPP (`systemctl stop vpp`), then:
+
+- `POST /api/v1/runtime/apply` → HTTP 202, `status=apply_failed`,
+  `runtime_state=degraded`, reason from the transparent runtime
+  (`dataplane_locked: failed prerequisites …`). No handler-level
+  `dataplane_locked` status was returned.
+- `GET /api/v1/runtime/status` → `status=degraded`; both `vpp` and
+  `persistence` unavailable with `connect: Connection refused`.
+- The transparent transaction journal
+  `/var/lib/ly-route/orchestrator/transparent-transaction.json` was absent, and
+  no new generation was committed (after restore the generation was still
+  `fd3afd6b…`).
+- No direct leak: LAN→server ping 100% loss, TCP/8080 timed out; the host had
+  no bridge and no route for 10.99.0.0/24 over the data NICs.
+- `/api/v1/config/apply` (async) did **not** return 423/`dataplane_locked`: it
+  accepted the request (202, `apply_in_progress`) and the async transaction
+  terminated as `apply_failed` / `runtime_state=degraded` (HTTP status 422).
+  This is the Gateway-line non-fatal capability probe behaviour for the
+  Orchestrator profile; the Gateway profile itself was not part of this run.
+- After `systemctl start vpp`, the same generation `fd3afd6b…` returned,
+  `POST /runtime/apply` committed again, and forwarding was restored.
+
+Evidence: `failclosed/failclosed-test.log`, `fc-apply-broken.*`,
+`fc-status-broken.*`, `fc-no-generation.txt`, `fc-ping-broken.txt`,
+`fc-tcp-broken.txt`, `fc-host-broken.txt`, `fc-config-apply-*`,
+`fc-generation-verdict.txt`, `fc-apply-restored.*`.
+
+### 7. UI acceptance
+
+The release image serves the 12-page source-tree controller-shell
+(`frontend/orchestrator`): 系统概况, 流量概况, 在线用户, Top连接, 网卡设置,
+编排设置, 流量编排, 流量控制, 安全控制, IP管理, 系统用户管理, 配置管理.
+The release sweep navigated every sidebar page in real headless Chromium:
+**12/12 passed, 0 × HTTP 404, 0 unexpected console errors** (the only 401 is
+the expected pre-auth session probe). Evidence: `ui-release/result.json` and 12
+PNG screenshots.
+
+The **required 11-page UI is not shipped**. Running the accepted
+`ui-sweep.mjs` (11-page routes/pages) against the built image fails 0/11: the
+bundle has no `/topology`, `/transparent`, `/runtime`, `/upgrades`, … pages and
+its relative asset paths produce `/system/*` 404s when the harness deep-links.
+As a diagnostic only, the accepted `08af368` bundle was copied into
+`/opt/ly-route/admin` (the shipped bundle was backed up first): it then passed
+**11/11** with 0 × 404 and the expected single pre-auth 401, proving the release
+backend supports the accepted UI. The shipped bundle was restored and verified
+(`app.js` `018563a2…`). This overlay result is **not** a pass for the built
+image; it isolates the failure to packaging. Evidence: `ui/result.json` (0/11),
+`ui-accepted-bundle-diagnostic/result.json` (11/11),
+`ui-accepted-bundle-overlay.txt`, `ui-accepted-bundle-restored.txt`.
+
+### 8. Regressions versus the e2c16ef acceptance
+
+1. **`/api/v1/runtime/status` after an apply is degraded.** The merged
+   `handleRuntimeStatus` short-circuits to `statusHealthComponents` when the
+   in-memory receipt is committed but has no cached component inventory; that
+   helper does not filter components by product profile, so the Orchestrator
+   reports absent gateway services. A control-api restart rebuilds the plan and
+   reports correctly. This is a P1 reporting regression; the datapath and
+   apply commit are unaffected.
+2. **The release image ships the wrong UI bundle.** e2c16ef image: 11-page
+   bundle (`app.js` `dba17962…`); accepted overlay: 11-page `08af368`
+   (`0787685e…`); release image: 12-page controller-shell
+   (`018563a2…`). The release build script does not pass `--frontend-bundle`,
+   so `build-rootfs.sh` defaults to `build-controller-shell.sh`. The 11-page
+   UI contract in the acceptance plan is therefore not met by the built image.
+3. Not regressions: generation, restart recovery, functional policy and
+   fail-closed semantics match the e2c16ef results (same generation digest for
+   the same topology/policy).
+
+### 9. Gaps
+
+- Gateway-product `/api/v1/config/apply` semantics were not exercised here
+  (only the Orchestrator profile); the Gateway line has its own acceptance.
+- Upgrade/rollback of this build was not executed; the upgrade package was
+  verified statically (`includes_dataplane=false`, plugin present).
+- Orchestration-group (`via`) hops, IPv6 policy and host reboot remain
+  unexercised.
+- AF_PACKET acceptance mode is not a performance claim; the observed
+  ~0.71 Mbit/s is informational only.
+
+### Evidence
+
+`/root/work/orch-acceptance/evidence/20261025T0730Z-release/` — `summary.json`
+(machine-readable verdicts), `README.md` (file index), `deploy.log`, API dumps,
+VPP/host dumps, functional logs, fail-closed logs, UI results and screenshots,
+and `analysis-status-regression.md` / `analysis-ui-bundle.md`.
+
+## Historical record: e2c16ef acceptance (2026-10-24)
 
 Run `20261024T1530Z-orch-af`. This is a functional and UI acceptance of the
 **Orchestrator product** only; Gateway results are never substituted for it.
