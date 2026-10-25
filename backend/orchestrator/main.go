@@ -173,7 +173,7 @@ func run() error {
 	if recoveryRepository != nil && recoveryRuntime != nil {
 		go runTransparentRecovery(recoveryCtx, recoveryRepository, recoveryRuntime, reconcileInterval)
 	}
-	server.StartDataplaneWatcher(context.Background(), 3*time.Second)
+	server.StartDataplaneWatcher(context.Background(), envDuration("LY_ROUTE_DATAPLANE_WATCH_INTERVAL", 3*time.Second))
 	log.Printf("ly-route %s control API listening on %s database=%s config=%s", profile.ID(), addr, databasePath, configPath)
 	if err := httpapi.ListenAndServe(addr, server); err != nil {
 		return fmt.Errorf("serve control API: %w", err)

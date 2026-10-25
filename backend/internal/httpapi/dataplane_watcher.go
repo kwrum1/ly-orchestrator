@@ -103,7 +103,7 @@ func (server *Server) watchDataplaneOnce(ctx context.Context) {
 				continue
 			}
 			dataplaneWatcherLast[name] = time.Now()
-			if entry.Mode == "af_packet" && !policyAllowsAFPort(policy, server.displayInterfaceName(ctx, name)) {
+			if entry.Mode == "af_packet" && !server.allowsAFPacketFor(ctx, policy, name) {
 				log.Printf("dataplane watcher: %s lost its VPP attachment; AF_PACKET consent required; kernel netdev left intact", name)
 				dropDPDKVerification(name)
 				server.recordAuditWithTransaction("system", "system", "interface:"+name, "dataplane.takeover.consent_required", "blocked", "af_packet", "")
@@ -153,7 +153,7 @@ func (server *Server) watchDataplaneOnce(ctx context.Context) {
 		}
 		dataplaneWatcherLast[name] = time.Now()
 		if capability, unsupported := capabilities.NativeUnsupported(strings.TrimSpace(item.KernelDriver), strings.TrimSpace(item.PCIAddress)); unsupported {
-			if policyAllowsAFPort(policy, server.displayInterfaceName(ctx, name)) {
+			if server.allowsAFPacketFor(ctx, policy, name) {
 				if entry, ok := server.autoAdoptAF(ctx, name); ok {
 					updates[name] = entry
 					server.recordAuditWithTransaction("system", "system", "interface:"+name, "dataplane.takeover.auto_adopt", "success", "mode=af_packet", "")

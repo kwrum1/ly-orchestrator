@@ -35,7 +35,7 @@ func (server *Server) buildOrchestratorRuntimePlan(ctx context.Context, requestI
 	nativePath := observation.NativePathRequest(server.managementInterfaceID(ctx), interfaces, server.now().UTC(), server.managementNetworkShared(ctx))
 	for index := range nativePath.Assignments {
 		port := server.displayInterfaceName(ctx, nativePath.Assignments[index].LinuxInterface)
-		nativePath.Assignments[index].AFPacketConsent = policyAllowsAFPort(dataplanePolicy, port)
+		nativePath.Assignments[index].AFPacketConsent = server.allowsAFPacketFor(ctx, dataplanePolicy, port)
 	}
 	selectedPath, selectionErr := vpp.SelectNativePath(nativePath)
 	dataplanePrepared := false
@@ -64,7 +64,7 @@ func (server *Server) buildOrchestratorRuntimePlan(ctx context.Context, requestI
 		case errors.As(buildErr, &afRequired):
 			operations = nil
 			dataplaneState = "af_fallback_required"
-			afRequiredInterfaces = append([]string(nil), afRequired.Interfaces...)
+			afRequiredInterfaces = server.canonicalAFRequiredInterfaces(ctx, afRequired.Interfaces)
 			afRequiredMessage = "AF_PACKET 兼容模式需要操作员明确确认：该模式仍由 VPP 转发，但性能受限，请确认后再应用。"
 			warnings = append(warnings, buildErr.Error())
 		case errors.As(buildErr, &locked):

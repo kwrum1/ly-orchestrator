@@ -33,6 +33,12 @@ unassigned unsupported port does not block an apply. Only a configured/assigned
 port that cannot be realized is an apply-blocking condition, and the error names
 that port.
 
+Consent is keyed by the product interface id (`eth0`, `eth1`, ...), which is
+derived from the PCI address and is stable before and after a DPDK bind. The
+policy API accepts a Linux netdev name for backwards compatibility and stores
+the canonical product id; matching accepts either form. The
+`af_fallback_required` error always lists product ids.
+
 ## Ownership preflight
 
 `/usr/lib/ly-route/prepare-vfio.sh` binds each selected data PCI independently:

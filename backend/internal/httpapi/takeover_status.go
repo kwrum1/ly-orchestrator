@@ -182,7 +182,7 @@ func (server *Server) interfaceTakeoverStatus(ctx context.Context, name string, 
 			verificationState = "pending_link"
 		}
 	} else {
-		mode, reason = server.bestAvailableTakeoverMode(name, pci, policy, capabilities)
+		mode, reason = server.bestAvailableTakeoverMode(ctx, name, pci, policy, capabilities)
 		class = takeoverClass(mode)
 		if mode == "" {
 			state = "unsupported"
@@ -190,7 +190,7 @@ func (server *Server) interfaceTakeoverStatus(ctx context.Context, name string, 
 			if reason == "" {
 				reason = "该网卡当前没有可用的接管模式"
 			}
-		} else if mode == "af_packet" && !policyAllowsAFPort(policy, server.displayInterfaceName(ctx, name)) {
+		} else if mode == "af_packet" && !server.allowsAFPacketFor(ctx, policy, name) {
 			state = "consent_required"
 			verificationState = "pending_link"
 			reason = "需要确认 AF_PACKET 兼容模式（性能受限）"
@@ -280,7 +280,7 @@ func (server *Server) persistNativeTakeoverProofs(ctx context.Context, path vpp.
 // binds a device: it reads the cached runtime capability report first and only
 // falls back to driver/XDP facts from sysfs. The selected order follows the
 // documented policy (see docs/DATAPLANE-REFERENCES.md).
-func (server *Server) bestAvailableTakeoverMode(name, pci string, policy DataplanePolicy, capabilities dataplane.TakeoverCapabilityState) (string, string) {
+func (server *Server) bestAvailableTakeoverMode(ctx context.Context, name, pci string, policy DataplanePolicy, capabilities dataplane.TakeoverCapabilityState) (string, string) {
 	if report, err := loadCapabilityReport(envOrDefault("LY_ROUTE_VPP_CAPABILITY_PROOF", "/var/lib/ly-route/vpp-native-capabilities.json")); err == nil {
 		for _, proof := range report.Proofs {
 			if strings.TrimSpace(proof.LinuxInterface) != name {
@@ -308,7 +308,7 @@ func (server *Server) bestAvailableTakeoverMode(name, pci string, policy Datapla
 	}
 	driver := strings.TrimSpace(inventoryDriver(name))
 	if _, unsupported := capabilities.NativeUnsupported(driver, pci); unsupported {
-		if policyAllowsAFPort(policy, name) {
+		if server.allowsAFPacketFor(ctx, policy, name) {
 			return "af_packet", ""
 		}
 		return "af_packet", "原生接管在该网卡上不可用；AF_PACKET 兼容模式需要确认"

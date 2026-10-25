@@ -48,7 +48,7 @@ func (server *Server) dataplanePolicy(ctx context.Context) DataplanePolicy {
 			return policy
 		}
 		policy.AFPacketFallback = decoded.AFPacketFallback
-		policy.Ports = normalizePolicyPorts(decoded.Ports)
+		policy.Ports = server.canonicalPolicyPorts(ctx, decoded.Ports)
 		policy.UpdatedAt = decoded.UpdatedAt
 		return policy
 	}
@@ -67,6 +67,44 @@ func normalizePolicyPorts(ports []string) []string {
 		result = append(result, port)
 	}
 	return result
+}
+
+// canonicalPolicyPorts resolves saved consent to product ids and persists only
+// the canonical form. Linux names are accepted for backwards compatibility.
+func (server *Server) canonicalPolicyPorts(ctx context.Context, ports []string) []string {
+	result := make([]string, 0, len(ports))
+	seen := map[string]bool{}
+	for _, port := range normalizePolicyPorts(ports) {
+		canonical := server.canonicalInterfaceID(ctx, port)
+		if canonical == "" || seen[canonical] {
+			continue
+		}
+		seen[canonical] = true
+		result = append(result, canonical)
+	}
+	return result
+}
+
+// allowsAFPacketFor is the tolerant consent matcher: it accepts either a
+// product id or the Linux name for the same physical port (resolved by PCI/MAC).
+func (server *Server) allowsAFPacketFor(ctx context.Context, policy DataplanePolicy, port string) bool {
+	if !policy.AFPacketFallback {
+		return false
+	}
+	if len(policy.Ports) == 0 {
+		return true
+	}
+	canonical := server.canonicalInterfaceID(ctx, port)
+	for _, allowed := range policy.Ports {
+		allowed = strings.TrimSpace(allowed)
+		if allowed == "" {
+			continue
+		}
+		if allowed == strings.TrimSpace(port) || server.canonicalInterfaceID(ctx, allowed) == canonical {
+			return true
+		}
+	}
+	return false
 }
 
 // policyAllowsAFPort answers whether the operator consented to AF_PACKET for a
@@ -92,7 +130,7 @@ func (server *Server) saveDataplanePolicy(ctx context.Context, policy DataplaneP
 	if server.store == nil {
 		return fmt.Errorf("local store is not configured")
 	}
-	policy.Ports = normalizePolicyPorts(policy.Ports)
+	policy.Ports = server.canonicalPolicyPorts(ctx, policy.Ports)
 	if policy.UpdatedAt.IsZero() {
 		policy.UpdatedAt = server.now().UTC()
 	}
@@ -149,7 +187,7 @@ func (server *Server) handleDataplanePolicy(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	policy.AFPacketFallback = *payload.AFPacketFallback
-	policy.Ports = normalizePolicyPorts(payload.Ports)
+	policy.Ports = server.canonicalPolicyPorts(r.Context(), payload.Ports)
 	policy.UpdatedAt = server.now().UTC()
 	if err := server.saveDataplanePolicy(r.Context(), policy); err != nil {
 		writeError(w, r, http.StatusInternalServerError, "dataplane_policy_persist_failed", err.Error())

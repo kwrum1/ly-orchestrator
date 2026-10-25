@@ -5532,6 +5532,7 @@ func (server *Server) lastRuntimeApply() *RuntimeApplyResult {
 
 func (server *Server) buildRuntimePlan(ctx context.Context, requestID string) (RuntimePlan, error) {
 	ctx = withInterfaceAliasCache(ctx)
+	ctx = withInterfaceIdentities(ctx)
 	if server.profile.ID() == product.Orchestrator().ID() {
 		return server.buildOrchestratorRuntimePlan(ctx, requestID)
 	}
@@ -5714,7 +5715,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	nativePath := observation.NativePathRequest(server.managementInterfaceID(ctx), dataInterfaces, server.now().UTC(), server.managementNetworkShared(ctx))
 	for index := range nativePath.Assignments {
 		port := server.displayInterfaceName(ctx, nativePath.Assignments[index].LinuxInterface)
-		nativePath.Assignments[index].AFPacketConsent = policyAllowsAFPort(dataplanePolicy, port)
+		nativePath.Assignments[index].AFPacketConsent = server.allowsAFPacketFor(ctx, dataplanePolicy, port)
 	}
 	if observation.Degraded {
 		planningWarnings = append(planningWarnings, "dataplane capability degraded ("+string(observation.Source)+"): "+observation.Reason)
@@ -5783,15 +5784,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		case errors.As(err, &afRequired):
 			operations = nil
 			dataplaneState = "af_fallback_required"
-			for _, interfaceName := range afRequired.Interfaces {
-				port := server.displayInterfaceName(ctx, interfaceName)
-				if strings.TrimSpace(port) == "" {
-					port = interfaceName
-				}
-				if !containsString(afRequiredInterfaces, port) {
-					afRequiredInterfaces = append(afRequiredInterfaces, port)
-				}
-			}
+			afRequiredInterfaces = server.canonicalAFRequiredInterfaces(ctx, afRequired.Interfaces)
 			afRequiredMessage = "AF_PACKET 兼容模式需要操作员明确确认：该模式仍由 VPP 转发，但性能受限。请在数据面策略中允许这些端口使用 AF_PACKET 兼容模式后重试。"
 			warnings = append(warnings, afRequired.Error())
 		case errors.As(err, &locked):
@@ -9893,6 +9886,7 @@ func (server *Server) interfaceRuntimeItem(ctx context.Context, id string) (map[
 }
 
 func (server *Server) interfaceRuntimeSnapshot(ctx context.Context) ([]map[string]any, []controlapi.CapabilityState, error) {
+	ctx = withInterfaceIdentities(ctx)
 	discovered := hostInterfaceInventory()
 	if server.interfaceTelemetry != nil {
 		items, err := server.interfaceTelemetry.Interfaces(ctx)
@@ -10098,29 +10092,7 @@ func (server *Server) resolveInterfaceID(ctx context.Context, id string) string 
 }
 
 func (server *Server) displayInterfaceName(ctx context.Context, actual string) string {
-	actual = strings.TrimSpace(actual)
-	if actual == "" {
-		return ""
-	}
-	items := server.interfaceAliasSnapshot(ctx)
-	management := server.managementInterfaceID(ctx)
-	ordered := make([]string, 0, len(items))
-	if management != "" {
-		ordered = append(ordered, management)
-	}
-	for _, item := range items {
-		name := strings.TrimSpace(firstNonEmpty(stringField(item, "system_name"), stringField(item, "id"), stringField(item, "name")))
-		if name == "" || name == management {
-			continue
-		}
-		ordered = append(ordered, name)
-	}
-	for index, name := range ordered {
-		if name == actual {
-			return fmt.Sprintf("eth%d", index)
-		}
-	}
-	return actual
+	return server.canonicalInterfaceID(ctx, actual)
 }
 
 func (server *Server) interfaceAliasSnapshot(ctx context.Context) []map[string]any {
@@ -10156,11 +10128,11 @@ func localInterfaceInventory() []map[string]any {
 		if name == "" || name == "lo" {
 			continue
 		}
-		if _, err := net.InterfaceByName(name); err != nil {
-			continue
-		}
 		path := filepath.Join("/sys/class/net", name)
 		if _, err := os.Stat(filepath.Join(path, "device")); err != nil && !envBoolOrDefault("LY_ROUTE_INCLUDE_VIRTUAL_INTERFACES", false) {
+			continue
+		}
+		if _, err := net.InterfaceByName(name); err != nil {
 			continue
 		}
 		mtu := 1500
@@ -10173,7 +10145,11 @@ func localInterfaceInventory() []map[string]any {
 		if data, err := os.ReadFile(filepath.Join(path, "operstate")); err == nil {
 			linkState = strings.TrimSpace(string(data))
 		}
-		items = append(items, map[string]any{"id": name, "name": name, "admin_state": "up", "link_state": linkState, "speed": localInterfaceSpeed(path), "mtu": mtu, "mac": localInterfaceMAC(name), "addresses": localInterfaceAddresses(name), "work_mode": "kernel_stack", "active_path": "kernel_stack", "mode_role": map[string]any{"gateway": nil, "bridge": nil}, "candidate_scopes": []string{"lan", "wan", "internal", "external"}, "capability": defaultDatapathCapability()})
+		pci := ""
+		if resolved, resolveErr := filepath.EvalSymlinks(filepath.Join(path, "device")); resolveErr == nil {
+			pci = normalizePCICandidate(filepath.Base(resolved))
+		}
+		items = append(items, map[string]any{"id": name, "name": name, "pci": pci, "admin_state": "up", "link_state": linkState, "speed": localInterfaceSpeed(path), "mtu": mtu, "mac": localInterfaceMAC(name), "addresses": localInterfaceAddresses(name), "work_mode": "kernel_stack", "active_path": "kernel_stack", "mode_role": map[string]any{"gateway": nil, "bridge": nil}, "candidate_scopes": []string{"lan", "wan", "internal", "external"}, "capability": defaultDatapathCapability()})
 	}
 	return items
 }

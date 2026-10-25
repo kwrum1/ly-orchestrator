@@ -49,6 +49,22 @@ replaced by driver/kernel strings.
 - `pci` is exposed because the operator uses it for inventory correlation; it
   is not a driver or kernel detail.
 
+## Stable identity and consent matching
+
+- A port's product id is assigned from its **PCI address**, not its current
+  kernel netdev name. The management port is pinned to `eth0`; data ports are
+  ordered by PCI (`eth1`, `eth2`, ...). The identity set is the union of the
+  current kernel inventory and persisted ownership/active records, so an id
+  does not change when a NIC is bound to VFIO/UIO and its netdev disappears.
+- `GET`/`PUT /api/v1/dataplane/policy` persist product ids. A saved Linux name
+  (`ens224`), PCI address or MAC is resolved to the same physical port and is
+  rewritten to the product id on save.
+- Consent matching accepts either form, so consent saved before adoption still
+  applies afterwards.
+- The `409 af_fallback_required` payload (`error.ports` and
+  `af_fallback_required.ports`) contains product ids only. Kernel names are
+  internal and must not appear in the API.
+
 ## Source of the values
 
 - `takeover_state` / `takeover_mode` / `takeover_class`: ownership record,
