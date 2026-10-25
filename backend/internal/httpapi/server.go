@@ -178,6 +178,11 @@ type Server struct {
 	capabilityProber              *vpp.CapabilityProber
 	runtimeMu                     sync.Mutex
 	runtimeApplyMu                sync.Mutex
+	applyMu                       sync.Mutex
+	applyHolder                   *applyLease
+	applyTimeout                  time.Duration
+	applyGrace                    time.Duration
+	applyWorkOverride             func(context.Context, string, http.ResponseWriter)
 	configApplyAsyncMu            sync.Mutex
 	configApplyAsync              map[string]ConfigApplyAsyncState
 	latestConfigApplyAsync        string
@@ -369,6 +374,28 @@ func WithClock(now func() time.Time) Option {
 func WithStore(store *persistence.Store) Option {
 	return func(server *Server) { server.store = store }
 }
+
+// WithApplyTimeout overrides the wall-clock bound of one runtime/config apply
+// transaction. Production uses runtimeApplyTimeout; tests use a short bound to
+// exercise the timeout path deterministically.
+func WithApplyTimeout(timeout time.Duration) Option {
+	return func(server *Server) {
+		if timeout > 0 {
+			server.applyTimeout = timeout
+		}
+	}
+}
+
+// withApplyGrace overrides how long a timed-out apply may take to unwind before
+// the gate is released anyway. Tests use a short grace period.
+func withApplyGrace(grace time.Duration) Option {
+	return func(server *Server) {
+		if grace >= 0 {
+			server.applyGrace = grace
+		}
+	}
+}
+
 
 func WithSubscriptionFetcher(fetch func(context.Context, string, bool) ([]byte, error)) Option {
 	return func(server *Server) {
@@ -5052,16 +5079,23 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 	if server.passwordChangeRequired(w, r, session, "/api/v1/runtime/apply", "apply") {
 		return
 	}
-	if !server.runtimeApplyMu.TryLock() {
+	transactionID := "runtime-" + newRequestID()
+	lease, acquired := server.beginApply("runtime-apply", transactionID, 0)
+	if !acquired {
 		// A second click must not queue for minutes behind the first apply.
-		// Return the existing transaction state immediately; clients can poll
-		// runtime/status for the committed receipt.
-		transactionID := "runtime-" + newRequestID()
+		// Return the transaction that actually owns the gate; a fresh,
+		// never-executed ID would make the client poll a transaction that can
+		// never commit. Clients can poll runtime/status for the real receipt.
+		inFlight := server.applyState()
+		holderTransactionID := inFlight.TransactionID
+		if holderTransactionID == "" {
+			holderTransactionID = transactionID
+		}
 		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "denied", "another runtime apply is in progress", r)
-		writeJSON(w, http.StatusAccepted, map[string]any{"status": "apply_in_progress", "runtime_state": "degraded", "reason": "another runtime apply is in progress", "transaction_id": transactionID, "request_id": requestID(r)})
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "apply_in_progress", "runtime_state": "degraded", "reason": "another runtime apply is in progress", "transaction_id": holderTransactionID, "in_flight_apply": inFlight, "request_id": requestID(r)})
 		return
 	}
-	defer server.runtimeApplyMu.Unlock()
+	defer lease.release()
 	if server.profile.ID() == product.Orchestrator().ID() {
 		server.BeginOperation("runtime-apply", "orchestrator runtime")
 		defer server.EndOperation()
@@ -5069,9 +5103,37 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 	// A gateway apply owns daemon and VPP transitions that can outlive a reverse
 	// proxy's request timeout. Keep the transaction bounded, but do not cancel a
 	// valid commit just because the browser or nginx closed its HTTP request.
-	applyCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), runtimeApplyTimeout)
+	applyCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), server.applyTimeoutOrDefault())
 	defer cancel()
-	transactionID := "runtime-" + newRequestID()
+	// Run the apply body behind a hard wall-clock bound.  Cancellation alone
+	// cannot prove that a wedged child returned, so the request goroutine also
+	// stops waiting after the grace period and releases the gate.
+	buffered := newBufferedHTTPResponse()
+	completed := runBoundedWork(applyCtx, server.applyGraceOrDefault(), func() {
+		server.executeRuntimeApply(buffered, r, session, applyCtx, transactionID, lease)
+	})
+	if !completed {
+		cancel()
+		lease.expired.Store(true)
+		reason := applyTimeoutReason("runtime apply", server.applyTimeoutOrDefault())
+		result := degradedRuntimeResult(transactionID, reason, server.now().UTC())
+		result.Status = "apply_failed"
+		server.setRuntimeEvidence(result)
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", reason, r)
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "apply_failed", "runtime_state": "degraded", "reason": reason, "transaction_id": transactionID, "request_id": requestID(r)})
+		return
+	}
+	buffered.flushTo(w)
+}
+
+// executeRuntimeApply is the bounded body of /api/v1/runtime/apply. It never
+// acquires the apply gate itself: the handler owns the lease and guarantees it
+// is released even if this function never returns.
+func (server *Server) executeRuntimeApply(w http.ResponseWriter, r *http.Request, session Session, applyCtx context.Context, transactionID string, lease *applyLease) {
+	if server.applyWorkOverride != nil {
+		server.applyWorkOverride(applyCtx, "runtime-apply", w)
+		return
+	}
 	// Force a live capability observation before committing. A probe failure is
 	// reported by the plan as a degradation and never aborts the apply: the
 	// previous generation keeps forwarding until a real eligibility failure.
@@ -5081,7 +5143,7 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 			cause := "orchestrator apply: " + err.Error()
 			result := degradedRuntimeResult(transactionID, cause, server.now().UTC())
 			result.Status = "apply_failed"
-			server.setRuntimeEvidence(result)
+			server.publishRuntimeResult(lease, result)
 			server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", cause, r)
 			writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": cause, "transaction_id": transactionID, "request_id": requestID(r)})
 			return
@@ -5130,7 +5192,7 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 		result := degradedRuntimeResult(transactionID, "service runtime controller is not configured", server.now().UTC())
 		result.Status = "unavailable"
 		result.RuntimeState = "unavailable"
-		server.setRuntimeEvidence(result)
+		server.publishRuntimeResult(lease, result)
 		result.Components = server.applyRuntimeEvidence(plan.Components)
 		if err := server.recordRuntimeApply(applyCtx, result, session, r); err != nil {
 			result.Reason += ": audit persistence: " + err.Error()
@@ -5178,7 +5240,7 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 		result := degradedRuntimeResult(transactionID, cause, server.now().UTC())
 		result.Status = "apply_failed"
 		result.RollbackReceipt = execution.RollbackReceipt
-		server.setRuntimeEvidence(result)
+		server.publishRuntimeResult(lease, result)
 		result.Components = server.applyRuntimeEvidence(plan.Components)
 		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", cause, r)
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": result.Reason, "transaction_id": transactionID, "rollback_receipt": result.RollbackReceipt, "components": result.Components, "request_id": requestID(r)})
@@ -5188,13 +5250,13 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 		cause := "PPPoE IPv6 hot apply: " + err.Error()
 		result := degradedRuntimeResult(transactionID, cause, server.now().UTC())
 		result.Status = "apply_failed"
-		server.setRuntimeEvidence(result)
+		server.publishRuntimeResult(lease, result)
 		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", cause, r)
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": cause, "transaction_id": transactionID, "request_id": requestID(r)})
 		return
 	}
 	receipt, readback := execution.Receipt, execution.Readback
-	server.setRuntimeEvidence(RuntimeApplyResult{Status: "committed", RuntimeState: "running", TransactionID: transactionID, Receipt: receipt, Readback: readback, GatewayPlan: &plan.GatewayPlan, GatewayEvidence: execution.GatewayResult.Evidence, AppliedAt: receipt.AppliedAt})
+	server.publishRuntimeResult(lease, RuntimeApplyResult{Status: "committed", RuntimeState: "running", TransactionID: transactionID, Receipt: receipt, Readback: readback, GatewayPlan: &plan.GatewayPlan, GatewayEvidence: execution.GatewayResult.Evidence, AppliedAt: receipt.AppliedAt})
 	components := server.runtimeStatusComponents(applyCtx, appliedArtifacts, len(plan.VppOperations) > 0)
 	components = applyCapabilityFailures(components, capabilityFailures, transactionID, server.now().UTC())
 	state := runtimeState(components)
@@ -5207,7 +5269,7 @@ func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request)
 		reason = "runtime apply completed with degraded components"
 	}
 	result := RuntimeApplyResult{Status: resultStatus, RuntimeState: state, TransactionID: transactionID, Reason: reason, Components: components, Applied: artifactServiceNames(appliedArtifacts), SnapshotHash: runtimePlanHash(plan), AppliedAt: server.now().UTC(), Receipt: receipt, Readback: readback, GatewayPlan: &plan.GatewayPlan, GatewayEvidence: execution.GatewayResult.Evidence, CapabilityFailures: capabilityFailures}
-	server.setRuntimeEvidence(result)
+	server.publishRuntimeResult(lease, result)
 	writeJSON(w, statusCode, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": result.Reason, "transaction_id": transactionID, "components": components, "applied_services": result.Applied, "capability_failures": result.CapabilityFailures, "snapshot_hash": result.SnapshotHash, "request_id": requestID(r)})
 }
 
@@ -5294,6 +5356,7 @@ func (server *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request
 				"status":     "degraded",
 				"components": []RuntimeComponentState{{Name: "配置检查", State: "degraded", Available: false, Reason: serviceRuntime.Redact(err.Error())}},
 				"last_apply": server.lastRuntimeApply(),
+				"apply":      server.applyState(),
 				"request_id": requestID(r),
 			})
 			return
@@ -5305,7 +5368,7 @@ func (server *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request
 		}
 		server.runtimeMu.Unlock()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": runtimeState(components), "components": components, "last_apply": server.lastRuntimeApply(), "request_id": requestID(r)})
+	writeJSON(w, http.StatusOK, map[string]any{"status": runtimeState(components), "components": components, "last_apply": server.lastRuntimeApply(), "apply": server.applyState(), "request_id": requestID(r)})
 }
 
 // reprobeRuntimeComponents refreshes the live state of an already-rendered
@@ -8234,8 +8297,6 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		server.handleConfigApplyAsync(w, r)
 		return
 	}
-	server.runtimeApplyMu.Lock()
-	defer server.runtimeApplyMu.Unlock()
 	var req ConfigApplyRequest
 	if r.Body != nil && r.ContentLength != 0 {
 		if err := decodeStrictJSON(r, &req); err != nil {
@@ -8250,12 +8311,60 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 	if transactionID == "" {
 		transactionID = "txn-" + newRequestID()
 	}
+	lease, acquired := server.beginApply("config apply", transactionID, 0)
+	if !acquired {
+		// The async front-end already rejects a second click, but a sync caller
+		// (or a worker racing a proxy reconcile) must also get an immediate
+		// answer instead of queueing behind an apply for minutes. Report the
+		// transaction that actually owns the gate so a poller follows real
+		// evidence instead of a phantom ID.
+		inFlight := server.applyState()
+		holderTransactionID := inFlight.TransactionID
+		if holderTransactionID == "" {
+			holderTransactionID = transactionID
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"status": "apply_in_progress", "runtime_state": "applying",
+			"reason":          "another configuration apply is in progress",
+			"transaction_id":  holderTransactionID,
+			"in_flight_apply": inFlight,
+			"query":           configApplyAsyncQueryPath + "?transaction_id=" + url.QueryEscape(holderTransactionID),
+			"request_id":      requestID(r),
+		})
+		return
+	}
+	defer lease.release()
+	applyCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), server.applyTimeoutOrDefault())
+	defer cancel()
+	buffered := newBufferedHTTPResponse()
+	completed := runBoundedWork(applyCtx, server.applyGraceOrDefault(), func() {
+		server.executeConfigApply(buffered, r, session, req, applyCtx, transactionID, lease)
+	})
+	if !completed {
+		cancel()
+		lease.expired.Store(true)
+		reason := applyTimeoutReason("configuration apply", server.applyTimeoutOrDefault())
+		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", reason, r)
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "apply_failed", "runtime_state": "degraded", "reason": reason, "transaction_id": transactionID, "query": configApplyAsyncQueryPath + "?transaction_id=" + url.QueryEscape(transactionID), "request_id": requestID(r)})
+		return
+	}
+	buffered.flushTo(w)
+}
+
+// executeConfigApply is the bounded body of /api/v1/config/apply, shared by the
+// synchronous handler and the asynchronous worker. The caller owns the apply
+// gate and its bounded context.
+func (server *Server) executeConfigApply(w http.ResponseWriter, r *http.Request, session Session, req ConfigApplyRequest, applyCtx context.Context, transactionID string, lease *applyLease) {
+	if server.applyWorkOverride != nil {
+		server.applyWorkOverride(applyCtx, "config apply", w)
+		return
+	}
 	// Dataplane capability is observed actively before compiling the
 	// transaction. A probe failure is a degradation reported by the plan, never
 	// a dataplane lock: the UI writes through this endpoint and a transient
 	// probe outage must not block an otherwise valid configuration change.
-	_ = server.refreshDataplaneCapability(r.Context())
-	runtimePlan, proxyEgress, flowIntent, err := server.configApplyPlan(r.Context(), transactionID, req.ProxyEgress, req.FlowIntent)
+	_ = server.refreshDataplaneCapability(applyCtx)
+	runtimePlan, proxyEgress, flowIntent, err := server.configApplyPlan(applyCtx, transactionID, req.ProxyEgress, req.FlowIntent)
 	if err != nil {
 		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", err.Error(), r)
 		writeError(w, r, http.StatusUnprocessableEntity, "config_apply_plan_failed", err.Error())
@@ -8266,24 +8375,29 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 	// so the first transaction would otherwise commit without them. Start the
 	// PPPoE helper from the already-rendered artifacts, wait for the live lease,
 	// then rebuild the plan before creating the transaction.
-	if configApplyAsyncEnabled() && server.portMapsAwaitingDynamicWAN(r.Context(), runtimePlan) && server.serviceRuntimeConfigured() {
+	if configApplyAsyncEnabled() && server.portMapsAwaitingDynamicWAN(applyCtx, runtimePlan) && server.serviceRuntimeConfigured() {
 		pppoeArtifacts := artifactsForService(runtimePlan.RuntimeArtifacts, serviceRuntime.PPPoE)
 		if len(pppoeArtifacts) > 0 {
-			report := server.services.ApplyCapabilitiesForTransaction(r.Context(), transactionID, pppoeArtifacts)
+			report := server.services.ApplyCapabilitiesForTransaction(applyCtx, transactionID, pppoeArtifacts)
 			if err := report.Err(); err != nil {
 				server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", "PPPoE bootstrap: "+err.Error(), r)
 				writeJSON(w, http.StatusAccepted, map[string]any{"status": "apply_failed", "runtime_state": "degraded", "reason": "PPPoE bootstrap: " + err.Error(), "transaction_id": transactionID, "request_id": requestID(r)})
 				return
 			}
 			deadline := server.now().Add(90 * time.Second)
+		waitLease:
 			for server.now().Before(deadline) {
-				current, currentErr := server.currentNATConfig(r.Context())
-				if currentErr == nil && len(current.PortMappings) >= server.desiredPortMapCount(r.Context()) {
+				current, currentErr := server.currentNATConfig(applyCtx)
+				if currentErr == nil && len(current.PortMappings) >= server.desiredPortMapCount(applyCtx) {
 					break
 				}
-				time.Sleep(2 * time.Second)
+				select {
+				case <-applyCtx.Done():
+					break waitLease
+				case <-time.After(2 * time.Second):
+				}
 			}
-			runtimePlan, proxyEgress, flowIntent, err = server.configApplyPlan(r.Context(), transactionID, req.ProxyEgress, req.FlowIntent)
+			runtimePlan, proxyEgress, flowIntent, err = server.configApplyPlan(applyCtx, transactionID, req.ProxyEgress, req.FlowIntent)
 			if err != nil {
 				writeError(w, r, http.StatusUnprocessableEntity, "config_apply_plan_failed", err.Error())
 				return
@@ -8317,14 +8431,14 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		Receipt: func(ctx context.Context, _ apply.Plan) (apply.ApplyReceipt, error) {
 			return server.runtimeReceipt(ctx, evidenceRequest)
 		},
-		HealthCheck: func(context.Context, apply.Plan) error {
+		HealthCheck: func(healthCtx context.Context, _ apply.Plan) error {
 			if server.services == nil {
 				return errors.New("live runtime health checker is not configured")
 			}
 			if len(artifactsForService(appliedArtifacts, serviceRuntime.Xray)) == 0 {
 				return nil
 			}
-			health, err := server.services.HealthCheck(r.Context(), serviceRuntime.Xray)
+			health, err := server.services.HealthCheck(healthCtx, serviceRuntime.Xray)
 			if err != nil {
 				return err
 			}
@@ -8346,12 +8460,12 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		server.configureLegacyServiceStages(&executor, transactionID, serviceArtifacts, &evidenceRequest, &appliedArtifacts, &capabilityFailures)
 	}
 	applyLANPlan := runtimePlan.GatewayPlan
-	if assignments, err := server.runtimeAddressAssignments(r.Context()); err == nil && len(assignments) > 0 {
+	if assignments, err := server.runtimeAddressAssignments(applyCtx); err == nil && len(assignments) > 0 {
 		applyLANPlan.AddressAssignments = assignments
 	}
 	restoreLAN := setApplyLANVPPEnvironment(applyLANPlan)
 	defer restoreLAN()
-	result, err := executor.Run(r.Context(), apply.Request{
+	result, err := executor.Run(applyCtx, apply.Request{
 		TransactionID:      transactionID,
 		Actor:              session.Username,
 		Role:               session.Role,
@@ -8359,7 +8473,7 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		ProxyEgress:        proxyEgress,
 		FlowIntent:         flowIntent,
 		SnapshotID:         "snapshot-" + transactionID,
-		PreviousSnapshotID: server.latestRuntimeSnapshotID(r.Context()),
+		PreviousSnapshotID: server.latestRuntimeSnapshotID(applyCtx),
 		RollbackID:         "rollback-" + transactionID,
 		GatewayPlan:        runtimePlan.GatewayPlan,
 		Hooks:              hooks,
@@ -8376,7 +8490,7 @@ func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) 
 		runtimeResult.Reason = "runtime apply completed with degraded capabilities"
 		statusCode = http.StatusAccepted
 	}
-	server.setRuntimeEvidence(runtimeResult)
+	server.publishRuntimeResult(lease, runtimeResult)
 	writeJSON(w, statusCode, map[string]any{"status": runtimeResult.Status, "runtime_state": runtimeResult.RuntimeState, "reason": runtimeResult.Reason, "transaction_id": transactionID, "apply_receipt": result.Receipt, "readback": result.Readback, "capability_failures": capabilityFailures, "gateway_resources": result.GatewayResult.Order, "events": applyEventResponses(result.Events), "request_id": requestID(r)})
 }
 
@@ -8385,11 +8499,14 @@ func configApplyAsyncEnabled() bool {
 }
 
 func (server *Server) handleConfigApplyAsync(w http.ResponseWriter, r *http.Request) {
-	if server.configApplyInProgress() {
+	if state, ok := server.configApplyState(""); ok && state.Status == "apply_in_progress" {
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"status": "apply_in_progress", "runtime_state": "applying",
-			"reason": "another configuration apply is in progress",
-			"query":  configApplyAsyncQueryPath, "request_id": requestID(r),
+			"reason":          "another configuration apply is in progress",
+			"transaction_id":  state.TransactionID,
+			"in_flight_apply": server.applyState(),
+			"query":           state.Query,
+			"request_id":      requestID(r),
 		})
 		return
 	}
@@ -8425,6 +8542,18 @@ func (server *Server) handleConfigApplyAsync(w http.ResponseWriter, r *http.Requ
 		if state.Status == "" {
 			state.Status = "apply_failed"
 		}
+		if state.Status == "apply_in_progress" {
+			// The worker could not take the apply gate. It did not queue, so
+			// this transaction will never run: record a terminal failure instead
+			// of leaving /config/apply/status reporting apply_in_progress
+			// forever.
+			state.Status = "apply_failed"
+			state.RuntimeState = "degraded"
+			state.HTTPStatus = http.StatusAccepted
+			if strings.TrimSpace(state.Reason) == "" {
+				state.Reason = "another apply is already in progress"
+			}
+		}
 		if state.RuntimeState == "" {
 			state.RuntimeState = "degraded"
 		}
@@ -8438,10 +8567,41 @@ func (server *Server) handleConfigApplyAsync(w http.ResponseWriter, r *http.Requ
 }
 
 func (server *Server) configApplyInProgress() bool {
+	state, ok := server.configApplyState(server.latestConfigApplyAsync)
+	return ok && state.Status == "apply_in_progress"
+}
+
+// configApplyState returns one async apply state, converting a record that has
+// outlived the bounded apply window into a terminal apply_failed state. The
+// bound is enforced by the worker itself; this read-side repair covers states
+// written by an older supervisor or a process that died before it could record
+// the terminal result.
+func (server *Server) configApplyState(transactionID string) (ConfigApplyAsyncState, bool) {
 	server.configApplyAsyncMu.Lock()
 	defer server.configApplyAsyncMu.Unlock()
-	state, ok := server.configApplyAsync[server.latestConfigApplyAsync]
-	return ok && state.Status == "apply_in_progress"
+	if transactionID == "" {
+		transactionID = server.latestConfigApplyAsync
+	}
+	state, ok := server.configApplyAsync[transactionID]
+	if !ok {
+		return ConfigApplyAsyncState{}, false
+	}
+	if state.Status == "apply_in_progress" {
+		// Do not race a live worker: repair only when no apply owns the gate
+		// and the record has clearly outlived both the bound and the short
+		// window in which a worker acquires the gate after the async response.
+		bound := server.applyTimeoutOrDefault() + server.applyGraceOrDefault() + 30*time.Second
+		updated := state.UpdatedAt
+		if !server.applyState().InProgress && (updated.IsZero() || server.now().UTC().Sub(updated) > bound) {
+			state.Status = "apply_failed"
+			state.RuntimeState = "degraded"
+			state.HTTPStatus = http.StatusAccepted
+			state.Reason = applyTimeoutReason("configuration apply", server.applyTimeoutOrDefault())
+			state.UpdatedAt = server.now().UTC()
+			server.configApplyAsync[transactionID] = state
+		}
+	}
+	return state, true
 }
 
 func (server *Server) setConfigApplyState(state ConfigApplyAsyncState) {
@@ -8464,12 +8624,7 @@ func (server *Server) handleConfigApplyStatus(w http.ResponseWriter, r *http.Req
 		return
 	}
 	transactionID := strings.TrimSpace(r.URL.Query().Get("transaction_id"))
-	server.configApplyAsyncMu.Lock()
-	if transactionID == "" {
-		transactionID = server.latestConfigApplyAsync
-	}
-	state, ok := server.configApplyAsync[transactionID]
-	server.configApplyAsyncMu.Unlock()
+	state, ok := server.configApplyState(transactionID)
 	if !ok {
 		writeError(w, r, http.StatusNotFound, "apply_not_found", "no apply transaction matches this ID")
 		return
