@@ -50,8 +50,16 @@ the Gateway-line non-fatal capability probe (no 423 `dataplane_locked`).
 ## UI bundles
 
 `ui-sweep.mjs` targets the accepted 11-page Vite bundle (`08af368`, absolute
-`/app.js` / `/styles.css`, per-page URLs). `ui-sweep-release.mjs` targets the
-12-page source-tree controller-shell bundle that `build-rootfs.sh` produces by
-default (`frontend/orchestrator`, sidebar `[data-page]` navigation, no
-per-page URLs). Run the one that matches the bundle served by the image under
-test; the 506cc4c release image serves the controller-shell bundle.
+`/app.js` / `/styles.css`, per-page URLs). This is what the Orchestrator
+product image ships by default: `scripts/build-rootfs.sh` and
+`scripts/build-upgrade-package.sh` use the pinned bundle in
+`packaging/orchestrator-frontend/bundle` (see
+`packaging/build-profiles/orchestrator.json` and
+`packaging/orchestrator-frontend/README.md`).
+
+`ui-sweep-release.mjs` targets the legacy 12-page source-tree controller-shell
+bundle (`frontend/orchestrator`, sidebar `[data-page]` navigation, no per-page
+URLs). It is produced only by an explicit
+`scripts/build-controller-shell.sh --product orchestrator` invocation, which
+the product pipeline no longer uses; the 506cc4c regression image shipped that
+bundle. Use it only when testing such an explicitly built bundle.
