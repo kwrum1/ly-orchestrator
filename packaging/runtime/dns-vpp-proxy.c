@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -49,7 +50,7 @@ struct source_route {
 static struct source_route source_routes[MAX_SOURCE_ROUTES];
 static size_t source_route_count;
 static int source_routes_loaded;
-static time_t source_routes_next_reload;
+static struct stat source_routes_stat;
 
 static int parse_decimal(const char *text, unsigned int maximum, unsigned int *value) {
     unsigned int parsed = 0;
@@ -186,10 +187,26 @@ static int load_source_routes(const char *path) {
 static int refresh_source_routes(void) {
     const char *path = getenv("LY_ROUTE_DNS_SOURCE_ROUTES");
     if (!path || !*path) path = "/etc/ly-route/dns-source-routes.conf";
-    time_t now = time(NULL);
-    if (source_routes_loaded && now < source_routes_next_reload) return 0;
-    source_routes_next_reload = now + 1;
-    return load_source_routes(path);
+    /* Reload immediately when the rendered map changes. A one-second polling
+     * throttle let the first query after an apply use the previous map, so a
+     * source-scoped policy leaked that query to the default resolver. */
+    struct stat current;
+    if (stat(path, &current) != 0) {
+        return source_routes_loaded ? 0 : -1;
+    }
+    if (source_routes_loaded &&
+        current.st_mtim.tv_sec == source_routes_stat.st_mtim.tv_sec &&
+        current.st_mtim.tv_nsec == source_routes_stat.st_mtim.tv_nsec &&
+        current.st_size == source_routes_stat.st_size) {
+        return 0;
+    }
+    if (load_source_routes(path) != 0) {
+        /* A concurrent non-atomic rewrite can be observed mid-update. Keep
+         * serving the last complete map instead of black-holing DNS. */
+        return source_routes_loaded ? 0 : -1;
+    }
+    source_routes_stat = current;
+    return 0;
 }
 
 static int parse_query_domain(const uint8_t *query, size_t length, char *domain) {

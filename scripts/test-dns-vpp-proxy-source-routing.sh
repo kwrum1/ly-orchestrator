@@ -35,7 +35,6 @@ static size_t make_query(uint8_t *query, const char *domain) {
 }
 
 static void require_port(const uint8_t *query, size_t length, const struct sockaddr *client, int expected) {
-    source_routes_next_reload = time(NULL) + 3600;
     int actual = source_route_port(query, length, client);
     if (actual != expected) {
         fprintf(stderr, "source route port = %d, want %d\n", actual, expected);

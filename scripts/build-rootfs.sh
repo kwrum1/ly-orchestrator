@@ -227,7 +227,11 @@ install_extra_debs() {
     # net.ipv6.bindv6only is 0.  Do not add 0.0.0.0:53 next to it: SmartDNS
     # cannot hold both wildcards at once, the second bind fails with
     # EADDRINUSE and the unit crash-loops on every boot.
-    grep -q '^bind \[::\]:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind [::]:53 -no-speed-check\nbind-tcp [::]:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
+    # Bind the loopback stub the VPP DNS adapter forwards to. A wildcard
+    # [::]:53 listener also accepted LAN queries delivered through the VPP
+    # LCP host interface, so every LAN query was resolved a second time by
+    # the default SmartDNS group and bypassed the per-source policy.
+    grep -q '^bind 127.0.0.53:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind 127.0.0.53:53 -no-speed-check\nbind-tcp 127.0.0.53:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
     fi
     vcl_library=$(find "$target/usr/lib" -type f -name 'libvcl_ldpreload.so.*' -print -quit)
     if [ -n "$vcl_library" ]; then
@@ -254,7 +258,11 @@ install_extra_debs() {
     # net.ipv6.bindv6only is 0.  Do not add 0.0.0.0:53 next to it: SmartDNS
     # cannot hold both wildcards at once, the second bind fails with
     # EADDRINUSE and the unit crash-loops on every boot.
-    grep -q '^bind \[::\]:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind [::]:53 -no-speed-check\nbind-tcp [::]:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
+    # Bind the loopback stub the VPP DNS adapter forwards to. A wildcard
+    # [::]:53 listener also accepted LAN queries delivered through the VPP
+    # LCP host interface, so every LAN query was resolved a second time by
+    # the default SmartDNS group and bypassed the per-source policy.
+    grep -q '^bind 127.0.0.53:53 ' "$target/etc/smartdns/smartdns.conf" || printf 'bind 127.0.0.53:53 -no-speed-check\nbind-tcp 127.0.0.53:53 -no-speed-check\n' >> "$target/etc/smartdns/smartdns.conf"
   fi
 }
 
