@@ -53,6 +53,11 @@ export function OrchestratorTopologyPage() {
     else if (topologyQuery.data === null) setDraft(emptyTopology(managementDefault));
   }, [topologyQuery.data, managementDefault]);
 
+  const physicalInventory = inventoryItems.filter((item) => {
+    const kind = String(item.kind || item.type || "").toLowerCase();
+    if (["lan_bridge", "bridge", "vlan", "logical"].includes(kind)) return false;
+    return !/^(lan-|lan_|br-|wan-|wan_|proxy-|egress-)/i.test(String(item.id || item.name || ""));
+  });
   const physicalPorts = inventoryItems.filter((item) =>
     (item.name || item.id) !== draft?.management_interface &&
     takeoverInfo(item).assignable
@@ -167,7 +172,7 @@ export function OrchestratorTopologyPage() {
         title="单机拓扑"
         subtitle="本地管理口、逻辑 LAN/WAN 与编排组；当前产品不是多站点/跨网关纳管"
         actions={<><Button size="sm" icon={<RefreshCw size={14} />} onClick={() => topologyQuery.refetch()}>刷新</Button><Button size="sm" variant="primary" icon={<Save size={14} />} loading={busy} onClick={save} disabled={session?.role === "readonly"}>保存拓扑</Button></>}
-        meta={<><span className="meta-item">本机唯一拓扑</span><span className="meta-item">checksum {text(topologyQuery.data?.checksum, "未保存")}</span></>}
+        meta={<><span className="meta-item">本机唯一拓扑</span><span className="meta-item">校验值 {text(topologyQuery.data?.checksum, "未保存")}</span></>}
       />
 
       {!topologyQuery.data && <div className="inline-warning">当前还没有已保存的编排拓扑。填写 LAN/WAN 与可选编排组后保存；首次保存会触发透明编排。</div>}
@@ -176,7 +181,7 @@ export function OrchestratorTopologyPage() {
       <div className="orch-topology-grid">
         <Card title="逻辑接口" subtitle="LAN/WAN 各一个；端口不能与编排组/管理口重复">
           <div className="form-grid">
-            <Field label="管理接口" hint="管理口由 Linux 管理，不能加入 LAN/WAN 或编排组">
+            <Field label="管理接口" hint="管理口由系统保留，不能加入 LAN/WAN 或编排组">
               <Input value={draft.management_interface} onChange={(event) => setDraft({ ...draft, management_interface: event.target.value })} placeholder="eth0" />
             </Field>
             <div />
@@ -216,7 +221,7 @@ export function OrchestratorTopologyPage() {
 
         <Card title="物理端口使用" subtitle="接管能力与链路状态分开显示">
           <div className="orch-port-list">
-            {inventoryItems.map((item) => {
+            {physicalInventory.map((item) => {
               const name = item.name || item.id;
               const used = usedPorts.has(name);
               const role = name === draft.management_interface ? "管理口" : interfaceFor(draft, "lan")?.port === name ? "LAN" : interfaceFor(draft, "wan")?.port === name ? "WAN" : draft.orchestration_groups.some((group) => group.ports.some((port) => port.interface === name)) ? "编排组" : used ? "聚合成员" : "未使用";
