@@ -1,0 +1,4 @@
+/* Ly Route Orchestrator product stylesheet.
+   Design tokens and shared components are compiled into styles.css.
+   This file is retained for the appliance packaging contract and is linked so
+   older packaging checks can verify the product bundle shape. */

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "product": "orchestrator",
+  "bundle": "bundle",
+  "pages": 11,
+  "description": "Accepted Orchestrator 11-page UI (React/Vite build of frontend/gateway with LY_ROUTE_PRODUCT=orchestrator).",
+  "source_commit": "08af368d79cea85300849258decec26933f845fa",
+  "source_branch": "feat/orchestrator-ui-align",
+  "source_path": "frontend/gateway",
+  "build_command": "cd frontend/gateway && LY_ROUTE_PRODUCT=orchestrator pnpm build",
+  "built_at": "2026-10-24T09:35:26Z",
+  "app_js_sha256": "0787685e8117c87e2e87a932c5e2f54e389ba668621c92bff65af00466199d35",
+  "files": {
+    "index.html": "a72211015f2cce50ce0238b08abe3c93c34e1b727c9358354832615ab68af2f6",
+    "styles.css": "9d5958b8f98924f03503ad6d7aaeedfe47377edeb85871400e7eb1d25d8eaf7b",
+    "product.css": "cb8a9088e70340f8a12c41a49033416d0846511134131baa60088f5dbe12b1a6",
+    "app.js": "0787685e8117c87e2e87a932c5e2f54e389ba668621c92bff65af00466199d35",
+    "shell.js": "e935675fb4b2b838aead9c4071edade229a8bb445f1301b9ea2fb5d1e4935e43",
+    "commercial.css": "0f901e4b534ec1e8cc7ea8c292141d2412303369dbe68810a5bfa35e77a947fd",
+    "capabilities.json": "7e0a88f454c2750b44d36a717d4a66bca6f7e63a27ba488f8d82ce06ffaba91d"
+  }
+}

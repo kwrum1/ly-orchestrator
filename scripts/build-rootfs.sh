@@ -69,6 +69,11 @@ geodata_dir=${LY_ROUTE_GEODATA_DIR:-$repo_root/packaging/geodata}
 . "$repo_root/packaging/runtime-boundaries/gateway.sh"
 . "$repo_root/scripts/lib/product-build-profile.sh"
 load_product_build_profile "$repo_root" "$product" "$manifest"
+# Orchestrator builds must always ship the accepted pinned UI bundle; the
+# legacy controller shell is not the Orchestrator product UI.
+if [ -z "$frontend_bundle" ] && [ -n "${PRODUCT_FRONTEND_BUNDLE:-}" ]; then
+  frontend_bundle=$PRODUCT_FRONTEND_BUNDLE
+fi
 if [ "$product" = gateway ]; then
   case ",$extra_packages," in
     *,nftables,*) ;;

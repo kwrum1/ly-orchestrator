@@ -1,6 +1,135 @@
 # Orchestrator acceptance on ESXi (AF_PACKET mode)
 
-## Release build 506cc4c — merged Gateway + Orchestrator line (2026-10-25)
+## Fix run — release-blocking regressions resolved (2026-10-25)
+
+Run `20261025-fix-release-orch-regressions` on branch
+`fix/release-orch-regressions`, built from the branch HEAD. This re-runs the
+Orchestrator acceptance against an image built by the fixed pipeline after the
+two regressions found on `506cc4c`. Data path is the same explicit AF_PACKET
+acceptance mode (`hook=af_packet`, `mode=linux_packet_socket`,
+`acceptance_only=true`, `high_performance=false`); no performance claim is
+made. Evidence:
+`/root/work/orch-acceptance/evidence/20261025-fix-release-orch-regressions/`
+(`summary.json`, `README.md`, `analysis-status-regression-fix.md`,
+`analysis-ui-bundle-fix.md`). The exact build commit and artifact SHA-256
+values are recorded in `build/git.txt`, `build/SHA256SUMS`,
+`build/rootfs-artifact-manifest.json` and `build/disk-image.manifest.json`; the
+image artifact manifest must report `product=orchestrator` and
+`source_commit` equal to the branch HEAD that was built.
+
+Commits on `fix/release-orch-regressions` (not pushed):
+
+- `af7f1a6` — `fix(orchestrator): keep runtime status on the transparent datapath`
+- `3e0ca15` — `fix(packaging): pin the accepted 11-page Orchestrator UI bundle`
+- the acceptance-documentation commits on top of `3e0ca15` (this file); the
+  final image is built from the resulting branch HEAD so the artifact
+  manifest's `source_commit` matches it
+
+### Verdict
+
+| # | Requirement | Verdict | Evidence |
+|---|---|---|---|
+| 1 | Deploy the rebuilt release; manifest product `orchestrator`, `source_commit` = built branch HEAD | **PASS** | `build/*`, `final/identity-and-vpp.txt` |
+| 2 | `health` ok; password change/login; Orchestrator profile | **PASS** | `phase-a.log`, `health*.json`, `login*.json`, `product.json` |
+| 3 | AF datapath: VPP owns both NICs, apply committed, `/runtime/status` running + generation; stable across ≥5 polls and after a control-api restart | **PASS** | `phase-b.log`, `functional/*`, `status-stability/*`, `final/api-runtime-status-{1..5}.json` |
+| 4 | Control-api restart and VPP restart keep the same generation and forwarding | **PASS** | `restart-persistence-test.log`, `persistence/*` |
+| 5 | Bidirectional reachability, policy allow TCP/8080, policy drop TCP/9000, reverse direction | **PASS** | `functional/*`, `datapath-test.log` |
+| 6 | Fail-closed: broken dataplane reports `apply_failed`/`degraded`, no generation committed, no direct leak, recovers | **PASS** | `failclosed-test.log`, `failclosed/*` |
+| 7 | UI 11/11 pages in real Chromium, zero 404s, clean console | **PASS** | `ui/result.json`, `ui/*.png` |
+| 8 | Evidence + acceptance document update, committed (not pushed) | **PASS** | this document, `evidence/20261025-fix-release-orch-regressions/` |
+
+### Regression 1 — runtime status (fixed)
+
+`handleRuntimeStatus` no longer consults the cached Gateway component inventory
+or plan-operation evidence for the Orchestrator profile; every poll is answered
+from `orchestratorStatusComponents` (the transparent VPP generation plus local
+persistence). `statusHealthComponents` also filters by `profile.AllowsService`,
+and `reprobeRuntimeComponents` is transparent-aware. Regression tests in
+`backend/internal/httpapi/orchestrator_runtime_status_regression_test.go` cover
+the post-apply component set, five polls from the post-restart state, the cached
+reprobe (`no VPP operations rendered` before the fix) and the unchanged Gateway
+inventory.
+
+Observed on the deployed image:
+
+- Immediately after `POST /runtime/apply` (`committed`/`running`, transaction
+  `runtime-aae81c869410c69f776ff80cc0e4f456`) the status was `running` with
+  exactly `vpp` + `persistence` and generation
+  `fd3afd6b162faed4fe22188ab88cf55295ef096e4c742dad35d7bee9441b28e0`.
+- 6 consecutive polls before an extra control-api restart and 6 consecutive
+  polls after it: all `running`, same two components, same generation, no
+  oscillation (`status-stability/*-summary.jsonl`, `*-poll-{1..6}.json`).
+- After the fail-closed/recovery cycle, 5 more polls were `running`
+  (`final/api-runtime-status-{1..5}.json`).
+
+### Regression 2 — UI bundle (fixed)
+
+The Orchestrator build profile now pins the accepted 11-page bundle
+(`packaging/orchestrator-frontend/bundle`, `app.js` SHA-256 `0787685e…`,
+source `08af368`). `build-rootfs.sh`/`build-upgrade-package.sh` default to it,
+`validate_frontend_bundle`/`copy_product_frontend` and `build-disk-image.sh`
+enforce the pin, and artifact manifests record the provenance. The Gateway
+profile has no pin and its strict validation/controller-shell path is
+unchanged.
+
+Verified on the rebuilt artifacts and the deployed image:
+
+| Artifact | `app.js` SHA-256 |
+|---|---|
+| rootfs | `0787685e8117c87e2e87a932c5e2f54e389ba668621c92bff65af00466199d35` |
+| upgrade package | `0787685e8117c87e2e87a932c5e2f54e389ba668621c92bff65af00466199d35` |
+| disk image / `/opt/ly-route/admin/app.js` | `0787685e8117c87e2e87a932c5e2f54e389ba668621c92bff65af00466199d35` |
+
+The accepted 11-page sweep passed **11/11** pages in headless Chromium with
+**0 × HTTP 404** and **0 unexpected console errors** (the single 401 is the
+expected pre-auth `/api/v1/auth/session` probe). A build with the legacy
+controller-shell bundle is rejected:
+`Frontend bundle app.js sha256 mismatch for orchestrator: expected 0787685e…,
+got 018563a2…`.
+
+### Build identity
+
+Artifact SHA-256 values are recorded in the evidence directory:
+`build/SHA256SUMS`, `build/disk-image.manifest.json`,
+`build/rootfs-artifact-manifest.json`, `build/ui-app-js.sha256`, and
+`build/git.txt` (branch + HEAD). The image artifact manifest reports
+`product=orchestrator` and `source_commit` equal to that HEAD; the pinned UI
+`app.js` is
+`0787685e8117c87e2e87a932c5e2f54e389ba668621c92bff65af00466199d35` in the
+rootfs, the upgrade package and the deployed image.
+
+Deployment: one fresh VM on datastore `data (1)` with 4 vCPU / 4 GB and three
+vmxnet3 NICs (`VM Network` management, `lyacc-orch-pg` WAN,
+`lyacc-orch-b-pg` LAN), created by
+`/root/work/ly-route-acceptance-esxi/esxi/deploy-esxi-vm.sh`. The exact VM
+name, management address, MACs and deployment log are recorded in the
+evidence directory (`deploy.log`, `build/git.txt`). Previous acceptance VMs
+connected to the same isolated data portgroups were powered off (not deleted)
+for the run so they could not duplicate datapath traffic. Gateway VMs,
+`dist-arch-v1-*`, `palog`, `DNS-8`, `vCLS` and
+`/root/work/ly-route-acceptance-v1` were not touched.
+
+### Verification commands
+
+`cd backend && go build ./... && go vet ./...` and
+`go test -p 1 -count=1 ./...` pass (`BUILD_OK`, `VET_OK`, `TEST_EXIT=0`).
+`scripts/test-product-builders.sh` is not green on this host for a
+pre-existing Gateway reason (`Gateway runtime env misses command: smartdns`,
+reproduced at `7d0a9ab` in a clean worktree); the Orchestrator-specific
+pipeline paths were validated directly: the pinned default build embeds
+`0787685e…` in rootfs/upgrade/disk with provenance, and the legacy bundle is
+rejected.
+
+### Remaining gaps
+
+- The upgrade package was verified statically (`includes_dataplane=false`,
+  plugin and pinned UI present); upgrade/rollback was not executed.
+- No throughput/line-rate claim in AF_PACKET acceptance mode.
+- No orchestration-group (`via`) hop, IPv6 policy, or host reboot.
+- Gateway Gate A/B and the Gateway product profile were not run here; the
+  Gateway status path is covered by unit tests only.
+
+## Historical (superseded): release build 506cc4c — merged Gateway + Orchestrator line (2026-10-25)
 
 Run `20261025T0730Z-release`. This is the re-run of the Orchestrator acceptance
 against the single release line `feat/release-integration` @ `506cc4cc6361`

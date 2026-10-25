@@ -70,6 +70,12 @@ const expected = {
   systemd_units: profile.systemd_units,
   packages: profile.required_packages,
 };
+// Products that pin a frontend bundle record its provenance in the manifest.
+if (product === "orchestrator") {
+  expected.frontend_app_sha256 = profile.frontend_app_sha256;
+  expected.frontend_bundle_source = profile.frontend_bundle_source;
+  expected.frontend_bundle_origin = profile.frontend_bundle;
+}
 if (JSON.stringify(actual) !== JSON.stringify(expected)) {
   throw new Error(`artifact manifest mismatch\nexpected=${JSON.stringify(expected)}\nactual=${JSON.stringify(actual)}`);
 }
@@ -91,8 +97,18 @@ validate_product_payload() {
     "$extract_dir/etc/ly-route/product-manifest.json"
   cmp "$extract_dir/etc/ly-route/product-manifest.json" \
     "$extract_dir/opt/ly-route/admin/capabilities.json"
-  grep -F "window.LY_ROUTE_PRODUCT_ENTRYPOINT = \"$product\";" \
-    "$extract_dir/opt/ly-route/admin/app.js" >/dev/null
+  if [ "$product" = gateway ]; then
+    grep -F "window.LY_ROUTE_PRODUCT_ENTRYPOINT = \"$product\";" \
+      "$extract_dir/opt/ly-route/admin/app.js" >/dev/null
+  else
+    pinned_app_sha256=$(node - "$repo_root/packaging/build-profiles/$product.json" <<'NODE'
+const { readFileSync } = require("node:fs");
+process.stdout.write(JSON.parse(readFileSync(process.argv[2], "utf8")).frontend_app_sha256 || "");
+NODE
+)
+    [ -n "$pinned_app_sha256" ] || fail "orchestrator frontend app.js is not pinned"
+    printf '%s  %s\n' "$pinned_app_sha256" "$extract_dir/opt/ly-route/admin/app.js" | sha256sum -c - >/dev/null
+  fi
   grep -F "LY_ROUTE_PRODUCT_PROFILE=/etc/ly-route/product-manifest.json" \
     "$extract_dir/etc/systemd/system/ly-route-control-api.service" >/dev/null
   grep -F "LY_ROUTE_DB_PATH=/var/lib/ly-route/$product/ly-route.db" \
@@ -189,7 +205,14 @@ for product in gateway orchestrator; do
 exit 0
 EOF
   chmod 0755 "$tmp/control-$product"
-  "$repo_root/scripts/build-controller-shell.sh" --product "$product" --out "$tmp/bundle-$product" >/dev/null
+  if [ "$product" = orchestrator ]; then
+    # The Orchestrator ships the accepted pinned 11-page bundle; keep the
+    # controller-shell output as a fixture for the pin rejection test.
+    "$repo_root/scripts/build-controller-shell.sh" --product "$product" --out "$tmp/bundle-orchestrator-legacy" >/dev/null
+    cp -a "$repo_root/packaging/orchestrator-frontend/bundle" "$tmp/bundle-$product"
+  else
+    "$repo_root/scripts/build-controller-shell.sh" --product "$product" --out "$tmp/bundle-$product" >/dev/null
+  fi
 done
 cat >"$tmp/vpp-apply" <<'EOF'
 #!/bin/sh
@@ -234,6 +257,9 @@ expect_rejection "tampered rootfs profile" "Product manifest mismatch: expected 
 expect_rejection "cross-product upgrade" "Upgrade base product mismatch: expected gateway, got orchestrator" "$tmp/reject-upgrade" \
   env $common_upgrade_env LY_ROUTE_CONTROL_BINARY="$tmp/control-gateway" LY_ROUTE_CONTROL_PRODUCT=gateway LY_ROUTE_VPP_APPLY_BINARY="$tmp/vpp-apply" \
   "$upgrade_builder" --product gateway --base-manifest "$repo_root/packaging/product-profiles/orchestrator.json" --out "$tmp/reject-upgrade"
+expect_rejection "unaccepted orchestrator frontend bundle" "Frontend bundle app.js sha256 mismatch for orchestrator" "$tmp/reject-rootfs" \
+  env $common_rootfs_env LY_ROUTE_CONTROL_BINARY="$tmp/control-orchestrator" LY_ROUTE_CONTROL_PRODUCT=orchestrator \
+  "$rootfs_builder" --product orchestrator --frontend-bundle "$tmp/bundle-orchestrator-legacy" --out "$tmp/reject-rootfs"
 
 for product in gateway orchestrator; do
   for arch in amd64 arm64; do
@@ -261,5 +287,32 @@ for product in gateway orchestrator; do
     validate_upgrade_manifest "$product" "$arch" "$tmp/extract-upgrade"
   done
 done
+
+# The Orchestrator product defaults to the pinned accepted bundle even when no
+# --frontend-bundle is supplied, so the release driver cannot fall back to the
+# legacy 12-page controller shell.
+default_rootfs="$tmp/rootfs-default-orchestrator"
+env $common_rootfs_env LY_ROUTE_CONTROL_BINARY="$tmp/control-orchestrator" LY_ROUTE_CONTROL_PRODUCT=orchestrator LY_ROUTE_VPP_APPLY_BINARY="$tmp/vpp-apply" \
+  "$rootfs_builder" --product orchestrator --arch amd64 --out "$default_rootfs" >/dev/null
+default_extract="$tmp/extract-default-orchestrator"
+rm -rf "$default_extract"
+mkdir -p "$default_extract"
+tar -xf "$default_rootfs/ly-route-rootfs-orchestrator-bookworm-amd64.tar" -C "$default_extract"
+pinned_app_sha256=$(node - "$repo_root/packaging/build-profiles/orchestrator.json" <<'NODE'
+const { readFileSync } = require("node:fs");
+process.stdout.write(JSON.parse(readFileSync(process.argv[2], "utf8")).frontend_app_sha256 || "");
+NODE
+)
+printf '%s  %s\n' "$pinned_app_sha256" "$default_extract/opt/ly-route/admin/app.js" | sha256sum -c - >/dev/null
+node - "$default_extract/usr/share/ly-route/artifact-manifest.json" "$pinned_app_sha256" <<'NODE'
+const { readFileSync } = require("node:fs");
+const [manifestPath, pinned] = process.argv.slice(2);
+const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+if (manifest.frontend_app_sha256 !== pinned ||
+    manifest.frontend_bundle_origin !== "packaging/orchestrator-frontend/bundle" ||
+    !manifest.frontend_bundle_source) {
+  throw new Error("orchestrator rootfs manifest is missing frontend bundle provenance");
+}
+NODE
 
 printf 'Product-aware rootfs and upgrade builder tests passed\n'

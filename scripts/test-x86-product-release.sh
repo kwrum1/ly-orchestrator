@@ -107,7 +107,17 @@ validate_image() {
   tar -xf "$image" -C "$extract"
   cmp "$repo_root/packaging/product-profiles/$product.json" "$extract/etc/ly-route/product-manifest.json"
   cmp "$extract/etc/ly-route/product-manifest.json" "$extract/opt/ly-route/admin/capabilities.json"
-  grep -F "window.LY_ROUTE_PRODUCT_ENTRYPOINT = \"$product\";" "$extract/opt/ly-route/admin/app.js" >/dev/null
+  if [ "$product" = gateway ]; then
+    grep -F "window.LY_ROUTE_PRODUCT_ENTRYPOINT = \"$product\";" "$extract/opt/ly-route/admin/app.js" >/dev/null
+  else
+    pinned_app_sha256=$(node - "$repo_root/packaging/build-profiles/$product.json" <<'NODE'
+const { readFileSync } = require("node:fs");
+process.stdout.write(JSON.parse(readFileSync(process.argv[2], "utf8")).frontend_app_sha256 || "");
+NODE
+)
+    [ -n "$pinned_app_sha256" ] || fail "orchestrator frontend app.js is not pinned"
+    printf '%s  %s\n' "$pinned_app_sha256" "$extract/opt/ly-route/admin/app.js" | sha256sum -c - >/dev/null
+  fi
   grep -F "LY_ROUTE_DB_PATH=/var/lib/ly-route/$product/ly-route.db" \
     "$extract/etc/systemd/system/ly-route-control-api.service" >/dev/null
   test -L "$extract/etc/systemd/system/multi-user.target.wants/ly-route-firstboot.service"

@@ -5328,6 +5328,16 @@ func (server *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request
 	// so a slow plan read cannot starve them and vice versa.
 	ctx, cancel := context.WithTimeout(r.Context(), statusPlanBudget)
 	defer cancel()
+	// The Orchestrator profile runs a transparent datapath. Its component
+	// inventory is defined by the observed VPP generation plus local
+	// persistence; the Gateway service inventory and plan-operation evidence
+	// below describe a different product. Answer every poll from the
+	// transparent evidence so the inventory cannot oscillate between a plan
+	// rebuild and the cached Gateway component reprobe.
+	if components, handled := server.orchestratorStatusComponents(ctx); handled {
+		writeJSON(w, http.StatusOK, map[string]any{"status": runtimeState(components), "components": components, "last_apply": server.lastRuntimeApply(), "request_id": requestID(r)})
+		return
+	}
 	server.runtimeMu.Lock()
 	last := server.lastRuntime
 	server.runtimeMu.Unlock()
@@ -5374,6 +5384,13 @@ func (server *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request
 // reprobeRuntimeComponents refreshes the live state of an already-rendered
 // component inventory without rebuilding the runtime plan.
 func (server *Server) reprobeRuntimeComponents(ctx context.Context, components []RuntimeComponentState) []RuntimeComponentState {
+	// The Orchestrator transparent datapath is refreshed from its generation
+	// evidence, never from the cached Gateway component inventory: its vpp
+	// component carries no Gateway plan operations, and treating that as
+	// "nothing rendered" degrades a healthy generation.
+	if live, handled := server.orchestratorStatusComponents(ctx); handled {
+		return live
+	}
 	updated := append([]RuntimeComponentState(nil), components...)
 	services := make([]serviceRuntime.ServiceName, 0, len(updated))
 	index := make(map[string]int, len(updated))
