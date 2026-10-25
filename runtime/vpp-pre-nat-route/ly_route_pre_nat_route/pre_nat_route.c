@@ -4,7 +4,14 @@
 #include <vlib/vlib.h>
 #include <vnet/feature/feature.h>
 #include <vnet/fib/fib_table.h>
+#include <vnet/adj/adj.h>
+#include <vnet/dpo/load_balance.h>
+#include <vnet/dpo/load_balance_map.h>
+#include <vnet/dpo/lookup_dpo.h>
+#include <vnet/fib/fib_entry.h>
+#include <vnet/fib/ip4_fib.h>
 #include <vnet/ip/ip4.h>
+#include <vnet/ip/ip4_inlines.h>
 #include <vnet/ip/format.h>
 #include <vnet/plugin/plugin.h>
 #include <vnet/tcp/tcp_packet.h>
@@ -69,6 +76,75 @@ typedef struct
 static ly_pre_nat_route_main_t ly_pre_nat_route_main;
 
 #define LY_PRE_NAT_ROUTE_TAG 0x4c595250u
+
+/* NAT44-ed runs before ip4-lookup and reads sw_if_index[VLIB_TX] as the
+ * output interface in order to pick the outside address. Writing the private
+ * FIB index into that field therefore made NAT select the WAN whose interface
+ * index happened to equal the FIB index. Resolve the selected FIB's current
+ * forwarding interface instead; the private FIB index travels separately in the
+ * post-NAT tag and is restored for the real lookup. */
+/* NAT44-ed runs before ip4-lookup and reads sw_if_index[VLIB_TX] as the
+ * output interface in order to pick the outside address. Writing the private
+ * FIB index into that field therefore made NAT select the WAN whose interface
+ * index happened to equal the FIB index. Walk the selected FIB's forwarding
+ * DPO chain (a route table usually resolves through a WAN-group table) and
+ * return the interface the FIB would really transmit on; the private FIB index
+ * travels separately in the post-NAT tag and is restored for the real lookup. */
+static_always_inline u32
+ly_pre_nat_route_resolving_interface (vlib_main_t * vm, u32 fib_index,
+				      ip4_header_t * ip4)
+{
+  for (u32 depth = 0; depth < 8; depth++)
+    {
+      u32 lbi = ip4_fib_forwarding_lookup (fib_index, &ip4->dst_address);
+      if ((u32) ~ 0 == lbi)
+	return (u32) ~ 0;
+      load_balance_t *lb = load_balance_get (lbi);
+      if (NULL == lb || 0 == lb->lb_n_buckets)
+	return (u32) ~ 0;
+
+      const dpo_id_t *dpo;
+      if (lb->lb_n_buckets > 1)
+	{
+	  u32 hash = ip4_compute_flow_hash (ip4, lb->lb_hash_config);
+	  dpo = load_balance_get_fwd_bucket (lb, hash & lb->lb_n_buckets_minus_1);
+	}
+      else
+	{
+	  dpo = load_balance_get_bucket_i (lb, 0);
+	}
+      if (DPO_LOAD_BALANCE == dpo->dpoi_type)
+	{
+	  load_balance_t *nested = load_balance_get (dpo->dpoi_index);
+	  if (NULL == nested || 0 == nested->lb_n_buckets)
+	    return (u32) ~ 0;
+	  dpo = load_balance_get_bucket_i (nested, 0);
+	}
+      if (dpo_is_adj (dpo))
+	{
+	  u32 sw_if_index = adj_get_sw_if_index (dpo->dpoi_index);
+	  if ((u32) ~ 0 != sw_if_index)
+	    return sw_if_index;
+	  return (u32) ~ 0;
+	}
+      if (DPO_RECEIVE == dpo->dpoi_type || DPO_DROP == dpo->dpoi_type ||
+	  DPO_IP_NULL == dpo->dpoi_type)
+	return (u32) ~ 0;
+      /* Lookup DPOs register their own dynamic DPO subtypes (>= DPO_LAST),
+       * so their data-plane next node is not a stable discriminator. Follow
+       * the child FIB for any other dynamic forwarding object. */
+      if (dpo->dpoi_type >= DPO_LAST)
+	{
+	  lookup_dpo_t *lkd = lookup_dpo_get (dpo->dpoi_index);
+	  if (NULL == lkd || lkd->lkd_fib_index == fib_index)
+	    return (u32) ~ 0;
+	  fib_index = lkd->lkd_fib_index;
+	  continue;
+	}
+      return (u32) ~ 0;
+    }
+  return (u32) ~ 0;
+}
 
 static_always_inline void
 ly_pre_nat_route_set_tag (vlib_buffer_t *buffer, u32 fib_index)
@@ -262,7 +338,10 @@ VLIB_NODE_FN (ly_pre_nat_route_ip4_node) (vlib_main_t *vm,
           // Keep the selected FIB through NAT. The post-NAT feature consumes
           // this override before legacy ABF rules can observe the rewritten
           // source address and replace the intended path.
-          vnet_buffer (buffer)->sw_if_index[VLIB_TX] = rule->fib_index;
+          ip4_header_t *ip4 = vlib_buffer_get_current (buffer);
+          u32 egress = ly_pre_nat_route_resolving_interface (
+            vm, rule->fib_index, ip4);
+          vnet_buffer (buffer)->sw_if_index[VLIB_TX] = egress;
           ly_pre_nat_route_set_tag (buffer, rule->fib_index);
           vlib_node_increment_counter (vm, node->node_index,
                                        LY_PRE_NAT_ROUTE_ERROR_MATCHED, 1);
