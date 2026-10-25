@@ -17,13 +17,22 @@ cat > "$tmp/bin/systemctl" <<'EOF'
 #!/usr/bin/env sh
 exit 0
 EOF
+cat > "$tmp/bin/ip" <<'EOF'
+#!/usr/bin/env sh
+exit 0
+EOF
 cat > "$tmp/bin/vppctl" <<'EOF'
 #!/usr/bin/env sh
 printf '%s\n' "$*" >> "$VPPCTL_LOG"
 case "$*" in
   'show plugin') printf '%s\n' "$VPPCTL_PLUGINS" ;;
   'show cli') printf '%s\n' 'show dpdk interface' ;;
-  show\ hardware-interfaces\ *) printf '%s PCI %s\n' "$3" "${VPPCTL_ACTIVE_PCI:-}" ;;
+  'show hardware-interfaces')
+    printf '%s 1 up %s\n  Intel e1000\n    pci: device 8086:1539 address %s numa 0\n' \
+      "${VPPCTL_VPP_INTERFACE:-GigabitEthernet3/0/0}" "${VPPCTL_VPP_INTERFACE:-GigabitEthernet3/0/0}" "${VPPCTL_ACTIVE_PCI:-}"
+    ;;
+  show\ hardware-interfaces\ *)
+    printf '%s PCI %s\n  Intel e1000\n' "$3" "${VPPCTL_ACTIVE_PCI:-}" ;;
   'show threads') printf '%s\n' "${VPPCTL_THREADS:-vpp_main}" ;;
   'show dpdk interface hqos placement') printf '%s\n' "${VPPCTL_HQOS_PLACEMENT:-}" ;;
   create\ interface\ af_xdp*)
@@ -43,10 +52,11 @@ cat > "$tmp/bin/native-benchmark" <<'EOF'
 case "$2" in
   rdma) printf '%s\n' "${VPPCTL_RDMA_SCORE:-90}" ;;
   af_xdp) printf '%s\n' "${VPPCTL_AFXDP_SCORE:-80}" ;;
+  af_packet) printf '%s\n' 10 ;;
   *) exit 1 ;;
 esac
 EOF
-chmod 0755 "$tmp/bin/systemctl" "$tmp/bin/vppctl" "$tmp/bin/native-benchmark"
+chmod 0755 "$tmp/bin/systemctl" "$tmp/bin/ip" "$tmp/bin/vppctl" "$tmp/bin/native-benchmark"
 
 run_check() {
   scenario=$1
@@ -57,6 +67,11 @@ run_check() {
   management_shared=${6:-false}
   scenario_dir="$tmp/$scenario"
   mkdir -p "$scenario_dir" "$scenario_dir/sys"
+  for interface in $(printf '%s' "$data_interfaces" | tr ',' ' '); do
+    if [ -z "${VPPCTL_ACTIVE_PCI:-}" ]; then
+      mkdir -p "$scenario_dir/sys/class/net/$interface"
+    fi
+  done
   PATH="$tmp/bin:$PATH" \
     VPPCTL_LOG="$scenario_dir/vppctl.log" \
     VPPCTL_PLUGINS="$plugins" \
@@ -67,7 +82,10 @@ run_check() {
     LY_ROUTE_VPP_CAPABILITY_PROOF="$scenario_dir/proof.json" \
     LY_ROUTE_DATAPLANE_ACTIVE_STATE="$scenario_dir/active.json" \
     LY_ROUTE_ACTIVE_DPDK_READER="$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/active-dpdk-state.py" \
+    LY_ROUTE_DATAPLANE_INVENTORY="$scenario_dir/inventory.json" \
+    LY_ROUTE_DPDK_OWNERSHIP_STATE="$scenario_dir/ownership.json" \
     LY_ROUTE_COMMERCIAL_RUNTIME_REQUIRED=false \
+    LY_ROUTE_PRODUCT=test \
     LY_ROUTE_REQUIRED_COMMANDS=sh \
     LY_ROUTE_REQUIRED_UNITS= \
     LY_ROUTE_MANAGEMENT_INTERFACE="$management" \
@@ -82,14 +100,20 @@ setup_dpdk_fixture() {
   interface_name=$2
   scenario_dir="$tmp/$scenario"
   device="$scenario_dir/sys/devices/pci0000:00/0000:03:00.0"
-  driver="$scenario_dir/sys/bus/pci/drivers/ixgbe"
+  driver="$scenario_dir/sys/bus/pci/drivers/vfio-pci"
   iommu="$scenario_dir/sys/kernel/iommu_groups/17"
   mkdir -p "$scenario_dir/sys/class/net/$interface_name" "$device" "$driver" "$iommu" \
-    "$scenario_dir/sys/module/vfio_pci" "$scenario_dir/sys/kernel/mm/hugepages/hugepages-2048kB"
+    "$scenario_dir/sys/module/vfio_pci" "$scenario_dir/sys/kernel/mm/hugepages/hugepages-2048kB" \
+    "$scenario_dir/sys/bus/pci/devices"
   ln -s "$device" "$scenario_dir/sys/class/net/$interface_name/device"
+  ln -s "$device" "$scenario_dir/sys/bus/pci/devices/0000:03:00.0"
   ln -s "$driver" "$device/driver"
   ln -s "$iommu" "$device/iommu_group"
   printf '%s\n' 64 > "$scenario_dir/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
+  cat > "$scenario_dir/inventory.json" <<EOF
+{"schema_version":1,"source":"test","management":{"linux_interface":"eth0","pci":"0000:01:00.0"},"data_interfaces":[{"linux_interface":"$interface_name","pci":"0000:03:00.0","mac":"00:11:22:33:44:55","kernel_driver":"ixgbe","role":"data"}]}
+EOF
+  chmod 0600 "$scenario_dir/inventory.json"
 }
 
 setup_active_dpdk_fixture() {
@@ -111,6 +135,23 @@ EOF
   chmod 0600 "$scenario_dir/active.json"
 }
 
+setup_inventory_uio_fixture() {
+  scenario=$1
+  interface_name=$2
+  scenario_dir="$tmp/$scenario"
+  device="$scenario_dir/sys/devices/pci0000:00/0000:03:00.0"
+  driver="$scenario_dir/sys/bus/pci/drivers/uio_pci_generic"
+  mkdir -p "$device" "$driver" "$scenario_dir/sys/bus/pci/devices" \
+    "$scenario_dir/sys/module/uio_pci_generic" "$scenario_dir/sys/kernel/mm/hugepages/hugepages-2048kB"
+  ln -s "$device" "$scenario_dir/sys/bus/pci/devices/0000:03:00.0"
+  ln -s "$driver" "$device/driver"
+  printf '%s\n' 64 > "$scenario_dir/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
+  cat > "$scenario_dir/inventory.json" <<EOF
+{"schema_version":1,"source":"test","management":{"linux_interface":"eth0","pci":"0000:01:00.0"},"data_interfaces":[{"linux_interface":"$interface_name","pci":"0000:03:00.0","mac":"00:11:22:33:44:55","kernel_driver":"igb","role":"data"}]}
+EOF
+  chmod 0600 "$scenario_dir/inventory.json"
+}
+
 run_check native eth0 eth1 af_xdp_plugin.so 1
 grep -q '"dataplane_state": "native_ready"' "$tmp/native/readiness.json"
 # arch-v1 first boot: optional services (SmartDNS/Kea/xray) are reported as
@@ -130,19 +171,41 @@ grep -q '"hook":"rdma"' "$tmp/native-benchmark/proof.json"
 grep -q '"hook":"af_xdp"' "$tmp/native-benchmark/proof.json"
 grep -q '"performance_score":90' "$tmp/native-benchmark/proof.json"
 
+# AF_PACKET is always recorded as the last-resort candidate, never as a
+# high-performance path.
+run_check af-fallback eth0 eth1 af_packet_plugin.so 0
+grep -q '"hook":"af_packet"' "$tmp/af-fallback/proof.json"
+grep -q '"acceptance_only":true' "$tmp/af-fallback/proof.json"
+grep -q '"high_performance":false' "$tmp/af-fallback/proof.json"
+
+setup_inventory_uio_fixture dpdk-uio-miss eth1
+VPPCTL_ACTIVE_PCI=0000:99:00.0 run_check dpdk-uio-miss eth0 eth1 dpdk_plugin.so 0
+grep -q '"dataplane_state": "dataplane_locked"' "$tmp/dpdk-uio-miss/readiness.json"
+grep -q 'runtime_capability_proof:eth1' "$tmp/dpdk-uio-miss/readiness.json"
+
 run_check unsupported eth0 eth1 unrelated_plugin.so 0
 grep -q '"dataplane_state": "dataplane_locked"' "$tmp/unsupported/readiness.json"
 grep -q 'runtime_capability_proof:eth1' "$tmp/unsupported/readiness.json"
 grep -q '"proofs":\[\]' "$tmp/unsupported/proof.json"
 
 setup_dpdk_fixture dpdk eth1
-run_check dpdk eth0 eth1 dpdk_plugin.so 0
+VPPCTL_ACTIVE_PCI=0000:03:00.0 run_check dpdk eth0 eth1 dpdk_plugin.so 0
 grep -q '"dataplane_state": "dpdk_ready"' "$tmp/dpdk/readiness.json"
 grep -q '"tier":"vpp_dpdk"' "$tmp/dpdk/proof.json"
 grep -q '"pci_address":"0000:03:00.0"' "$tmp/dpdk/proof.json"
 grep -q '"kernel_driver":"ixgbe"' "$tmp/dpdk/proof.json"
 grep -q '"iommu_group":"17"' "$tmp/dpdk/proof.json"
 grep -q '"dpdk_plugin_available":true' "$tmp/dpdk/proof.json"
+
+setup_inventory_uio_fixture dpdk-uio eth1
+VPPCTL_ACTIVE_PCI=0000:03:00.0 run_check dpdk-uio eth0 eth1 dpdk_plugin.so 0
+grep -q '"dataplane_state": "dpdk_ready"' "$tmp/dpdk-uio/readiness.json"
+grep -q '"mode":"uio_pci_generic"' "$tmp/dpdk-uio/proof.json"
+grep -q '"transport":"uio"' "$tmp/dpdk-uio/proof.json"
+grep -q '"high_performance":true' "$tmp/dpdk-uio/proof.json"
+grep -q '"acceptance_only":false' "$tmp/dpdk-uio/proof.json"
+grep -q '"vpp_interface":"GigabitEthernet3/0/0"' "$tmp/dpdk-uio/proof.json"
+grep -q '"kernel_driver":"igb"' "$tmp/dpdk-uio/proof.json"
 
 setup_active_dpdk_fixture dpdk-active eth1
 VPPCTL_ACTIVE_PCI=0000:03:00.0 run_check dpdk-active eth0 eth1 dpdk_plugin.so 0

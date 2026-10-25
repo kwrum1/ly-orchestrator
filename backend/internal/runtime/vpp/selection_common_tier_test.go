@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func TestCommonTier_prefers_native_on_every_active_interface(t *testing.T) {
+func TestCommonTier_prefers_dpdk_on_every_active_interface(t *testing.T) {
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 	request := NativePathRequest{ManagementInterface: "eth0", Now: now, Assignments: []NativeAssignment{
 		{LinuxInterface: "eth2", Explicit: true, Candidates: []CapabilityProof{candidateProof(now, DataplaneTierDPDK, NativeHookDPDK, NativeModeDPDKVFIO, 100), candidateProof(now, DataplaneTierNative, NativeHookAFXDP, NativeModeZeroCopy, 10)}},
@@ -20,15 +20,15 @@ func TestCommonTier_prefers_native_on_every_active_interface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if path.Tier != DataplaneTierNative {
-		t.Fatalf("tier = %q, want native", path.Tier)
+	if path.Tier != DataplaneTierDPDK {
+		t.Fatalf("tier = %q, want ordered DPDK preference", path.Tier)
 	}
 	if len(path.Attachments) != 2 || path.Attachments[0].LinuxInterface != "eth1" || path.Attachments[1].LinuxInterface != "eth2" {
 		t.Fatalf("attachments = %#v, want deterministic eth1/eth2", path.Attachments)
 	}
 	for _, attachment := range path.Attachments {
-		if attachment.Tier != DataplaneTierNative || attachment.Hook == NativeHookDPDK {
-			t.Fatalf("attachment = %#v, want native common tier", attachment)
+		if attachment.Tier != DataplaneTierDPDK || attachment.Hook != NativeHookDPDK {
+			t.Fatalf("attachment = %#v, want DPDK common tier", attachment)
 		}
 	}
 }
@@ -76,6 +76,8 @@ func TestCommonTierUsesUIOPCIGenericWhenVFIOIsUnavailable(t *testing.T) {
 	proof.IOMMUProtected = false
 	proof.VFIOAvailable = false
 	proof.UIOPCIAvailable = true
+	proof.Transport = "uio"
+	proof.KernelDriver = "igb"
 	path, err := SelectNativePath(NativePathRequest{
 		ManagementInterface: "eth0",
 		Now:                 now,
@@ -104,11 +106,11 @@ func TestCommonTierSmartQoSPreservesPreferredNativeTierWhenPluginIsAvailable(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if path.Tier != DataplaneTierNative {
-		t.Fatalf("smart QoS tier = %q, want preferred VPP-native tier", path.Tier)
+	if path.Tier != DataplaneTierDPDK {
+		t.Fatalf("smart QoS tier = %q, want ordered DPDK preference", path.Tier)
 	}
 	for _, attachment := range path.Attachments {
-		if attachment.Tier != DataplaneTierNative {
+		if attachment.Tier != DataplaneTierDPDK {
 			t.Fatalf("smart QoS attachment = %#v", attachment)
 		}
 	}
@@ -200,7 +202,7 @@ func TestBuildOperations_dpdk_selection_fails_closed_until_runtime_adapter_is_re
 	assertFailedPrerequisite(t, locked.Prerequisites, "dpdk_runtime_adapter_ready")
 }
 
-func TestCommonTier_locks_when_interfaces_have_no_common_tier(t *testing.T) {
+func TestCommonTier_allows_mixed_native_and_dpdk_ports(t *testing.T) {
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 	request := NativePathRequest{ManagementInterface: "eth0", Now: now, Assignments: []NativeAssignment{
 		{LinuxInterface: "eth1", Explicit: true, Candidates: []CapabilityProof{candidateProof(now, DataplaneTierNative, NativeHookAFXDP, NativeModeZeroCopy, 10)}},
@@ -209,14 +211,12 @@ func TestCommonTier_locks_when_interfaces_have_no_common_tier(t *testing.T) {
 
 	path, err := SelectNativePath(request)
 
-	if len(path.Attachments) != 0 {
-		t.Fatalf("path = %#v, want locked", path)
+	if err != nil {
+		t.Fatalf("mixed native/DPDK path must be allowed: %v", err)
 	}
-	var locked *DataplaneLockedError
-	if !errors.As(err, &locked) {
-		t.Fatalf("error = %T %v, want DataplaneLockedError", err, err)
+	if len(path.Attachments) != 2 || path.Attachments[0].Tier != DataplaneTierNative || path.Attachments[1].Tier != DataplaneTierDPDK {
+		t.Fatalf("path = %#v, want native eth1 and DPDK eth2", path)
 	}
-	assertFailedPrerequisite(t, locked.Prerequisites, "common_dataplane_tier")
 }
 
 func TestCommonTier_selects_highest_measured_candidate_within_tier(t *testing.T) {
@@ -233,8 +233,8 @@ func TestCommonTier_selects_highest_measured_candidate_within_tier(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(path.Attachments) != 1 || path.Attachments[0].Hook != NativeHookRDMA {
-		t.Fatalf("attachments = %#v, want highest measured RDMA candidate", path.Attachments)
+	if len(path.Attachments) != 1 || path.Attachments[0].Hook != NativeHookAFXDP || path.Attachments[0].Mode != NativeModeZeroCopy {
+		t.Fatalf("attachments = %#v, want ordered AF_XDP zero-copy over RDMA", path.Attachments)
 	}
 }
 

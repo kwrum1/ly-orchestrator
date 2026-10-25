@@ -255,7 +255,15 @@ type RuntimePlan struct {
 	Components         []RuntimeComponentState            `json:"components"`
 	Warnings           []string                           `json:"warnings,omitempty"`
 	DataplaneState     string                             `json:"dataplane_state"`
+	DataplanePolicy    DataplanePolicy                    `json:"dataplane_policy"`
 	DataplaneProof     []vpp.PrerequisiteResult           `json:"dataplane_prerequisites,omitempty"`
+	// SelectedNativePath is the per-interface fallback decision used to build
+	// the apply plan. It is evidence for AF_PACKET degradation and mixed mode.
+	SelectedNativePath vpp.NativePath `json:"selected_native_path,omitempty"`
+	// AFRequiredInterfaces is populated when the only remaining path for an
+	// assigned interface is AF_PACKET and the operator has not consented yet.
+	AFRequiredInterfaces []string `json:"af_required_interfaces,omitempty"`
+	AFRequiredMessage    string   `json:"af_required_message,omitempty"`
 	// DataplaneDegradations lists optional features that are unavailable while
 	// the dataplane keeps forwarding (arch-v1: retired Smart QoS).
 	DataplaneDegradations []vpp.Degradation `json:"dataplane_degradations,omitempty"`
@@ -395,7 +403,6 @@ func withApplyGrace(grace time.Duration) Option {
 		}
 	}
 }
-
 
 func WithSubscriptionFetcher(fetch func(context.Context, string, bool) ([]byte, error)) Option {
 	return func(server *Server) {
@@ -5170,6 +5177,55 @@ func (server *Server) executeRuntimeApply(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": result.Reason, "transaction_id": transactionID, "request_id": requestID(r)})
 		return
 	}
+	if (plan.DataplaneState == "dataplane_locked" || plan.DataplaneState == "dataplane_degraded" || plan.DataplaneState == "af_fallback_required") && len(plan.GatewayPlan.NativePath.Assignments) > 0 {
+		// A fresh, API-configured appliance has no installer NIC mapping, so the
+		// boot ownership preflight had nothing to bind. Before declaring the
+		// dataplane locked, run the same preflight now, restart VPP, and re-probe
+		// once. This is the first-takeover path; repeated applies see the NICs
+		// already owned by VPP and skip it.
+		if server.bootstrapDataplaneOwnership(applyCtx) {
+			if server.capabilityProber != nil {
+				server.capabilityProber.Invalidate()
+			}
+			_ = server.refreshDataplaneCapability(applyCtx)
+			if retried, retryErr := server.buildRuntimePlan(applyCtx, transactionID); retryErr == nil {
+				plan = retried
+			}
+		}
+	}
+	if plan.DataplaneState == "af_fallback_required" && len(plan.AFRequiredInterfaces) > 0 {
+		reason := plan.AFRequiredMessage
+		if strings.TrimSpace(reason) == "" {
+			reason = vpp.AFPacketDegradedReason
+		}
+		result := degradedRuntimeResult(transactionID, reason, server.now().UTC())
+		result.Status = "af_fallback_required"
+		result.RuntimeState = "degraded"
+		result.GatewayPlan = &plan.GatewayPlan
+		result.Components = plan.Components
+		if recordErr := server.recordRuntimeApply(applyCtx, result, session, r); recordErr != nil {
+			result.Reason += ": audit persistence: " + recordErr.Error()
+		}
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "denied", reason, r)
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"status":        "af_fallback_required",
+			"runtime_state": "degraded",
+			"reason":        reason,
+			"error": map[string]any{
+				"code":    "af_fallback_required",
+				"message": reason,
+				"ports":   plan.AFRequiredInterfaces,
+			},
+			"af_fallback_required": map[string]any{
+				"ports":   plan.AFRequiredInterfaces,
+				"message": reason,
+			},
+			"dataplane_degradations": plan.DataplaneDegradations,
+			"transaction_id":         transactionID,
+			"request_id":             requestID(r),
+		})
+		return
+	}
 	if (plan.DataplaneState == "dataplane_locked" || plan.DataplaneState == "dataplane_degraded") && len(plan.GatewayPlan.NativePath.Assignments) > 0 {
 		reason := "dataplane prerequisites are not satisfied"
 		if plan.DataplaneState == "dataplane_degraded" {
@@ -5259,6 +5315,13 @@ func (server *Server) executeRuntimeApply(w http.ResponseWriter, r *http.Request
 	server.publishRuntimeResult(lease, RuntimeApplyResult{Status: "committed", RuntimeState: "running", TransactionID: transactionID, Receipt: receipt, Readback: readback, GatewayPlan: &plan.GatewayPlan, GatewayEvidence: execution.GatewayResult.Evidence, AppliedAt: receipt.AppliedAt})
 	components := server.runtimeStatusComponents(applyCtx, appliedArtifacts, len(plan.VppOperations) > 0)
 	components = applyCapabilityFailures(components, capabilityFailures, transactionID, server.now().UTC())
+	if pathUsesAFPacket(plan.SelectedNativePath) {
+		components = append(components, RuntimeComponentState{
+			Name:   "af_packet_fallback",
+			State:  "degraded",
+			Reason: vpp.AFPacketDegradedReason,
+		})
+	}
 	state := runtimeState(components)
 	statusCode := http.StatusOK
 	resultStatus := "committed"
@@ -5614,8 +5677,14 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	mark("pppoe-peers")
 	artifacts = append(artifacts, pppoeArtifacts...)
 	dataInterfaces := server.runtimeDataInterfaces(ctx)
+	server.persistDataplaneInventory(ctx, dataInterfaces)
+	dataplanePolicy := server.dataplanePolicy(ctx)
 	observation := server.observeDataplaneCapability(ctx, dataInterfaces)
 	nativePath := observation.NativePathRequest(server.managementInterfaceID(ctx), dataInterfaces, server.now().UTC(), server.managementNetworkShared(ctx))
+	for index := range nativePath.Assignments {
+		port := server.displayInterfaceName(ctx, nativePath.Assignments[index].LinuxInterface)
+		nativePath.Assignments[index].AFPacketConsent = policyAllowsAFPort(dataplanePolicy, port)
+	}
 	if observation.Degraded {
 		planningWarnings = append(planningWarnings, "dataplane capability degraded ("+string(observation.Source)+"): "+observation.Reason)
 	}
@@ -5647,6 +5716,8 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	dataplaneState := "native_ready"
 	var dataplaneProof []vpp.PrerequisiteResult
 	dataplaneDegradations := []vpp.Degradation{}
+	var afRequiredInterfaces []string
+	afRequiredMessage := ""
 	degradedObservation := capabilityObservationDegradesDataplane(observation, len(nativePath.Assignments))
 	if selectionErr == nil {
 		dataplaneDegradations = append(dataplaneDegradations, selectedPath.Degradations...)
@@ -5661,19 +5732,36 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	warnings := append([]string(nil), planningWarnings...)
 	gatewayBonds := []vpp.BondState{}
 	if err != nil {
+		var afRequired *vpp.AFFallbackRequiredError
 		var locked *vpp.DataplaneLockedError
-		if !errors.As(err, &locked) {
+		switch {
+		case errors.As(err, &afRequired):
+			operations = nil
+			dataplaneState = "af_fallback_required"
+			for _, interfaceName := range afRequired.Interfaces {
+				port := server.displayInterfaceName(ctx, interfaceName)
+				if strings.TrimSpace(port) == "" {
+					port = interfaceName
+				}
+				if !containsString(afRequiredInterfaces, port) {
+					afRequiredInterfaces = append(afRequiredInterfaces, port)
+				}
+			}
+			afRequiredMessage = "AF_PACKET 兼容模式需要操作员明确确认：该模式仍由 VPP 转发，但性能受限。请在数据面策略中允许这些端口使用 AF_PACKET 兼容模式后重试。"
+			warnings = append(warnings, afRequired.Error())
+		case errors.As(err, &locked):
+			operations = nil
+			dataplaneState = locked.Code()
+			// A failed observation is a degradation, not an eligibility verdict, but
+			// only when it is the reason no path exists.
+			if degradedObservation {
+				dataplaneState = "dataplane_degraded"
+			}
+			dataplaneProof = locked.Prerequisites
+			warnings = append(warnings, err.Error())
+		default:
 			return RuntimePlan{}, err
 		}
-		operations = nil
-		dataplaneState = locked.Code()
-		// A failed observation is a degradation, not an eligibility verdict, but
-		// only when it is the reason no path exists.
-		if degradedObservation {
-			dataplaneState = "dataplane_degraded"
-		}
-		dataplaneProof = locked.Prerequisites
-		warnings = append(warnings, err.Error())
 	}
 	if err == nil {
 		bondOperations, err := server.currentInterfaceBondOperations(ctx, requestID)
@@ -5694,7 +5782,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 			gatewayBonds = bondStatesFromOperations(bondOperations)
 		}
 	}
-	if dataplaneState == "dataplane_locked" || dataplaneState == "dataplane_degraded" {
+	if dataplaneState == "dataplane_locked" || dataplaneState == "dataplane_degraded" || dataplaneState == "af_fallback_required" {
 		artifacts = nonForwardingArtifacts(artifacts)
 		compiledProxy.NftablesCapture = proxy.NftablesCapturePlan{}
 		compiledProxy.LinuxPolicyRouting = proxy.LinuxPolicyRoutingPlan{}
@@ -5720,7 +5808,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	gatewayPlan := canonicalGatewayPlan
 	gatewayPlan.Interfaces = gatewayInterfaces
 	gatewayPlan.Bonds = gatewayBonds
-	return RuntimePlan{ProxyEgress: proxyEgress, CompiledProxy: compiledProxy, FlowIntent: flowIntent, CompiledFlow: compiledFlow, CompiledNAT: compiledNAT, CompiledPolicy: compiledPolicy, DNSPolicies: dnsPolicies, ServiceArtifacts: summarizeRuntimeArtifacts(artifacts), RuntimeArtifacts: artifacts, VppOperations: operations, NftablesCapture: compiledProxy.NftablesCapture, DNSInterception: dnsInterception, LinuxPolicyRouting: compiledProxy.LinuxPolicyRouting, DHCPServers: dhcpPlans, PPPoEPeers: summarizePPPoEPeers(pppoePeers), Components: components, Warnings: warnings, DataplaneState: dataplaneState, DataplaneProof: dataplaneProof, DataplaneDegradations: dataplaneDegradations, CapabilitySource: string(observation.Source), GatewayPlan: gatewayPlan}, nil
+	return RuntimePlan{ProxyEgress: proxyEgress, CompiledProxy: compiledProxy, FlowIntent: flowIntent, CompiledFlow: compiledFlow, CompiledNAT: compiledNAT, CompiledPolicy: compiledPolicy, DNSPolicies: dnsPolicies, ServiceArtifacts: summarizeRuntimeArtifacts(artifacts), RuntimeArtifacts: artifacts, VppOperations: operations, NftablesCapture: compiledProxy.NftablesCapture, DNSInterception: dnsInterception, LinuxPolicyRouting: compiledProxy.LinuxPolicyRouting, DHCPServers: dhcpPlans, PPPoEPeers: summarizePPPoEPeers(pppoePeers), Components: components, Warnings: warnings, DataplaneState: dataplaneState, DataplanePolicy: dataplanePolicy, DataplaneProof: dataplaneProof, DataplaneDegradations: dataplaneDegradations, SelectedNativePath: selectedPath, AFRequiredInterfaces: afRequiredInterfaces, AFRequiredMessage: afRequiredMessage, CapabilitySource: string(observation.Source), GatewayPlan: gatewayPlan}, nil
 }
 
 func hasLANAddressAssignment(assignments []vpp.AddressAssignment) bool {
@@ -8178,6 +8266,15 @@ func isPolicyReadbackOperation(name string) bool {
 	default:
 		return false
 	}
+}
+
+func pathUsesAFPacket(path vpp.NativePath) bool {
+	for _, attachment := range path.Attachments {
+		if attachment.Hook == vpp.NativeHookAFPacket && attachment.Mode == vpp.NativeModeAFPacket {
+			return true
+		}
+	}
+	return false
 }
 
 func runtimeState(components []RuntimeComponentState) string {

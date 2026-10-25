@@ -9,6 +9,7 @@ const (
 	ConfigResourceManagementNetwork   ConfigResource = "management_network"
 	ConfigResourceInterfaceBond       ConfigResource = "interface_bond"
 	ConfigResourceObjectGroup         ConfigResource = "object_group"
+	ConfigResourceDataplanePolicy     ConfigResource = "dataplane_policy"
 	ConfigResourceSecurityACL         ConfigResource = "security_acl"
 	ConfigResourceSecurityBinding     ConfigResource = "security_ip_mac_binding"
 	ConfigResourceSecurityThreatIntel ConfigResource = "security_threat_intel"
@@ -48,6 +49,7 @@ func (profile Profile) AllowsConfigResource(raw string) bool {
 		ConfigResourceManagementNetwork,
 		ConfigResourceInterfaceBond,
 		ConfigResourceObjectGroup,
+		ConfigResourceDataplanePolicy,
 		ConfigResourceSecurityACL,
 		ConfigResourceSecurityBinding,
 		ConfigResourceSecurityThreatIntel,

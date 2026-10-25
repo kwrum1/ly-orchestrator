@@ -71,44 +71,54 @@ const (
 )
 
 type CapabilityProof struct {
-	Tier                    DataplaneTier `json:"tier,omitempty"`
-	Hook                    NativeHook    `json:"hook"`
-	Mode                    NativeMode    `json:"mode"`
-	VPPInterface            string        `json:"vpp_interface,omitempty"`
-	MACAddress              string        `json:"mac_address,omitempty"`
-	Source                  ProofSource   `json:"source"`
-	RuntimeVerified         bool          `json:"runtime_verified"`
-	Native                  bool          `json:"native"`
-	HighPerformance         bool          `json:"high_performance"`
-	ObservedAt              time.Time     `json:"observed_at"`
-	ValidUntil              time.Time     `json:"valid_until"`
-	PerformanceScore        float64       `json:"performance_score,omitempty"`
-	PCIAddress              string        `json:"pci_address,omitempty"`
-	KernelDriver            string        `json:"kernel_driver,omitempty"`
-	IOMMUGroup              string        `json:"iommu_group,omitempty"`
-	IOMMUProtected          bool          `json:"iommu_protected,omitempty"`
-	VFIOAvailable           bool          `json:"vfio_available,omitempty"`
-	UIOPCIAvailable         bool          `json:"uio_pci_available,omitempty"`
-	HugepagesAvailable      bool          `json:"hugepages_available,omitempty"`
-	DPDKPluginAvailable     bool          `json:"dpdk_plugin_available,omitempty"`
-	HQoSAvailable           bool          `json:"hqos_available,omitempty"`
+	Tier DataplaneTier `json:"tier,omitempty"`
+	Hook NativeHook    `json:"hook"`
+	Mode NativeMode    `json:"mode"`
+	// Transport is the DPDK PCI binding transport observed for this proof:
+	// "vfio" for an IOMMU-protected vfio-pci device, "uio" for the
+	// uio_pci_generic no-IOMMU fallback. It is intentionally redundant with
+	// Mode so reports and operator evidence can state the transport without
+	// re-deriving it from the driver name.
+	Transport           string      `json:"transport,omitempty"`
+	VPPInterface        string      `json:"vpp_interface,omitempty"`
+	LinkState           string      `json:"link_state,omitempty"`
+	MACAddress          string      `json:"mac_address,omitempty"`
+	Source              ProofSource `json:"source"`
+	RuntimeVerified     bool        `json:"runtime_verified"`
+	Native              bool        `json:"native"`
+	HighPerformance     bool        `json:"high_performance"`
+	ObservedAt          time.Time   `json:"observed_at"`
+	ValidUntil          time.Time   `json:"valid_until"`
+	PerformanceScore    float64     `json:"performance_score,omitempty"`
+	PCIAddress          string      `json:"pci_address,omitempty"`
+	KernelDriver        string      `json:"kernel_driver,omitempty"`
+	IOMMUGroup          string      `json:"iommu_group,omitempty"`
+	IOMMUProtected      bool        `json:"iommu_protected,omitempty"`
+	VFIOAvailable       bool        `json:"vfio_available,omitempty"`
+	UIOPCIAvailable     bool        `json:"uio_pci_available,omitempty"`
+	HugepagesAvailable  bool        `json:"hugepages_available,omitempty"`
+	DPDKPluginAvailable bool        `json:"dpdk_plugin_available,omitempty"`
+	HQoSAvailable       bool        `json:"hqos_available,omitempty"`
 	// SmartQoSPluginAvailable is retained only so capability reports written by
 	// pre-arch-v1 firmware still decode (the report loader rejects unknown
 	// fields). It never influences eligibility.
-	SmartQoSPluginAvailable bool          `json:"smart_qos_plugin_available,omitempty"`
-	AcceptanceOnly          bool          `json:"acceptance_only,omitempty"`
+	SmartQoSPluginAvailable bool `json:"smart_qos_plugin_available,omitempty"`
+	AcceptanceOnly          bool `json:"acceptance_only,omitempty"`
 }
 
 type NativeAssignment struct {
-	LinuxInterface string            `json:"linux_interface"`
-	Explicit       bool              `json:"explicit"`
-	Proof          CapabilityProof   `json:"proof"`
-	Candidates     []CapabilityProof `json:"candidates,omitempty"`
+	LinuxInterface string `json:"linux_interface"`
+	Explicit       bool   `json:"explicit"`
+	// AFPacketConsent is resolved per assignment from the persisted
+	// dataplane_policy ports list. It is never inferred from the transport.
+	AFPacketConsent bool              `json:"af_packet_consent,omitempty"`
+	Proof           CapabilityProof   `json:"proof"`
+	Candidates      []CapabilityProof `json:"candidates,omitempty"`
 }
 
 type NativePathRequest struct {
-	ManagementInterface string               `json:"management_interface"`
-	ManagementShared    bool                 `json:"management_shared,omitempty"`
+	ManagementInterface string `json:"management_interface"`
+	ManagementShared    bool   `json:"management_shared,omitempty"`
 	// RequireSmartQoS is accepted for wire compatibility but ignored. Smart QoS
 	// was removed as a dataplane prerequisite: requiring it turned a missing
 	// optional plugin into dataplane_locked and blocked clean first boot.
@@ -116,7 +126,11 @@ type NativePathRequest struct {
 	Assignments         []NativeAssignment   `json:"assignments"`
 	ReportPrerequisites []PrerequisiteResult `json:"report_prerequisites,omitempty"`
 	Now                 time.Time            `json:"-"`
-	AcceptanceAFPacket  bool                 `json:"-"`
+	// AFPacketConsent is the persisted operator consent for the last-resort
+	// AF_PACKET compatibility mode. It participates in the serialized plan so
+	// enabling/disabling the fallback changes the runtime plan hash.
+	AFPacketConsent    bool `json:"af_packet_consent,omitempty"`
+	AcceptanceAFPacket bool `json:"-"`
 	// AllowUnproven derives the attachment list from declarative assignment
 	// data without re-validating live capability proofs. Reconciliation of a
 	// persisted prior generation needs operation identities and commands, not
@@ -211,6 +225,10 @@ func smartQoSRetiredDegradation() Degradation {
 
 type NativePath struct {
 	Tier DataplaneTier `json:"tier,omitempty"`
+	// Degraded is true when a selected attachment uses the AF_PACKET
+	// compatibility fallback. The dataplane is committed and forwarding still
+	// runs through VPP, but the runtime state must be reported as degraded.
+	Degraded bool `json:"degraded,omitempty"`
 	// SmartQoS is retained for wire compatibility with pre-arch-v1 plans and
 	// receipts. It is always false: the retired feature never participates in
 	// dataplane selection or operation building.
@@ -237,9 +255,18 @@ type CapabilityReport struct {
 }
 
 type InterfaceProof struct {
-	LinuxInterface string            `json:"linux_interface"`
-	Proof          CapabilityProof   `json:"proof"`
-	Candidates     []CapabilityProof `json:"candidates,omitempty"`
+	LinuxInterface string             `json:"linux_interface"`
+	Proof          CapabilityProof    `json:"proof"`
+	Candidates     []CapabilityProof  `json:"candidates,omitempty"`
+	Failures       []CandidateFailure `json:"failures,omitempty"`
+}
+
+// CandidateFailure records why a probed fallback hook could not be used. It is
+// evidence only: selection never treats a failure entry as approval.
+type CandidateFailure struct {
+	Hook   NativeHook `json:"hook"`
+	Mode   NativeMode `json:"mode"`
+	Reason string     `json:"reason"`
 }
 
 type DataplaneLockedError struct {
@@ -258,6 +285,22 @@ func (err *DataplaneLockedError) Error() string {
 }
 
 func (*DataplaneLockedError) Code() string { return "dataplane_locked" }
+
+// AFFallbackRequiredError is the machine-readable consent gate for the
+// last-resort AF_PACKET compatibility mode. It is not a dataplane lock: the UI
+// can ask the operator for consent and retry the same apply.
+type AFFallbackRequiredError struct {
+	Interfaces []string `json:"interfaces"`
+	Reason     string   `json:"reason"`
+}
+
+func (err *AFFallbackRequiredError) Error() string {
+	return "af_fallback_required: AF_PACKET compatibility mode requires explicit operator consent for " + strings.Join(err.Interfaces, ", ")
+}
+
+func (*AFFallbackRequiredError) Code() string { return "af_fallback_required" }
+
+const AFPacketDegradedReason = "AF_PACKET 兼容模式（性能受限）"
 
 func SelectNativePath(request NativePathRequest) (NativePath, error) {
 	if request.AllowUnproven {
@@ -423,11 +466,9 @@ func nativePathRequestFromReport(report CapabilityReport, reportPrerequisites []
 }
 
 func acceptanceAFPacketProof(enabled bool, proof CapabilityProof) bool {
-	driver := strings.ToLower(strings.TrimSpace(proof.KernelDriver))
 	return enabled && proof.AcceptanceOnly &&
 		((proof.Hook == NativeHookAFPacket && proof.Mode == NativeModeAFPacket) ||
-			(proof.Hook == NativeHookTapBridge && proof.Mode == NativeModeTapBridge)) &&
-		(driver == "vmxnet3" || driver == "e1000")
+			(proof.Hook == NativeHookTapBridge && proof.Mode == NativeModeTapBridge))
 }
 
 func interfaceNameSafe(name string) bool {
