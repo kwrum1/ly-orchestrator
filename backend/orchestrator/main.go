@@ -29,9 +29,51 @@ import (
 )
 
 func Run() {
+	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		fmt.Println(Version())
+		return
+	}
 	if err := run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// buildVersion is stamped by release builds. It is authoritative for a
+// hot-deployed control binary even when the on-disk artifact manifest belongs
+// to the previous package.
+var buildVersion string
+
+// Version is the release identity reported by /health and the installer
+// preflight. Prefer an explicit environment value, then the release stamp
+// embedded in the running control binary, then the immutable package
+// provenance on disk.
+func Version() string {
+	if value := strings.TrimSpace(os.Getenv("LY_ROUTE_VERSION")); value != "" && !strings.EqualFold(value, "dev") {
+		return value
+	}
+	if value := strings.TrimSpace(buildVersion); value != "" && !strings.EqualFold(value, "dev") {
+		return value
+	}
+	path := strings.TrimSpace(os.Getenv("LY_ROUTE_ARTIFACT_MANIFEST"))
+	if path == "" {
+		path = "/usr/share/ly-route/artifact-manifest.json"
+	}
+	data, err := os.ReadFile(path)
+	if err == nil {
+		var manifest struct {
+			SourceCommit string `json:"source_commit"`
+			Commit       string `json:"commit"`
+			Version      string `json:"version"`
+		}
+		if json.Unmarshal(data, &manifest) == nil {
+			for _, candidate := range []string{manifest.SourceCommit, manifest.Commit, manifest.Version} {
+				if value := strings.TrimSpace(candidate); value != "" {
+					return value
+				}
+			}
+		}
+	}
+	return "dev"
 }
 
 func run() error {
