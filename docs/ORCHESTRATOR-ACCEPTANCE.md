@@ -1,5 +1,177 @@
 # Orchestrator acceptance on ESXi (AF_PACKET mode)
 
+## Release candidate `1262522` — acceptance on ESXi `10.1.18.124` (2026-10-26)
+
+Run `20261025T1545Z-orch-rc1262522-124`. Candidate `/root/work/ly-route-rc` @
+`1262522dd18bea406f8373414b12a425df1c71ed` (`1262522dd18b`, "merge: apply-lock
+lease and bounded apply paths"); dist
+`/root/work/dist-release-orchestrator-1262522dd18b`. Product `orchestrator`,
+data path in AF_PACKET acceptance mode (`hook=af_packet`,
+`mode=linux_packet_socket`, `tier=vpp_native`, `acceptance_only=true`,
+`high_performance=false`); no performance claim.
+
+Platform: **standalone ESXi 8.0.3 (build-24859861) `10.1.18.124`**, not
+vCenter, not `.121`, no QEMU. Two new isolated networks were created for the run
+and only used by these VMs: `vSwitch ORCH-WAN` + `orch-wan-pg`, `vSwitch
+ORCH-LAN` + `orch-lan-pg` (no uplinks, permissive security policy). The
+Gateway VMs (`lyacc-gw-*`), `lyacc-wan`, `lyacc-lan`, `WAN-iso`, `LAN-lab` and
+`VM Network` data segments were not touched.
+
+### Verdict
+
+| # | Requirement | Verdict | Evidence |
+|---|---|---|---|
+| 1 | Build identity: manifests/version/UI hash, `--version` = commit | **PASS** | `build/*`, `identity-*` |
+| 2 | health ok, password change + login, product `orchestrator` | **PASS** | `phase-a.log`, `health*.json`, `login*.json`, `password-change.*`, `product.json` |
+| 3 | AF datapath: VPP owns both NICs, apply committed, status running + generation, exactly `vpp`+`persistence`, stable ≥5 polls | **PASS** | `phase-b.log`, `af-env-and-proof.json`, `api-runtime-apply.json`, `status-stability/` (6 polls), `status-stability-after-restart/` (6), `final/api-runtime-status-{1..5}.json` |
+| 4 | control-api and VPP restart keep generation and forwarding | **PASS** | `restart-persistence-test.log`, `persistence/` |
+| 5 | bidirectional reachability; policy allow TCP/8080, deny TCP/9000 + counters; reverse | **PASS** | `datapath-test.log`, `functional/` |
+| 6 | Fail-closed: `apply_failed`/degraded, no commit, no leak, recovery | **PASS** | `failclosed-test.log`, `failclosed/` |
+| 7 | UI 11/11 in real Chromium, zero 404, clean console | **PASS** | `ui/result.json`, `ui/*.png` |
+| 8 | **Upgrade and rollback execution** | **PASS** | `upgrade-test.log`, `upgrade/` |
+| — | apply-lock: a second concurrent apply returns the real in-flight transaction | **PASS** | `applylock-test.log`, `apply-lock/` |
+
+Overall: **PASS on all eight items plus apply-lock**, with one non-blocking
+finding (F1). Evidence:
+`/root/work/orch-acceptance/evidence/20261025T1545Z-orch-rc1262522-124/`
+(`summary.json`, `README.md`, `FINDINGS-apply-readback-race.md`).
+
+### Build identity
+
+Every `.sha256` file and `SHA256SUMS` verify; the disk manifest's internal
+checksums were recomputed. Manifest: `product=orchestrator`,
+`source_commit=1262522dd18b` (equal to HEAD), `frontend_app_sha256`
+`0787685e8117c87e2e87a932c5e2f54e389ba668621c92bff65af00466199d35`; the same UI
+hash is in the rootfs, the upgrade package and the deployed
+`/opt/ly-route/admin/app.js`. The deployed control binary answers `--version`
+with `1262522dd18b`; `/health` reports `26.06+lyroute1`.
+
+| Artifact | SHA-256 |
+|---|---|
+| rootfs | `cfd56c3959a33e90aa25ca96231a1b1621e5c08978e610a6abbf42f0a39f895f` |
+| upgrade | `c08e328cf39d4c6818d01fc22220dcf7901cd465cbc4e507bbf474fe68bdb943` |
+| disk image | `96269b54e4691c8adfea2d5842e5afe23f98a407aa7846bfb65e4c485c03c2be` |
+| disk image `.zst` | `55ffbf5606ca4615593859a2df2aae59472bb01a174a050ce29f198c30dcc578` |
+| control binary (deployed) | `eefa077e87fdf6074341a5e43a27c66af79969e6ab47c45dd5a1510c2fd4fc2a` |
+| VPP orchestrator plugin | `29a5617266f5109002b55fa100644bc6c67562dbe41c151978d7a3a5a668236a` |
+
+### Deployment
+
+- Orchestrator VM `lyacc-orch-1262522` (vmid 53): 4 vCPU / 4 GB, 3 × vmxnet3,
+  `pciBridge4..7 virtualDev=pcieRootPort`, RSA key + static management injected
+  before conversion (`virt-customize`), disk converted raw → monolithicSparse →
+  thin on `[data]`; mgmt `10.1.18.242/24` `ens192` (`VM Network`), WAN `ens224`
+  (`orch-wan-pg`), LAN `ens256` (`orch-lan-pg`).
+- Peer VM `lyacc-orch-peer-124` (vmid 50): Debian 12 genericcloud + cloud-init
+  NoCloud seed, 2 vCPU / 2 GB, `pvscsi` disk, mgmt `10.1.18.243/24`, `ens224`
+  on `orch-wan-pg` (netns `wan`, 10.99.0.2/24), `ens256` on `orch-lan-pg`
+  (netns `lan`, 10.99.0.3/24).
+- Deviations, stated rather than hidden: the assigned `10.1.18.240`/`.241` were
+  already answering on the LAN (Debian 13 and Debian 12 SSH banners) and were
+  left untouched, so `.242`/`.243` were used; the peer carries **three** NICs
+  (mgmt + one per data leg) because a two-port transparent node needs a client
+  leg and a server leg on separate port groups; the peer disk uses `pvscsi`
+  because the Debian cloud kernel ships no ahci/mptsas (SATA and lsisas1068 both
+  drop to an initramfs shell). The appliance image still uses `lsisas1068` as
+  before.
+
+### Runtime and functional results
+
+Generation for the accepted topology/policy:
+`fd3afd6b162faed4fe22188ab88cf55295ef096e4c742dad35d7bee9441b28e0` (the same
+digest as the earlier accepted runs for the same topology/policy).
+
+- VPP owns both NICs: `lyroute-ens224` / `lyroute-ens256`, `Linux PACKET socket
+  interface v3`, MACs `00:50:56:ac:24:02` / `…:03`; capability proof records
+  `hook=af_packet`, `acceptance_only=true`, `high_performance=false`, driver
+  `vmxnet3`; af_xdp/rdma/dpdk recorded as failed prerequisites.
+- `POST /api/v1/runtime/apply` → 200 `committed` / `running`
+  (`runtime-b1986f9c…`); `/runtime/status` → `running`, exactly `vpp` +
+  `persistence`, generation in the reason; 6 consecutive polls before the
+  restarts and 6 after them are identical, plus 5 final polls after the
+  fail-closed cycle.
+- ICMP 5/5 both directions; TCP/8080 HTTP 200 (1 684 024 B inside the 20 s
+  harness deadline); TCP/9000 times out with the listener up and the VPP rule
+  counter at `packets 3 bytes 222` (node drops incremented); reverse TCP/8082
+  HTTP 200. Informational 2 MiB download ≈57 kB/s — not a performance claim.
+- Fail-closed with VPP stopped: 202 `apply_failed` / `degraded` with
+  `dataplane_locked: failed prerequisites` (not a handler-level lock),
+  `/runtime/status` degraded, no transaction journal, no new generation, no
+  leak (ping 100 % loss, TCP timeout, no bridge or route), `/config/apply`
+  202 `apply_in_progress` without 423. After `systemctl start vpp` the same
+  generation returns, forwarding works and the next apply commits (200).
+
+### UI
+
+Accepted 11-page bundle in headless Chromium, authenticated, 1440×900:
+**11/11** pages, **0 × HTTP 404**, **0 unexpected console errors** (one
+expected pre-auth 401 from `/api/v1/auth/session`), 11 screenshots.
+
+### Upgrade / rollback (first execution)
+
+The upgrade package from the same dist (`c08e328c…`, `includes_dataplane=false`,
+`commit=1262522dd18b`) was staged through `POST /api/v1/orchestrator/upgrades`
+(201 `staged`) and installed (`202` + `Location` + `Retry-After: 2` →
+`installed`, "orchestrator payload installed and health check passed") across
+the control-api restart; identity, health, `/runtime/status` and the generation
+were re-verified. Rollback returned 202 and terminated `rolled_back` ("service
+enable state and control payload restored") with the pre-install identity
+restored. An invalid upload was rejected with 422 `invalid_upgrade_package` and
+no task. A tampered staged package (bit flip after staging) was accepted and
+then terminated `failed` ("package hash mismatch"); the installer rejected the
+payload before mutating files (identity and health unchanged) and the failed
+task rolled back cleanly. All 17 checks in
+`upgrade/upgrade-verdict.txt` pass.
+
+### Apply-lock behaviour
+
+Three bursts of four simultaneous `POST /runtime/apply`: exactly one caller
+entered the gate each time; the other three received **202
+`apply_in_progress`** with `in_flight_apply.transaction_id` equal to the real
+holder, `in_progress=true`, `retry_after_seconds: 2` — never a fresh phantom
+id. A periodic proxy reconcile holding the gate likewise yields
+`retry_after_seconds` without a transaction id, as designed.
+
+### Finding F1 (P2, non-blocking)
+
+A re-apply can answer 202 `degraded` ("transparent orchestrator runtime is
+applying or recovering") when its post-commit evidence readback collides with
+the 2 s transparent recovery loop, which holds `transparentMu` across its whole
+observe/replay while `TransparentRuntimeEvidence` uses `TryLock`. Measured: 3 of
+8 sequential applies 3 s apart, and the gate winner in 3 of 3 concurrent bursts;
+`/runtime/status` stayed `running`/`committed` in 5/5 immediate polls and the
+retry commits. No dataplane, generation or persistence effect; operator-visible
+only. Repro and recommendation: `FINDINGS-apply-readback-race.md`.
+
+### Gaps
+
+- No throughput/line-rate/latency claim (AF_PACKET acceptance mode).
+- No native vmxnet3/DPDK/AF_XDP attachment (recorded as failed prerequisites).
+- No orchestration-group (`via`) hop, no IPv6 policy, no host or ESXi reboot.
+- The upgrade was executed as a same-commit re-install (the dist carries one
+  package); no cross-version upgrade was available.
+- Gateway Gate A/B were run by a separate agent on the same host and are not
+  re-run or substituted here.
+
+### Reproduce
+
+```bash
+export ORCH_SSH=root@10.1.18.242 PEER_SSH=root@10.1.18.243
+export SSH_KEY=/root/.ssh/esxi124_rsa ORCH_API=https://10.1.18.242
+export ORCH_PASS_FILE=/root/work/esxi124/.secrets/orch-admin.pass
+export PEER_WAN_IF=ens224 PEER_LAN_IF=ens256 CLIENT_IP=10.99.0.3 SERVER_IP=10.99.0.2
+export ORCH_OUT=/root/work/orch-acceptance/evidence/20261025T1545Z-orch-rc1262522-124/functional
+cd scripts/acceptance/orchestrator-esxi
+./datapath-test.sh && ./restart-persistence-test.sh && ./failclosed-test.sh
+ORCH_BASE=$ORCH_API ORCH_OUT=../ui node ui-sweep.mjs
+```
+
+Deployment helpers and the item-8/apply-lock drivers:
+`/root/work/esxi124/` (`deploy-orch.sh`, `deploy-peer.sh`, `genvmx.py`,
+`phase-a.sh`, `phase-b.sh`, `applylock-test.sh`, `upgrade-test.sh`).
+
+
+
 ## Fix run — release-blocking regressions resolved (2026-10-25)
 
 Run `20261025-fix-release-orch-regressions` on branch
@@ -123,7 +295,8 @@ rejected.
 ### Remaining gaps
 
 - The upgrade package was verified statically (`includes_dataplane=false`,
-  plugin and pinned UI present); upgrade/rollback was not executed.
+  plugin and pinned UI present); upgrade/rollback was not executed in that run
+  (executed and passing in the `1262522` run above).
 - No throughput/line-rate claim in AF_PACKET acceptance mode.
 - No orchestration-group (`via`) hop, IPv6 policy, or host reboot.
 - Gateway Gate A/B and the Gateway product profile were not run here; the
