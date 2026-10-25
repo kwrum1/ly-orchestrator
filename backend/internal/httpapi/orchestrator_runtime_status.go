@@ -47,12 +47,36 @@ func (server *Server) orchestratorTransparentRuntimeComponents(ctx context.Conte
 		Readback:              apply.Readback{TransactionID: evidence.TransactionID, Capability: capability, Timestamp: evidence.ObservedAt, Fresh: true},
 		ReconciliationReceipt: apply.ReconciliationReceipt{TransactionID: evidence.TransactionID, Capability: "runtime.reconciliation", Status: apply.ReceiptApplied, Cause: "live transparent VPP generation verified", Timestamp: evidence.ObservedAt},
 	}
-	server.setRuntimeEvidence(result)
 	components := []RuntimeComponentState{
 		{Name: "vpp", State: "running", Available: true, Reason: "transparent VPP generation " + evidence.Generation + " verified"},
 		{Name: "persistence", State: "running", Available: server.store != nil, Reason: persistenceRuntimeReason(server.store != nil)},
 	}
+	// Persist the inventory with the receipt so every consumer (status,
+	// telemetry, cached reprobe) sees the same transparent component set.
+	result.Components = append([]RuntimeComponentState(nil), components...)
+	server.setRuntimeEvidence(result)
 	return server.applyRuntimeEvidence(components), true
+}
+
+// orchestratorStatusComponents is the only component inventory the
+// Orchestrator profile may report: the transparent VPP generation and local
+// persistence. The Gateway service set (smartdns/dnsmasq/xray/pppoe) and the
+// Gateway plan-operation evidence describe a different product and must never
+// be consulted here. handled is false for every other profile, so the Gateway
+// status path is unchanged.
+func (server *Server) orchestratorStatusComponents(ctx context.Context) ([]RuntimeComponentState, bool) {
+	if server.profile.ID() != product.Orchestrator().ID() {
+		return nil, false
+	}
+	if components, handled := server.orchestratorTransparentRuntimeComponents(ctx); handled {
+		return components, true
+	}
+	reason := "transparent orchestrator runtime evidence is not configured"
+	server.setRuntimeEvidence(degradedRuntimeResult("orchestrator-observe", reason, server.now().UTC()))
+	return server.applyRuntimeEvidence([]RuntimeComponentState{
+		{Name: "vpp", State: "degraded", Available: false, Reason: reason},
+		{Name: "persistence", State: "running", Available: server.store != nil, Reason: persistenceRuntimeReason(server.store != nil)},
+	}), true
 }
 
 // orchestratorRuntimeCapability makes /health reflect the committed

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"ly-route/backend/internal/persistence"
+	"ly-route/backend/internal/product"
 	"ly-route/backend/internal/runtime/apply"
 	serviceRuntime "ly-route/backend/internal/runtime/service"
 )
@@ -57,14 +58,21 @@ func incompleteRuntimeEvidenceReason(result RuntimeApplyResult, now time.Time) s
 func (server *Server) statusHealthComponents(ctx context.Context) []RuntimeComponentState {
 	components := []RuntimeComponentState{}
 	for _, item := range []struct {
-		name    string
-		service serviceRuntime.ServiceName
+		name           string
+		service        serviceRuntime.ServiceName
+		productService product.Service
 	}{
-		{"smartdns", serviceRuntime.SmartDNS},
-		{"dnsmasq", serviceRuntime.Dnsmasq},
-		{"xray", serviceRuntime.Xray},
-		{"pppoe", serviceRuntime.PPPoE},
+		{"smartdns", serviceRuntime.SmartDNS, product.ServiceSmartDNS},
+		{"dnsmasq", serviceRuntime.Dnsmasq, product.ServiceDnsmasq},
+		{"xray", serviceRuntime.Xray, product.ServiceXray},
+		{"pppoe", serviceRuntime.PPPoE, product.ServicePPPoE},
 	} {
+		// Never report a service the active product does not ship. Without
+		// this filter the Orchestrator profile lists the Gateway-only
+		// services as degraded and reports a healthy appliance as degraded.
+		if !server.profile.AllowsService(item.productService) {
+			continue
+		}
 		component := RuntimeComponentState{Name: item.name}
 		if !server.serviceRuntimeConfigured() {
 			component.State = "unavailable"
@@ -86,7 +94,7 @@ func (server *Server) statusHealthComponents(ctx context.Context) []RuntimeCompo
 		}
 		components = append(components, component)
 	}
-	if server.serviceRuntimeConfigured() {
+	if server.serviceRuntimeConfigured() && server.profile.AllowsService(product.ServiceVPP) {
 		health, err := server.services.HealthCheck(ctx, serviceRuntime.VPP)
 		vpp := RuntimeComponentState{Name: "vpp"}
 		if err == nil && len(health) > 0 && health[0].Available {
