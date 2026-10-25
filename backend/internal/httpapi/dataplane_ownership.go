@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"ly-route/backend/internal/runtime/dataplane"
+	"ly-route/backend/internal/runtime/vpp"
 )
 
 // dataplaneInventoryPath is the persisted operator interface mapping the boot
@@ -45,6 +46,17 @@ func dataplaneVerificationPath() string {
 		stateDir = "/var/lib/ly-route/dataplane"
 	}
 	return filepath.Join(stateDir, "dpdk-verification.json")
+}
+
+func takeoverCapabilityPath() string {
+	if value := strings.TrimSpace(os.Getenv("LY_ROUTE_TAKEOVER_CAPABILITY_STATE")); value != "" {
+		return value
+	}
+	stateDir := strings.TrimSpace(os.Getenv("LY_ROUTE_DATAPLANE_STATE_DIR"))
+	if stateDir == "" {
+		stateDir = "/var/lib/ly-route/dataplane"
+	}
+	return filepath.Join(stateDir, "takeover-capabilities.json")
 }
 
 func readInventoryInterface(name string) (dataplane.InventoryInterface, bool) {
@@ -227,6 +239,7 @@ func (server *Server) verifyDPDKTakeovers(ctx context.Context, interfaces []stri
 		verification := dataplane.DPDKVerification{
 			LinuxInterface: name,
 			PCIAddress:     pci,
+			Mode:           current,
 			LinkState:      state,
 			HardwareLink:   hardwareLink,
 			LinkSpeedMbps:  linkSpeed,
@@ -234,6 +247,7 @@ func (server *Server) verifyDPDKTakeovers(ctx context.Context, interfaces []stri
 		}
 		if state == "up" {
 			verification.FunctionalVerified = true
+			verification.Verification = "verified"
 			verification.Method = "link_state_up"
 		} else if linkSpeed > 0 && peer != "" {
 			before, _ := vppInterfaceCounters(string(interfaceOutput), vppInterface)
@@ -246,16 +260,17 @@ func (server *Server) verifyDPDKTakeovers(ctx context.Context, interfaces []stri
 			verification.TXAfter = after
 			if after > before {
 				verification.FunctionalVerified = true
+				verification.Verification = "verified"
 				verification.Method = "tx_counter_and_link_speed"
 			} else {
+				verification.Verification = "pending_link"
 				verification.Reason = "VPP status is down and no TX counter increment was observed"
 			}
-		} else if state != "up" {
-			verification.Reason = "VPP status is down and no functional traffic/link-speed proof is available"
-		}
-		if !verification.FunctionalVerified {
-			failures = append(failures, dpdkTakeoverFailure{LinuxInterface: name, PCIAddress: pci, Reason: nonEmpty(verification.Reason, "functional verification failed")})
-			continue
+		} else {
+			// Link is down, but ownership must remain. This is an approved
+			// pending_link takeover; the watcher promotes it when the link rises.
+			verification.Verification = "pending_link"
+			verification.Reason = "link is down; takeover retained and awaiting link"
 		}
 		verified = append(verified, verification)
 	}
@@ -365,6 +380,18 @@ func (server *Server) releaseFailedDPDKTakeovers(ctx context.Context, failures [
 		return false
 	}
 	command := envOrDefault("LY_ROUTE_DPDK_RELEASE_COMMAND", "/usr/lib/ly-route/release-dpdk-port.sh")
+	hasReleasable := false
+	for _, failure := range failures {
+		if strings.TrimSpace(failure.PCIAddress) != "" {
+			hasReleasable = true
+			break
+		}
+	}
+	if hasReleasable {
+		// VPP holds the PCI device; stop it before restoring the kernel driver.
+		stop := envOrDefault("LY_ROUTE_VPP_STOP_COMMAND", "systemctl stop vpp.service")
+		_ = exec.CommandContext(ctx, "/bin/sh", "-c", stop).Run()
+	}
 	released := false
 	for _, failure := range failures {
 		if strings.TrimSpace(failure.PCIAddress) == "" {
@@ -378,8 +405,31 @@ func (server *Server) releaseFailedDPDKTakeovers(ctx context.Context, failures [
 		}
 		log.Printf("dataplane takeover rejected: %s (%s): %s; restored kernel driver", failure.LinuxInterface, failure.PCIAddress, failure.Reason)
 		released = true
+		dropDPDKVerification(failure.LinuxInterface)
 	}
 	return released
+}
+
+func dropDPDKVerification(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	state, err := dataplane.LoadDPDKVerification(dataplaneVerificationPath())
+	if err != nil {
+		return
+	}
+	kept := state.Interfaces[:0]
+	for _, entry := range state.Interfaces {
+		if strings.TrimSpace(entry.LinuxInterface) == name {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	state.Interfaces = kept
+	if err := dataplane.SaveDPDKVerification(dataplaneVerificationPath(), state); err != nil {
+		log.Printf("drop DPDK verification for %s: %v", name, err)
+	}
 }
 
 func (server *Server) restartVPPAndWait(ctx context.Context) bool {
@@ -435,8 +485,33 @@ func (server *Server) bootstrapDataplaneOwnership(ctx context.Context) bool {
 		log.Printf("dataplane ownership bootstrap inventory: %v", err)
 		return false
 	}
+	capabilities, _ := dataplane.LoadTakeoverCapabilities(takeoverCapabilityPath())
+	skips := []string{}
+	for _, name := range interfaces {
+		item, ok := readInventoryInterface(name)
+		if !ok {
+			continue
+		}
+		if nonDestructiveTakeoverActive(name) {
+			skips = append(skips, strings.TrimSpace(item.PCIAddress))
+			log.Printf("dataplane takeover skipped for %s (%s): non-destructive takeover keeps the kernel netdev", name, item.PCIAddress)
+			continue
+		}
+		if afXDPOutranksDestructive(name) {
+			// The ordered policy ranks a verified AF_XDP zero-copy path above
+			// the destructive no-IOMMU DPDK path. Never destroy a netdev that
+			// already has a faster, non-destructive, link-independent path.
+			skips = append(skips, strings.TrimSpace(item.PCIAddress))
+			log.Printf("dataplane takeover skipped for %s (%s): AF_XDP zero-copy is proven and preferred over destructive DPDK", name, item.PCIAddress)
+			continue
+		}
+		if capability, unsupported := capabilities.NativeUnsupported(strings.TrimSpace(item.KernelDriver), strings.TrimSpace(item.PCIAddress)); unsupported && capability.Reason != "" {
+			skips = append(skips, strings.TrimSpace(item.PCIAddress))
+			log.Printf("dataplane takeover skipped for %s (%s): native path marked unsupported: %s", name, item.PCIAddress, capability.Reason)
+		}
+	}
 	bootstrap := exec.CommandContext(ctx, command)
-	bootstrap.Env = append(os.Environ(), "LY_ROUTE_VFIO_BOOTSTRAP=apply")
+	bootstrap.Env = append(os.Environ(), "LY_ROUTE_VFIO_BOOTSTRAP=apply", "LY_ROUTE_DPDK_SKIP_PCIS="+strings.Join(skips, " "))
 	if output, err := bootstrap.CombinedOutput(); err != nil {
 		log.Printf("dataplane ownership bootstrap failed: %v: %s", err, strings.TrimSpace(string(output)))
 		return false
@@ -456,14 +531,150 @@ func (server *Server) bootstrapDataplaneOwnership(ctx context.Context) bool {
 	}
 	verified, failures := server.verifyDPDKTakeovers(ctx, interfaces)
 	if len(failures) > 0 {
-		if server.releaseFailedDPDKTakeovers(ctx, failures) {
-			if !server.restartVPPAndWait(ctx) {
+		for _, failure := range failures {
+			if !strings.Contains(failure.Reason, "set interface state up failed") && !strings.Contains(failure.Reason, "readback failed") {
+				continue
+			}
+			driver := ""
+			if item, ok := readInventoryInterface(failure.LinuxInterface); ok {
+				driver = strings.TrimSpace(item.KernelDriver)
+			}
+			capabilities.MarkUnsupported(driver, failure.PCIAddress, failure.Reason)
+		}
+		if err := dataplane.SaveTakeoverCapabilities(takeoverCapabilityPath(), capabilities); err != nil {
+			log.Printf("persist takeover crash guard: %v", err)
+		}
+		server.releaseFailedDPDKTakeovers(ctx, failures)
+		// The release path stops VPP to unbind the device. Restart it even if a
+		// release failed, otherwise a bad candidate would leave no dataplane.
+		if !server.restartVPPAndWait(ctx) {
+			return false
+		}
+	}
+	if len(verified) > 0 {
+		if err := mergeDPDKVerification(dataplaneVerificationPath(), verified); err != nil {
+			log.Printf("persist DPDK functional verification: %v", err)
+		}
+	}
+	return true
+}
+
+// mergeDPDKVerification upserts verification facts without erasing proofs for
+// ports that this probe did not inspect. An empty probe keeps the last valid
+// proof instead of turning a running port into "unknown".
+func mergeDPDKVerification(path string, verified []dataplane.DPDKVerification) error {
+	state, err := dataplane.LoadDPDKVerification(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range verified {
+		name := strings.TrimSpace(entry.LinuxInterface)
+		if name == "" {
+			continue
+		}
+		replaced := false
+		for index := range state.Interfaces {
+			if strings.TrimSpace(state.Interfaces[index].LinuxInterface) == name {
+				state.Interfaces[index] = entry
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			state.Interfaces = append(state.Interfaces, entry)
+		}
+	}
+	return dataplane.SaveDPDKVerification(path, state)
+}
+
+// nonDestructiveTakeoverActive reports whether the port is currently owned by a
+// path that keeps the Linux netdev (AF_XDP, AF_PACKET, RDMA). Such a port must
+// never be silently destroyed by a DPDK re-bind, especially not by the watcher.
+func nonDestructiveTakeoverActive(name string) bool {
+	name = strings.TrimSpace(name)
+	if mode, ok := activeDataplaneMode(name); ok && nonDestructiveMode(mode) {
+		return true
+	}
+	state, err := dataplane.LoadDPDKVerification(dataplaneVerificationPath())
+	if err != nil {
+		return false
+	}
+	for _, entry := range state.Interfaces {
+		if strings.TrimSpace(entry.LinuxInterface) != name {
+			continue
+		}
+		if nonDestructiveMode(takeoverModeFromDriver(entry.Mode)) {
+			return true
+		}
+	}
+	return false
+}
+
+// afXDPOutranksDestructive reports whether a verified AF_XDP zero-copy path
+// should block a destructive VFIO/UIO bind. VFIO wins when it is available
+// because it is IOMMU-protected and faster; AF_XDP copy and AF_PACKET never
+// outrank UIO.
+func afXDPOutranksDestructive(name string) bool {
+	report, err := loadCapabilityReport(envOrDefault("LY_ROUTE_VPP_CAPABILITY_PROOF", "/var/lib/ly-route/vpp-native-capabilities.json"))
+	if err != nil {
+		return false
+	}
+	foundZeroCopy := false
+	for _, proof := range report.Proofs {
+		if strings.TrimSpace(proof.LinuxInterface) != strings.TrimSpace(name) {
+			continue
+		}
+		candidates := proof.Candidates
+		if len(candidates) == 0 {
+			candidates = []vpp.CapabilityProof{proof.Proof}
+		}
+		for _, candidate := range candidates {
+			if !candidate.RuntimeVerified {
+				continue
+			}
+			if candidate.Tier == vpp.DataplaneTierDPDK && candidate.Mode == vpp.NativeModeDPDKVFIO {
 				return false
+			}
+			if candidate.Hook == vpp.NativeHookAFXDP && candidate.Mode == vpp.NativeModeZeroCopy {
+				foundZeroCopy = true
 			}
 		}
 	}
-	if err := dataplane.SaveDPDKVerification(dataplaneVerificationPath(), dataplane.DPDKVerificationState{Interfaces: verified}); err != nil {
-		log.Printf("persist DPDK functional verification: %v", err)
+	return foundZeroCopy
+}
+
+// afXDPZeroCopyProven reads the cached, non-destructive runtime probe. Only a
+// verified zero-copy candidate outranks the destructive UIO path; an AF_XDP
+// copy or AF_PACKET proof does not, because UIO is still faster.
+func afXDPZeroCopyProven(name string) bool {
+	report, err := loadCapabilityReport(envOrDefault("LY_ROUTE_VPP_CAPABILITY_PROOF", "/var/lib/ly-route/vpp-native-capabilities.json"))
+	if err != nil {
+		return false
 	}
-	return true
+	for _, proof := range report.Proofs {
+		if strings.TrimSpace(proof.LinuxInterface) != strings.TrimSpace(name) {
+			continue
+		}
+		candidates := proof.Candidates
+		if len(candidates) == 0 {
+			candidates = []vpp.CapabilityProof{proof.Proof}
+		}
+		for _, candidate := range candidates {
+			if !candidate.RuntimeVerified {
+				continue
+			}
+			if candidate.Hook == vpp.NativeHookAFXDP && candidate.Mode == vpp.NativeModeZeroCopy {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func nonDestructiveMode(mode string) bool {
+	switch mode {
+	case "af_packet", "af_xdp_zero_copy", "af_xdp_copy", "rdma":
+		return true
+	}
+	return false
 }

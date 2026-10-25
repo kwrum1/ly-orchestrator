@@ -13,7 +13,9 @@ import (
 type DPDKVerification struct {
 	LinuxInterface     string    `json:"linux_interface"`
 	PCIAddress         string    `json:"pci_address"`
+	Mode               string    `json:"mode,omitempty"`
 	FunctionalVerified bool      `json:"functional_verified"`
+	Verification       string    `json:"verification,omitempty"`
 	Method             string    `json:"method,omitempty"`
 	LinkState          string    `json:"link_state,omitempty"`
 	HardwareLink       string    `json:"hardware_link,omitempty"`

@@ -17,6 +17,9 @@ exit 0
 EOF
 cat > "$tmp/bin/ip" <<'EOF'
 #!/usr/bin/env sh
+if [ -n "${IP_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$IP_LOG"
+fi
 exit 0
 EOF
 cat > "$tmp/bin/bind-helper" <<'EOF'
@@ -82,7 +85,9 @@ run_prepare() {
     LY_ROUTE_VPP_STARTUP_CONFIG="$fixture/startup.conf" \
     LY_ROUTE_DPDK_OWNERSHIP_STATE="$fixture/ownership.json" \
     LY_ROUTE_DATAPLANE_ACTIVE_STATE="$fixture/active.json" \
+    LY_ROUTE_DPDK_VERIFICATION_STATE="$fixture/verification.json" \
     LY_ROUTE_PCI_BIND_HELPER="$tmp/bin/bind-helper" \
+    IP_LOG="${IP_LOG:-}" \
     LY_ROUTE_VFIO_BOOTSTRAP="${LY_ROUTE_VFIO_BOOTSTRAP:-apply}" \
     sh "$script"
 }
@@ -178,6 +183,21 @@ if grep -q 'BEGIN LY ROUTE DPDK' "$fixture/startup.conf"; then
   echo 'stale DPDK block survived boot preflight' >&2
   exit 1
 fi
+
+# A non-DPDK takeover proof survives an empty DPDK probe, and the kernel port
+# is admin-upped so AF_XDP can attach even with the cable unplugged.
+fixture=$(setup_fixture keep-af-proof no)
+printf '%s\n' '{"schema_version":1,"interfaces":[{"linux_interface":"enp3s0","pci_address":"0000:03:00.0","mode":"af_packet","link_state":"down","verification":"pending_link"}]}' > "$fixture/verification.json"
+IP_LOG="$fixture/ip.log" LY_ROUTE_VFIO_BOOTSTRAP=boot run_prepare "$fixture" > "$fixture/log" 2>&1
+grep -q 'no verified DPDK owner; Linux retains NIC drivers' "$fixture/log"
+grep -q 'link set dev enp3s0 promisc on up' "$fixture/ip.log"
+python3 - "$fixture/verification.json" <<'PY'
+import json, sys
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+assert len(document["interfaces"]) == 1, document
+assert document["interfaces"][0]["mode"] == "af_packet"
+assert document["interfaces"][0]["verification"] == "pending_link"
+PY
 
 # A null/empty data_interfaces list must not raise TypeError or block startup.
 fixture=$(setup_fixture null-inventory no)

@@ -85,6 +85,7 @@ type CapabilityProof struct {
 	HardwareLink        string      `json:"hardware_link,omitempty"`
 	DriverModel         string      `json:"driver_model,omitempty"`
 	FunctionalVerified  bool        `json:"functional_verified,omitempty"`
+	Verification        string      `json:"verification,omitempty"`
 	FunctionalMethod    string      `json:"functional_method,omitempty"`
 	LinkSpeedMbps       int64       `json:"link_speed_mbps,omitempty"`
 	MACAddress          string      `json:"mac_address,omitempty"`
@@ -181,21 +182,25 @@ func declarativeNativePath(request NativePathRequest) NativePath {
 			PCIAddress:     proof.PCIAddress,
 			KernelDriver:   proof.KernelDriver,
 			IOMMUGroup:     proof.IOMMUGroup,
+			Verification:   attachmentVerification(proof),
 		})
 	}
 	return NativePath{Tier: tier, SmartQoS: false, Attachments: attachments, Degradations: []Degradation{smartQoSRetiredDegradation()}}
 }
 
 type NativeAttachment struct {
-	LinuxInterface        string        `json:"linux_interface"`
-	VPPInterface          string        `json:"vpp_interface"`
-	MACAddress            string        `json:"mac_address,omitempty"`
-	Tier                  DataplaneTier `json:"tier,omitempty"`
-	Hook                  NativeHook    `json:"hook"`
-	Mode                  NativeMode    `json:"mode"`
-	PCIAddress            string        `json:"pci_address,omitempty"`
-	KernelDriver          string        `json:"kernel_driver,omitempty"`
-	IOMMUGroup            string        `json:"iommu_group,omitempty"`
+	LinuxInterface string        `json:"linux_interface"`
+	VPPInterface   string        `json:"vpp_interface"`
+	MACAddress     string        `json:"mac_address,omitempty"`
+	Tier           DataplaneTier `json:"tier,omitempty"`
+	Hook           NativeHook    `json:"hook"`
+	Mode           NativeMode    `json:"mode"`
+	PCIAddress     string        `json:"pci_address,omitempty"`
+	KernelDriver   string        `json:"kernel_driver,omitempty"`
+	IOMMUGroup     string        `json:"iommu_group,omitempty"`
+	// Verification is the link-independent takeover proof state. A down link
+	// is reported as pending_link: the port is still owned by VPP.
+	Verification          string `json:"verification,omitempty"`
 	capabilityFingerprint string
 }
 
@@ -507,4 +512,23 @@ func prerequisite(name, interfaceName string, passed bool, reason string) Prereq
 		reason = ""
 	}
 	return PrerequisiteResult{Name: name, Interface: interfaceName, Passed: passed, Reason: reason}
+}
+
+// attachmentVerification keeps capability and link state orthogonal: an
+// approved takeover with a down link is pending_link, never rejected.
+func attachmentVerification(proof CapabilityProof) string {
+	switch strings.ToLower(strings.TrimSpace(proof.Verification)) {
+	case "verified", "pending_link", "failed":
+		return strings.ToLower(strings.TrimSpace(proof.Verification))
+	}
+	if proof.FunctionalVerified {
+		return "verified"
+	}
+	if link := strings.ToLower(strings.TrimSpace(proof.HardwareLink)); link == "down" {
+		return "pending_link"
+	}
+	if link := strings.ToLower(strings.TrimSpace(proof.LinkState)); link == "down" {
+		return "pending_link"
+	}
+	return "verified"
 }

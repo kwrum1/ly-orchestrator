@@ -185,7 +185,7 @@ func TestSelectNativePathApprovesNonIntelDPDKAttach(t *testing.T) {
 	}
 }
 
-func TestSelectNativePathRejectsDPDKAttachWithDownLink(t *testing.T) {
+func TestSelectNativePathApprovesDPDKAttachWithDownLink(t *testing.T) {
 	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
 	proof := candidateProof(now, DataplaneTierDPDK, NativeHookDPDK, NativeModeDPDKUIO, 75)
 	proof.IOMMUGroup = "none"
@@ -195,7 +195,8 @@ func TestSelectNativePathRejectsDPDKAttachWithDownLink(t *testing.T) {
 	proof.Transport = "uio"
 	proof.KernelDriver = "vmxnet3"
 	proof.LinkState = "down"
-	_, err := SelectNativePath(NativePathRequest{
+	proof.HardwareLink = "down"
+	path, err := SelectNativePath(NativePathRequest{
 		ManagementInterface: "eth0",
 		Now:                 now,
 		Assignments: []NativeAssignment{{
@@ -204,12 +205,36 @@ func TestSelectNativePathRejectsDPDKAttachWithDownLink(t *testing.T) {
 			Candidates:     []CapabilityProof{proof},
 		}},
 	})
-	locked, ok := err.(*DataplaneLockedError)
-	if !ok {
-		t.Fatalf("error = %T %v, want dataplane_locked for a down DPDK link", err, err)
+	if err != nil {
+		t.Fatalf("down-link DPDK candidate must still be approved: %v", err)
 	}
-	if !candidateReasonContains(locked.Candidates, "link state is down") {
-		t.Fatalf("candidate reasons = %#v", locked.Candidates)
+	if len(path.Attachments) != 1 {
+		t.Fatalf("attachments = %#v", path.Attachments)
+	}
+	if path.Attachments[0].Verification != "pending_link" {
+		t.Fatalf("verification = %q, want pending_link", path.Attachments[0].Verification)
+	}
+}
+
+func TestSelectNativePathApprovesDownLinkAFXDPAsPendingLink(t *testing.T) {
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	proof := candidateProof(now, DataplaneTierNative, NativeHookAFXDP, NativeModeZeroCopy, 90)
+	proof.LinkState = "down"
+	proof.HardwareLink = "down"
+	path, err := SelectNativePath(NativePathRequest{
+		ManagementInterface: "eth0",
+		Now:                 now,
+		Assignments: []NativeAssignment{{
+			LinuxInterface: "eth1",
+			Explicit:       true,
+			Candidates:     []CapabilityProof{proof},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("down-link AF_XDP candidate must still be approved: %v", err)
+	}
+	if len(path.Attachments) != 1 || path.Attachments[0].Verification != "pending_link" {
+		t.Fatalf("attachments = %#v, want one pending_link attachment", path.Attachments)
 	}
 }
 

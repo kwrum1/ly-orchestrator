@@ -308,6 +308,7 @@ type committedStateFile struct {
 			PCIAddress     string        `json:"pci_address"`
 			KernelDriver   string        `json:"kernel_driver"`
 			IOMMUGroup     string        `json:"iommu_group"`
+			Verification   string        `json:"verification"`
 		} `json:"attachments"`
 	} `json:"path"`
 }
@@ -358,8 +359,19 @@ func committedCapabilityReport(path string) (CapabilityReport, bool) {
 		dpdk := tier == DataplaneTierDPDK
 		afCompatibility := hook == NativeHookAFPacket && mode == NativeModeAFPacket || hook == NativeHookTapBridge && mode == NativeModeTapBridge
 		functionalMethod := ""
+		verificationState := ""
 		if dpdk {
 			functionalMethod = "committed_state"
+			verificationState = "verified"
+			switch strings.ToLower(strings.TrimSpace(attachment.Verification)) {
+			case "pending_link":
+				// Ownership survived a link-down event: approved, not yet
+				// proven with traffic. It must never lock the dataplane.
+				verificationState = "pending_link"
+				functionalMethod = "pending_link"
+			case "failed":
+				verificationState = "failed"
+			}
 		}
 		proof := CapabilityProof{
 			Tier:               tier,
@@ -373,7 +385,8 @@ func committedCapabilityReport(path string) (CapabilityReport, bool) {
 			Native:             !dpdk,
 			HighPerformance:    !afCompatibility,
 			AcceptanceOnly:     afCompatibility,
-			FunctionalVerified: dpdk,
+			FunctionalVerified: dpdk && verificationState == "verified",
+			Verification:       verificationState,
 			FunctionalMethod:   functionalMethod,
 			// The committed generation is authoritative until the next
 			// transaction replaces it, so the reconstructable proof is not

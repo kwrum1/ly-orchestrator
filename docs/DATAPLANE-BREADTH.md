@@ -53,18 +53,41 @@ The bootstrap never trusts a status string alone. After binding it runs
 1. VPP is still alive and the interface exists;
 2. if `show interface` says `up`, the port is functionally verified with method
    `link_state_up`;
-3. if it says `down`, the port is accepted only when the link speed is non-zero
-   and a functional TX probe increments the VPP TX counter (method
+3. if it says `down`, the port is verified when the link speed is non-zero and
+   a functional TX probe increments the VPP TX counter (method
    `tx_counter_and_link_speed`; set `LY_ROUTE_DPDK_FUNCTIONAL_PEER` to a peer
    address);
-4. otherwise the port is rejected, the kernel driver restored, and the AF
-   path is tried.
+4. if it says `down` and no counter proof is available, the takeover is still
+   **approved** as `verification=pending_link`. The port is not restored; a
+   watcher promotes it on link up without a new apply.
+5. only an admin-up failure, a missing VPP interface or a VPP/driver crash is a
+   rejection: the kernel driver is restored and the failure is persisted in the
+   crash guard.
 
 The proof records `link_state`, `hardware_link`, `link_speed_mbps`,
-`functional_verified` and `functional_method`. A functionally verified port is
-native even if `link_state` says `down`; a port that is down and not
-functionally verified is restored to Linux and can still be assigned through
-AF_PACKET.
+`functional_verified`, `verification` and `functional_method`. A functionally
+verified port is native even if `link_state` says `down`. A down link changes
+only `verification` (to `pending_link`), never `takeover_state`, and never
+un-binds the port.
+
+### Link independence and auto-adoption
+
+- `takeover_state` answers "can this product take the port over?"; `link_state`
+  answers "is the cable/peer live?". They are independent fields.
+- The watcher runs every 3 seconds (bounded, idempotent) in both Gateway and
+  Orchestrator. It reacts to link up, a new PCI device and a new interface on a
+  role-assigned port.
+- Auto-adoption never binds the management port, never binds a port without a
+  role, and never re-binds a port that is already owned by a non-destructive
+  path (AF_XDP/AF_PACKET/RDMA keep their kernel netdevice).
+- A crash-guarded driver/device is never retried automatically. If AF_PACKET is
+  the only remaining path and consent is absent, the port is reported as
+  `consent_required` and the kernel netdev stays intact; it is not
+  `dataplane_locked`.
+- `GET /api/v1/interfaces` reports `takeover_state`, `takeover_mode`,
+  `takeover_class`, `link_state`, `link_speed_mbps`, `verification`, `reason`,
+  `management` and `pci` for every physical port, including unassigned spares
+  and ports that are currently down. No driver/model/kernel string is exposed.
 
 ### vmxnet3 result
 
@@ -87,7 +110,28 @@ attachment still commits and the runtime is reported degraded. This is why an
 isolated port group can show `carrier down` yet the port remains usable in the
 compatibility path.
 
-## Proof ownership
+### Auto re-adoption after VPP restart
+
+When VPP restarts it recreates only the devices in `startup.conf`. AF_PACKET,
+AF_XDP and RDMA interfaces are created by the apply transaction and would
+otherwise disappear. The watcher detects an ownership proof whose VPP interface
+is missing and re-creates it without an apply:
+
+- AF_PACKET: `create host-interface name <if>`, rename `host-<if>` to
+  `lyroute-<if>`, restore the Linux MAC, admin-up;
+- AF_XDP: re-create with the recorded zero-copy/copy mode after admin-up;
+- the Linux netdev is never removed and no PCI re-bind is attempted.
+
+The interface-existence check parses the `show interface` table instead of
+searching for the name as a substring, because VPP echoes CLI errors (which
+contain the name) on stdout.
+
+A port that has no ownership proof and no role is never adopted. A port whose
+only remaining path is AF_PACKET and whose consent is absent is reported as
+`consent_required`; the watcher leaves the private netdev intact and drops the
+stale proof instead of pretending the port is still owned.
+
+### Proof ownership
 
 An empty probe result does not erase an existing proof for the same realizable
 interface set. The probe preserves the existing proof when every interface in

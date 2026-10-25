@@ -27,7 +27,7 @@ GigabitEthernet1b/0/0              2    down  GigabitEthernet1b/0/0
 	}
 }
 
-func TestVerifyDPDKTakeoversRejectsDownVPPInterface(t *testing.T) {
+func TestVerifyDPDKTakeoversKeepsDownVPPInterfaceAsPendingLink(t *testing.T) {
 	root := t.TempDir()
 	inventoryPath := filepath.Join(root, "inventory.json")
 	if err := os.WriteFile(inventoryPath, []byte(`{"schema_version":1,"management":{"linux_interface":"ens192","pci":"0000:0b:00.0"},"data_interfaces":[{"linux_interface":"ens224","pci":"0000:13:00.0","kernel_driver":"vmxnet3"}]}`), 0o600); err != nil {
@@ -63,9 +63,12 @@ esac
 	t.Setenv("LY_ROUTE_SYSFS_ROOT", root)
 	t.Setenv("LY_ROUTE_VPPCTL", vppctl)
 	server := &Server{}
-	_, failures := server.verifyDPDKTakeovers(context.Background(), []string{"ens224"})
-	if len(failures) != 1 || failures[0].PCIAddress != "0000:13:00.0" || !strings.Contains(failures[0].Reason, "no functional traffic") {
-		t.Fatalf("failures = %#v, want a functional-rejection failure", failures)
+	verified, failures := server.verifyDPDKTakeovers(context.Background(), []string{"ens224"})
+	if len(failures) != 0 {
+		t.Fatalf("failures = %#v, want none for a down link", failures)
+	}
+	if len(verified) != 1 || verified[0].Verification != "pending_link" || verified[0].FunctionalVerified {
+		t.Fatalf("verified = %#v, want pending_link without functional proof", verified)
 	}
 }
 
