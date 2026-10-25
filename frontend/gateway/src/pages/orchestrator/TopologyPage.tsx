@@ -9,6 +9,7 @@ import type { OrchestrationGroup, Topology, TopologyInterface } from "../../api/
 import { Badge, Button, Card, Field, Input, PageHeader, Select, Skeleton, useToast } from "../../components/ui";
 import { useAuth, useConfirm } from "../../state/providers";
 import { roleLabel, text } from "../../lib/format";
+import { linkInfo, takeoverInfo } from "../../lib/human";
 
 function emptyTopology(management: string): Topology {
   return {
@@ -52,7 +53,10 @@ export function OrchestratorTopologyPage() {
     else if (topologyQuery.data === null) setDraft(emptyTopology(managementDefault));
   }, [topologyQuery.data, managementDefault]);
 
-  const physicalPorts = inventoryItems.filter((item) => (item.name || item.id) !== draft?.management_interface);
+  const physicalPorts = inventoryItems.filter((item) =>
+    (item.name || item.id) !== draft?.management_interface &&
+    takeoverInfo(item).assignable
+  );
   const usedPorts = useMemo(() => {
     const used = new Set<string>();
     if (draft?.management_interface) used.add(draft.management_interface);
@@ -210,16 +214,18 @@ export function OrchestratorTopologyPage() {
           </div>
         </Card>
 
-        <Card title="物理端口使用" subtitle="来自 /interfaces 与当前拓扑草稿">
+        <Card title="物理端口使用" subtitle="接管能力与链路状态分开显示">
           <div className="orch-port-list">
             {inventoryItems.map((item) => {
               const name = item.name || item.id;
               const used = usedPorts.has(name);
               const role = name === draft.management_interface ? "管理口" : interfaceFor(draft, "lan")?.port === name ? "LAN" : interfaceFor(draft, "wan")?.port === name ? "WAN" : draft.orchestration_groups.some((group) => group.ports.some((port) => port.interface === name)) ? "编排组" : used ? "聚合成员" : "未使用";
+              const capability = name === draft.management_interface ? "管理口" : takeoverInfo(item).label;
+              const link = linkInfo(item);
               return (
                 <div className="orch-port-row" key={item.id}>
                   <span className="port-icon"><Cable size={15} /></span>
-                  <div><strong>{name}</strong><small>{item.speed || "--"} · {item.mac || "--"}</small></div>
+                  <div><strong>{name}</strong><small>{capability} · <span className={`link-chip${link.down ? " is-down" : ""}${link.pending ? " is-pending" : ""}`}>{link.label}</span></small></div>
                   <Badge tone={role === "管理口" ? "neutral" : role === "LAN" ? "success" : role === "WAN" ? "info" : role === "未使用" ? "neutral" : "warning"}>{role}</Badge>
                 </div>
               );

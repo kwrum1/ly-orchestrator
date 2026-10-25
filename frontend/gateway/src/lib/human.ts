@@ -43,35 +43,30 @@ export function humanErrorMessage(value: unknown, fallback = "操作失败，请
   return cleaned;
 }
 
-export type TakeoverKind = "native" | "compat" | "none";
+export type TakeoverKind = "native" | "compat" | "available" | "consent" | "unsupported" | "management";
 
 export interface TakeoverInfo {
   kind: TakeoverKind;
   label: string;
-  tone: "success" | "warning" | "neutral";
-  /** Advanced detail. Only rendered inside a details tooltip. */
+  tone: "success" | "warning" | "neutral" | "info";
+  /** Whether this port can be assigned to a line / bond. Link state is irrelevant. */
+  assignable: boolean;
+  state: string;
   detail: string;
 }
 
-const COMPAT_DRIVER = /af[_-]?packet/i;
-const NATIVE_DRIVER = /(dpdk|vfio|uio|af[_-]?xdp|rdma|vpp[_-]?native|vpp|native|hardware)/i;
-
-function driverText(item: any): string {
-  const direct = [item?.hook, item?.driver, item?.dataplane_hook, item?.dataplane_driver, item?.takeover_driver]
-    .filter((value) => typeof value === "string" && value.trim());
-  if (direct.length) return String(direct[0]).trim();
-  const state = [item?.takeover, item?.takeover_state, item?.takeover_mode, item?.active_path, item?.work_mode]
-    .filter((value) => typeof value === "string" && value.trim());
-  return state.length ? String(state[0]).trim() : "";
+export interface LinkInfo {
+  label: string;
+  down: boolean;
+  pending: boolean;
 }
 
-/**
- * Map a port's runtime takeover state to operator wording.
- * Accepts several backend field spellings while the dataplane branch settles on
- * one canonical shape (takeover / takeover_state / driver / active_path).
- */
-export function takeoverInfo(item: any): TakeoverInfo {
-  const tokens = [item?.takeover, item?.takeover_state, item?.takeover_mode, item?.hook, item?.driver, item?.dataplane_hook, item?.dataplane_driver, item?.active_path, item?.work_mode]
+function normalized(value: unknown): string {
+  return String(value ?? "").toLowerCase().replace(/[\s-]+/g, "_");
+}
+
+function legacyTokens(item: any): string {
+  return [item?.takeover, item?.takeover_mode, item?.active_path, item?.work_mode]
     .map((value) => {
       if (typeof value === "string") return value;
       if (value && typeof value === "object") {
@@ -83,43 +78,135 @@ export function takeoverInfo(item: any): TakeoverInfo {
       }
       return "";
     })
-    .join(" ");
-  const driver = driverText(item);
-  if (COMPAT_DRIVER.test(tokens)) {
-    return {
-      kind: "compat",
-      label: "兼容模式（性能受限）",
-      tone: "warning",
-      detail: `高级信息：接管驱动 ${driver || "af_packet"}；吞吐低于高性能模式，CPU 占用更高。`,
-    };
-  }
-  if (NATIVE_DRIVER.test(tokens)) {
+    .join(" ")
+    .toLowerCase();
+}
+
+function takeoverClassOf(item: any): "native" | "compatibility" | "" {
+  const explicit = normalized(item?.takeover_class || item?.takeover_mode);
+  if (/compat|fallback/.test(explicit)) return "compatibility";
+  if (/native|high|direct/.test(explicit)) return "native";
+  const tokens = legacyTokens(item);
+  if (/af[_-]?packet|compat/.test(tokens)) return "compatibility";
+  if (/(dpdk|af[_-]?xdp|rdma|vpp|native)/.test(tokens)) return "native";
+  return "";
+}
+
+function takeoverStateOf(item: any): string {
+  const explicit = normalized(item?.takeover_state);
+  if (explicit) return explicit;
+  const tokens = legacyTokens(item);
+  if (/unsupported|not_supported/.test(tokens)) return "unsupported";
+  if (/consent/.test(tokens)) return "consent_required";
+  if (/available|ready/.test(tokens)) return "available";
+  if (/taken_over|takenover|bound/.test(tokens)) return "taken_over";
+  if (/af[_-]?packet|compat|dpdk|af[_-]?xdp|rdma/.test(tokens)) return "taken_over";
+  // Capability-first fallback: without an explicit state, assume the port is
+  // assignable instead of making a down link look unsupported.
+  return "available";
+}
+
+/**
+ * Map a port's takeover capability to operator wording. The label depends only
+ * on takeover_state / takeover_class, never on link state.
+ */
+export function takeoverInfo(item: any): TakeoverInfo {
+  const state = takeoverStateOf(item);
+  const takeoverClass = takeoverClassOf(item);
+  if (state === "taken_over") {
+    if (takeoverClass === "compatibility") {
+      return {
+        kind: "compat",
+        label: "已接管 · 兼容模式（性能受限）",
+        tone: "warning",
+        assignable: true,
+        state,
+        detail: "该网卡已使用兼容模式接管，吞吐低于高性能模式。",
+      };
+    }
     return {
       kind: "native",
       label: "高性能（原生）",
       tone: "success",
-      detail: `高级信息：接管驱动 ${driver || "native"}。`,
+      assignable: true,
+      state,
+      detail: "该网卡已由数据面高性能接管。",
+    };
+  }
+  if (state === "consent_required") {
+    return {
+      kind: "consent",
+      label: "可接管 · 需确认兼容模式",
+      tone: "warning",
+      assignable: false,
+      state,
+      detail: "该网卡需要确认后才能使用兼容模式，吞吐会受限。",
+    };
+  }
+  if (state === "unsupported" || state === "not_supported") {
+    return {
+      kind: "unsupported",
+      label: "不支持接管",
+      tone: "neutral",
+      assignable: false,
+      state,
+      detail: "该网卡暂不支持接管，不能分配给线路或聚合组。",
     };
   }
   return {
-    kind: "none",
-    label: "未接管",
-    tone: "neutral",
-    detail: driver ? `高级信息：当前驱动 ${driver}，未接入数据面。` : "该网卡未接入数据面，暂不可分配给线路或聚合组。",
+    kind: "available",
+    label: "可接管（高性能）",
+    tone: "info",
+    assignable: true,
+    state,
+    detail: "该网卡可由数据面高性能接管。",
   };
 }
 
-export function takeoverSummary(items: any[]): { compat: number; native: number; none: number; mixed: boolean } {
-  let compat = 0;
-  let native = 0;
-  let none = 0;
+/** Link state is deliberately a separate, neutral secondary label. */
+export function linkInfo(item: any): LinkInfo {
+  const verification = normalized(item?.verification);
+  if (verification === "pending_link") {
+    return { label: "等待链路", down: false, pending: true };
+  }
+  if (verification === "failed") {
+    return { label: "验证未通过", down: false, pending: false };
+  }
+  const down = normalized(item?.link_state) === "down";
+  if (down) return { label: "网线未连接", down: true, pending: false };
+  const mbps = Number(item?.link_speed_mbps);
+  if (Number.isFinite(mbps) && mbps > 0) {
+    return {
+      label: mbps >= 1000 ? `${Number((mbps / 1000).toFixed(2))} Gbps` : `${Math.round(mbps)} Mbps`,
+      down: false,
+      pending: false,
+    };
+  }
+  const speed = String(item?.speed || "").trim();
+  return { label: speed || "链路正常", down: false, pending: false };
+}
+
+export interface TakeoverSummary {
+  native: number;
+  compat: number;
+  available: number;
+  consent: number;
+  unsupported: number;
+  mixed: boolean;
+}
+
+export function takeoverSummary(items: any[]): TakeoverSummary {
+  const summary: TakeoverSummary = { native: 0, compat: 0, available: 0, consent: 0, unsupported: 0, mixed: false };
   for (const item of items) {
     const kind = takeoverInfo(item).kind;
-    if (kind === "compat") compat += 1;
-    else if (kind === "native") native += 1;
-    else none += 1;
+    if (kind === "native") summary.native += 1;
+    else if (kind === "compat") summary.compat += 1;
+    else if (kind === "consent") summary.consent += 1;
+    else if (kind === "unsupported") summary.unsupported += 1;
+    else summary.available += 1;
   }
-  return { compat, native, none, mixed: compat > 0 && native + compat > 0 };
+  summary.mixed = summary.compat > 0;
+  return summary;
 }
 
 /**

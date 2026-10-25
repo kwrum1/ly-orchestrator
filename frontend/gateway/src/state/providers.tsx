@@ -183,6 +183,7 @@ interface ApplyContextValue {
   afFallback: { ports: string[] } | null;
   consentBusy: boolean;
   apply: () => Promise<RuntimeApply | null>;
+  requestAfConsent: (ports: string[]) => void;
   consentAf: () => Promise<void>;
   declineAf: () => void;
   dismiss: () => void;
@@ -329,6 +330,12 @@ export function ApplyProvider({ children }: { children: ReactNode }) {
   }, [finish, poll, toast, triggerPending]);
   applyRef.current = apply;
 
+  const requestAfConsent = useCallback((ports: string[]) => {
+    setAfFallback({ ports: ports.filter(Boolean) });
+    setPhase("consent");
+    setMessage("部分网卡需要使用兼容模式，需要确认接管方式");
+  }, []);
+
   const consentAf = useCallback(async () => {
     const ports = afFallback?.ports || [];
     setConsentBusy(true);
@@ -384,11 +391,12 @@ export function ApplyProvider({ children }: { children: ReactNode }) {
       afFallback,
       consentBusy,
       apply,
+      requestAfConsent,
       consentAf,
       declineAf,
       dismiss,
     }),
-    [phase, message, transactionId, startedAt, result, afFallback, consentBusy, apply, consentAf, declineAf, dismiss]
+    [phase, message, transactionId, startedAt, result, afFallback, consentBusy, apply, requestAfConsent, consentAf, declineAf, dismiss]
   );
   return <ApplyContext.Provider value={value}>{children}</ApplyContext.Provider>;
 }

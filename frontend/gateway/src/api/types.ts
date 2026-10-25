@@ -142,10 +142,11 @@ export interface InterfaceItem {
   takeover?: string | AnyRecord;
   takeover_state?: string;
   takeover_mode?: string;
-  hook?: string;
-  driver?: string;
-  dataplane_hook?: string;
-  dataplane_driver?: string;
+  takeover_class?: string;
+  verification?: string;
+  link_speed_mbps?: number;
+  management?: boolean;
+  reason?: string;
   bond?: string;
   bond_id?: string;
   member_of?: string;

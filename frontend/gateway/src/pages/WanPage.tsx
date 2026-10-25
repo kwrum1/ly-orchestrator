@@ -86,10 +86,13 @@ export function WanPage({ mode = "lan" }: { mode?: "lan" | "wan" } = {}) {
   const lanItems = allInterfaces.filter((item) => (item.gateway_role || item.role) === "lan");
   // A port that failed takeover is not assignable to a line. Management and
   // logical LAN objects are also excluded from the interface selectors.
-  const assignableInterfaces = allInterfaces.filter((item) =>
-    (item.gateway_role || item.role) !== "management" &&
-    takeoverInfo(item).kind !== "none"
-  );
+  const assignableInterfaces = allInterfaces.filter((item) => {
+    if ((item.gateway_role || item.role) === "management") return false;
+    const kind = String(item.kind || item.type || "").toLowerCase();
+    if (["lan_bridge", "bridge", "vlan", "logical"].includes(kind)) return false;
+    if (/^(lan-|lan_|br-|wan-|wan_|proxy-|egress-)/i.test(String(item.id || item.name || ""))) return false;
+    return takeoverInfo(item).assignable;
+  });
   const wanItems = wanLinks.data?.items || [];
   const proxyItems = proxyEgresses.data?.items || [];
   const pppoePeers = pppoePeersOf(pppoe.data);

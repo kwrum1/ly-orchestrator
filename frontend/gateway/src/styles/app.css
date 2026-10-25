@@ -186,6 +186,9 @@ input[type="file"]::file-selector-button:hover { border-color: var(--accent); co
 .status-dot-warning { background: var(--warning); box-shadow: 0 0 0 2px rgba(217,119,6,.12); }
 .status-dot-danger { background: var(--danger); box-shadow: 0 0 0 2px rgba(220,38,38,.12); }
 .status-dot-neutral { background: #94a3b8; }
+.status-dot-info { background: var(--info); box-shadow: 0 0 0 2px rgba(3,105,161,.12); }
+.link-chip { display: inline-flex; align-items: center; width: fit-content; padding: 1px 7px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-sunken); color: var(--text-secondary); font-size: 10px; line-height: 1.6; white-space: nowrap; }
+.link-chip.is-down, .link-chip.is-pending { color: var(--text-secondary); background: #f8fafc; border-color: #e6ecf3; }
 
 /* ---------- metrics ---------- */
 .metric-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
@@ -241,16 +244,22 @@ input[type="file"]::file-selector-button:hover { border-color: var(--accent); co
 .egress-rate span { display: inline-flex; align-items: center; gap: 3px; }
 .port-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
 .port-grid-large { grid-template-columns: repeat(6, minmax(0, 1fr)); margin-bottom: 2px; }
-.port-card { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; grid-template-rows: auto auto auto; align-items: center; gap: 2px 8px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: #fff; text-align: left; }
+.port-card { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; grid-template-rows: auto auto auto auto; align-items: center; gap: 2px 8px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: #fff; text-align: left; }
 .port-card:hover { border-color: #c8d9ee; background: #fbfdff; }
 .port-card.static { cursor: default; }
-.port-icon { grid-row: 1 / 4; display: grid; place-items: center; width: 28px; height: 28px; border-radius: 7px; background: var(--surface-sunken); color: var(--text-secondary); }
+.port-icon { grid-row: 1 / 5; display: grid; place-items: center; width: 28px; height: 28px; border-radius: 7px; background: var(--surface-sunken); color: var(--text-secondary); }
 .port-name { display: flex; flex-direction: column; min-width: 0; font-size: 12px; font-weight: 600; }
 .port-name small { color: var(--text-tertiary); font-size: 10px; font-weight: 400; }
 .port-state { display: flex; align-items: center; gap: 4px; color: var(--text-tertiary); font-size: 10px; }
 .port-takeover { grid-column: 2 / -1; display: flex; align-items: center; min-width: 0; }
 .port-takeover .badge { font-size: 9px; padding: 1px 6px; }
 .port-rate { grid-column: 2 / -1; display: flex; gap: 10px; color: var(--text-tertiary); font-size: 10px; font-variant-numeric: tabular-nums; }
+.port-card.overview-port { grid-template-columns: 24px minmax(0, 1fr); grid-template-rows: auto auto auto auto; }
+.port-card.overview-port .port-icon { grid-row: 1 / 5; width: 24px; height: 24px; }
+.port-card.overview-port .link-chip,
+.port-card.overview-port .port-takeover,
+.port-card.overview-port .port-rate { grid-column: 2 / -1; }
+.port-card.overview-port .badge { font-size: 9px; padding: 1px 6px; }
 .takeover-panel { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
 .takeover-panel p { flex: 1 1 320px; margin: 0; }
 .takeover-facts { display: flex; flex-wrap: wrap; gap: 12px; font-size: 11px; color: var(--text-secondary); }

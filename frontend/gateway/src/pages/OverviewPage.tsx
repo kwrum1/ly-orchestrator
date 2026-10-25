@@ -39,6 +39,7 @@ import { Sparkline, TrafficChart, latestValue, seriesColor, totalLatest } from "
 import { formatDateTime, formatDuration, formatRate, formatTime, isOnlineUser, percent, roleLabel, stateLabel, text, timeAgo } from "../lib/format";
 import { auditActionLabel, auditResourceLabel } from "../lib/format";
 import { sanitizeDetail } from "../lib/human";
+import { linkInfo, takeoverInfo } from "../lib/human";
 import { useAuth } from "../state/providers";
 
 const WINDOWS = [
@@ -289,20 +290,24 @@ export function OverviewPage() {
           actions={<Button size="sm" variant="text" onClick={() => navigate("/interfaces")}>接口设置</Button>}
         >
           <div className="port-grid">
-            {physicalInterfaces.slice(0, 8).map((item) => (
-              <button type="button" className="port-card" key={item.id || item.name} onClick={() => navigate("/interfaces")}>
-                <span className="port-icon"><Cable size={16} /></span>
-                <span className="port-name">{item.name || item.id}<small>{item.gateway_role ? roleLabel(item.gateway_role) : "未配置"}</small></span>
-                <span className="port-state">
-                  <i className={`status-dot status-dot-${item.link_state === "up" ? "success" : "danger"}`} />
-                  {item.speed || "--"}
-                </span>
-                <span className="port-rate">
-                  <span>↓ {formatRate(item.rx_bps ?? item.stats?.rx_bps)}</span>
-                  <span>↑ {formatRate(item.tx_bps ?? item.stats?.tx_bps)}</span>
-                </span>
-              </button>
-            ))}
+            {physicalInterfaces.slice(0, 8).map((item) => {
+              const link = linkInfo(item);
+              const management = Boolean(item.management) || item.gateway_role === "management";
+              const info = management ? { label: "管理口", tone: "neutral" as const } : takeoverInfo(item);
+              const role = management ? "系统保留" : item.gateway_role ? roleLabel(item.gateway_role) : "未配置";
+              return (
+                <button type="button" className="port-card overview-port" key={item.id || item.name} onClick={() => navigate("/interfaces")}>
+                  <span className="port-icon"><Cable size={16} /></span>
+                  <span className="port-name">{item.name || item.id}<small>{role}</small></span>
+                  <span className="port-takeover"><Badge tone={info.tone}>{info.label}</Badge></span>
+                  <span className={`link-chip${link.down ? " is-down" : ""}${link.pending ? " is-pending" : ""}`}>{link.label}</span>
+                  <span className="port-rate">
+                    <span>↓ {formatRate(item.rx_bps ?? item.stats?.rx_bps)}</span>
+                    <span>↑ {formatRate(item.tx_bps ?? item.stats?.tx_bps)}</span>
+                  </span>
+                </button>
+              );
+            })}
             {!physicalInterfaces.length && <EmptyState title="暂无接口数据" description="接口数据暂不可用。" icon={<Cable size={22} />} />}
           </div>
         </Card>

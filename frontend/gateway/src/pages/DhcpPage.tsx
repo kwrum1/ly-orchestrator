@@ -49,7 +49,7 @@ export function DhcpPage() {
     const kind = String(item?.kind || item?.type || "").toLowerCase();
     if (kind === "lan_bridge" || kind === "bridge") return true;
     if ((item?.gateway_role || item?.role) === "management") return false;
-    return takeoverInfo(item).kind !== "none";
+    return takeoverInfo(item).assignable;
   };
   const candidates = (lanInterfaces.length ? lanInterfaces : (interfaces.data?.items || []).filter((item) => (item.gateway_role || item.role) !== "management"))
     .filter(assignable);

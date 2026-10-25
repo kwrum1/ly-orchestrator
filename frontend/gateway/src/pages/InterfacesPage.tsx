@@ -11,14 +11,14 @@ import { DataTable } from "../components/DataTable";
 import { Badge, Button, Card, Field, Input, Modal, PageHeader, Select, useToast } from "../components/ui";
 import { useApply, useAuth, useConfirm } from "../state/providers";
 import { formatRate, roleLabel, text } from "../lib/format";
-import { humanErrorMessage, takeoverInfo, takeoverSummary, type TakeoverInfo } from "../lib/human";
+import { humanErrorMessage, linkInfo, takeoverInfo, takeoverSummary, type TakeoverInfo } from "../lib/human";
 
 function interfaceRole(item: InterfaceItem) {
   return item.gateway_role || item.role || item.mode_role?.gateway || "";
 }
 
 function isManagement(item: InterfaceItem) {
-  return interfaceRole(item) === "management" || String(item.name || "").toLowerCase() === "eth0";
+  return Boolean(item.management) || interfaceRole(item) === "management" || String(item.name || "").toLowerCase() === "eth0";
 }
 
 const LOGICAL_KINDS = new Set(["lan_bridge", "bridge", "vlan", "wan", "proxy", "egress", "subscription", "logical", "bond", "bond_member"]);
@@ -64,16 +64,19 @@ interface PortRow extends InterfaceItem {
 
 function bondTakeover(members: InterfaceItem[]): TakeoverInfo {
   if (!members.length) {
-    return { kind: "none", label: "未接管", tone: "neutral", detail: "聚合组成员当前不可用。" };
+    return { kind: "available", label: "可接管（高性能）", tone: "info", assignable: true, state: "available", detail: "聚合组成员信息暂不可用。" };
   }
   const states = members.map((member) => takeoverInfo(member));
   if (states.some((state) => state.kind === "compat")) {
-    return { kind: "compat", label: "兼容模式（性能受限）", tone: "warning", detail: "聚合组中至少一张成员网卡使用兼容模式，整体吞吐会受限。" };
+    return { kind: "compat", label: "已接管 · 兼容模式（性能受限）", tone: "warning", assignable: true, state: "taken_over", detail: "聚合组中至少一张成员网卡使用兼容模式，整体吞吐会受限。" };
   }
   if (states.every((state) => state.kind === "native")) {
-    return { kind: "native", label: "高性能（原生）", tone: "success", detail: "聚合组的成员网卡均使用高性能接管。" };
+    return { kind: "native", label: "高性能（原生）", tone: "success", assignable: true, state: "taken_over", detail: "聚合组的成员网卡均使用高性能接管。" };
   }
-  return { kind: "none", label: "未接管", tone: "neutral", detail: "聚合组中仍有成员网卡未接入数据面。" };
+  if (states.some((state) => state.kind === "unsupported")) {
+    return { kind: "unsupported", label: "不支持接管", tone: "neutral", assignable: false, state: "unsupported", detail: "聚合组中有成员网卡不支持接管。" };
+  }
+  return { kind: "available", label: "可接管（高性能）", tone: "info", assignable: true, state: "available", detail: "聚合组等待成员网卡完成接管。" };
 }
 
 function mergeTakeover(item: any, fallback: TakeoverInfo) {
@@ -82,7 +85,7 @@ function mergeTakeover(item: any, fallback: TakeoverInfo) {
 
 function displayTakeover(item: any): TakeoverInfo {
   if (!item?.__bond && isManagement(item)) {
-    return { kind: "none", label: "管理口", tone: "neutral", detail: "管理口由系统保留，不参与数据面接管，也不可分配给线路或聚合组。" };
+    return { kind: "management", label: "管理口", tone: "neutral", assignable: false, state: "management", detail: "管理口由系统保留，不参与数据面接管。" };
   }
   return takeoverInfo(item);
 }
@@ -92,6 +95,7 @@ export function InterfacesPage() {
   const { toast } = useToast();
   const confirm = useConfirm();
   const apply = useApply();
+  const { requestAfConsent } = apply;
   const { session } = useAuth();
   const resource = useInterfacesResource();
   const telemetry = useInterfacesTelemetry();
@@ -130,6 +134,7 @@ export function InterfacesPage() {
   const bondRows = useMemo<PortRow[]>(() => bonds.map((bond) => {
     const members = physicalPorts.filter((item) => itemMatchesMembers(item, memberKeys(bond)));
     const up = members.length > 0 && members.every((item) => item.link_state === "up");
+    const pending = members.some((item) => linkInfo(item).pending);
     return {
       ...bond,
       __bond: true,
@@ -139,6 +144,8 @@ export function InterfacesPage() {
       members: bond.members || [],
       memberCount: members.length,
       link_state: bond.link_state || (up ? "up" : "down"),
+      link_speed_mbps: bond.link_speed_mbps || members[0]?.link_speed_mbps,
+      verification: bond.verification || (pending ? "pending_link" : undefined),
       speed: bond.speed || members[0]?.speed,
       rx_bps: members.reduce((sum, item) => sum + Number(item.rx_bps || item.stats?.rx_bps || 0), 0),
       tx_bps: members.reduce((sum, item) => sum + Number(item.tx_bps || item.stats?.tx_bps || 0), 0),
@@ -159,9 +166,8 @@ export function InterfacesPage() {
   const candidates = useMemo(
     () => physicalPorts.filter((item) =>
       !isManagement(item) &&
-      item.link_state !== "down" &&
       !itemMatchesMembers(item, allMembers) &&
-      takeoverInfo(item).kind !== "none"
+      takeoverInfo(item).assignable
     ),
     [physicalPorts, allMembers]
   );
@@ -188,21 +194,24 @@ export function InterfacesPage() {
       meta: { width: 220 },
     },
     {
-      id: "state",
-      header: "状态",
-      accessorFn: (row) => row.link_state,
-      cell: ({ row }) => <Badge tone={row.original.link_state === "up" ? "success" : "danger"} dot>{row.original.link_state === "up" ? "LINKUP" : "DOWN"}</Badge>,
-      meta: { width: 100 },
-    },
-    {
       id: "takeover",
-      header: "接管方式",
+      header: "接管能力",
       accessorFn: (row) => mergeTakeover(row, displayTakeover(row)).label,
       cell: ({ row }) => {
         const info = mergeTakeover(row.original, displayTakeover(row.original));
         return <Badge tone={info.tone} title={info.detail}>{info.label}</Badge>;
       },
-      meta: { width: 170 },
+      meta: { width: 190 },
+    },
+    {
+      id: "state",
+      header: "链路",
+      accessorFn: (row) => linkInfo(row).label,
+      cell: ({ row }) => {
+        const link = linkInfo(row.original);
+        return <span className={`link-chip${link.down ? " is-down" : ""}${link.pending ? " is-pending" : ""}`}>{link.label}</span>;
+      },
+      meta: { width: 110 },
     },
     {
       id: "role",
@@ -213,36 +222,55 @@ export function InterfacesPage() {
         : <Badge tone={isManagement(row.original) ? "neutral" : interfaceRole(row.original) === "wan" ? "info" : "success"}>{roleLabel(interfaceRole(row.original)) || "未配置"}</Badge>,
       meta: { width: 95 },
     },
-    { id: "speed", header: "速率", accessorFn: (row) => row.speed, cell: ({ getValue }) => text(getValue()), meta: { width: 90 } },
     { id: "rx", header: "接收", accessorFn: (row) => row.rx_bps ?? row.stats?.rx_bps, cell: ({ getValue }) => formatRate(getValue()), meta: { width: 105, align: "right" } },
     { id: "tx", header: "发送", accessorFn: (row) => row.tx_bps ?? row.stats?.tx_bps, cell: ({ getValue }) => formatRate(getValue()), meta: { width: 105, align: "right" } },
     { id: "mac", header: "MAC", accessorFn: (row) => row.mac, cell: ({ getValue }) => <span className="mono">{text(getValue())}</span>, meta: { width: 150 } },
     {
       id: "actions",
       header: "操作",
-      cell: ({ row }) => isBondRow(row.original) ? (
-        <Button
-          size="sm"
-          variant="text"
-          icon={<Trash2 size={14} />}
-          disabled={session?.role === "readonly"}
-          onClick={() => void removeBond(row.original)}
-        >
-          删除聚合
-        </Button>
-      ) : (
-        <Button
-          size="sm"
-          variant="text"
-          icon={<Settings2 size={14} />}
-          disabled={isManagement(row.original) || displayTakeover(row.original).kind === "none" || session?.role === "readonly"}
-          title={displayTakeover(row.original).kind === "none" ? "该网卡尚未接管，不能分配角色" : undefined}
-          onClick={() => { setRoleTarget(row.original); setRoleValue(interfaceRole(row.original) === "lan" ? "lan" : "wan"); }}
-        >
-          角色配置
-        </Button>
-      ),
-      meta: { width: 100, align: "right", hideable: false },
+      cell: ({ row }) => {
+        if (isBondRow(row.original)) {
+          return (
+            <Button
+              size="sm"
+              variant="text"
+              icon={<Trash2 size={14} />}
+              disabled={session?.role === "readonly"}
+              onClick={() => void removeBond(row.original)}
+            >
+              删除聚合
+            </Button>
+          );
+        }
+        const info = displayTakeover(row.original);
+        const portName = String(row.original.name || row.original.id || "");
+        if (info.kind === "consent") {
+          return (
+            <Button
+              size="sm"
+              variant="text"
+              icon={<ShieldAlert size={14} />}
+              disabled={session?.role === "readonly"}
+              onClick={() => requestAfConsent([portName])}
+            >
+              启用兼容模式
+            </Button>
+          );
+        }
+        return (
+          <Button
+            size="sm"
+            variant="text"
+            icon={<Settings2 size={14} />}
+            disabled={!info.assignable || session?.role === "readonly"}
+            title={!info.assignable ? "该网卡暂不支持接管，不能分配角色" : undefined}
+            onClick={() => { setRoleTarget(row.original); setRoleValue(interfaceRole(row.original) === "lan" ? "lan" : "wan"); }}
+          >
+            角色配置
+          </Button>
+        );
+      },
+      meta: { width: 150, align: "right", hideable: false },
     },
   ], [session?.role, bonds]);
 
@@ -378,8 +406,8 @@ export function InterfacesPage() {
         title="网卡接管"
         subtitle="优先使用高性能方式接管；兼容模式只在确认后启用"
         actions={
-          <Badge tone={summary.mixed ? "warning" : "success"} dot>
-            {summary.mixed ? "部分兼容模式 · 性能受限" : summary.none === assignablePorts.length && assignablePorts.length > 0 ? "未接管" : "高性能接管"}
+          <Badge tone={summary.mixed ? "warning" : summary.native + summary.compat > 0 ? "success" : "info"} dot>
+            {summary.mixed ? "部分兼容模式 · 性能受限" : summary.native + summary.compat > 0 ? "已接管" : "可接管"}
           </Badge>
         }
       >
@@ -387,12 +415,15 @@ export function InterfacesPage() {
           <div className="takeover-facts">
             <span><i className="status-dot status-dot-success" />高性能 {summary.native} 张</span>
             <span><i className="status-dot status-dot-warning" />兼容模式 {summary.compat} 张</span>
-            <span><i className="status-dot status-dot-neutral" />未接管 {summary.none} 张</span>
+            <span><i className="status-dot status-dot-info" />可接管 {summary.available + summary.consent} 张</span>
+            <span><i className="status-dot status-dot-neutral" />不支持 {summary.unsupported} 张</span>
           </div>
           <p className="muted">
             {summary.compat > 0
               ? "部分网卡正在使用兼容模式，吞吐和时延会受到影响。"
-              : "设备会优先尝试高性能接管；无法接管的网卡不会分配线路，也不影响其他网卡。"}
+              : summary.available + summary.consent > 0
+                ? "部分网卡尚未完成接管；网线未连接不影响接管能力，插线后会自动完成。"
+                : "设备会优先尝试高性能接管；无法接管的网卡不会分配线路，也不影响其他网卡。"}
           </p>
           <Button
             size="sm"
@@ -411,6 +442,7 @@ export function InterfacesPage() {
         <div className="port-grid port-grid-large">
           {visibleItems.map((item) => {
             const info = mergeTakeover(item, displayTakeover(item));
+            const link = linkInfo(item);
             return (
               <div className="port-card static" key={item.id || item.name}>
                 <span className="port-icon">{isBondRow(item) ? <Link2 size={16} /> : <Cable size={16} />}</span>
@@ -418,8 +450,8 @@ export function InterfacesPage() {
                   {item.name || item.id}
                   <small>{isBondRow(item) ? `聚合 · ${item.members?.length || 0} 张成员` : interfaceRole(item) ? roleLabel(interfaceRole(item)) : "未配置"}</small>
                 </span>
-                <span className="port-state"><i className={`status-dot status-dot-${item.link_state === "up" ? "success" : "danger"}`} />{item.link_state === "up" ? "LINKUP" : "DOWN"}</span>
                 <span className="port-takeover" title={info.detail}><Badge tone={info.tone}>{info.label}</Badge></span>
+                <span className={`link-chip${link.down ? " is-down" : ""}${link.pending ? " is-pending" : ""}`}>{link.label}</span>
                 <span className="port-rate"><span>↓ {formatRate(item.rx_bps ?? item.stats?.rx_bps)}</span><span>↑ {formatRate(item.tx_bps ?? item.stats?.tx_bps)}</span></span>
               </div>
             );
@@ -443,7 +475,7 @@ export function InterfacesPage() {
         open={Boolean(roleTarget)}
         onClose={() => !busy && setRoleTarget(null)}
         title="角色配置"
-        subtitle={roleTarget ? `${roleTarget.name || roleTarget.id} · ${roleTarget.work_mode || ""}` : ""}
+        subtitle={roleTarget ? `${roleTarget.name || roleTarget.id} · ${displayTakeover(roleTarget).label}` : ""}
         size="sm"
         busy={busy}
         footer={<><Button onClick={() => setRoleTarget(null)} disabled={busy}>取消</Button><Button variant="primary" loading={busy} onClick={saveRole}>保存并应用</Button></>}
@@ -464,7 +496,7 @@ export function InterfacesPage() {
         open={bondOpen}
         onClose={() => !busy && setBondOpen(false)}
         title="创建聚合"
-        subtitle="选择至少两张同速率、同工作模式的网卡"
+        subtitle="选择至少两张速率相同的已接管网卡"
         size="md"
         busy={busy}
         footer={<><Button onClick={() => setBondOpen(false)} disabled={busy}>取消</Button><Button variant="primary" loading={busy} onClick={saveBond}>创建</Button></>}
@@ -489,7 +521,7 @@ export function InterfacesPage() {
               );
             })}
           </div>
-          {!candidates.length && <div className="inline-warning">没有可加入聚合组的网卡；请先确认网卡已接通并成功接管。</div>}
+          {!candidates.length && <div className="inline-warning">没有可加入聚合组的网卡；不支持的网卡不会出现在这里。</div>}
         </div>
       </Modal>
     </div>

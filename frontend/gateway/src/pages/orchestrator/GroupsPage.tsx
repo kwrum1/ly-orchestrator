@@ -11,6 +11,7 @@ import { DataTable } from "../../components/DataTable";
 import { Badge, Button, Field, Input, Modal, PageHeader, Select, useToast } from "../../components/ui";
 import { useAuth, useConfirm } from "../../state/providers";
 import { text } from "../../lib/format";
+import { takeoverInfo } from "../../lib/human";
 
 type GroupForm = { name: string; lan: string; wan: string };
 
@@ -75,6 +76,7 @@ export function OrchestratorGroupsPage() {
     for (const item of inventory.data?.items || []) {
       const value = item.system_name || item.name || item.id;
       if (!value) continue;
+      if (!takeoverInfo(item).assignable && value !== form.lan && value !== form.wan) continue;
       const label = (item.system_name && item.name && item.name !== item.system_name ? `${item.name} · ${item.system_name}` : (item.name || item.id || item.system_name)) || value;
       values.set(value, label);
     }
