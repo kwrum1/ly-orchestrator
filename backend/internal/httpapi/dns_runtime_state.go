@@ -18,7 +18,6 @@ func (server *Server) decorateDNSRuntimeCapabilities(ctx context.Context, items 
 		return items
 	}
 	capability := server.serviceCapability(ctx, serviceRuntime.SmartDNS, "smartdns", "SmartDNS service runtime is not configured")
-	applied := runtimeTransactionCommitted(server.runtimeEvidence()) && capability.Available
 	for _, item := range items {
 		item["degraded"] = !capability.Available
 		if capability.Available {
@@ -29,16 +28,6 @@ func (server *Server) decorateDNSRuntimeCapabilities(ctx context.Context, items 
 				reason = "SmartDNS service runtime is unavailable"
 			}
 			item["degraded_reason"] = reason
-		}
-		// DNS resources use the same settled-transaction rule as every other
-		// runtime resource. A committed transaction with a degraded component
-		// (for example AF_PACKET compatibility) must not leave DNS readback
-		// stuck at desired_not_applied while SmartDNS is serving it.
-		if applied && desiredEnabled(item) {
-			switch strings.TrimSpace(stringField(item, "runtime_state")) {
-			case "", "desired_not_applied":
-				item["runtime_state"] = "applied"
-			}
 		}
 	}
 	return items
@@ -55,11 +44,7 @@ func (server *Server) decorateDNSUpstreamRuntimeStates(ctx context.Context, item
 		return items
 	}
 	result := server.runtimeEvidence()
-	committed := result.Status == RuntimeStatusCommitted &&
-		result.RuntimeState == RuntimeStateRunning &&
-		result.Receipt.Status == apply.ReceiptApplied &&
-		result.TransactionID != "" &&
-		result.Receipt.TransactionID == result.TransactionID
+	committed := runtimeTransactionCommitted(result)
 	if !committed {
 		return items
 	}

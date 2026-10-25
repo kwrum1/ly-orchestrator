@@ -79,6 +79,15 @@ func TestRuntimeReadbackPromotesEveryFixtureResourceAfterSettledApply(t *testing
 		t.Fatal(err)
 	}
 	plan := vpp.Plan{Policy: policyConfig, NAT: natConfig, Flow: compiledFlow}
+	// A WAN-pinned DNS upstream is applied as a supplemental service network;
+	// the readback decorator verifies that network instead of trusting the
+	// transaction alone, so the fixture must carry the same evidence a real
+	// apply would.
+	dnsNetwork, err := vpp.DNSServiceNetworkForUpstreamID("dns-acc", "wan-acc", []string{"9.9.9.9"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.DNSServiceNetworks = []vpp.DNSServiceNetwork{dnsNetwork}
 
 	transactionID := "txn-readback-degraded"
 	server.runtimeMu.Lock()
@@ -100,7 +109,7 @@ func TestRuntimeReadbackPromotesEveryFixtureResourceAfterSettledApply(t *testing
 	assertConfiguredItemApplied(t, "port map", "port-acc", server.decoratePortMapRuntimeStates(ctx, mustDesiredItems(t, server, "port_map")))
 	assertConfiguredItemApplied(t, "WAN link", "wan-acc", server.decorateWANLinkRuntimeStates(ctx, mustDesiredItems(t, server, "wan_link")))
 	assertConfiguredItemApplied(t, "DHCP server", "dhcp-acc", server.decorateDHCPRuntimeStates(ctx, mustDesiredItems(t, server, "dhcp_server")))
-	assertConfiguredItemApplied(t, "DNS upstream", "dns-acc", server.decorateDNSRuntimeCapabilities(ctx, mustDesiredItems(t, server, "dns_upstream")))
+	assertConfiguredItemApplied(t, "DNS upstream", "dns-acc", server.decorateDNSUpstreamRuntimeStates(ctx, server.decorateDNSRuntimeCapabilities(ctx, mustDesiredItems(t, server, "dns_upstream"))))
 	assertConfiguredItemApplied(t, "traffic control", "flow-acc", server.decorateTrafficControlRuntimeStates(ctx, mustDesiredItems(t, server, "traffic_control")))
 }
 
