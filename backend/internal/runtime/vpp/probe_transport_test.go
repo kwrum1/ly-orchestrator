@@ -156,6 +156,115 @@ func TestCommittedCapabilityReportRecordsTransport(t *testing.T) {
 	}
 }
 
+func TestSelectNativePathApprovesNonIntelDPDKAttach(t *testing.T) {
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	proof := candidateProof(now, DataplaneTierDPDK, NativeHookDPDK, NativeModeDPDKUIO, 75)
+	proof.IOMMUGroup = "none"
+	proof.IOMMUProtected = false
+	proof.VFIOAvailable = false
+	proof.UIOPCIAvailable = true
+	proof.Transport = "uio"
+	proof.KernelDriver = "vmxnet3"
+	proof.LinkState = "up"
+	proof.HardwareLink = "up"
+	proof.DriverModel = "VMware vmxnet3"
+	path, err := SelectNativePath(NativePathRequest{
+		ManagementInterface: "eth0",
+		Now:                 now,
+		Assignments: []NativeAssignment{{
+			LinuxInterface: "eth1",
+			Explicit:       true,
+			Candidates:     []CapabilityProof{proof},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("non-Intel VPP DPDK attach was rejected: %v", err)
+	}
+	if path.Tier != DataplaneTierDPDK || len(path.Attachments) != 1 {
+		t.Fatalf("path = %#v", path)
+	}
+}
+
+func TestSelectNativePathApprovesDPDKAttachWithDownLink(t *testing.T) {
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	proof := candidateProof(now, DataplaneTierDPDK, NativeHookDPDK, NativeModeDPDKUIO, 75)
+	proof.IOMMUGroup = "none"
+	proof.IOMMUProtected = false
+	proof.VFIOAvailable = false
+	proof.UIOPCIAvailable = true
+	proof.Transport = "uio"
+	proof.KernelDriver = "vmxnet3"
+	proof.LinkState = "down"
+	proof.HardwareLink = "down"
+	path, err := SelectNativePath(NativePathRequest{
+		ManagementInterface: "eth0",
+		Now:                 now,
+		Assignments: []NativeAssignment{{
+			LinuxInterface: "eth1",
+			Explicit:       true,
+			Candidates:     []CapabilityProof{proof},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("down-link DPDK candidate must still be approved: %v", err)
+	}
+	if len(path.Attachments) != 1 {
+		t.Fatalf("attachments = %#v", path.Attachments)
+	}
+	if path.Attachments[0].Verification != "pending_link" {
+		t.Fatalf("verification = %q, want pending_link", path.Attachments[0].Verification)
+	}
+}
+
+func TestSelectNativePathApprovesDownLinkAFXDPAsPendingLink(t *testing.T) {
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	proof := candidateProof(now, DataplaneTierNative, NativeHookAFXDP, NativeModeZeroCopy, 90)
+	proof.LinkState = "down"
+	proof.HardwareLink = "down"
+	path, err := SelectNativePath(NativePathRequest{
+		ManagementInterface: "eth0",
+		Now:                 now,
+		Assignments: []NativeAssignment{{
+			LinuxInterface: "eth1",
+			Explicit:       true,
+			Candidates:     []CapabilityProof{proof},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("down-link AF_XDP candidate must still be approved: %v", err)
+	}
+	if len(path.Attachments) != 1 || path.Attachments[0].Verification != "pending_link" {
+		t.Fatalf("attachments = %#v, want one pending_link attachment", path.Attachments)
+	}
+}
+
+func TestSelectNativePathApprovesFunctionallyVerifiedDownLink(t *testing.T) {
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	proof := candidateProof(now, DataplaneTierDPDK, NativeHookDPDK, NativeModeDPDKUIO, 75)
+	proof.IOMMUGroup = "none"
+	proof.IOMMUProtected = false
+	proof.VFIOAvailable = false
+	proof.UIOPCIAvailable = true
+	proof.Transport = "uio"
+	proof.KernelDriver = "vmxnet3"
+	proof.LinkState = "down"
+	proof.HardwareLink = "down"
+	proof.LinkSpeedMbps = 10000
+	proof.FunctionalVerified = true
+	proof.FunctionalMethod = "tx_counter_and_link_speed"
+	if _, err := SelectNativePath(NativePathRequest{
+		ManagementInterface: "eth0",
+		Now:                 now,
+		Assignments: []NativeAssignment{{
+			LinuxInterface: "eth1",
+			Explicit:       true,
+			Candidates:     []CapabilityProof{proof},
+		}},
+	}); err != nil {
+		t.Fatalf("functionally verified down-link candidate was rejected: %v", err)
+	}
+}
+
 func candidateReasonContains(evaluations []CandidateEvaluation, expected string) bool {
 	for _, evaluation := range evaluations {
 		for _, reason := range evaluation.Reasons {

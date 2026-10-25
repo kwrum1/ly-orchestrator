@@ -36,12 +36,86 @@ log() {
   printf '%s\n' "$*"
 }
 
+# AF_XDP requires the Linux netdev to be admin-up (the kernel does not require
+# carrier). Do this for every configured data port that is not handed to DPDK,
+# so a cable-down port can still be attached and a later apply does not depend
+# on firstboot having brought the interface up. Best effort: a missing netdev
+# is skipped, never fatal.
+bring_up_kernel_data_ports() {
+  ip_command=${LY_ROUTE_IP_COMMAND:-ip}
+  [ -r "$inventory" ] || return 0
+  for data_name in $("$python_bin" - "$inventory" <<'PY'
+import json
+import re
+import sys
+
+pattern = re.compile(r"^[A-Za-z0-9_.:-]{1,32}$")
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        document = json.load(source)
+except (OSError, ValueError):
+    raise SystemExit(0)
+for item in document.get("data_interfaces") or []:
+    if not isinstance(item, dict):
+        continue
+    name = str(item.get("linux_interface", "")).strip()
+    if pattern.fullmatch(name):
+        print(name)
+PY
+); do
+    [ -e "$sysfs/class/net/$data_name" ] || continue
+    "$ip_command" link set dev "$data_name" promisc on up >/dev/null 2>&1 || true
+  done
+}
+
+# Remove only stale *DPDK* proofs. AF_XDP/AF_PACKET/RDMA proofs describe a
+# takeover that keeps the kernel netdev and must survive an empty DPDK probe.
+drop_stale_dpdk_proofs() {
+  [ -r "$verification_state" ] || return 0
+  "$python_bin" - "$verification_state" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as source:
+        document = json.load(source)
+except (OSError, ValueError):
+    raise SystemExit(0)
+interfaces = []
+for item in document.get("interfaces") or []:
+    if not isinstance(item, dict):
+        continue
+    if str(item.get("mode", "")).strip() in {"vfio", "vfio-pci", "vfio_pci", "uio", "uio_pci_generic"}:
+        continue
+    interfaces.append(item)
+if not interfaces:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    raise SystemExit(0)
+document["interfaces"] = interfaces
+try:
+    with open(path, "w", encoding="utf-8") as target:
+        json.dump(document, target, indent=2)
+        target.write("\n")
+except OSError:
+    pass
+PY
+}
+
 sysfs=${LY_ROUTE_SYSFS_ROOT:-/sys}
 rows_file=${LY_ROUTE_VFIO_DEVICES:-/etc/ly-route/vfio-devices}
 inventory=${LY_ROUTE_DATAPLANE_INVENTORY:-/etc/ly-route/dataplane-inventory.json}
 network=${LY_ROUTE_INSTALLER_NETWORK:-/etc/ly-route/installed-network.json}
 startup=${LY_ROUTE_VPP_STARTUP_CONFIG:-/etc/vpp/startup.conf}
 ownership=${LY_ROUTE_DPDK_OWNERSHIP_STATE:-/var/lib/ly-route/dataplane/ownership.json}
+active_state=${LY_ROUTE_DATAPLANE_ACTIVE_STATE:-/var/lib/ly-route/dataplane/active.json}
+verification_state=${LY_ROUTE_DPDK_VERIFICATION_STATE:-/var/lib/ly-route/dataplane/dpdk-verification.json}
+bootstrap_mode=${LY_ROUTE_VFIO_BOOTSTRAP:-}
+skip_pcis=${LY_ROUTE_DPDK_SKIP_PCIS:-}
 python_bin=${LY_ROUTE_PYTHON:-python3}
 bind_helper=${LY_ROUTE_PCI_BIND_HELPER:-}
 
@@ -70,7 +144,10 @@ if not isinstance(management, dict):
     management = {}
 print("management|" + str(management.get("linux_interface", "")).strip() + "|" +
       str(management.get("pci", "")).strip() + "|" + str(management.get("mac", "")).strip())
-for item in document.get("data_interfaces", []):
+data_interfaces = document.get("data_interfaces")
+if not isinstance(data_interfaces, list):
+    data_interfaces = []
+for item in data_interfaces:
     if not isinstance(item, dict):
         continue
     pci = str(item.get("pci", "")).strip()
@@ -92,7 +169,10 @@ with open(sys.argv[1], encoding="utf-8") as source:
     document = json.load(source)
 management = document.get("management", {})
 print("management|" + str(management.get("pci", "")).strip())
-for interface in document.get("data_interfaces", []):
+data_interfaces = document.get("data_interfaces")
+if not isinstance(data_interfaces, list):
+    data_interfaces = []
+for interface in data_interfaces:
     selected = interface.get("selected")
     if not isinstance(selected, dict):
         continue
@@ -108,11 +188,72 @@ else
   exit 0
 fi
 
+# Crash-guarded devices are never retried automatically.
+if [ -n "$skip_pcis" ]; then
+  filtered_pcis=
+  for pci in $pci_rows; do
+    case " $skip_pcis " in
+      *" $pci "*) log "VPP ownership preflight: skipping $pci (native path marked unsupported)" ;;
+      *) filtered_pcis="$filtered_pcis $pci" ;;
+    esac
+  done
+  pci_rows=$filtered_pcis
+fi
+
+# Boot-mode ownership is evidence-based: only ports that were already
+# verified/committed as DPDK are re-bound. The control API's apply bootstrap
+# sets LY_ROUTE_VFIO_BOOTSTRAP=apply to test new candidates transactionally.
+if [ "$bootstrap_mode" != apply ]; then
+  verified_pcis=
+  if [ -r "$active_state" ]; then
+    verified_pcis=$(python3 - "$active_state" "$pci_rows" <<'PY'
+import json
+import re
+import sys
+
+path, rows = sys.argv[1], sys.argv[2].split()
+pattern = re.compile(r"^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$")
+try:
+    with open(path, encoding="utf-8") as source:
+        state = json.load(source)
+    attachments = state.get("path", {}).get("attachments") or []
+except (OSError, ValueError, AttributeError):
+    attachments = []
+for item in attachments:
+    if not isinstance(item, dict):
+        continue
+    if item.get("tier") != "vpp_dpdk":
+        continue
+    if item.get("mode") not in {"vfio_pci", "uio_pci_generic"}:
+        continue
+    pci = str(item.get("pci_address", "")).strip()
+    if pattern.fullmatch(pci) and pci in rows:
+        print(pci)
+PY
+    ) || verified_pcis=
+  fi
+  pci_rows=$(printf '%s\n' "$verified_pcis" | awk 'NF')
+fi
+
 if [ -z "$pci_rows" ]; then
   # VMnet/AF_PACKET and native paths do not hand PCI devices to VFIO/UIO. A
   # MAC-only installer mapping has no management PCI, and that must not block
-  # VPP startup when there is no DPDK data interface to take over.
-  log 'VPP ownership preflight: no DPDK data interface; Linux retains NIC drivers'
+  # VPP startup when there is no verified DPDK data interface to take over.
+  # Always remove a stale managed block so a failed takeover cannot survive a
+  # reboot.
+  if [ -f "$startup" ]; then
+    sed -i '/^# BEGIN LY ROUTE DPDK$/,/^# END LY ROUTE DPDK$/d' "$startup"
+    if grep -q 'plugin dpdk_plugin.so { enable }' "$startup"; then
+      sed -i 's/plugin dpdk_plugin\.so { enable }/plugin dpdk_plugin.so { disable }/' "$startup"
+    fi
+  fi
+  drop_stale_dpdk_proofs
+  bring_up_kernel_data_ports
+  if [ "$bootstrap_mode" = apply ]; then
+    log 'VPP ownership preflight: no DPDK data interface; Linux retains NIC drivers'
+  else
+    log 'VPP ownership preflight: no verified DPDK owner; Linux retains NIC drivers'
+  fi
   exit 0
 fi
 [ -n "$management_pci" ] || fail 'management PCI identity is missing'
@@ -179,7 +320,10 @@ import sys
 path, pci, field = sys.argv[1:]
 with open(path, encoding="utf-8") as source:
     document = json.load(source)
-for interface in document.get("data_interfaces", []):
+data_interfaces = document.get("data_interfaces")
+if not isinstance(data_interfaces, list):
+    data_interfaces = []
+for interface in data_interfaces:
     if str(interface.get("pci", "")).strip() != pci:
         continue
     if field == "linux_interface":
@@ -436,3 +580,4 @@ fi
   done
   printf '}\n# END LY ROUTE DPDK\n'
 } >> "$startup"
+bring_up_kernel_data_ports

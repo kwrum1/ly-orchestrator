@@ -32,8 +32,8 @@ func TestOrderedFallbackSelectsFirstUsableTransport(t *testing.T) {
 	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
 	all := []CapabilityProof{
 		fallbackProof(now, DataplaneTierDPDK, NativeHookDPDK, NativeModeDPDKVFIO),
-		fallbackProof(now, DataplaneTierDPDK, NativeHookDPDK, NativeModeDPDKUIO),
 		fallbackProof(now, DataplaneTierNative, NativeHookAFXDP, NativeModeZeroCopy),
+		fallbackProof(now, DataplaneTierDPDK, NativeHookDPDK, NativeModeDPDKUIO),
 		fallbackProof(now, DataplaneTierNative, NativeHookAFXDP, NativeModeCopy),
 		fallbackProof(now, DataplaneTierNative, NativeHookRDMA, NativeModeRDMADV),
 		fallbackProof(now, DataplaneTierNative, NativeHookAFPacket, NativeModeAFPacket),

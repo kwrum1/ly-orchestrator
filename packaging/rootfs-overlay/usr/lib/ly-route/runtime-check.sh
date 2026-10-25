@@ -26,6 +26,7 @@ umask 077
 : "${LY_ROUTE_ACTIVE_DPDK_READER:=/usr/lib/ly-route/active-dpdk-state.py}"
 : "${LY_ROUTE_DATAPLANE_INVENTORY:=/etc/ly-route/dataplane-inventory.json}"
 : "${LY_ROUTE_DPDK_OWNERSHIP_STATE:=/var/lib/ly-route/dataplane/ownership.json}"
+: "${LY_ROUTE_DPDK_VERIFICATION_STATE:=/var/lib/ly-route/dataplane/dpdk-verification.json}"
 
 split_csv() {
   printf '%s' "$1" | tr ',' ' '
@@ -201,6 +202,62 @@ raise SystemExit(1)
 PY
 }
 
+dpdk_verification_value() {
+  probe_interface=$1
+  [ -r "$LY_ROUTE_DPDK_VERIFICATION_STATE" ] || return 1
+  python3 - "$LY_ROUTE_DPDK_VERIFICATION_STATE" "$probe_interface" <<'PY'
+import json
+import sys
+
+path, interface = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as source:
+        document = json.load(source)
+except (OSError, ValueError):
+    raise SystemExit(1)
+for item in document.get("interfaces") or []:
+    if not isinstance(item, dict):
+        continue
+    if str(item.get("linux_interface", "")).strip() != interface:
+        continue
+    values = [
+        "true" if item.get("functional_verified") else "false",
+        str(item.get("method", "")).strip(),
+        str(item.get("link_state", "")).strip(),
+        str(item.get("hardware_link", "")).strip(),
+        str(item.get("link_speed_mbps", "")).strip(),
+    ]
+    print("|".join(values))
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+apply_functional_verification() {
+  probe_interface=$1
+  dpdk_functional_verified=false
+  dpdk_functional_method=
+  dpdk_link_speed=
+  dpdk_verification=pending_link
+  verification=$(dpdk_verification_value "$probe_interface" 2>/dev/null) || verification=
+  if [ -n "$verification" ]; then
+    old_ifs=$IFS
+    IFS='|'
+    set -- $verification
+    IFS=$old_ifs
+    if [ "${1:-false}" = true ]; then
+      dpdk_functional_verified=true
+      dpdk_functional_method=${2:-unknown}
+      dpdk_verification=verified
+    fi
+    dpdk_link_speed=${5:-}
+  elif [ "$dpdk_link_state" = up ]; then
+    dpdk_functional_verified=true
+    dpdk_functional_method=link_state_up
+    dpdk_verification=verified
+  fi
+}
+
 find_vpp_interface_for_pci() {
   find_pci=$1
   find_pci_padded=${find_pci%.*}.0${find_pci##*.}
@@ -240,6 +297,12 @@ probe_dpdk_interface() {
   dpdk_transport=
   dpdk_vpp_interface=
   dpdk_link_state=
+  dpdk_driver_model=
+  dpdk_hardware_link=
+  dpdk_functional_verified=false
+  dpdk_functional_method=
+  dpdk_link_speed=
+  dpdk_verification=pending_link
   dpdk_iommu_protected=false
   dpdk_vfio_available=false
   dpdk_uio_available=false
@@ -292,11 +355,32 @@ probe_dpdk_interface() {
   hardware_output=$(vppctl show hardware-interfaces "$dpdk_vpp_interface" 2>/dev/null) || return 1
   printf '%s\n' "$hardware_output" | grep -q "$dpdk_vpp_interface" || return 1
   printf '%s\n' "$hardware_output" | grep -q "$dpdk_pci_address" || return 1
-  printf '%s\n' "$hardware_output" | grep -Eiq 'intel e1000|e1000|igb' || return 1
+  # Driver/model is evidence, never a gate. Any NIC VPP attaches and reports up
+  # is a valid native takeover candidate.
+  dpdk_driver_model=$(printf '%s\n' "$hardware_output" | awk '
+    /^  [A-Za-z]/ {
+      line=$0
+      gsub(/^ +| +$/, "", line)
+      if (line !~ /^(Link speed|RX Queues|TX Queues|Ethernet address|carrier |flags:|Devargs:|rx:|tx:|pci:|max rx|promiscuous:|vlan |rss |tx burst|rx burst)/) {
+        print line
+        exit
+      }
+    }
+  ')
+  [ -n "$dpdk_driver_model" ] || dpdk_driver_model=unknown
+  dpdk_hardware_link=$(printf '%s\n' "$hardware_output" | awk '
+    /carrier (up|down)/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "carrier") { print $(i + 1); exit }
+      }
+    }
+  ')
+  [ -n "$dpdk_hardware_link" ] || dpdk_hardware_link=unknown
   interface_output=$(vppctl show interface "$dpdk_vpp_interface" 2>/dev/null) || return 1
   printf '%s\n' "$interface_output" | grep -q "$dpdk_vpp_interface" || return 1
   dpdk_link_state=$(vpp_link_state "$dpdk_vpp_interface")
   [ -n "$dpdk_link_state" ] || return 1
+  apply_functional_verification "$probe_interface"
   return 0
 }
 
@@ -318,6 +402,12 @@ probe_active_dpdk_interface() {
   dpdk_transport=
   dpdk_vpp_interface=$active_vpp_interface
   dpdk_link_state=
+  dpdk_driver_model=
+  dpdk_hardware_link=
+  dpdk_functional_verified=false
+  dpdk_functional_method=
+  dpdk_link_speed=
+  dpdk_verification=pending_link
   device_path="$LY_ROUTE_SYSFS_ROOT/bus/pci/devices/$dpdk_pci_address"
   [ -d "$device_path" ] || return 1
   driver_path="$device_path/driver"
@@ -356,11 +446,32 @@ probe_active_dpdk_interface() {
   hardware_output=$(vppctl show hardware-interfaces "$active_vpp_interface" 2>/dev/null) || return 1
   printf '%s\n' "$hardware_output" | grep -q "$active_vpp_interface" || return 1
   printf '%s\n' "$hardware_output" | grep -q "$dpdk_pci_address" || return 1
-  printf '%s\n' "$hardware_output" | grep -Eiq 'intel e1000|e1000|igb' || return 1
+  # Driver/model is evidence, never a gate. Any NIC VPP attaches and reports up
+  # is a valid native takeover candidate.
+  dpdk_driver_model=$(printf '%s\n' "$hardware_output" | awk '
+    /^  [A-Za-z]/ {
+      line=$0
+      gsub(/^ +| +$/, "", line)
+      if (line !~ /^(Link speed|RX Queues|TX Queues|Ethernet address|carrier |flags:|Devargs:|rx:|tx:|pci:|max rx|promiscuous:|vlan |rss |tx burst|rx burst)/) {
+        print line
+        exit
+      }
+    }
+  ')
+  [ -n "$dpdk_driver_model" ] || dpdk_driver_model=unknown
+  dpdk_hardware_link=$(printf '%s\n' "$hardware_output" | awk '
+    /carrier (up|down)/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "carrier") { print $(i + 1); exit }
+      }
+    }
+  ')
+  [ -n "$dpdk_hardware_link" ] || dpdk_hardware_link=unknown
   interface_output=$(vppctl show interface "$active_vpp_interface" 2>/dev/null) || return 1
   printf '%s\n' "$interface_output" | grep -q "$active_vpp_interface" || return 1
   dpdk_link_state=$(vpp_link_state "$active_vpp_interface")
   [ -n "$dpdk_link_state" ] || return 1
+  apply_functional_verification "$probe_interface"
   return 0
 }
 
@@ -641,12 +752,12 @@ for interface_name in $(split_csv "$LY_ROUTE_VPP_DATA_INTERFACES"); do
     dpdk_source=active_runtime_readback
     dpdk_score=80
     [ "$dpdk_mode" = uio_pci_generic ] && dpdk_score=75
-    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"transport\":\"$dpdk_transport\",\"vpp_interface\":\"$(json_escape "$dpdk_vpp_interface")\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"acceptance_only\":false,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true,\"link_state\":\"$dpdk_link_state\"}"
+    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"transport\":\"$dpdk_transport\",\"vpp_interface\":\"$(json_escape "$dpdk_vpp_interface")\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"acceptance_only\":false,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true,\"link_state\":\"$dpdk_link_state\",\"hardware_link\":\"$dpdk_hardware_link\",\"driver_model\":\"$(json_escape "$dpdk_driver_model")\",\"functional_verified\":$dpdk_functional_verified,\"verification\":\"$dpdk_verification\",\"functional_method\":\"$(json_escape "$dpdk_functional_method")\",\"link_speed_mbps\":${dpdk_link_speed:-0}}"
     any_dpdk=true
   elif command -v vppctl >/dev/null 2>&1 && probe_dpdk_interface "$interface_name"; then
     dpdk_score=80
     [ "$dpdk_mode" = uio_pci_generic ] && dpdk_score=75
-    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"transport\":\"$dpdk_transport\",\"vpp_interface\":\"$(json_escape "$dpdk_vpp_interface")\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"acceptance_only\":false,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true,\"link_state\":\"$dpdk_link_state\"}"
+    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"transport\":\"$dpdk_transport\",\"vpp_interface\":\"$(json_escape "$dpdk_vpp_interface")\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"acceptance_only\":false,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true,\"link_state\":\"$dpdk_link_state\",\"hardware_link\":\"$dpdk_hardware_link\",\"driver_model\":\"$(json_escape "$dpdk_driver_model")\",\"functional_verified\":$dpdk_functional_verified,\"verification\":\"$dpdk_verification\",\"functional_method\":\"$(json_escape "$dpdk_functional_method")\",\"link_speed_mbps\":${dpdk_link_speed:-0}}"
     any_dpdk=true
   else
     add_candidate_failure dpdk vfio_pci "no live VPP DPDK attach (VFIO) with matching PCI, driver and link readback"
@@ -673,11 +784,71 @@ if [ -z "$dataplane_failures" ]; then
     dataplane_state=native_ready
   fi
 fi
+preserve_existing_proof() {
+  [ -s "$LY_ROUTE_VPP_CAPABILITY_PROOF" ] || return 1
+  python3 - "$LY_ROUTE_VPP_CAPABILITY_PROOF" "$LY_ROUTE_SYSFS_ROOT" "$LY_ROUTE_DPDK_OWNERSHIP_STATE" "$LY_ROUTE_MANAGEMENT_INTERFACE" "$LY_ROUTE_VPP_DATA_INTERFACES" <<'PY'
+import json
+import os
+import sys
+
+proof_path, sysfs, ownership_path, management, requested = sys.argv[1:]
+try:
+    with open(proof_path, encoding="utf-8") as source:
+        document = json.load(source)
+except (OSError, ValueError):
+    raise SystemExit(1)
+if str(document.get("management_interface", "")).strip() != management.strip():
+    raise SystemExit(1)
+proofs = document.get("proofs")
+if not isinstance(proofs, list) or not proofs:
+    raise SystemExit(1)
+names = [str(item.get("linux_interface", "")).strip() for item in proofs if isinstance(item, dict)]
+if requested.strip():
+    wanted = [item.strip() for item in requested.split(",") if item.strip()]
+    if sorted(names) != sorted(wanted):
+        raise SystemExit(1)
+ownership = {}
+try:
+    with open(ownership_path, encoding="utf-8") as source:
+        state = json.load(source)
+    for device in state.get("devices", []) or []:
+        if isinstance(device, dict):
+            ownership[str(device.get("linux_interface", "")).strip()] = str(device.get("pci_address", "")).strip()
+except (OSError, ValueError):
+    ownership = {}
+for name in names:
+    if not name:
+        raise SystemExit(1)
+    if os.path.isdir(os.path.join(sysfs, "class/net", name)):
+        continue
+    pci = ownership.get(name, "")
+    if not pci:
+        raise SystemExit(1)
+    try:
+        driver = os.path.basename(os.path.realpath(os.path.join(sysfs, "bus/pci/devices", pci, "driver")))
+    except OSError:
+        raise SystemExit(1)
+    if driver not in {"vfio-pci", "uio_pci_generic"}:
+        raise SystemExit(1)
+print(management)
+PY
+}
+
 mkdir -p "$(dirname "$LY_ROUTE_VPP_CAPABILITY_PROOF")"
 proof_tmp="$LY_ROUTE_VPP_CAPABILITY_PROOF.tmp.$$"
-printf '{"management_interface":"%s","proofs":[%s]}\n' "$(json_escape "$LY_ROUTE_MANAGEMENT_INTERFACE")" "$proof_items" > "$proof_tmp"
-mv -f "$proof_tmp" "$LY_ROUTE_VPP_CAPABILITY_PROOF"
-proof_tmp=
+if [ -z "$proof_items" ]; then
+  preserved_management=$(preserve_existing_proof 2>/dev/null) || preserved_management=
+  if [ -n "$preserved_management" ]; then
+    # An empty probe for the same realizable interface set must not erase the
+    # last valid proof. A genuinely changed set still writes the empty result.
+    proof_tmp=
+  fi
+fi
+if [ -n "$proof_tmp" ]; then
+  printf '{"management_interface":"%s","proofs":[%s]}\n' "$(json_escape "$LY_ROUTE_MANAGEMENT_INTERFACE")" "$proof_items" > "$proof_tmp"
+  mv -f "$proof_tmp" "$LY_ROUTE_VPP_CAPABILITY_PROOF"
+  proof_tmp=
+fi
 
 {
   printf '{\n'

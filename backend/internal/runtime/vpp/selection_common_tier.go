@@ -111,6 +111,7 @@ func selectCommonDataplanePath(request NativePathRequest) (NativePath, error) {
 			PCIAddress:     strings.TrimSpace(proof.PCIAddress),
 			KernelDriver:   strings.TrimSpace(proof.KernelDriver),
 			IOMMUGroup:     strings.TrimSpace(proof.IOMMUGroup),
+			Verification:   attachmentVerification(proof),
 		}))
 	}
 	results = append(results, prerequisite("common_dataplane_tier", "", true, ""))
@@ -141,14 +142,17 @@ func candidatePreference(proof CapabilityProof) int {
 		case NativeModeDPDKVFIO:
 			return 0
 		case NativeModeDPDKUIO:
-			return 1
+			// Destructive no-IOMMU path. A verified AF_XDP zero-copy
+			// candidate ranks above it because it keeps the kernel netdev
+			// and does not depend on a PCI re-bind.
+			return 2
 		default:
 			return 100
 		}
 	}
 	switch {
 	case proof.Hook == NativeHookAFXDP && proof.Mode == NativeModeZeroCopy:
-		return 2
+		return 1
 	case proof.Hook == NativeHookAFXDP && proof.Mode == NativeModeCopy:
 		return 3
 	case proof.Hook == NativeHookRDMA && proof.Mode == NativeModeRDMADV:
@@ -255,6 +259,11 @@ func candidateRejectionReasons(proof CapabilityProof, now time.Time, tier Datapl
 		}
 		if strings.TrimSpace(proof.KernelDriver) == "" {
 			reasons = append(reasons, "DPDK candidate has no current kernel driver")
+		}
+		if proof.Verification == "failed" {
+			reasons = append(reasons, "DPDK candidate takeover verification failed")
+		} else if proof.Verification == "" && proof.FunctionalMethod != "" && !proof.FunctionalVerified {
+			reasons = append(reasons, "DPDK candidate was not functionally verified")
 		}
 		switch proof.Mode {
 		case NativeModeDPDKVFIO:

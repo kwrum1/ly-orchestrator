@@ -9,11 +9,24 @@ Every configured data port independently tries the following transports, in
 order:
 
 1. `dpdk` + `vfio-pci` (IOMMU-isolated devices)
-2. `dpdk` + `uio_pci_generic` (no usable IOMMU group)
-3. `af_xdp` zero-copy
+2. `af_xdp` zero-copy (non-destructive, keeps the kernel netdevice)
+3. `dpdk` + `uio_pci_generic` (no usable IOMMU group)
 4. `af_xdp` copy
 5. `rdma`
 6. `af_packet` compatibility mode (explicit operator consent only)
+
+AF_XDP zero-copy ranks above the destructive no-IOMMU DPDK path because it is
+verified only when the VPP runtime probe actually created a zero-copy
+interface. It keeps the kernel netdevice (and therefore the management/fallback
+path), does not require a PCI re-bind, and is link-independent: only the Linux
+interface needs to be admin-up, not its carrier. See
+`docs/DATAPLANE-REFERENCES.md` for the evidence behind the order.
+
+Capability and link state are orthogonal. A down link never changes the order,
+never demotes a takeover, never un-binds a port and never produces
+`dataplane_locked` by itself. A taken-over port with a down link is reported as
+`verification=pending_link`; a watcher promotes it to `verified` when the link
+rises, without a new apply request.
 
 A port that cannot use any of these is not assigned a LAN/WAN role. An
 unassigned unsupported port does not block an apply. Only a configured/assigned

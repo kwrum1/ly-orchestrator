@@ -5311,6 +5311,7 @@ func (server *Server) executeRuntimeApply(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": result.Reason, "transaction_id": transactionID, "rollback_receipt": result.RollbackReceipt, "components": result.Components, "request_id": requestID(r)})
 		return
 	}
+	server.persistNativeTakeoverProofs(applyCtx, plan.SelectedNativePath)
 	if err := server.applyLivePPPoEIPv6(applyCtx); err != nil {
 		cause := "PPPoE IPv6 hot apply: " + err.Error()
 		result := degradedRuntimeResult(transactionID, cause, server.now().UTC())
@@ -10276,6 +10277,7 @@ func (server *Server) normalizeInterfaceSnapshot(ctx context.Context, items []ma
 	managementInterface := server.managementInterfaceID(ctx)
 	appliedVPP := server.appliedVPPDataplaneInterfaces()
 	desiredCIDRs := server.desiredInterfaceCIDRs(ctx)
+	vppNames := server.vppInterfaceNames(ctx)
 	snapshot := make([]map[string]any, 0, len(items))
 	for _, item := range items {
 		clone := cloneObject(item)
@@ -10324,6 +10326,10 @@ func (server *Server) normalizeInterfaceSnapshot(ctx context.Context, items []ma
 			}
 		}
 		clone["stats"] = map[string]any{"rx_bps": clone["rx_bps"], "tx_bps": clone["tx_bps"], "rx_pps": clone["rx_pps"], "tx_pps": clone["tx_pps"], "sessions": clone["sessions"]}
+		for key, value := range server.interfaceTakeoverStatus(ctx, name, clone, vppNames) {
+			clone[key] = value
+		}
+		stripInternalInterfaceFields(clone)
 		clone["runtime_state"] = state
 		clone["degraded"] = degraded
 		if reason != "" {

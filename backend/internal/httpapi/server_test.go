@@ -1933,7 +1933,7 @@ func TestInterfaceRuntimeSnapshotBacksInterfacesStatsAndTelemetry(t *testing.T) 
 	if interfaces.Code != http.StatusOK {
 		t.Fatalf("interfaces status = %d, want 200: %s", interfaces.Code, interfaces.Body.String())
 	}
-	for _, required := range []string{"eth9", "work_mode", "stats", "vpp_interface_runtime"} {
+	for _, required := range []string{"eth9", "takeover_state", "stats", "vpp_interface_runtime"} {
 		if !strings.Contains(interfaces.Body.String(), required) {
 			t.Fatalf("interfaces response missing %q: %s", required, interfaces.Body.String())
 		}
@@ -1972,7 +1972,7 @@ func TestInterfaceRuntimeSnapshotIncludesLinkDownHostInterfaces(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("interfaces status = %d, want 200: %s", res.Code, res.Body.String())
 	}
-	for _, required := range []string{"enp1s0", "enp2s0", "enp3s0", `"link_state":"down"`, `"gateway_role":"management"`, `"work_mode":"kernel_stack"`} {
+	for _, required := range []string{"enp1s0", "enp2s0", "enp3s0", `"link_state":"down"`, `"gateway_role":"management"`, `"takeover_state":"available"`} {
 		if !strings.Contains(res.Body.String(), required) {
 			t.Fatalf("interfaces response missing %q: %s", required, res.Body.String())
 		}
@@ -2064,7 +2064,7 @@ func TestInterfaceRolePatchOverlaysRuntimeSnapshotAndAudit(t *testing.T) {
 		t.Fatalf("role patch response = %d %s", patch.Code, patch.Body.String())
 	}
 	interfaces := authenticatedJSONRequest(t, server, http.MethodGet, "/api/v1/interfaces", "", cookie)
-	if interfaces.Code != http.StatusOK || !strings.Contains(interfaces.Body.String(), `"id":"eth1"`) || !strings.Contains(interfaces.Body.String(), `"gateway_role":"wan"`) || !strings.Contains(interfaces.Body.String(), `"work_mode":"vpp"`) {
+	if interfaces.Code != http.StatusOK || !strings.Contains(interfaces.Body.String(), `"id":"eth1"`) || !strings.Contains(interfaces.Body.String(), `"gateway_role":"wan"`) || !strings.Contains(interfaces.Body.String(), `"takeover_state"`) {
 		t.Fatalf("interfaces after role patch = %d %s", interfaces.Code, interfaces.Body.String())
 	}
 	audit := authenticatedJSONRequest(t, server, http.MethodGet, "/api/v1/telemetry/audit-events", "", cookie)
