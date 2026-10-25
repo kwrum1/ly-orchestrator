@@ -43,6 +43,7 @@ network=${LY_ROUTE_INSTALLER_NETWORK:-/etc/ly-route/installed-network.json}
 startup=${LY_ROUTE_VPP_STARTUP_CONFIG:-/etc/vpp/startup.conf}
 ownership=${LY_ROUTE_DPDK_OWNERSHIP_STATE:-/var/lib/ly-route/dataplane/ownership.json}
 active_state=${LY_ROUTE_DATAPLANE_ACTIVE_STATE:-/var/lib/ly-route/dataplane/active.json}
+verification_state=${LY_ROUTE_DPDK_VERIFICATION_STATE:-/var/lib/ly-route/dataplane/dpdk-verification.json}
 bootstrap_mode=${LY_ROUTE_VFIO_BOOTSTRAP:-}
 python_bin=${LY_ROUTE_PYTHON:-python3}
 bind_helper=${LY_ROUTE_PCI_BIND_HELPER:-}
@@ -163,6 +164,7 @@ if [ -z "$pci_rows" ]; then
       sed -i 's/plugin dpdk_plugin\.so { enable }/plugin dpdk_plugin.so { disable }/' "$startup"
     fi
   fi
+  rm -f "$verification_state"
   if [ "$bootstrap_mode" = apply ]; then
     log 'VPP ownership preflight: no DPDK data interface; Linux retains NIC drivers'
   else

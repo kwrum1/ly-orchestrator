@@ -85,6 +85,7 @@ run_check() {
     LY_ROUTE_ACTIVE_DPDK_READER="$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/active-dpdk-state.py" \
     LY_ROUTE_DATAPLANE_INVENTORY="$scenario_dir/inventory.json" \
     LY_ROUTE_DPDK_OWNERSHIP_STATE="$scenario_dir/ownership.json" \
+    LY_ROUTE_DPDK_VERIFICATION_STATE="$scenario_dir/dpdk-verification.json" \
     LY_ROUTE_COMMERCIAL_RUNTIME_REQUIRED=false \
     LY_ROUTE_PRODUCT=test \
     LY_ROUTE_REQUIRED_COMMANDS=sh \
@@ -217,6 +218,8 @@ VPPCTL_ACTIVE_PCI=0000:03:00.0 VPPCTL_DRIVER_MODEL='VMware vmxnet3' \
 grep -q '"dataplane_state": "dpdk_ready"' "$tmp/dpdk-vmxnet3/readiness.json"
 grep -q '"driver_model":"VMware vmxnet3"' "$tmp/dpdk-vmxnet3/proof.json"
 grep -q '"high_performance":true' "$tmp/dpdk-vmxnet3/proof.json"
+grep -q '"functional_verified":true' "$tmp/dpdk-vmxnet3/proof.json"
+grep -q '"functional_method":"link_state_up"' "$tmp/dpdk-vmxnet3/proof.json"
 
 # A down VPP interface is recorded but is not treated as an up native attach.
 setup_inventory_uio_fixture dpdk-down eth1 vmxnet3
@@ -225,6 +228,21 @@ VPPCTL_ACTIVE_PCI=0000:03:00.0 VPPCTL_DRIVER_MODEL='VMware vmxnet3' \
   run_check dpdk-down eth0 eth1 dpdk_plugin.so 0
 grep -q '"link_state":"down"' "$tmp/dpdk-down/proof.json"
 grep -q '"hardware_link":"down"' "$tmp/dpdk-down/proof.json"
+grep -q '"functional_verified":false' "$tmp/dpdk-down/proof.json"
+
+# A port that was functionally verified (e.g. TX counter + link speed) is
+# native even when the status string says down.
+setup_inventory_uio_fixture dpdk-func-down eth1 vmxnet3
+cat > "$tmp/dpdk-func-down/dpdk-verification.json" <<'EOF'
+{"schema_version":1,"interfaces":[{"linux_interface":"eth1","pci_address":"0000:03:00.0","functional_verified":true,"method":"tx_counter_and_link_speed","link_state":"down","hardware_link":"down","link_speed_mbps":10000}]}
+EOF
+chmod 0600 "$tmp/dpdk-func-down/dpdk-verification.json"
+VPPCTL_ACTIVE_PCI=0000:03:00.0 VPPCTL_DRIVER_MODEL='VMware vmxnet3' \
+  VPPCTL_LINK_STATE=down VPPCTL_HARDWARE_LINK=down \
+  run_check dpdk-func-down eth0 eth1 dpdk_plugin.so 0
+grep -q '"link_state":"down"' "$tmp/dpdk-func-down/proof.json"
+grep -q '"functional_verified":true' "$tmp/dpdk-func-down/proof.json"
+grep -q '"functional_method":"tx_counter_and_link_speed"' "$tmp/dpdk-func-down/proof.json"
 
 # An empty probe for the same realizable interfaces must not erase an existing
 # valid proof.

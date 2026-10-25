@@ -256,7 +256,11 @@ func candidateRejectionReasons(proof CapabilityProof, now time.Time, tier Datapl
 		if strings.TrimSpace(proof.KernelDriver) == "" {
 			reasons = append(reasons, "DPDK candidate has no current kernel driver")
 		}
-		if linkState := strings.ToLower(strings.TrimSpace(proof.LinkState)); linkState != "" && linkState != "up" {
+		if proof.FunctionalMethod != "" {
+			if !proof.FunctionalVerified {
+				reasons = append(reasons, "DPDK candidate was not functionally verified")
+			}
+		} else if linkState := strings.ToLower(strings.TrimSpace(proof.LinkState)); linkState != "" && linkState != "up" {
 			reasons = append(reasons, "VPP DPDK interface link state is "+linkState+", not up")
 		}
 		switch proof.Mode {

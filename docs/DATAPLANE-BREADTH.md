@@ -45,19 +45,47 @@ When there is no verified DPDK owner, the preflight removes any stale
 `# BEGIN LY ROUTE DPDK` block and disables `dpdk_plugin.so`. `data_interfaces:
 null` or `[]` is treated as an empty inventory, never as a Python TypeError.
 
-## Link state on vmxnet3
+## Functional verification and link state
 
-On vmxnet3 the VPP `show interface` state and the hardware readback can differ.
-The probe records both:
+The bootstrap never trusts a status string alone. After binding it runs
+`set interface state <if> up` and then verifies:
 
-- `link_state` — VPP interface state (`up`/`down`);
-- `hardware_link` — `carrier up`/`carrier down` from the hardware block.
+1. VPP is still alive and the interface exists;
+2. if `show interface` says `up`, the port is functionally verified with method
+   `link_state_up`;
+3. if it says `down`, the port is accepted only when the link speed is non-zero
+   and a functional TX probe increments the VPP TX counter (method
+   `tx_counter_and_link_speed`; set `LY_ROUTE_DPDK_FUNCTIONAL_PEER` to a peer
+   address);
+4. otherwise the port is rejected, the kernel driver restored, and the AF
+   path is tried.
 
-A down DPDK link is not approved as native; the bootstrap restores the kernel
-driver and uses AF_PACKET (or another native hook). A down link does not by
-itself prevent the port from being assigned: the AF attachment still commits
-(and the runtime is reported degraded). This is why an isolated port group can
-show `carrier down` yet the port remains usable in the compatibility path.
+The proof records `link_state`, `hardware_link`, `link_speed_mbps`,
+`functional_verified` and `functional_method`. A functionally verified port is
+native even if `link_state` says `down`; a port that is down and not
+functionally verified is restored to Linux and can still be assigned through
+AF_PACKET.
+
+### vmxnet3 result
+
+On the ESXi gateway VM, bringing the vmxnet3 DPDK ports up aborts VPP:
+
+```text
+received signal SIGSEGV ...
+#2 clib_sysfs_read_bitmap
+#4 unserialize_vnet_interface_state
+vpp.service: Main process exited, code=killed, status=6/ABRT
+```
+
+The bootstrap treats this as a failed functional verification, restores
+`vmxnet3`, removes the `dev` entries, restarts VPP, and commits AF_PACKET. So
+the earlier `down` was a symptom of a broken vmxnet3 DPDK PMD on this build,
+not a mere status-string false negative. Native vmxnet3 is not claimed.
+
+A down link in the AF path does not by itself prevent assignment: the AF
+attachment still commits and the runtime is reported degraded. This is why an
+isolated port group can show `carrier down` yet the port remains usable in the
+compatibility path.
 
 ## Proof ownership
 

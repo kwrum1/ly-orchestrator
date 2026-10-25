@@ -26,6 +26,7 @@ umask 077
 : "${LY_ROUTE_ACTIVE_DPDK_READER:=/usr/lib/ly-route/active-dpdk-state.py}"
 : "${LY_ROUTE_DATAPLANE_INVENTORY:=/etc/ly-route/dataplane-inventory.json}"
 : "${LY_ROUTE_DPDK_OWNERSHIP_STATE:=/var/lib/ly-route/dataplane/ownership.json}"
+: "${LY_ROUTE_DPDK_VERIFICATION_STATE:=/var/lib/ly-route/dataplane/dpdk-verification.json}"
 
 split_csv() {
   printf '%s' "$1" | tr ',' ' '
@@ -201,6 +202,59 @@ raise SystemExit(1)
 PY
 }
 
+dpdk_verification_value() {
+  probe_interface=$1
+  [ -r "$LY_ROUTE_DPDK_VERIFICATION_STATE" ] || return 1
+  python3 - "$LY_ROUTE_DPDK_VERIFICATION_STATE" "$probe_interface" <<'PY'
+import json
+import sys
+
+path, interface = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as source:
+        document = json.load(source)
+except (OSError, ValueError):
+    raise SystemExit(1)
+for item in document.get("interfaces") or []:
+    if not isinstance(item, dict):
+        continue
+    if str(item.get("linux_interface", "")).strip() != interface:
+        continue
+    values = [
+        "true" if item.get("functional_verified") else "false",
+        str(item.get("method", "")).strip(),
+        str(item.get("link_state", "")).strip(),
+        str(item.get("hardware_link", "")).strip(),
+        str(item.get("link_speed_mbps", "")).strip(),
+    ]
+    print("|".join(values))
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+apply_functional_verification() {
+  probe_interface=$1
+  dpdk_functional_verified=false
+  dpdk_functional_method=
+  dpdk_link_speed=
+  verification=$(dpdk_verification_value "$probe_interface" 2>/dev/null) || verification=
+  if [ -n "$verification" ]; then
+    old_ifs=$IFS
+    IFS='|'
+    set -- $verification
+    IFS=$old_ifs
+    if [ "${1:-false}" = true ]; then
+      dpdk_functional_verified=true
+      dpdk_functional_method=${2:-unknown}
+    fi
+    dpdk_link_speed=${5:-}
+  elif [ "$dpdk_link_state" = up ]; then
+    dpdk_functional_verified=true
+    dpdk_functional_method=link_state_up
+  fi
+}
+
 find_vpp_interface_for_pci() {
   find_pci=$1
   find_pci_padded=${find_pci%.*}.0${find_pci##*.}
@@ -242,6 +296,9 @@ probe_dpdk_interface() {
   dpdk_link_state=
   dpdk_driver_model=
   dpdk_hardware_link=
+  dpdk_functional_verified=false
+  dpdk_functional_method=
+  dpdk_link_speed=
   dpdk_iommu_protected=false
   dpdk_vfio_available=false
   dpdk_uio_available=false
@@ -319,6 +376,7 @@ probe_dpdk_interface() {
   printf '%s\n' "$interface_output" | grep -q "$dpdk_vpp_interface" || return 1
   dpdk_link_state=$(vpp_link_state "$dpdk_vpp_interface")
   [ -n "$dpdk_link_state" ] || return 1
+  apply_functional_verification "$probe_interface"
   return 0
 }
 
@@ -342,6 +400,9 @@ probe_active_dpdk_interface() {
   dpdk_link_state=
   dpdk_driver_model=
   dpdk_hardware_link=
+  dpdk_functional_verified=false
+  dpdk_functional_method=
+  dpdk_link_speed=
   device_path="$LY_ROUTE_SYSFS_ROOT/bus/pci/devices/$dpdk_pci_address"
   [ -d "$device_path" ] || return 1
   driver_path="$device_path/driver"
@@ -405,6 +466,7 @@ probe_active_dpdk_interface() {
   printf '%s\n' "$interface_output" | grep -q "$active_vpp_interface" || return 1
   dpdk_link_state=$(vpp_link_state "$active_vpp_interface")
   [ -n "$dpdk_link_state" ] || return 1
+  apply_functional_verification "$probe_interface"
   return 0
 }
 
@@ -685,12 +747,12 @@ for interface_name in $(split_csv "$LY_ROUTE_VPP_DATA_INTERFACES"); do
     dpdk_source=active_runtime_readback
     dpdk_score=80
     [ "$dpdk_mode" = uio_pci_generic ] && dpdk_score=75
-    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"transport\":\"$dpdk_transport\",\"vpp_interface\":\"$(json_escape "$dpdk_vpp_interface")\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"acceptance_only\":false,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true,\"link_state\":\"$dpdk_link_state\",\"hardware_link\":\"$dpdk_hardware_link\",\"driver_model\":\"$(json_escape "$dpdk_driver_model")\"}"
+    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"transport\":\"$dpdk_transport\",\"vpp_interface\":\"$(json_escape "$dpdk_vpp_interface")\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"acceptance_only\":false,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true,\"link_state\":\"$dpdk_link_state\",\"hardware_link\":\"$dpdk_hardware_link\",\"driver_model\":\"$(json_escape "$dpdk_driver_model")\",\"functional_verified\":$dpdk_functional_verified,\"functional_method\":\"$(json_escape "$dpdk_functional_method")\",\"link_speed_mbps\":${dpdk_link_speed:-0}}"
     any_dpdk=true
   elif command -v vppctl >/dev/null 2>&1 && probe_dpdk_interface "$interface_name"; then
     dpdk_score=80
     [ "$dpdk_mode" = uio_pci_generic ] && dpdk_score=75
-    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"transport\":\"$dpdk_transport\",\"vpp_interface\":\"$(json_escape "$dpdk_vpp_interface")\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"acceptance_only\":false,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true,\"link_state\":\"$dpdk_link_state\",\"hardware_link\":\"$dpdk_hardware_link\",\"driver_model\":\"$(json_escape "$dpdk_driver_model")\"}"
+    dpdk_candidate="{\"tier\":\"vpp_dpdk\",\"hook\":\"dpdk\",\"mode\":\"$dpdk_mode\",\"transport\":\"$dpdk_transport\",\"vpp_interface\":\"$(json_escape "$dpdk_vpp_interface")\",\"source\":\"$dpdk_source\",\"runtime_verified\":true,\"native\":false,\"high_performance\":true,\"acceptance_only\":false,\"observed_at\":\"$observed_at\",\"valid_until\":\"$valid_until\",\"performance_score\":$dpdk_score,\"pci_address\":\"$(json_escape "$dpdk_pci_address")\",\"kernel_driver\":\"$(json_escape "$dpdk_kernel_driver")\",\"iommu_group\":\"$(json_escape "$dpdk_iommu_group")\",\"iommu_protected\":$dpdk_iommu_protected,\"vfio_available\":$dpdk_vfio_available,\"uio_pci_available\":$dpdk_uio_available,\"hugepages_available\":true,\"dpdk_plugin_available\":true,\"link_state\":\"$dpdk_link_state\",\"hardware_link\":\"$dpdk_hardware_link\",\"driver_model\":\"$(json_escape "$dpdk_driver_model")\",\"functional_verified\":$dpdk_functional_verified,\"functional_method\":\"$(json_escape "$dpdk_functional_method")\",\"link_speed_mbps\":${dpdk_link_speed:-0}}"
     any_dpdk=true
   else
     add_candidate_failure dpdk vfio_pci "no live VPP DPDK attach (VFIO) with matching PCI, driver and link readback"

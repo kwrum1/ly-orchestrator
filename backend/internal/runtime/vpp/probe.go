@@ -357,18 +357,24 @@ func committedCapabilityReport(path string) (CapabilityReport, bool) {
 		}
 		dpdk := tier == DataplaneTierDPDK
 		afCompatibility := hook == NativeHookAFPacket && mode == NativeModeAFPacket || hook == NativeHookTapBridge && mode == NativeModeTapBridge
+		functionalMethod := ""
+		if dpdk {
+			functionalMethod = "committed_state"
+		}
 		proof := CapabilityProof{
-			Tier:            tier,
-			Hook:            hook,
-			Mode:            mode,
-			Transport:       dpdkTransportForMode(mode),
-			VPPInterface:    strings.TrimSpace(attachment.VPPInterface),
-			MACAddress:      strings.TrimSpace(attachment.MACAddress),
-			Source:          ProofSourceActiveRuntimeReadback,
-			RuntimeVerified: true,
-			Native:          !dpdk,
-			HighPerformance: !afCompatibility,
-			AcceptanceOnly:  afCompatibility,
+			Tier:               tier,
+			Hook:               hook,
+			Mode:               mode,
+			Transport:          dpdkTransportForMode(mode),
+			VPPInterface:       strings.TrimSpace(attachment.VPPInterface),
+			MACAddress:         strings.TrimSpace(attachment.MACAddress),
+			Source:             ProofSourceActiveRuntimeReadback,
+			RuntimeVerified:    true,
+			Native:             !dpdk,
+			HighPerformance:    !afCompatibility,
+			AcceptanceOnly:     afCompatibility,
+			FunctionalVerified: dpdk,
+			FunctionalMethod:   functionalMethod,
 			// The committed generation is authoritative until the next
 			// transaction replaces it, so the reconstructable proof is not
 			// stamped with a short lease.

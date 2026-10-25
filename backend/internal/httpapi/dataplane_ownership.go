@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,17 @@ func dataplaneOwnershipPath() string {
 
 func sysfsRoot() string {
 	return envOrDefault("LY_ROUTE_SYSFS_ROOT", "/sys")
+}
+
+func dataplaneVerificationPath() string {
+	if value := strings.TrimSpace(os.Getenv("LY_ROUTE_DPDK_VERIFICATION_STATE")); value != "" {
+		return value
+	}
+	stateDir := strings.TrimSpace(os.Getenv("LY_ROUTE_DATAPLANE_STATE_DIR"))
+	if stateDir == "" {
+		stateDir = "/var/lib/ly-route/dataplane"
+	}
+	return filepath.Join(stateDir, "dpdk-verification.json")
 }
 
 func readInventoryInterface(name string) (dataplane.InventoryInterface, bool) {
@@ -147,10 +159,10 @@ type dpdkTakeoverFailure struct {
 // A takeover is only verified when the VPP interface for the PCI exists and its
 // show-interface state is up. The hardware model is deliberately not a gate:
 // any NIC that VPP attaches and brings up is a valid native path.
-func (server *Server) verifyDPDKTakeovers(ctx context.Context, interfaces []string) []dpdkTakeoverFailure {
+func (server *Server) verifyDPDKTakeovers(ctx context.Context, interfaces []string) ([]dataplane.DPDKVerification, []dpdkTakeoverFailure) {
 	inventory, err := dataplane.LoadInventory(dataplaneInventoryPath())
 	if err != nil {
-		return []dpdkTakeoverFailure{{Reason: "dataplane inventory is unreadable: " + err.Error()}}
+		return nil, []dpdkTakeoverFailure{{Reason: "dataplane inventory is unreadable: " + err.Error()}}
 	}
 	byInterface := map[string]dataplane.InventoryInterface{}
 	for _, item := range inventory.DataInterfaces {
@@ -159,8 +171,10 @@ func (server *Server) verifyDPDKTakeovers(ctx context.Context, interfaces []stri
 	vppctl := envOrDefault("LY_ROUTE_VPPCTL", "vppctl")
 	hardwareOutput, hardwareErr := exec.CommandContext(ctx, vppctl, "show", "hardware-interfaces").Output()
 	if hardwareErr != nil {
-		return []dpdkTakeoverFailure{{Reason: "vppctl show hardware-interfaces failed: " + hardwareErr.Error()}}
+		return nil, []dpdkTakeoverFailure{{Reason: "vppctl show hardware-interfaces failed: " + hardwareErr.Error()}}
 	}
+	peer := strings.TrimSpace(os.Getenv("LY_ROUTE_DPDK_FUNCTIONAL_PEER"))
+	verified := []dataplane.DPDKVerification{}
 	failures := []dpdkTakeoverFailure{}
 	for _, name := range interfaces {
 		name = strings.TrimSpace(name)
@@ -183,18 +197,69 @@ func (server *Server) verifyDPDKTakeovers(ctx context.Context, interfaces []stri
 			failures = append(failures, dpdkTakeoverFailure{LinuxInterface: name, PCIAddress: pci, Reason: "VPP did not create an interface for the PCI device"})
 			continue
 		}
+		// Admin-up is part of the verification. On some PMDs (vmxnet3 in this
+		// environment) this can abort VPP; that is a failed native candidate,
+		// not a reason to trust a stale status string.
+		upCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		upOutput, upErr := exec.CommandContext(upCtx, vppctl, "set", "interface", "state", vppInterface, "up").CombinedOutput()
+		cancel()
+		if upErr != nil {
+			failures = append(failures, dpdkTakeoverFailure{
+				LinuxInterface: name,
+				PCIAddress:     pci,
+				Reason:         "set interface state up failed: " + upErr.Error() + ": " + strings.TrimSpace(string(upOutput)),
+			})
+			continue
+		}
 		interfaceOutput, interfaceErr := exec.CommandContext(ctx, vppctl, "show", "interface", vppInterface).Output()
 		if interfaceErr != nil {
 			failures = append(failures, dpdkTakeoverFailure{LinuxInterface: name, PCIAddress: pci, Reason: "VPP interface readback failed: " + interfaceErr.Error()})
 			continue
 		}
-		state := vppInterfaceState(string(interfaceOutput), vppInterface)
-		if state != "up" {
-			failures = append(failures, dpdkTakeoverFailure{LinuxInterface: name, PCIAddress: pci, Reason: "VPP interface " + vppInterface + " state is " + nonEmpty(state, "unknown") + ", not up"})
+		hardwareInterface, hardwareInterfaceErr := exec.CommandContext(ctx, vppctl, "show", "hardware-interfaces", vppInterface).Output()
+		if hardwareInterfaceErr != nil {
+			failures = append(failures, dpdkTakeoverFailure{LinuxInterface: name, PCIAddress: pci, Reason: "VPP hardware readback failed: " + hardwareInterfaceErr.Error()})
 			continue
 		}
+		state := vppInterfaceState(string(interfaceOutput), vppInterface)
+		hardwareLink := vppHardwareCarrier(string(hardwareInterface))
+		linkSpeed := vppLinkSpeedMbps(string(hardwareInterface))
+		verification := dataplane.DPDKVerification{
+			LinuxInterface: name,
+			PCIAddress:     pci,
+			LinkState:      state,
+			HardwareLink:   hardwareLink,
+			LinkSpeedMbps:  linkSpeed,
+			ObservedAt:     time.Now().UTC(),
+		}
+		if state == "up" {
+			verification.FunctionalVerified = true
+			verification.Method = "link_state_up"
+		} else if linkSpeed > 0 && peer != "" {
+			before, _ := vppInterfaceCounters(string(interfaceOutput), vppInterface)
+			pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
+			_, _ = exec.CommandContext(pingCtx, vppctl, "ping", peer, "source", vppInterface, "repeat", "1").CombinedOutput()
+			cancelPing()
+			afterOutput, _ := exec.CommandContext(ctx, vppctl, "show", "interface", vppInterface).Output()
+			after, _ := vppInterfaceCounters(string(afterOutput), vppInterface)
+			verification.TXBefore = before
+			verification.TXAfter = after
+			if after > before {
+				verification.FunctionalVerified = true
+				verification.Method = "tx_counter_and_link_speed"
+			} else {
+				verification.Reason = "VPP status is down and no TX counter increment was observed"
+			}
+		} else if state != "up" {
+			verification.Reason = "VPP status is down and no functional traffic/link-speed proof is available"
+		}
+		if !verification.FunctionalVerified {
+			failures = append(failures, dpdkTakeoverFailure{LinuxInterface: name, PCIAddress: pci, Reason: nonEmpty(verification.Reason, "functional verification failed")})
+			continue
+		}
+		verified = append(verified, verification)
 	}
-	return failures
+	return verified, failures
 }
 
 func findVPPInterfaceByPCI(output, pci string) string {
@@ -229,6 +294,70 @@ func vppInterfaceState(output, name string) string {
 		}
 	}
 	return ""
+}
+
+func vppHardwareCarrier(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		for index, field := range fields {
+			if field == "carrier" && index+1 < len(fields) {
+				return fields[index+1]
+			}
+		}
+	}
+	return "unknown"
+}
+
+func vppLinkSpeedMbps(output string) int64 {
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.Contains(line, "Link speed:") {
+			continue
+		}
+		fields := strings.Fields(strings.SplitN(line, "Link speed:", 2)[1])
+		if len(fields) == 0 {
+			return 0
+		}
+		value, err := strconv.ParseFloat(fields[0], 64)
+		if err != nil {
+			return 0
+		}
+		unit := ""
+		if len(fields) > 1 {
+			unit = strings.ToLower(fields[1])
+		}
+		switch {
+		case strings.HasPrefix(unit, "gbps"):
+			return int64(value * 1000)
+		case strings.HasPrefix(unit, "mbps"):
+			return int64(value)
+		case strings.HasPrefix(unit, "kbps"):
+			return int64(value / 1000)
+		default:
+			return int64(value)
+		}
+	}
+	return 0
+}
+
+func vppInterfaceCounters(output, name string) (int64, int64) {
+	var tx, rx int64
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if fields[0] == "tx" && len(fields) >= 3 && fields[1] == "packets" {
+			if value, err := strconv.ParseInt(fields[2], 10, 64); err == nil {
+				tx = value
+			}
+		}
+		if fields[0] == "rx" && len(fields) >= 3 && fields[1] == "packets" {
+			if value, err := strconv.ParseInt(fields[2], 10, 64); err == nil {
+				rx = value
+			}
+		}
+	}
+	return tx, rx
 }
 
 func (server *Server) releaseFailedDPDKTakeovers(ctx context.Context, failures []dpdkTakeoverFailure) bool {
@@ -325,13 +454,16 @@ func (server *Server) bootstrapDataplaneOwnership(ctx context.Context) bool {
 		_ = server.restartVPPAndWait(ctx)
 		return true
 	}
-	failures := server.verifyDPDKTakeovers(ctx, interfaces)
+	verified, failures := server.verifyDPDKTakeovers(ctx, interfaces)
 	if len(failures) > 0 {
 		if server.releaseFailedDPDKTakeovers(ctx, failures) {
 			if !server.restartVPPAndWait(ctx) {
 				return false
 			}
 		}
+	}
+	if err := dataplane.SaveDPDKVerification(dataplaneVerificationPath(), dataplane.DPDKVerificationState{Interfaces: verified}); err != nil {
+		log.Printf("persist DPDK functional verification: %v", err)
 	}
 	return true
 }

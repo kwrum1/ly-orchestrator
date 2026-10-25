@@ -84,6 +84,9 @@ type CapabilityProof struct {
 	LinkState           string      `json:"link_state,omitempty"`
 	HardwareLink        string      `json:"hardware_link,omitempty"`
 	DriverModel         string      `json:"driver_model,omitempty"`
+	FunctionalVerified  bool        `json:"functional_verified,omitempty"`
+	FunctionalMethod    string      `json:"functional_method,omitempty"`
+	LinkSpeedMbps       int64       `json:"link_speed_mbps,omitempty"`
 	MACAddress          string      `json:"mac_address,omitempty"`
 	Source              ProofSource `json:"source"`
 	RuntimeVerified     bool        `json:"runtime_verified"`

@@ -125,4 +125,28 @@ os.chmod(temporary, 0o600)
 os.replace(temporary, path)
 PY
 
+verification=${LY_ROUTE_DPDK_VERIFICATION_STATE:-/var/lib/ly-route/dataplane/dpdk-verification.json}
+python3 - "$verification" "$pci" <<'PY'
+import json
+import os
+import sys
+
+path, pci = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as source:
+        document = json.load(source)
+except (OSError, ValueError):
+    raise SystemExit(0)
+document["interfaces"] = [item for item in document.get("interfaces", []) or [] if not isinstance(item, dict) or str(item.get("pci_address", "")) != pci]
+if not document["interfaces"]:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+else:
+    with open(path, "w", encoding="utf-8") as target:
+        json.dump(document, target, indent=2)
+        target.write("\n")
+PY
+
 printf '%s\n' "DPDK released: $pci $current_driver -> $original_driver"
