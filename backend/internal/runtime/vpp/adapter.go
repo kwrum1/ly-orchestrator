@@ -883,8 +883,13 @@ func dnsServiceNetworkCommands(network DNSServiceNetwork, behavior nat.Behavior)
 		fmt.Sprintf("show ip fib table %d", network.TableID),
 		"show tap",
 	}
+	// The DNS handoff owns its NAT44 role, so it must also ensure the NAT44
+	// plugin is enabled before the role command.  On a clean boot the
+	// service-networks node runs before the nat44 node; without this the
+	// interface role command is accepted-but-ignored while the plugin is
+	// disabled, and the graph's role verification fails closed.
+	commands = append(commands, natInitializeCommands(behavior)...)
 	if behavior == nat.BehaviorFullCone {
-		commands = append(commands, natInitializeCommands(behavior)...)
 		return append(commands,
 			fmt.Sprintf("?set interface nat44 ei in %s out %s output-feature del", network.VPPInterface, underlayInterface),
 			fmt.Sprintf("set interface nat44 ei in %s out %s", network.VPPInterface, underlayInterface),
