@@ -73,6 +73,16 @@ if (JSON.stringify(selected) !== JSON.stringify(canonical)) {
 NODE
 
   PRODUCT_FRONTEND_PRODUCT=$(product_build_json_field frontend_product)
+  # A product may pin the frontend bundle it must ship. The Gateway has no
+  # pin and keeps its controller-shell/validation path untouched.
+  PRODUCT_FRONTEND_BUNDLE_DIR=$(product_build_json_field frontend_bundle)
+  if [ -n "$PRODUCT_FRONTEND_BUNDLE_DIR" ]; then
+    PRODUCT_FRONTEND_BUNDLE="$repo_root/$PRODUCT_FRONTEND_BUNDLE_DIR"
+  else
+    PRODUCT_FRONTEND_BUNDLE=
+  fi
+  PRODUCT_FRONTEND_APP_SHA256=$(product_build_json_field frontend_app_sha256)
+  PRODUCT_FRONTEND_BUNDLE_SOURCE=$(product_build_json_field frontend_bundle_source)
   PRODUCT_VERSION=$(product_build_json_field version 2>/dev/null || true)
   [ -n "$PRODUCT_VERSION" ] || PRODUCT_VERSION=unknown
   PRODUCT_DEFAULT_CONFIG="$repo_root/$(product_build_json_field default_config)"
@@ -86,6 +96,18 @@ NODE
   PRODUCT_OPTIONAL_COMMANDS=$(product_build_json_field optional_commands)
   PRODUCT_OPTIONAL_UNITS=$(product_build_json_field optional_units)
   product_build_require_file "$PRODUCT_DEFAULT_CONFIG"
+}
+
+# verify_product_frontend_pin enforces the product's pinned app.js content.
+# Products without a frontend_app_sha256 pin (the Gateway) are unaffected.
+verify_product_frontend_pin() {
+  bundle=$1
+  pin=${PRODUCT_FRONTEND_APP_SHA256:-}
+  [ -n "$pin" ] || return 0
+  product_build_require_file "$bundle/app.js"
+  actual=$(sha256sum "$bundle/app.js" | cut -d' ' -f1)
+  [ "$actual" = "$pin" ] || \
+    product_build_fail "Frontend bundle app.js sha256 mismatch for ${PRODUCT_FRONTEND_PRODUCT:-unknown}: expected $pin, got $actual ($bundle)"
 }
 
 validate_frontend_bundle() {
@@ -127,6 +149,7 @@ if (bundle.product !== product || JSON.stringify(bundle) !== JSON.stringify(cano
   process.exit(1);
 }
 NODE
+  verify_product_frontend_pin "$bundle"
 }
 
 validate_prebuilt_control() {
@@ -182,6 +205,8 @@ copy_product_frontend() (
   else
     "$repo_root/scripts/build-controller-shell.sh" --product "$frontend_product" --out "$frontend_target"
   fi
+  # The copied artifact must match the product pin, whatever its source.
+  verify_product_frontend_pin "$frontend_target"
 )
 
 product_source_commit() {
@@ -217,10 +242,14 @@ write_product_artifact_manifest() (
   arch=$6
   source_commit=$7
   source_fingerprint=${LY_ROUTE_SOURCE_FINGERPRINT:-unknown}
+  frontend_app_sha256=${PRODUCT_FRONTEND_APP_SHA256:-}
+  frontend_bundle_source=${PRODUCT_FRONTEND_BUNDLE_SOURCE:-}
+  frontend_bundle_origin=${PRODUCT_FRONTEND_BUNDLE_DIR:-}
   mkdir -p "$(dirname "$output")"
-  node - "$PRODUCT_BUILD_PROFILE" "$output" "$artifact_type" "$artifact_name" "$product" "$suite" "$arch" "$source_commit" "$source_fingerprint" <<'NODE'
+  node - "$PRODUCT_BUILD_PROFILE" "$output" "$artifact_type" "$artifact_name" "$product" "$suite" "$arch" "$source_commit" "$source_fingerprint" "$frontend_app_sha256" "$frontend_bundle_source" "$frontend_bundle_origin" <<'NODE'
 const { readFileSync, writeFileSync } = require("node:fs");
-const [profilePath, outputPath, artifactType, artifactName, product, suite, arch, sourceCommit, sourceFingerprint] = process.argv.slice(2);
+const [profilePath, outputPath, artifactType, artifactName, product, suite, arch, sourceCommit, sourceFingerprint,
+  frontendAppSha256, frontendBundleSource, frontendBundleOrigin] = process.argv.slice(2);
 const profile = JSON.parse(readFileSync(profilePath, "utf8"));
 const manifest = {
   schema_version: 1,
@@ -240,6 +269,13 @@ const manifest = {
   systemd_units: profile.systemd_units,
   packages: profile.required_packages,
 };
+// Products that pin their frontend bundle record the accepted artifact so
+// every shipped manifest can be traced back to the reviewed UI build.
+if (frontendAppSha256) {
+  manifest.frontend_app_sha256 = frontendAppSha256;
+  manifest.frontend_bundle_source = frontendBundleSource;
+  manifest.frontend_bundle_origin = frontendBundleOrigin;
+}
 writeFileSync(outputPath, `${JSON.stringify(manifest, null, 2)}\n`);
 NODE
 )

@@ -190,6 +190,9 @@ product_build_require_file "$root_tree/opt/ly-route/admin/capabilities.json"
 product_build_require_file "$root_tree/opt/ly-route/admin/app.js"
 product_build_require_file "$root_tree/etc/systemd/system/ly-route-control-api.service"
 product_build_require_file "$root_tree/usr/lib/ly-route/firstboot.sh"
+# Re-verify the product's pinned frontend before imaging: an Orchestrator
+# image must never be produced from a rootfs carrying an unaccepted UI.
+verify_product_frontend_pin "$root_tree/opt/ly-route/admin"
 
 if [ "$product" = gateway ]; then
   case "$rootfs_name" in

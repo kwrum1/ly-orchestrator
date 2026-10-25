@@ -68,6 +68,11 @@ esac
 vpp_plugin_rel="usr/lib/$vpp_multiarch/vpp_plugins/pppoeclient_plugin.so"
 . "$repo_root/scripts/lib/product-build-profile.sh"
 load_product_build_profile "$repo_root" "$product" "$manifest"
+# Orchestrator builds must always ship the accepted pinned UI bundle; the
+# legacy controller shell is not the Orchestrator product UI.
+if [ -z "$frontend_bundle" ] && [ -n "${PRODUCT_FRONTEND_BUNDLE:-}" ]; then
+  frontend_bundle=$PRODUCT_FRONTEND_BUNDLE
+fi
 export LY_ROUTE_SOURCE_FINGERPRINT=$(product_source_fingerprint "$repo_root")
 validate_prebuilt_control "$control_binary" "$product"
 validate_prebuilt_vpp_apply "$vpp_apply_binary"
