@@ -41,10 +41,7 @@ func (server *Server) appliedNATPortMapIDs(ctx context.Context) map[string]struc
 
 func (server *Server) evidenceNATPortMapIDs(ctx context.Context) map[string]struct{} {
 	result := server.runtimeEvidence()
-	if result.Status != RuntimeStatusCommitted || result.RuntimeState != RuntimeStateRunning || result.GatewayPlan == nil {
-		return nil
-	}
-	if result.TransactionID == "" || result.Receipt.Status != apply.ReceiptApplied || result.Receipt.TransactionID != result.TransactionID {
+	if !runtimeTransactionCommitted(result) || result.GatewayPlan == nil {
 		return nil
 	}
 	matched := false

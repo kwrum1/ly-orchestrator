@@ -5204,7 +5204,13 @@ func (server *Server) executeRuntimeApply(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": result.Reason, "transaction_id": transactionID, "request_id": requestID(r)})
 		return
 	}
+	var rejectedApplyServices map[serviceRuntime.ServiceName]struct{}
 	if (plan.DataplaneState == "dataplane_locked" || plan.DataplaneState == "dataplane_degraded" || plan.DataplaneState == "af_fallback_required") && len(plan.GatewayPlan.NativePath.Assignments) > 0 {
+		// A dataplane bootstrap restarts VPP. SmartDNS is PartOf=vpp.service, so
+		// an aborted apply (for example the 409 AF-consent gate) can leave a
+		// previously-running daemon stopped. Record the healthy baseline before
+		// touching VPP and restore it even when this apply is rejected.
+		rejectedApplyServices = server.captureRunningServices(applyCtx)
 		// A fresh, API-configured appliance has no installer NIC mapping, so the
 		// boot ownership preflight had nothing to bind. Before declaring the
 		// dataplane locked, run the same preflight now, restart VPP, and re-probe
@@ -5219,6 +5225,10 @@ func (server *Server) executeRuntimeApply(w http.ResponseWriter, r *http.Request
 				plan = retried
 			}
 		}
+		// Restore daemons stopped by the VPP restart before any early return.
+		// Repeating this after a successful plan is harmless and keeps a
+		// subsequent apply from needing a manual service start.
+		server.restoreRunningServices(applyCtx, rejectedApplyServices)
 	}
 	if plan.DataplaneState == "af_fallback_required" && len(plan.AFRequiredInterfaces) > 0 {
 		reason := plan.AFRequiredMessage
