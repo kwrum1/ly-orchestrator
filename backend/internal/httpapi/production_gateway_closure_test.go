@@ -60,8 +60,9 @@ func TestProductionGatewayHTTPCommitsOnlyAfterEightVPPCTLReadbacksAndRestarts(t 
 	wanApply := strings.Index(trace, "ip route add table")
 	// The LAN control plane reserves ABF policy 65000 for the DHCP broadcast
 	// bypass, so the first `abf policy add` in the trace is not the user route.
-	// Assert the dependency against this generation's route policy identity.
-	routeApply := strings.Index(trace, fmt.Sprintf("abf policy add id %d", proofStableID("route-abf:route-office", 10000, 8999)))
+	// A path-less WAN-group route policy is classified natively before NAT, so
+	// its identity appears on the pre-NAT rule instead of an ABF policy.
+	routeApply := strings.Index(trace, fmt.Sprintf("set ly-route pre-nat-route add id %d", proofStableID("route-abf:route-office", 10000, 8999)))
 	if firstShow < 0 || firstMutation < 0 || firstShow > firstMutation || wanApply < 0 || routeApply < 0 || wanApply > routeApply {
 		t.Fatalf("production command order is incomplete:\n%s", trace)
 	}
@@ -117,7 +118,7 @@ func TestProductionGatewayHTTPFailurePreservesExactPriorAndNeverRuns(t *testing.
 		t.Fatal(err)
 	}
 	trace := string(traceBytes)
-	for _, required := range []string{"delete acl-plugin", "abf policy del", "ip route del", "delete bond", "set interface state"} {
+	for _, required := range []string{"delete acl-plugin", "set ly-route pre-nat-route del", "ip route del", "delete bond", "set interface state"} {
 		if !strings.Contains(trace, required) {
 			t.Fatalf("rollback trace lacks %q:\n%s", required, trace)
 		}
@@ -180,7 +181,7 @@ func TestProductionGatewayHTTPFirstGenerationFailureCleansIntroducedState(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, command := range []string{"set interface ip address del lyroute-eth1 192.0.2.2/24", "delete acl-plugin acl index", "abf policy del", "delete interface af_xdp"} {
+	for _, command := range []string{"set interface ip address del lyroute-eth1 192.0.2.2/24", "delete acl-plugin acl index", "set ly-route pre-nat-route del", "delete interface af_xdp"} {
 		if !strings.Contains(string(trace), command) {
 			t.Fatalf("first-generation cleanup lacks %q:\n%s", command, trace)
 		}
