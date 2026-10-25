@@ -380,9 +380,28 @@ func (server *Server) runProxyReconciler(ctx context.Context, observer serviceRu
 }
 
 func (server *Server) reconcileProxyHealth(ctx context.Context, observer serviceRuntime.XrayObservatoryStateController) error {
-	server.runtimeApplyMu.Lock()
-	defer server.runtimeApplyMu.Unlock()
+	// The reconciler is best effort. It must never queue behind, or hold up, an
+	// operator apply: take the gate with TryLock and skip this cycle if an apply
+	// already owns it. A reconcile cycle also gets its own hard bound so a
+	// wedged health read cannot pin the gate for the next operator click.
+	lease, acquired := server.beginApply("proxy reconcile", "", proxyReconcileTimeout)
+	if !acquired {
+		return nil
+	}
+	defer lease.release()
+	reconcileCtx, cancel := context.WithTimeout(ctx, proxyReconcileTimeout)
+	defer cancel()
+	var reconcileErr error
+	completed := runBoundedWork(reconcileCtx, server.applyGraceOrDefault(), func() {
+		reconcileErr = server.reconcileProxyHealthWork(reconcileCtx, observer)
+	})
+	if !completed {
+		return reconcileCtx.Err()
+	}
+	return reconcileErr
+}
 
+func (server *Server) reconcileProxyHealthWork(ctx context.Context, observer serviceRuntime.XrayObservatoryStateController) error {
 	now := server.now().UTC()
 	egress, configured, err := server.runtimeProxyEgress(ctx)
 	if err != nil {
