@@ -13,10 +13,7 @@ import (
 // desired-state readback. A successfully negotiated WAN must not continue to
 // report desired_not_applied just because the declarative item is unchanged.
 func (server *Server) decorateWANLinkRuntimeStates(ctx context.Context, items []map[string]any) []map[string]any {
-	result := server.runtimeEvidence()
-	committed := result.Status == RuntimeStatusCommitted &&
-		result.RuntimeState == RuntimeStateRunning &&
-		result.Receipt.Status == apply.ReceiptApplied
+	committed := wanLinkTransactionCommitted(server.runtimeEvidence())
 	for _, item := range items {
 		id := strings.TrimSpace(stringField(item, "id"))
 		if id == "" {
@@ -58,6 +55,23 @@ func (server *Server) decorateWANLinkRuntimeStates(ctx context.Context, items []
 		}
 	}
 	return items
+}
+
+// wanLinkTransactionCommitted reports whether the last runtime transaction
+// actually committed. A component-level degradation (for example AF_PACKET
+// compatibility) still means the gateway resource graph was applied; it must
+// not leave WAN links permanently pending. A failed or unreconciled
+// transaction never promotes anything.
+func wanLinkTransactionCommitted(result RuntimeApplyResult) bool {
+	if result.TransactionID == "" || result.Receipt.TransactionID != result.TransactionID || result.Receipt.Status != apply.ReceiptApplied {
+		return false
+	}
+	switch result.Status {
+	case RuntimeStatusCommitted, "degraded":
+		return true
+	default:
+		return false
+	}
 }
 
 // wanLinkAppliedAfterCommit is deliberately conservative: PPPoE keeps its own

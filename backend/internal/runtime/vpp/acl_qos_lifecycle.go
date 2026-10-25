@@ -170,10 +170,19 @@ func (a Adapter) aclQoSFailure(ctx context.Context, channel Channel, transaction
 	rollbackErr := errors.Join(cleanupACLQoS(ctx, channel, transactionID, current), applyACLQoSSnapshot(ctx, channel, transactionID, prior))
 	request := aclQoSSnapshotRequest(transactionID, prior)
 	request.LANVPPInterface = current.IngressVPPInterface
+	checksQoS := aclQoSPlanHasQoS(current)
+	if !checksQoS {
+		// The failed operation was ACL-only. Do not require the QoS plugin to
+		// verify the rollback of an object this apply never touched.
+		request.Capabilities = withoutSnapshotCapability(request.Capabilities, SnapshotCapabilityQoS)
+		request.QoS = nil
+		request.Candidates.QoS = nil
+		request.AbsentQoS = nil
+	}
 	readback, err := a.Snapshot(ctx, request)
 	if err != nil {
 		rollbackErr = errors.Join(rollbackErr, err)
-	} else if !reflect.DeepEqual(readback.ACLs, prior.ACLs) || !reflect.DeepEqual(readback.QoS, prior.QoS) {
+	} else if !reflect.DeepEqual(readback.ACLs, prior.ACLs) || checksQoS && !reflect.DeepEqual(readback.QoS, prior.QoS) {
 		rollbackErr = errors.Join(rollbackErr, fmt.Errorf("rollback readback does not match prior snapshot"))
 	}
 	result := RollbackSucceeded
@@ -236,14 +245,25 @@ func aclQoSSnapshotRequest(transactionID string, snapshot Snapshot) SnapshotRequ
 	return request
 }
 
+func aclQoSPlanHasQoS(plan ACLQoSPlan) bool {
+	return len(plan.QoS) > 0 || len(plan.DeleteQoS) > 0 || len(plan.DeleteQoSState) > 0
+}
+
 func aclQoSSnapshotRequestForPlan(plan ACLQoSPlan) SnapshotRequest {
-	request := SnapshotRequest{TransactionID: plan.TransactionID, LANVPPInterface: plan.IngressVPPInterface, Capabilities: []SnapshotCapability{SnapshotCapabilityACLs, SnapshotCapabilityQoS}}
+	request := SnapshotRequest{TransactionID: plan.TransactionID, LANVPPInterface: plan.IngressVPPInterface, Capabilities: []SnapshotCapability{SnapshotCapabilityACLs}}
 	for _, acl := range plan.ACLs {
 		request.ACLs = append(request.ACLs, acl.ID)
 	}
 	request.Candidates.ACLs = append(request.Candidates.ACLs, plan.ACLs...)
 	request.AbsentACLs = append([]string(nil), plan.DeleteACLs...)
 	request.Candidates.ACLs = appendACLsByID(request.Candidates.ACLs, plan.DeleteACLs, plan.DeleteACLState)
+	if !aclQoSPlanHasQoS(plan) {
+		// An ACL-only operation must not require the QoS plugin. On a build
+		// without qos_plugin.so the `show qos` readback is unavailable and
+		// would fail an otherwise unrelated ACL apply or rollback.
+		return request
+	}
+	request.Capabilities = append(request.Capabilities, SnapshotCapabilityQoS)
 	for _, group := range plan.QoS {
 		if len(group.Objects) == 0 {
 			continue
@@ -303,6 +323,17 @@ func deleteQoSCommands(id string) []string {
 	default:
 		return []string{fmt.Sprintf("?qos delete %s", id), fmt.Sprintf("?show qos %s", id)}
 	}
+}
+
+func withoutSnapshotCapability(capabilities []SnapshotCapability, remove SnapshotCapability) []SnapshotCapability {
+	filtered := make([]SnapshotCapability, 0, len(capabilities))
+	for _, capability := range capabilities {
+		if capability == remove {
+			continue
+		}
+		filtered = append(filtered, capability)
+	}
+	return filtered
 }
 
 func aclByID(acls []trafficpolicy.SecurityACL, id string) (trafficpolicy.SecurityACL, bool) {

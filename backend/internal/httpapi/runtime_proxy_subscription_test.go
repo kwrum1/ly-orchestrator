@@ -129,11 +129,23 @@ func TestCompileProxySubscriptionUsesConfiguredDirectNode(t *testing.T) {
 		}
 	}
 	routing := compiled.XrayRuntime.ConfigPayload.Routing
-	if routing == nil || len(routing.Balancers) != 1 || routing.Balancers[0].FallbackTag != proxy.ProxyFailureOutboundTag {
-		t.Fatalf("routing fallback = %#v", routing)
+	if routing == nil || len(routing.Balancers) != 0 {
+		t.Fatalf("single direct node must not be health-gated by a balancer: %#v", routing)
 	}
-	if compiled.XrayRuntime.ConfigPayload.Metrics == nil {
-		t.Fatal("fixed node config did not enable observatory metrics")
+	if compiled.XrayRuntime.ConfigPayload.Observatory != nil {
+		t.Fatalf("single direct node must not depend on an external observatory: %#v", compiled.XrayRuntime.ConfigPayload.Observatory)
+	}
+	captured := 0
+	for _, rule := range routing.Rules {
+		if len(rule.InboundTags) > 0 && rule.OutboundTag == outbound.Tag {
+			captured++
+		}
+	}
+	if captured != 1 {
+		t.Fatalf("capture inbound is not routed directly to the node: %#v", routing.Rules)
+	}
+	if last := routing.Rules[len(routing.Rules)-1]; last.OutboundTag != proxy.ProxyFailureOutboundTag {
+		t.Fatalf("terminal rule is not the failure blackhole: %#v", routing.Rules)
 	}
 }
 

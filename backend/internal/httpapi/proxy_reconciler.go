@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -556,6 +558,21 @@ func (server *Server) sampleProxyLiveness(ctx context.Context, observer serviceR
 		return proxyLivenessSample{}, fmt.Errorf("read xray observatory: %w", err)
 	}
 	if len(states) == 0 {
+		// A single-outbound/direct config deliberately has no external
+		// observatory: the node endpoint is the data path. Probe it directly
+		// instead of treating the absent probe as a failed one.
+		if endpoint, nodeID, fixed := server.fixedProxyNodeEndpoint(ctx, egress); fixed {
+			if endpoint == "" {
+				return proxyLivenessSample{}, fmt.Errorf("proxy node %s is unavailable", nodeID)
+			}
+			if probeErr := probeProxyNodeEndpoint(ctx, endpoint); probeErr != nil {
+				// No observatory is configured. Do not invent a health verdict
+				// from a missing probe: hold the last mode, exactly like an
+				// observatory read error.
+				return proxyLivenessSample{}, fmt.Errorf("proxy node %s is unreachable: %w", nodeID, probeErr)
+			}
+			return proxyLivenessSample{}, nil
+		}
 		return proxyLivenessSample{}, fmt.Errorf("xray observatory has no samples")
 	}
 	expected, err := server.proxyLivenessTags(ctx, egress)
@@ -585,11 +602,68 @@ func (server *Server) sampleProxyLiveness(ctx context.Context, observer serviceR
 	}
 	sort.Strings(dead)
 	allDead := len(relevant) > 0 && len(dead) == len(relevant)
+	if allDead {
+		// The observatory probes an external URL *through* the node. A node
+		// that cannot reach that URL can still forward the client's real
+		// destinations. For a direct/fixed egress a reachable node endpoint is
+		// authoritative; without this override an observability gap becomes a
+		// data-path blackhole.
+		if endpoint, nodeID, fixed := server.fixedProxyNodeEndpoint(ctx, egress); fixed && endpoint != "" {
+			if probeProxyNodeEndpoint(ctx, endpoint) == nil {
+				return proxyLivenessSample{states: states}, nil
+			}
+			_ = nodeID
+		}
+	}
 	sample := proxyLivenessSample{allDead: allDead, deadNodeIDs: dead, states: states}
 	if allDead {
 		sample.reason = "all_proxy_nodes_unreachable"
 	}
 	return sample, nil
+}
+
+// fixedProxyNodeEndpoint returns the TCP endpoint of a directly configured
+// proxy node. A fixed egress has exactly one node and therefore no failover
+// candidate: a TCP reachability check is sufficient and, unlike the external
+// observatory probe, cannot blackhole a node that is able to forward traffic.
+func (server *Server) fixedProxyNodeEndpoint(ctx context.Context, egress proxy.Egress) (endpoint, nodeID string, fixed bool) {
+	nodeID = strings.TrimSpace(egress.NodeID)
+	if nodeID == "" {
+		return "", "", false
+	}
+	items, err := server.desiredItems(ctx, "proxy_node")
+	if err != nil {
+		return "", nodeID, true
+	}
+	for _, item := range items {
+		if strings.TrimSpace(stringField(item, "id")) != nodeID {
+			continue
+		}
+		if enabled, exists := item["enabled"].(bool); exists && !enabled {
+			return "", nodeID, true
+		}
+		address := strings.TrimSpace(stringField(item, "address"))
+		port := intField(item, "port")
+		if address == "" || port < 1 || port > 65535 {
+			return "", nodeID, true
+		}
+		resolved, resolveErr := proxy.ResolveNodeAddress(ctx, proxy.Node{ID: nodeID, Address: address, Port: port})
+		if resolveErr != nil {
+			return "", nodeID, true
+		}
+		return net.JoinHostPort(resolved.Address, strconv.Itoa(port)), nodeID, true
+	}
+	return "", nodeID, true
+}
+
+func probeProxyNodeEndpoint(ctx context.Context, endpoint string) error {
+	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	connection, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", endpoint)
+	if err != nil {
+		return err
+	}
+	return connection.Close()
 }
 
 // proxyLivenessTags returns the observatory outbound tags that must be present

@@ -8,12 +8,23 @@ import (
 // EnsureFailureFallback makes proxy failure fail closed instead of failing
 // open to the direct Internet path.
 //
-// Every routing rule that selects a proxy outbound is rewritten to a
-// single-node balancer whose fallbackTag is the "failure" blackhole outbound.
-// When the Xray observatory marks the node dead, the balancer therefore
-// selects blackhole, not a direct freedom outbound. The legacy "direct"
-// freedom outbound is removed and the terminal catch-all also points at the
-// same blackhole so no captured packet can fall through to direct routing.
+// With more than one proxy outbound every routing rule that selects a proxy
+// outbound is rewritten to a single-node balancer whose fallbackTag is the
+// "failure" blackhole outbound. When the Xray observatory marks a node dead,
+// the balancer therefore selects blackhole, not a direct freedom outbound.
+//
+// A single proxy outbound has no failover candidate. Routing directly to that
+// outbound is already fail closed: a dead node fails the connection and there
+// is no direct path to leak to. Keeping a health-gated balancer in that case
+// turns an external observatory probe (an Internet URL reached through the
+// node) into a data-path gate: a node that cannot resolve or reach the probe
+// URL would blackhole every captured packet even though it can forward the
+// client's real destinations. Fixed and fastest egresses therefore keep a
+// direct outbound; only multi-outbound generations use balancers.
+//
+// The legacy "direct" freedom outbound is always removed and the terminal
+// catch-all always points at the blackhole, so no captured packet can fall
+// through to direct routing.
 func EnsureFailureFallback(config *XrayConfigPayload, probeURL string) error {
 	if config == nil {
 		return fmt.Errorf("%w: xray config is required for failure fallback", ErrInvalidEgress)
@@ -54,10 +65,20 @@ func EnsureFailureFallback(config *XrayConfigPayload, probeURL string) error {
 		config.Routing = &XrayRouting{}
 	}
 
+	singleProxy := len(proxyTags) == 1
 	routed := false
 	for index := range config.Routing.Rules {
 		rule := &config.Routing.Rules[index]
 		if rule.BalancerTag != "" {
+			if singleProxy {
+				// A previous generation may already have a health-gated
+				// fallback balancer. Re-point it at the only outbound so an
+				// outdated probe result cannot blackhole live traffic.
+				rule.BalancerTag = ""
+				rule.OutboundTag = proxyTags[0]
+				routed = true
+				continue
+			}
 			if isFallbackBalancer(rule.BalancerTag, config.Routing.Balancers) {
 				routed = true
 			}
@@ -73,6 +94,12 @@ func EnsureFailureFallback(config *XrayConfigPayload, probeURL string) error {
 		if !containsString(proxyTags, rule.OutboundTag) {
 			continue
 		}
+		if singleProxy {
+			// Keep the direct outbound. A single node has no failover to
+			// perform, and a failed connection is already fail closed.
+			routed = true
+			continue
+		}
 		balancerTag := fallbackBalancerTag(rule.OutboundTag)
 		appendFailureBalancer(config.Routing, balancerTag, rule.OutboundTag)
 		rule.BalancerTag = balancerTag
@@ -80,33 +107,54 @@ func EnsureFailureFallback(config *XrayConfigPayload, probeURL string) error {
 		routed = true
 	}
 	if !routed {
-		balancerTag := fallbackBalancerTag(proxyTags[0])
-		appendFailureBalancer(config.Routing, balancerTag, proxyTags[0])
-		for _, inbound := range config.Inbounds {
-			if inbound.Tag == XrayRoutingAPIInbound || inbound.Protocol != "dokodemo-door" {
-				continue
+		if singleProxy {
+			for _, inbound := range config.Inbounds {
+				if inbound.Tag == XrayRoutingAPIInbound || inbound.Protocol != "dokodemo-door" {
+					continue
+				}
+				config.Routing.Rules = append(config.Routing.Rules, XrayRoutingRule{
+					Type:        "field",
+					InboundTags: []string{inbound.Tag},
+					OutboundTag: proxyTags[0],
+				})
 			}
-			config.Routing.Rules = append(config.Routing.Rules, XrayRoutingRule{
-				Type:        "field",
-				InboundTags: []string{inbound.Tag},
-				BalancerTag: balancerTag,
-			})
+		} else {
+			balancerTag := fallbackBalancerTag(proxyTags[0])
+			appendFailureBalancer(config.Routing, balancerTag, proxyTags[0])
+			for _, inbound := range config.Inbounds {
+				if inbound.Tag == XrayRoutingAPIInbound || inbound.Protocol != "dokodemo-door" {
+					continue
+				}
+				config.Routing.Rules = append(config.Routing.Rules, XrayRoutingRule{
+					Type:        "field",
+					InboundTags: []string{inbound.Tag},
+					BalancerTag: balancerTag,
+				})
+			}
 		}
 	}
 
-	// Existing balancers (for example a previous generation) must not keep a
-	// direct fallback. Only the selectors generated from proxy outbounds may
-	// remain selectable.
-	for index := range config.Routing.Balancers {
-		balancer := &config.Routing.Balancers[index]
-		balancer.FallbackTag = ProxyFailureOutboundTag
-		selector := make([]string, 0, len(balancer.Selector))
-		for _, tag := range balancer.Selector {
-			if containsString(proxyTags, strings.TrimSpace(tag)) {
-				selector = append(selector, strings.TrimSpace(tag))
+	if singleProxy {
+		// No balancer or external probe is involved in a single-outbound data
+		// path. Keeping either would let an unreachable probe URL blackhole
+		// traffic that the node can actually forward.
+		config.Routing.Balancers = nil
+		config.Observatory = nil
+	} else {
+		// Existing balancers (for example a previous generation) must not keep
+		// a direct fallback. Only the selectors generated from proxy outbounds
+		// may remain selectable.
+		for index := range config.Routing.Balancers {
+			balancer := &config.Routing.Balancers[index]
+			balancer.FallbackTag = ProxyFailureOutboundTag
+			selector := make([]string, 0, len(balancer.Selector))
+			for _, tag := range balancer.Selector {
+				if containsString(proxyTags, strings.TrimSpace(tag)) {
+					selector = append(selector, strings.TrimSpace(tag))
+				}
 			}
+			balancer.Selector = selector
 		}
-		balancer.Selector = selector
 	}
 
 	// Anything that did not match a capture inbound must be black-holed, not
@@ -117,7 +165,9 @@ func EnsureFailureFallback(config *XrayConfigPayload, probeURL string) error {
 		Network:     "tcp,udp",
 		OutboundTag: ProxyFailureOutboundTag,
 	})
-	ensureObservatory(config, proxyTags, probeURL)
+	if !singleProxy {
+		ensureObservatory(config, proxyTags, probeURL)
+	}
 	return nil
 }
 

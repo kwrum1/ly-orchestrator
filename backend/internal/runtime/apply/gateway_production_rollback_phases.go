@@ -123,6 +123,12 @@ func (adapter *productionGatewayAdapter) restoreNativeAttachments(ctx context.Co
 	prior := *plan.Previous.GatewayPlan
 	prior.AllowUnprovenOperations = true
 	prior.DataplanePrepared = true
+	// The current generation knows the QoS plugin is absent. A prior plan
+	// persisted from a plugin-capable build still carries QoS groups; they
+	// must not be replayed (or even compiled into commands) during rollback.
+	if plan.GatewayPlan.SkipQoS {
+		prior.SkipQoS = true
+	}
 	// Persisted plans strip the verified proof but keep the observed candidate.
 	// Reuse it so a declarative restore recreates the same AF_PACKET/AF_XDP
 	// attachment instead of defaulting to an unsupported hook.

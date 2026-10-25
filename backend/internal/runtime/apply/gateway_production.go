@@ -82,6 +82,12 @@ type productionGatewayAdapter struct {
 func (adapter *productionGatewayAdapter) Name() string { return adapter.name }
 
 func (adapter *productionGatewayAdapter) Applicable(plan Plan) bool {
+	if adapter.name == "qos" && plan.GatewayPlan.SkipQoS {
+		// The running VPP build has no QoS plugin. Never schedule an adapter
+		// that could only fail planning, apply or rollback for an object the
+		// dataplane cannot represent.
+		return false
+	}
 	diff, live, found := adapter.reconciler.state(plan.Request.TransactionID)
 	if !found {
 		return false

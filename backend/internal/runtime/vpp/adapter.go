@@ -49,6 +49,10 @@ type Plan struct {
 	// is no longer valid. Apply paths must leave it false so an unprovable
 	// tier still blocks mutation.
 	AllowUnprovenOperations bool `json:"-"`
+	// SkipQoS excludes QoS objects from live reconciliation. It is set when
+	// the running VPP build has no QoS plugin: the dataplane cannot represent
+	// those objects, and planning must not create, verify or delete them.
+	SkipQoS bool `json:"skip_qos,omitempty"`
 }
 
 type DNSTransparentInterception struct {
@@ -234,7 +238,11 @@ func (a Adapter) Rollback(context.Context, Snapshot) error {
 
 func BuildOperations(plan Plan) ([]Operation, error) {
 	operations := []Operation{}
-	needsDataplane := plan.DNSInterception || len(plan.DNSServiceNetworks) > 0 || len(plan.NativePath.Assignments) > 0 || len(plan.AddressAssignments) > 0 || len(plan.Proxy.VPPSteering) > 0 || len(plan.Flow.VPPGroups) > 0 || len(plan.Flow.Targets) > 0 || len(plan.NAT.StaticMappings) > 0 || len(plan.NAT.PortMappings) > 0 || len(plan.Policy.WANGroups) > 0 || len(plan.Policy.RoutePolicies) > 0 || len(plan.Policy.SecurityACLs) > 0 || len(plan.Security.ACLs) > 0 || len(plan.Security.MACIP) > 0 || len(plan.Security.AttackRules) > 0
+	flowGroups := plan.Flow.VPPGroups
+	if plan.SkipQoS {
+		flowGroups = WithoutQoSPluginGroups(flowGroups)
+	}
+	needsDataplane := plan.DNSInterception || len(plan.DNSServiceNetworks) > 0 || len(plan.NativePath.Assignments) > 0 || len(plan.AddressAssignments) > 0 || len(plan.Proxy.VPPSteering) > 0 || len(flowGroups) > 0 || len(plan.Flow.Targets) > 0 || len(plan.NAT.StaticMappings) > 0 || len(plan.NAT.PortMappings) > 0 || len(plan.Policy.WANGroups) > 0 || len(plan.Policy.RoutePolicies) > 0 || len(plan.Policy.SecurityACLs) > 0 || len(plan.Security.ACLs) > 0 || len(plan.Security.MACIP) > 0 || len(plan.Security.AttackRules) > 0
 	if !needsDataplane {
 		return operations, nil
 	}
@@ -335,7 +343,7 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 	for _, group := range plan.Policy.WANGroups {
 		wanGroups[group.ID] = group
 	}
-	for _, group := range plan.Flow.VPPGroups {
+	for _, group := range flowGroups {
 		if len(group.Objects) == 0 {
 			continue
 		}
@@ -344,7 +352,10 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 		operations = append(operations, operation)
 	}
 	for _, target := range plan.Flow.Targets {
-		if targetOwnedByGroup(plan.Flow.VPPGroups, target) {
+		if plan.SkipQoS && IsQoSPluginGroup(target.Kind) {
+			continue
+		}
+		if targetOwnedByGroup(flowGroups, target) {
 			continue
 		}
 		resource := strings.TrimSpace(target.RuleID)
