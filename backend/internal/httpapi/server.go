@@ -176,30 +176,33 @@ type Server struct {
 	gatewayState                  *gatewayTelemetryState
 	securityGuardObserver         SecurityGuardRuntimeObserver
 	capabilityProber              *vpp.CapabilityProber
-	runtimeMu                     sync.Mutex
-	runtimeApplyMu                sync.Mutex
-	applyMu                       sync.Mutex
-	applyHolder                   *applyLease
-	applyTimeout                  time.Duration
-	applyGrace                    time.Duration
-	applyWorkOverride             func(context.Context, string, http.ResponseWriter)
-	configApplyAsyncMu            sync.Mutex
-	configApplyAsync              map[string]ConfigApplyAsyncState
-	latestConfigApplyAsync        string
-	lastRuntime                   *RuntimeApplyResult
-	firmwareMu                    sync.Mutex
-	firmwareStageDir              string
-	firmwareStatus                FirmwareUpdateStatus
-	firmwareInstallStart          func(firmwareInstallInvocation) error
-	orchestratorUpgradeDir        string
-	orchestratorInstallStart      func(orchestratorUpgradeInvocation) error
-	conversionServiceState        productupdate.ServiceStateController
-	productTaskMu                 sync.Mutex
-	operationMu                   sync.Mutex
-	operation                     orchestratorapi.OperationState
-	dnsSyncToken                  string
-	proxyFailurePage              proxyFailureActuator
-	proxyFailure                  *proxyFailureTracker
+	// qosPluginProbe is injectable so plan tests can model a VPP build
+	// without the QoS plugin. It defaults to vpp.QoSPluginAvailable.
+	qosPluginProbe           func(context.Context) (bool, error)
+	runtimeMu                sync.Mutex
+	runtimeApplyMu           sync.Mutex
+	applyMu                  sync.Mutex
+	applyHolder              *applyLease
+	applyTimeout             time.Duration
+	applyGrace               time.Duration
+	applyWorkOverride        func(context.Context, string, http.ResponseWriter)
+	configApplyAsyncMu       sync.Mutex
+	configApplyAsync         map[string]ConfigApplyAsyncState
+	latestConfigApplyAsync   string
+	lastRuntime              *RuntimeApplyResult
+	firmwareMu               sync.Mutex
+	firmwareStageDir         string
+	firmwareStatus           FirmwareUpdateStatus
+	firmwareInstallStart     func(firmwareInstallInvocation) error
+	orchestratorUpgradeDir   string
+	orchestratorInstallStart func(orchestratorUpgradeInvocation) error
+	conversionServiceState   productupdate.ServiceStateController
+	productTaskMu            sync.Mutex
+	operationMu              sync.Mutex
+	operation                orchestratorapi.OperationState
+	dnsSyncToken             string
+	proxyFailurePage         proxyFailureActuator
+	proxyFailure             *proxyFailureTracker
 }
 
 type InterfaceTelemetryCollector interface {
@@ -267,6 +270,11 @@ type RuntimePlan struct {
 	// DataplaneDegradations lists optional features that are unavailable while
 	// the dataplane keeps forwarding (arch-v1: retired Smart QoS).
 	DataplaneDegradations []vpp.Degradation `json:"dataplane_degradations,omitempty"`
+	// QoSSkipped is set when the running VPP build has no QoS plugin. The plan
+	// then excludes QoS objects instead of failing apply or rollback on an
+	// object the dataplane cannot represent.
+	QoSSkipped bool   `json:"qos_skipped,omitempty"`
+	QoSReason  string `json:"qos_reason,omitempty"`
 	// CapabilitySource reports where the observed dataplane capability came
 	// from: runtime_probe, cached_report, committed_state or unavailable.
 	CapabilitySource string   `json:"capability_source,omitempty"`
@@ -443,6 +451,16 @@ func WithGatewayTransaction(transaction apply.GatewayTransactionRunner) Option {
 // observed report and reports a degradation instead of locking the dataplane.
 func WithCapabilityProber(prober *vpp.CapabilityProber) Option {
 	return func(server *Server) { server.capabilityProber = prober }
+}
+
+// withQoSPluginProbe injects the QoS plugin capability probe for tests. The
+// production default runs `vppctl show plugins` once per plan.
+func withQoSPluginProbe(probe func(context.Context) (bool, error)) Option {
+	return func(server *Server) {
+		if probe != nil {
+			server.qosPluginProbe = probe
+		}
+	}
 }
 
 func WithSecurityGuardRuntime(observer SecurityGuardRuntimeObserver) Option {
@@ -5325,6 +5343,9 @@ func (server *Server) executeRuntimeApply(w http.ResponseWriter, r *http.Request
 	server.publishRuntimeResult(lease, RuntimeApplyResult{Status: "committed", RuntimeState: "running", TransactionID: transactionID, Receipt: receipt, Readback: readback, GatewayPlan: &plan.GatewayPlan, GatewayEvidence: execution.GatewayResult.Evidence, AppliedAt: receipt.AppliedAt})
 	components := server.runtimeStatusComponents(applyCtx, appliedArtifacts, len(plan.VppOperations) > 0)
 	components = applyCapabilityFailures(components, capabilityFailures, transactionID, server.now().UTC())
+	if plan.QoSSkipped {
+		components = append(components, RuntimeComponentState{Name: "qos", State: "skipped", Reason: plan.QoSReason})
+	}
 	if pathUsesAFPacket(plan.SelectedNativePath) {
 		components = append(components, RuntimeComponentState{
 			Name:   "af_packet_fallback",
@@ -5712,6 +5733,14 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 			gatewayFlow.VPPGroups = append(gatewayFlow.VPPGroups, group)
 		}
 	}
+	qosSkipped := false
+	qosSkipReason := ""
+	if available, probeErr := server.qosPluginAvailable(ctx); probeErr == nil && !available {
+		qosSkipped = true
+		qosSkipReason = "qos plugin unavailable"
+		gatewayFlow.VPPGroups = withoutQoSPluginGroups(gatewayFlow.VPPGroups)
+		planningWarnings = append(planningWarnings, "qos plugin unavailable: skipping QoS object management")
+	}
 	gatewayPolicy := runtimePolicy
 	if len(securityGeneration.ACLs) > 0 || len(securityGeneration.MACIP) > 0 || len(securityGeneration.AttackRules) > 0 {
 		// The generation operation owns the complete security attachment list;
@@ -5723,12 +5752,15 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	if selectionErr == nil {
 		alignAddressAssignmentsWithPath(addressAssignments, selectedPath)
 	}
-	canonicalGatewayPlan := vpp.Plan{RequestID: requestID, NativePath: nativePath, DataplanePrepared: dataplanePrepared, AddressAssignments: addressAssignments, Proxy: compiledProxy, Flow: gatewayFlow, NAT: compiledNAT, Policy: gatewayPolicy, RetiredRoutePolicyIDs: retiredRoutePolicyIDs, Security: securityGeneration, DNSInterception: dnsInterceptionEnabled, DNSServiceNetworks: dnsServiceNetworks}
+	canonicalGatewayPlan := vpp.Plan{RequestID: requestID, NativePath: nativePath, DataplanePrepared: dataplanePrepared, AddressAssignments: addressAssignments, Proxy: compiledProxy, Flow: gatewayFlow, NAT: compiledNAT, Policy: gatewayPolicy, RetiredRoutePolicyIDs: retiredRoutePolicyIDs, Security: securityGeneration, DNSInterception: dnsInterceptionEnabled, DNSServiceNetworks: dnsServiceNetworks, SkipQoS: qosSkipped}
 	operations, err := vpp.BuildOperations(canonicalGatewayPlan)
 	mark("build-operations")
 	dataplaneState := "native_ready"
 	var dataplaneProof []vpp.PrerequisiteResult
 	dataplaneDegradations := []vpp.Degradation{}
+	if qosSkipped {
+		dataplaneDegradations = append(dataplaneDegradations, vpp.Degradation{Name: "qos", Reason: qosSkipReason, Impact: "qos"})
+	}
 	var afRequiredInterfaces []string
 	afRequiredMessage := ""
 	degradedObservation := capabilityObservationDegradesDataplane(observation, len(nativePath.Assignments))
@@ -5810,6 +5842,9 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	componentCtx, cancelComponents := context.WithTimeout(context.WithoutCancel(ctx), statusComponentBudget)
 	components := server.runtimeStatusComponents(componentCtx, artifacts, len(operations) > 0)
 	cancelComponents()
+	if qosSkipped {
+		components = append(components, RuntimeComponentState{Name: "qos", State: "skipped", Reason: qosSkipReason})
+	}
 	mark("components")
 	if proxyRuntimeWarning != "" {
 		components = markComponentDegraded(components, string(serviceRuntime.Xray), proxyRuntimeWarning)
@@ -5821,7 +5856,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	gatewayPlan := canonicalGatewayPlan
 	gatewayPlan.Interfaces = gatewayInterfaces
 	gatewayPlan.Bonds = gatewayBonds
-	return RuntimePlan{ProxyEgress: proxyEgress, CompiledProxy: compiledProxy, FlowIntent: flowIntent, CompiledFlow: compiledFlow, CompiledNAT: compiledNAT, CompiledPolicy: compiledPolicy, DNSPolicies: dnsPolicies, ServiceArtifacts: summarizeRuntimeArtifacts(artifacts), RuntimeArtifacts: artifacts, VppOperations: operations, NftablesCapture: compiledProxy.NftablesCapture, DNSInterception: dnsInterception, LinuxPolicyRouting: compiledProxy.LinuxPolicyRouting, DHCPServers: dhcpPlans, PPPoEPeers: summarizePPPoEPeers(pppoePeers), Components: components, Warnings: warnings, DataplaneState: dataplaneState, DataplanePolicy: dataplanePolicy, DataplaneProof: dataplaneProof, DataplaneDegradations: dataplaneDegradations, SelectedNativePath: selectedPath, AFRequiredInterfaces: afRequiredInterfaces, AFRequiredMessage: afRequiredMessage, CapabilitySource: string(observation.Source), GatewayPlan: gatewayPlan}, nil
+	return RuntimePlan{ProxyEgress: proxyEgress, CompiledProxy: compiledProxy, FlowIntent: flowIntent, CompiledFlow: compiledFlow, CompiledNAT: compiledNAT, CompiledPolicy: compiledPolicy, DNSPolicies: dnsPolicies, ServiceArtifacts: summarizeRuntimeArtifacts(artifacts), RuntimeArtifacts: artifacts, VppOperations: operations, NftablesCapture: compiledProxy.NftablesCapture, DNSInterception: dnsInterception, LinuxPolicyRouting: compiledProxy.LinuxPolicyRouting, DHCPServers: dhcpPlans, PPPoEPeers: summarizePPPoEPeers(pppoePeers), Components: components, Warnings: warnings, DataplaneState: dataplaneState, DataplanePolicy: dataplanePolicy, DataplaneProof: dataplaneProof, DataplaneDegradations: dataplaneDegradations, QoSSkipped: qosSkipped, QoSReason: qosSkipReason, SelectedNativePath: selectedPath, AFRequiredInterfaces: afRequiredInterfaces, AFRequiredMessage: afRequiredMessage, CapabilitySource: string(observation.Source), GatewayPlan: gatewayPlan}, nil
 }
 
 func hasLANAddressAssignment(assignments []vpp.AddressAssignment) bool {
@@ -7583,6 +7618,32 @@ func vppInterfacePresent(ctx context.Context, name string) bool {
 	return false
 }
 
+// qosPluginAvailable reports whether VPP can represent QoS objects. Probe
+// errors fail open: a missing/failed vppctl must not silently drop desired QoS
+// from a plan, but a successful inventory that lacks qos_plugin.so must.
+func (server *Server) qosPluginAvailable(ctx context.Context) (bool, error) {
+	if server.qosPluginProbe != nil {
+		return server.qosPluginProbe(ctx)
+	}
+	return vpp.QoSPluginAvailable(ctx, liveVPPBinary())
+}
+
+// withoutQoSPluginGroups drops object groups backed by the VPP QoS plugin.
+// ACL-based actions (vpp.acl.drop, vpp.behavior.rate, vpp.policer) use
+// different plugins and remain reconcilable.
+func withoutQoSPluginGroups(groups []flow.VPPObjectGroup) []flow.VPPObjectGroup {
+	filtered := make([]flow.VPPObjectGroup, 0, len(groups))
+	for _, group := range groups {
+		switch strings.TrimSpace(group.Kind) {
+		case "vpp.qos.classify", "vpp.qos.record", "vpp.qos.store", "vpp.qos.egress-map", "vpp.qos.mark":
+			continue
+		default:
+			filtered = append(filtered, group)
+		}
+	}
+	return filtered
+}
+
 func liveVPPBinary() string {
 	binary := strings.TrimSpace(os.Getenv("LY_ROUTE_VPPCTL"))
 	if binary == "" {
@@ -8309,7 +8370,7 @@ func pathUsesAFPacket(path vpp.NativePath) bool {
 func runtimeState(components []RuntimeComponentState) string {
 	state := "running"
 	for _, component := range components {
-		if component.State == "not_configured" {
+		if component.State == "not_configured" || component.State == "skipped" {
 			continue
 		}
 		if component.State == "unavailable" {
@@ -8626,6 +8687,9 @@ func (server *Server) executeConfigApply(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	runtimeResult := RuntimeApplyResult{Status: RuntimeStatusCommitted, RuntimeState: RuntimeStateRunning, TransactionID: transactionID, Receipt: result.Receipt, Readback: result.Readback, GatewayPlan: &runtimePlan.GatewayPlan, GatewayEvidence: result.GatewayResult.Evidence, AppliedAt: result.Receipt.AppliedAt, CapabilityFailures: capabilityFailures}
+	if runtimePlan.QoSSkipped {
+		runtimeResult.Components = append(runtimeResult.Components, RuntimeComponentState{Name: "qos", State: "skipped", Reason: runtimePlan.QoSReason})
+	}
 	statusCode := http.StatusOK
 	if len(capabilityFailures) > 0 {
 		runtimeResult.Status = apply.ReceiptDegraded

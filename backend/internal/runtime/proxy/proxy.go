@@ -217,7 +217,11 @@ type XrayInbound struct {
 }
 
 type XrayDokodemoSettings struct {
-	Address        string `json:"address,omitempty"`
+	Address string `json:"address,omitempty"`
+	// Port is the fixed dokodemo-door target port. Production capture inbounds
+	// use FollowRedirect and leave it zero; an explicit fixed target is used by
+	// the data-path regression test.
+	Port           int    `json:"port,omitempty"`
 	Network        string `json:"network"`
 	FollowRedirect bool   `json:"followRedirect"`
 }

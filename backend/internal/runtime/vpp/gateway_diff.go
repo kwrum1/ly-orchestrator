@@ -118,9 +118,17 @@ func ReconcileGatewayPlan(input GatewayReconciliationInput) (GatewayDiff, error)
 	// operation (no VPP command) or make the strict snapshot decoder report an
 	// incomplete object. Drop them from all three sides; an empty desired group
 	// still removes the corresponding prior non-empty group.
-	qos, err := diffResources(resourceStates[flow.VPPObjectGroup]{prior: nonEmptyQoSGroups(prior.Flow.VPPGroups), desired: nonEmptyQoSGroups(desired.Flow.VPPGroups), live: nonEmptyQoSGroups(live.QoS)}, qosContract(), input.RepairVerifiedDrift)
-	if err != nil {
-		return GatewayDiff{}, err
+	//
+	// When the running VPP has no QoS plugin the whole resource is outside the
+	// reconcilable graph. Leave prior and live state untouched: there is no
+	// object the dataplane could delete or recreate, and the persisted plan
+	// keeps the historical inventory for a future plugin-capable build.
+	qos := resourceDiff[flow.VPPObjectGroup]{}
+	if !desired.SkipQoS {
+		qos, err = diffResources(resourceStates[flow.VPPObjectGroup]{prior: nonEmptyQoSGroups(prior.Flow.VPPGroups), desired: nonEmptyQoSGroups(desired.Flow.VPPGroups), live: nonEmptyQoSGroups(live.QoS)}, qosContract(), input.RepairVerifiedDrift)
+		if err != nil {
+			return GatewayDiff{}, err
+		}
 	}
 	staticMappings, err := diffResources(resourceStates[nat.StaticMapping]{prior: prior.NAT.StaticMappings, desired: desired.NAT.StaticMappings, live: live.NAT.StaticMappings}, natStaticContract(), input.RepairVerifiedDrift)
 	if err != nil {

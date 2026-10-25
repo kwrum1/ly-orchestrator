@@ -139,17 +139,21 @@ func TestEnsureFailureFallbackIsIdempotentBlackholedAndMarked(t *testing.T) {
 			t.Fatalf("fail-closed config still contains a direct outbound: %#v", outbound)
 		}
 	}
-	if config.Routing == nil || len(config.Routing.Balancers) != 1 {
-		t.Fatalf("routing balancers = %#v", config.Routing)
+	if config.Routing == nil {
+		t.Fatal("routing is missing")
 	}
-	balancer := config.Routing.Balancers[0]
-	if balancer.FallbackTag != ProxyFailureOutboundTag || len(balancer.Selector) != 1 || balancer.Selector[0] != "node-a" {
-		t.Fatalf("failure balancer = %#v", balancer)
+	// A single outbound has no failover candidate. Routing directly to the
+	// node is fail closed and must not depend on an external health probe.
+	if len(config.Routing.Balancers) != 0 {
+		t.Fatalf("single-outbound config kept health-gated balancers: %#v", config.Routing.Balancers)
+	}
+	if config.Observatory != nil {
+		t.Fatalf("single-outbound config kept an external observatory gate: %#v", config.Observatory)
 	}
 	routed := 0
 	catchAll := 0
 	for index, rule := range config.Routing.Rules {
-		if rule.BalancerTag == balancer.Tag {
+		if len(rule.InboundTags) > 0 && containsString(rule.InboundTags, "proxy-in") && rule.OutboundTag == "node-a" {
 			routed++
 		}
 		if isFailureCatchAll(rule) {
@@ -161,12 +165,6 @@ func TestEnsureFailureFallbackIsIdempotentBlackholedAndMarked(t *testing.T) {
 	}
 	if routed != 1 || catchAll != 1 {
 		t.Fatalf("routing rules = %#v", config.Routing.Rules)
-	}
-	if config.Observatory == nil || !containsString(config.Observatory.SubjectSelector, "node-a") || config.Observatory.ProbeURL != ProxyProbeURL {
-		t.Fatalf("observatory = %#v", config.Observatory)
-	}
-	if config.Metrics == nil || config.Metrics.Listen != DefaultXrayMetricsListen {
-		t.Fatalf("observatory metrics are not enabled: %#v", config.Metrics)
 	}
 
 	ApplyOutboundSocketMark(&config, 0x200001)
@@ -183,10 +181,13 @@ func TestEnsureFailureFallbackIsIdempotentBlackholedAndMarked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{`"fallbackTag":"failure"`, `"protocol":"blackhole"`, `"metrics":{"listen":"127.0.0.1:11111"}`} {
+	for _, required := range []string{`"protocol":"blackhole"`, `"outboundTag":"node-a"`} {
 		if !strings.Contains(string(payload), required) {
 			t.Fatalf("rendered Xray config is missing %s: %s", required, payload)
 		}
+	}
+	if strings.Contains(string(payload), `"balancerTag"`) || strings.Contains(string(payload), `"observatory":{`) {
+		t.Fatalf("rendered single-node Xray config still contains a health gate: %s", payload)
 	}
 	if strings.Contains(string(payload), `"fallbackTag":"direct"`) || strings.Contains(string(payload), `"tag":"direct"`) {
 		t.Fatalf("rendered Xray config still contains a direct path: %s", payload)
@@ -262,6 +263,38 @@ func TestEnsureFailureFallbackRewritesAdaptiveLaneRules(t *testing.T) {
 	for _, rule := range config.Routing.Rules {
 		if len(rule.InboundTags) > 0 && rule.BalancerTag == "" {
 			t.Fatalf("lane rule was not rewritten to a failure balancer: %#v", rule)
+		}
+	}
+	assertNoCapturedPathReachesDirect(t, config)
+}
+
+func TestEnsureFailureFallbackSingleNodeDoesNotHealthGateTraffic(t *testing.T) {
+	config := XrayConfigPayload{
+		Inbounds:  []XrayInbound{{Tag: "proxy-in", Protocol: "dokodemo-door", Settings: XrayDokodemoSettings{Network: "tcp,udp"}}},
+		Outbounds: []XrayOutbound{{Tag: "node-a", Protocol: "vless"}},
+		Routing: &XrayRouting{
+			Rules: []XrayRoutingRule{{Type: "field", InboundTags: []string{"proxy-in"}, BalancerTag: "fallback-node-a"}},
+			Balancers: []XrayBalancer{{
+				Tag:         "fallback-node-a",
+				Selector:    []string{"node-a"},
+				FallbackTag: ProxyFailureOutboundTag,
+				Strategy:    XrayBalancerStrategy{Type: "random", Settings: map[string]any{}},
+			}},
+		},
+		Observatory: &XrayObservatory{SubjectSelector: []string{"node-a"}, ProbeURL: "http://127.0.0.1:1/unreachable", ProbeInterval: "1s"},
+	}
+	if err := EnsureFailureFallback(&config, "http://127.0.0.1:1/unreachable"); err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Routing.Balancers) != 0 || config.Observatory != nil {
+		t.Fatalf("single node kept a health gate: balancers=%#v observatory=%#v", config.Routing.Balancers, config.Observatory)
+	}
+	for _, rule := range config.Routing.Rules {
+		if rule.BalancerTag != "" {
+			t.Fatalf("rule still selects a balancer: %#v", rule)
+		}
+		if len(rule.InboundTags) > 0 && containsString(rule.InboundTags, "proxy-in") && rule.OutboundTag != "node-a" {
+			t.Fatalf("capture inbound is not routed to the node: %#v", rule)
 		}
 	}
 	assertNoCapturedPathReachesDirect(t, config)
