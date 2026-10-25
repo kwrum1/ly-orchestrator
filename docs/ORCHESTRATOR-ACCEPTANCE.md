@@ -18,7 +18,7 @@ explicit AF_PACKET acceptance mode (`hook=af_packet`,
 |---|---|---|---|
 | 1 | Deploy release build; image/manifest `506cc4cc6361`, product `orchestrator` | **PASS** | `identity-*.txt`, `build-verification.txt` |
 | 2 | `health` ok; password change/login; product profile correct | **PASS** | `health*.json`, `login*.json`, `password-change*.json`, `product.json` |
-| 3 | AF datapath: VPP owns both NICs, `runtime/apply` committed, `runtime/status` running + generation | **FAIL (status)** | `af-env-and-proof.json`, `api-runtime-apply.json`, `api-runtime-status.json`, `persistence/status-after-api.json` |
+| 3 | AF datapath: VPP owns both NICs, `runtime/apply` committed, `runtime/status` running + generation | **FAIL (status)** | `af-env-and-proof.json`, `api-runtime-apply.json`, `api-runtime-status.json`, `status-after-restart-call1.json` … `call3.json` |
 | 4 | Control-api restart and VPP restart keep the same generation and forwarding | **PASS** | `persistence/*`, `failclosed/fc-generation-*.txt` |
 | 5 | Bidirectional reachability, policy allow TCP/8080, policy drop TCP/9000, reverse direction | **PASS** | `functional/*`, `final-functional.txt` |
 | 6 | Fail-closed: broken dataplane reports `apply_failed`/`degraded`, no generation committed, no direct leak, recovers | **PASS** | `failclosed/*` |
@@ -28,9 +28,11 @@ explicit AF_PACKET acceptance mode (`hook=af_packet`,
 Item 3 is a real regression in the merged line: the commit itself succeeds and
 the datapath is correct, but `GET /api/v1/runtime/status` immediately after the
 apply reports `degraded` (and adds gateway-only `smartdns`, `dnsmasq`, `xray`,
-`pppoe` components) instead of `running` with the transparent generation. A
-control-api restart makes the same endpoint report `running` with the generation
-again. Root cause and exact evidence are in `analysis-status-regression.md`.
+`pppoe` components) instead of `running` with the transparent generation. The
+first status call after a control-api restart reports `running` with the
+generation, but the second and later calls degrade again with
+`vpp unavailable: no VPP operations rendered`. Root cause and exact evidence are
+in `analysis-status-regression.md`.
 
 Item 7 is a release-packaging regression, not a backend regression: the image
 ships the 12-page source-tree controller-shell UI (`app.js` sha256
@@ -113,10 +115,13 @@ policy drop-9000 group-position 10 sequence 10 action drop packets 0 bytes 0
 `status=degraded` and a component list of `smartdns`, `dnsmasq`, `xray`,
 `pppoe` (all degraded because those gateway services do not exist on the
 Orchestrator product), plus `vpp` and `persistence` running. After
-`systemctl restart ly-route-control-api`, the same endpoint returned
+`systemctl restart ly-route-control-api`, the **first** status call returned
 `status=running` with exactly `vpp` + `persistence` and the generation reason
-(`persistence/status-after-api.json`). This is a status-reporting regression in
-the merged Gateway line, not a datapath failure.
+(`persistence/status-after-api.json`), but the second and third calls returned
+`status=degraded` with `vpp unavailable: no VPP operations rendered`
+(`status-after-restart-call1.json` … `call3.json`,
+`analysis-status-oscillation.txt`) and the endpoint stayed degraded. This is a
+status-reporting regression in the merged Gateway line, not a datapath failure.
 
 ### 4. Restart persistence
 
@@ -202,12 +207,13 @@ image; it isolates the failure to packaging. Evidence: `ui/result.json` (0/11),
 ### 8. Regressions versus the e2c16ef acceptance
 
 1. **`/api/v1/runtime/status` after an apply is degraded.** The merged
-   `handleRuntimeStatus` short-circuits to `statusHealthComponents` when the
-   in-memory receipt is committed but has no cached component inventory; that
-   helper does not filter components by product profile, so the Orchestrator
-   reports absent gateway services. A control-api restart rebuilds the plan and
-   reports correctly. This is a P1 reporting regression; the datapath and
-   apply commit are unaffected.
+   `handleRuntimeStatus` short-circuits: immediately after an apply it uses
+   `statusHealthComponents` (which does not filter by product profile, so the
+   Orchestrator reports absent gateway services); after a restart the first
+   call rebuilds the plan and is correct, but subsequent calls re-probe the
+   cached inventory and `vppRuntimeComponent` returns
+   `unavailable: no VPP operations rendered` for the transparent runtime. This
+   is a P1 reporting regression; the datapath and apply commit are unaffected.
 2. **The release image ships the wrong UI bundle.** e2c16ef image: 11-page
    bundle (`app.js` `dba17962…`); accepted overlay: 11-page `08af368`
    (`0787685e…`); release image: 12-page controller-shell
@@ -234,7 +240,10 @@ image; it isolates the failure to packaging. Evidence: `ui/result.json` (0/11),
 `/root/work/orch-acceptance/evidence/20261025T0730Z-release/` — `summary.json`
 (machine-readable verdicts), `README.md` (file index), `deploy.log`, API dumps,
 VPP/host dumps, functional logs, fail-closed logs, UI results and screenshots,
-and `analysis-status-regression.md` / `analysis-ui-bundle.md`.
+and `analysis-status-regression.md` / `analysis-ui-bundle.md`. The
+status-regression sequence is in `api-runtime-status.json`,
+`status-after-restart-call1.json` … `call3.json` and
+`analysis-status-oscillation.txt`.
 
 ## Historical record: e2c16ef acceptance (2026-10-24)
 
