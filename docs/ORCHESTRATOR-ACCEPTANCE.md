@@ -36,7 +36,7 @@ Commits on `fix/release-orch-regressions` (not pushed):
 | 5 | Bidirectional reachability, policy allow TCP/8080, policy drop TCP/9000, reverse direction | **PASS** | `functional/*`, `datapath-test.log` |
 | 6 | Fail-closed: broken dataplane reports `apply_failed`/`degraded`, no generation committed, no direct leak, recovers | **PASS** | `failclosed-test.log`, `failclosed/*` |
 | 7 | UI 11/11 pages in real Chromium, zero 404s, clean console | **PASS** | `ui/result.json`, `ui/*.png` |
-| 8 | Evidence + acceptance document update, committed (not pushed) | **PASS** | this document, `evidence/20261025T1630Z-fix-3e0ca15/` |
+| 8 | Evidence + acceptance document update, committed (not pushed) | **PASS** | this document, `evidence/20261025-fix-release-orch-regressions/` |
 
 ### Regression 1 — runtime status (fixed)
 
