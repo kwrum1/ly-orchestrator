@@ -5658,7 +5658,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		}
 		artifacts = append(artifacts, routingArtifacts...)
 	}
-	dnsInterception := dnsLCPGuardPlan(addressAssignments)
+	dnsInterception := dnsLCPGuardPlan(addressAssignments, dnsServiceNetworks)
 	capturePlan := compiledProxy.NftablesCapture
 	if hasProxyEgress && strings.TrimSpace(capturePlan.Table) == "" {
 		// The proxy egress still exists but its runtime could not be compiled
@@ -5667,7 +5667,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		// stale TPROXY generation.
 		capturePlan = proxy.FailOpenNftablesCapture(proxyEgress.ID)
 	}
-	if strings.TrimSpace(capturePlan.Table) != "" {
+	if gatewayNftablesNeeded(capturePlan, dnsInterception) {
 		nftablesArtifacts, renderErr := serviceRuntime.RenderGatewayNftablesCapture(capturePlan, dnsInterception)
 		if renderErr != nil {
 			return RuntimePlan{}, renderErr
@@ -5834,9 +5834,21 @@ func hasLANAddressAssignment(assignments []vpp.AddressAssignment) bool {
 	return false
 }
 
-func dnsLCPGuardPlan(assignments []vpp.AddressAssignment) serviceRuntime.DNSInterceptionPlan {
+// gatewayNftablesNeeded reports whether the plan must render the managed
+// nftables artifact. A DNS LCP guard is independent of proxy capture: without
+// it, the duplicate DNS copy delivered to the Linux LCP interface hits an
+// unbound port on the gateway address and the kernel returns ICMP port
+// unreachable, which races and defeats the VPP DNS adapter's answer.
+func gatewayNftablesNeeded(capture proxy.NftablesCapturePlan, dns serviceRuntime.DNSInterceptionPlan) bool {
+	if strings.TrimSpace(capture.Table) != "" {
+		return true
+	}
+	return len(dns.LCPGuardAddresses) > 0 && len(dns.LCPGuardInterfaces) > 0
+}
+
+func dnsLCPGuardPlan(assignments []vpp.AddressAssignment, dnsNetworks []vpp.DNSServiceNetwork) serviceRuntime.DNSInterceptionPlan {
 	addresses := make([]string, 0, len(assignments))
-	interfaces := make([]string, 0, len(assignments))
+	interfaces := make([]string, 0, len(assignments)+len(dnsNetworks))
 	for _, assignment := range assignments {
 		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
 			continue
@@ -5845,15 +5857,28 @@ func dnsLCPGuardPlan(assignments []vpp.AddressAssignment) serviceRuntime.DNSInte
 		if err == nil {
 			addresses = append(addresses, prefix.Addr().String())
 		}
-		// The guard exists only for the duplicate LCP copy. Scoping it to the
-		// VPP LCP host interface keeps normal LAN DNS and the DNS service TAP
-		// deliverable to SmartDNS on the same gateway address.
+		// The guard exists only for the duplicate copies delivered to Linux:
+		// the LAN LCP tap and the VPP host-stack punt tap used by the DNS
+		// service network. SmartDNS binds the loopback stub, so neither copy
+		// may reach an unbound kernel socket and race the VPP adapter with an
+		// ICMP port-unreachable.
 		linuxInterface := strings.TrimSpace(assignment.LinuxInterface)
 		if linuxInterface == "" {
 			linuxInterface = strings.TrimPrefix(strings.TrimSpace(assignment.VPPInterface), "lyroute-")
 		}
 		if linuxInterface != "" {
+			// AF_PACKET leaves the Linux interface up, so the kernel also
+			// receives every data-plane frame on it. That copy is the one
+			// that answered with ICMP port-unreachable before the VPP
+			// adapter could. Guard both the physical interface and the
+			// LCP mirror.
+			interfaces = append(interfaces, linuxInterface)
 			interfaces = append(interfaces, vpp.LANControlPlaneHostInterface(linuxInterface))
+		}
+	}
+	for _, network := range dnsNetworks {
+		if name := strings.TrimSpace(network.HostInterface); name != "" {
+			interfaces = append(interfaces, name)
 		}
 	}
 	return serviceRuntime.DNSInterceptionPlan{LCPGuardAddresses: addresses, LCPGuardInterfaces: interfaces}

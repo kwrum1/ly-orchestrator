@@ -88,3 +88,39 @@ func TestExpectedNftablesRulesRejectsFailOpenOutsideManagedTable(t *testing.T) {
 		t.Fatal("fail-open marker was accepted for an unmanaged table")
 	}
 }
+
+func TestGuardOnlyNftablesReadbackMatchesLiveNftShape(t *testing.T) {
+	artifacts, err := RenderGatewayNftablesCapture(proxy.NftablesCapturePlan{}, DNSInterceptionPlan{
+		LCPGuardAddresses:  []string{"192.168.77.2"},
+		LCPGuardInterfaces: []string{"lylan-enp0s4"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifacts) != 1 {
+		t.Fatalf("artifacts = %#v", artifacts)
+	}
+	family, table, rules, err := expectedNftablesRules(artifacts[0].Content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if family != "inet" || table != "ly_route_dns_capture" || len(rules) != 2 {
+		t.Fatalf("guard-only readback expectation = %s %s %#v", family, table, rules)
+	}
+	live := `table inet ly_route_dns_capture {
+  chain dns_lcp_guard {
+    type filter hook input priority -300; policy accept;
+    iifname "lylan-enp0s4" ip daddr 192.168.77.2 udp dport 53 counter packets 7 bytes 420 drop
+    iifname "lylan-enp0s4" ip daddr 192.168.77.2 tcp dport 53 counter packets 0 bytes 0 drop
+  }
+}`
+	normalized := normalizedNftables(live)
+	position := -1
+	for _, rule := range rules {
+		next := nftablesRulePosition(normalized, rule, position)
+		if next < 0 {
+			t.Fatalf("guard rule %q is not found in live nft output", rule)
+		}
+		position = next
+	}
+}

@@ -57,7 +57,8 @@ func nftablesRulePosition(live, rendered string, previous int) int {
 
 func expectedNftablesRules(content string) (string, string, []string, error) {
 	var family, table string
-	rules := make([]string, 0, 4)
+	rules := make([]string, 0, 6)
+	guardRules := make([]string, 0, 2)
 	dnsRules := 0
 	tproxyRules := 0
 	firstTProxy := -1
@@ -68,6 +69,17 @@ func expectedNftablesRules(content string) (string, string, []string, error) {
 			family, table = fields[1], fields[2]
 		}
 		normalized := normalizedNftables(line)
+		isGuard := strings.Contains(normalized, "dport 53") &&
+			nftablesRuleHasToken(normalized, "iifname") &&
+			nftablesRuleHasToken(normalized, "drop")
+		if isGuard {
+			// The DNS LCP guard drops the duplicate copy that the Linux
+			// control-plane tap receives; the VPP DNS adapter owns the real
+			// query. It is a valid artifact on its own when no proxy capture
+			// is configured.
+			guardRules = append(guardRules, normalized)
+			continue
+		}
 		isDNS := strings.Contains(normalized, "dport 53") &&
 			(nftablesRuleHasToken(normalized, "redirect") || nftablesRuleHasToken(normalized, "return"))
 		isTProxy := nftablesRuleHasToken(normalized, "tproxy")
@@ -96,8 +108,11 @@ func expectedNftablesRules(content string) (string, string, []string, error) {
 	if failOpen && (family != "inet" || table != "ly_route_proxy_capture") {
 		return "", "", nil, fmt.Errorf("nftables fail-open marker is only valid for inet ly_route_proxy_capture")
 	}
-	if dnsRules == 0 && tproxyRules == 0 && !failOpen {
+	if dnsRules == 0 && tproxyRules == 0 && len(guardRules) == 0 && !failOpen {
 		return "", "", nil, fmt.Errorf("rendered nftables plan lacks capture rules")
+	}
+	if dnsRules == 0 && tproxyRules == 0 && len(guardRules) > 0 {
+		rules = append(rules, guardRules...)
 	}
 	if dnsRules > 0 && dnsRules < 2 {
 		return "", "", nil, fmt.Errorf("rendered nftables plan requires TCP and UDP DNS rules")
