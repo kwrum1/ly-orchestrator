@@ -67,3 +67,10 @@ bash scripts/build-disk-image.sh --product orchestrator \
 
 The disk manifest records `product=orchestrator`, `source_commit` and
 `frontend_app_sha256`; acceptance pins both separately.
+
+## Note on `.github/workflows/gateway-release.yml`
+
+The shared rootfs scaffold validation asserts the gateway release topology is
+present. This repository therefore keeps that workflow as **manual dispatch
+only** (reference for the gateway product); it never runs on push or tag here.
+Gateway images are built in the `ly-route` repository.
