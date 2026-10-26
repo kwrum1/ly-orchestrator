@@ -1,0 +1,249 @@
+name: Orchestrator build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ly-orchestrator-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  LY_ROUTE_GO_VERSION: go1.27.2
+  GOTOOLCHAIN: local
+  CGO_ENABLED: '0'
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: off
+  TZ: UTC
+  LC_ALL: C.UTF-8
+  # Debian mirrors used when a rootfs image is built.
+  LY_ROUTE_MIRROR: https://mirrors.ustc.edu.cn/debian
+  LY_ROUTE_SECURITY_MIRROR: https://mirrors.ustc.edu.cn/debian-security
+  # Pinned VPP source used by the packaged runtime.
+  LY_ROUTE_VPP_COMMIT: c3200b88dc46bd380f00a49ca3392a102cc1980b
+
+jobs:
+  verify:
+    name: Source verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.2'
+          cache-dependency-path: backend/go.sum
+      - name: Normalize and check toolchain
+        run: |
+          chmod +x scripts/*.sh packaging/rootfs-overlay/usr/lib/ly-route/*.sh 2>/dev/null || true
+          bash scripts/normalize-source-line-endings.sh "$GITHUB_WORKSPACE"
+          test "$(go version | awk '{print $3}')" = "$LY_ROUTE_GO_VERSION"
+          test "$(go env GOTOOLCHAIN)" = "$GOTOOLCHAIN"
+          test "$(uname -m)" = x86_64
+      - name: Release source gate
+        run: bash scripts/ci-release-verify.sh
+
+  backend:
+    name: Backend build and tests
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.2'
+          cache-dependency-path: backend/go.sum
+      - name: go build
+        working-directory: backend
+        run: go build ./...
+      - name: go vet
+        working-directory: backend
+        run: go vet ./...
+      - name: gofmt
+        working-directory: backend
+        run: |
+          unformatted=$(gofmt -l . | grep -v '^vendor/' || true)
+          test -z "$unformatted" || { echo "unformatted files:"; echo "$unformatted"; exit 1; }
+      - name: go test
+        working-directory: backend
+        run: go test -p 1 -count=1 -timeout 60m ./...
+      - name: Orchestrator control binary
+        working-directory: backend
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o "$RUNNER_TEMP/orchestrator-control" ./cmd/orchestrator-control
+          "$RUNNER_TEMP/orchestrator-control" --version
+          sha256sum "$RUNNER_TEMP/orchestrator-control" | tee "$RUNNER_TEMP/orchestrator-control.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: orchestrator-control
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/orchestrator-control
+            ${{ runner.temp }}/orchestrator-control.sha256
+
+  ui:
+    name: Orchestrator UI bundle (reproducible)
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Read pinned UI source commit
+        id: pin
+        run: |
+          source_commit=$(jq -r '.frontend_bundle_source' packaging/build-profiles/orchestrator.json)
+          expected_app=$(jq -r '.frontend_app_sha256' packaging/build-profiles/orchestrator.json)
+          test -n "$source_commit" -a "$source_commit" != null
+          test -n "$expected_app" -a "$expected_app" != null
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "expected_app=$expected_app" >> "$GITHUB_OUTPUT"
+          echo "pinned UI source: $source_commit"
+          echo "pinned app.js:    $expected_app"
+      - name: Fetch pinned UI source
+        run: |
+          git fetch --no-tags origin "${{ steps.pin.outputs.source_commit }}" || \
+            git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+          git cat-file -e "${{ steps.pin.outputs.source_commit }}^{commit}"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: ui-source-src/frontend/gateway/pnpm-lock.yaml
+      - name: Build the orchestrator bundle from the pinned source
+        run: |
+          git worktree add ui-source-src "${{ steps.pin.outputs.source_commit }}"
+          chmod +x ui-source-src/scripts/*.sh 2>/dev/null || true
+          sh ui-source-src/scripts/build-product-ui.sh \
+            --product orchestrator \
+            --manifest "$GITHUB_WORKSPACE/packaging/product-profiles/orchestrator.json" \
+            --out "$RUNNER_TEMP/orch-ui"
+      - name: Verify the shipped bundle is reproducible
+        run: |
+          built=$(sha256sum "$RUNNER_TEMP/orch-ui/app.js" | awk '{print $1}')
+          echo "built app.js:    $built"
+          echo "pinned app.js:   ${{ steps.pin.outputs.expected_app }}"
+          test "$built" = "${{ steps.pin.outputs.expected_app }}"
+          shipped=$(sha256sum packaging/orchestrator-frontend/bundle/app.js | awk '{print $1}')
+          test "$shipped" = "${{ steps.pin.outputs.expected_app }}"
+          diff -u packaging/orchestrator-frontend/bundle/styles.css "$RUNNER_TEMP/orch-ui/styles.css"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: orchestrator-ui-bundle
+          retention-days: 14
+          if-no-files-found: error
+          path: ${{ runner.temp }}/orch-ui
+
+  image:
+    name: Orchestrator image (rootfs + upgrade + disk)
+    needs: verify
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.2'
+          cache-dependency-path: backend/go.sum
+      - name: Install build tools
+        run: |
+          chmod +x scripts/*.sh packaging/rootfs-overlay/usr/lib/ly-route/*.sh 2>/dev/null || true
+          bash scripts/normalize-source-line-endings.sh "$GITHUB_WORKSPACE"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get update
+          sudo apt-get install -y mmdebstrap debian-archive-keyring zstd ca-certificates \
+            build-essential cmake dpkg-dev git curl rsync python3 debhelper devscripts
+      - name: Restore VPP package cache
+        id: vpp-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            vpp-base-debs
+            vpp-dev-debs
+          key: vpp-bookworm-amd64-${{ env.LY_ROUTE_VPP_COMMIT }}-${{ hashFiles('scripts/build-vpp-bookworm-debs.sh', 'packaging/vpp-patches/**') }}
+      - name: Fetch pinned VPP
+        if: steps.vpp-cache.outputs.cache-hit != 'true'
+        run: |
+          git init vpp-master
+          git -C vpp-master remote add origin https://github.com/FDio/vpp.git
+          git -C vpp-master fetch --depth 512 origin "$LY_ROUTE_VPP_COMMIT" '+refs/tags/v26.06:refs/tags/v26.06'
+          git -C vpp-master checkout --detach "$LY_ROUTE_VPP_COMMIT"
+          test "$(git -C vpp-master rev-parse HEAD)" = "$LY_ROUTE_VPP_COMMIT"
+      - name: Build pinned VPP packages
+        if: steps.vpp-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p vpp-base-debs vpp-dev-debs
+          sudo --preserve-env=LY_ROUTE_VPP_COMMIT,LY_ROUTE_MIRROR,LY_ROUTE_VPP_DEV_DEBS_DIR env \
+            LY_ROUTE_RUNTIME_DEB_ARCH=amd64 LY_ROUTE_VPP_SRC="$PWD/vpp-master" \
+            LY_ROUTE_RUNTIME_DEBS_DIR="$PWD/vpp-base-debs" \
+            LY_ROUTE_VPP_DEV_DEBS_DIR="$PWD/vpp-dev-debs" \
+            LY_ROUTE_VPP_MAKE_ARGS=DPDK_MLX_IBV_LINK=dlopen ./scripts/build-vpp-bookworm-debs.sh
+          sudo chown -R "$USER:$USER" vpp-base-debs vpp-dev-debs vpp-master
+      - name: Save VPP package cache
+        if: steps.vpp-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            vpp-base-debs
+            vpp-dev-debs
+          key: vpp-bookworm-amd64-${{ env.LY_ROUTE_VPP_COMMIT }}-${{ hashFiles('scripts/build-vpp-bookworm-debs.sh', 'packaging/vpp-patches/**') }}
+      - name: Build orchestrator runtime packages
+        run: |
+          mkdir -p runtime-debs
+          cp vpp-base-debs/*.deb runtime-debs/
+          vpp_package=$(find runtime-debs -maxdepth 1 -name 'vpp_*.deb' -print -quit)
+          test -f "$vpp_package"
+          export LY_ROUTE_RUNTIME_DEB_ARCH=amd64 \
+                 LY_ROUTE_VPP_DEV_DEBS_DIR="$PWD/vpp-dev-debs" \
+                 LY_ROUTE_VPP_PACKAGE_VERSION="$(dpkg-deb -f "$vpp_package" Version)"
+          for target in vpp-apply vpp-orchestrator; do
+            sudo --preserve-env=LY_ROUTE_RUNTIME_DEB_ARCH,LY_ROUTE_VPP_DEV_DEBS_DIR,LY_ROUTE_VPP_PACKAGE_VERSION \
+              ./scripts/build-runtime-debs.sh "$target"
+          done
+          sudo chown -R "$USER:$USER" runtime-debs
+      - name: Build rootfs, upgrade and disk image
+        run: |
+          sudo --preserve-env=LY_ROUTE_MIRROR env \
+            LY_ROUTE_EXTRA_DEBS_DIR="$PWD/runtime-debs" \
+            LY_ROUTE_EXTRA_PACKAGES=libxdp1 \
+            ./scripts/build-rootfs.sh --product orchestrator --arch amd64 --out dist/rootfs
+          sudo chown -R "$USER:$USER" dist
+          LY_ROUTE_EXTRA_DEBS_DIR="$PWD/runtime-debs" \
+            ./scripts/build-upgrade-package.sh --product orchestrator --arch amd64 --out dist/upgrade
+          sudo --preserve-env=LY_ROUTE_MIRROR,LY_ROUTE_SECURITY_MIRROR env \
+            ./scripts/build-disk-image.sh --product orchestrator \
+              --rootfs dist/rootfs/ly-route-rootfs-orchestrator-bookworm-amd64.tar.zst \
+              --out dist/disk --size 4G
+      - name: Verify deliverables
+        run: |
+          test -s dist/rootfs/ly-route-rootfs-orchestrator-bookworm-amd64.tar.zst
+          test -s dist/upgrade/ly-route-upgrade-orchestrator-bookworm-amd64.tar.zst
+          test -s dist/disk/ly-route-orchestrator-bookworm-amd64-4g.img.zst
+          jq -e '.product == "orchestrator"' dist/disk/*.zst.manifest.json
+          jq -e '.source_commit != null' dist/disk/*.zst.manifest.json
+          jq -e '.frontend_app_sha256 != null' dist/disk/*.zst.manifest.json
+          sha256sum dist/rootfs/*.tar.zst dist/upgrade/*.tar.zst dist/disk/*.img dist/disk/*.img.zst | tee dist/SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ly-route-orchestrator-amd64
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            dist/rootfs/*.tar.zst
+            dist/upgrade/*.tar.zst
+            dist/disk/*.img.zst
+            dist/disk/*.zst.manifest.json
+            dist/SHA256SUMS
