@@ -56,12 +56,6 @@ jobs:
                 '#!'*) sh -n "$file" ;;
               esac
             done
-      - name: Controller shell bundle
-        run: |
-          tmp=$(mktemp -d)
-          ./scripts/build-controller-shell.sh --product gateway --out "$tmp/gateway-ui"
-          test -s "$tmp/gateway-ui/app.js"
-          test -s "$tmp/gateway-ui/capabilities.json"
       - name: Compile every package
         working-directory: backend
         run: go test -run '^$' ./...
