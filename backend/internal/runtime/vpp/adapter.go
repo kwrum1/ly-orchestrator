@@ -390,13 +390,21 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 		// only when the pool address belongs to the packet's inside FIB
 		// (snat_address_t.fib_index == rx_fib_index). An address added with
 		// "nat44 add interface address" keeps fib_index ~0, so with more than
-		// one WAN VPP always picked the last pool address regardless of the
-		// routed WAN. Bind static WAN addresses to the inside (default) VRF so
-		// the WAN-group active member really selects its own address; keep the
+		// one WAN VPP ignored the routed WAN and picked a pool entry by hash
+		// order. Bind static WAN addresses to the inside (default) VRF so the
+		// WAN-group active member really selects its own address; keep the
 		// interface form for runtime-addressed WANs (DHCP/PPPoE).
+		staticPool := nat44PoolAddressMap(nat44PoolAddresses(plan.AddressAssignments))
 		for _, wan := range natOutsideInterfaces(plan) {
 			if plan.NAT.Behavior == nat.BehaviorFullCone {
 				initializeCommands = append(initializeCommands, "?nat44 ei add interface address "+wan)
+				continue
+			}
+			if address, ok := staticPool[wan]; ok {
+				initializeCommands = append(initializeCommands,
+					"?nat44 add interface address "+wan+" del",
+					"?nat44 add address "+address+" tenant-vrf 0",
+				)
 				continue
 			}
 			initializeCommands = append(initializeCommands, "?nat44 add interface address "+wan)
@@ -886,8 +894,13 @@ func dnsServiceNetworkCommands(network DNSServiceNetwork, behavior nat.Behavior)
 		fmt.Sprintf("show ip fib table %d", network.TableID),
 		"show tap",
 	}
+	// The DNS handoff owns its NAT44 role, so it must also ensure the NAT44
+	// plugin is enabled before the role command.  On a clean boot the
+	// service-networks node runs before the nat44 node; without this the
+	// interface role command is accepted-but-ignored while the plugin is
+	// disabled, and the graph's role verification fails closed.
+	commands = append(commands, natInitializeCommands(behavior)...)
 	if behavior == nat.BehaviorFullCone {
-		commands = append(commands, natInitializeCommands(behavior)...)
 		return append(commands,
 			fmt.Sprintf("?set interface nat44 ei in %s out %s output-feature del", network.VPPInterface, underlayInterface),
 			fmt.Sprintf("set interface nat44 ei in %s out %s", network.VPPInterface, underlayInterface),

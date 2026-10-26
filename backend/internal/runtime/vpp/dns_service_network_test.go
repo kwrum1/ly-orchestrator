@@ -37,6 +37,7 @@ func TestDNSServiceNetworkUsesStableDedicatedVPPHandoff(t *testing.T) {
 	assertOperationCommand(t, operations, "vpp.dns-service.network", "set interface mtu packet 1492 "+network.VPPInterface)
 	assertOperationCommand(t, operations, "vpp.dns-service.network", "ip route add table")
 	assertOperationCommand(t, operations, "vpp.dns-service.network", "set interface nat44 in "+network.VPPInterface+" out lyroute-wan0")
+	assertDNSServiceNetworkEnablesNATBeforeRole(t, operations, network)
 	plan.NAT.Behavior = nat.BehaviorFullCone
 	operations = mustBuildOperations(t, plan)
 	assertOperationCommand(t, operations, "vpp.dns-service.network", "set interface nat44 ei in "+network.VPPInterface+" out lyroute-wan0")
@@ -97,6 +98,32 @@ func TestDNSServiceNetworkRejectsInvalidEffectiveMTU(t *testing.T) {
 	}
 	if err := BindDNSServiceNetwork(&network, "lyroute-wan0", 500); err == nil || !strings.Contains(err.Error(), "invalid MTU") {
 		t.Fatalf("invalid MTU error = %v", err)
+	}
+}
+
+func assertDNSServiceNetworkEnablesNATBeforeRole(t *testing.T, operations []Operation, network DNSServiceNetwork) {
+	t.Helper()
+	var commands []string
+	for _, operation := range operations {
+		if operation.Name == "vpp.dns-service.network" {
+			commands = operation.VPPCtlCommands
+			break
+		}
+	}
+	enableAt, roleAt := -1, -1
+	for index, command := range commands {
+		if command == "?nat44 plugin enable" && enableAt < 0 {
+			enableAt = index
+		}
+		if strings.HasPrefix(command, "set interface nat44 in "+network.VPPInterface+" out ") && roleAt < 0 {
+			roleAt = index
+		}
+	}
+	if enableAt < 0 {
+		t.Fatalf("DNS service network does not enable NAT44 on a clean boot: %#v", commands)
+	}
+	if roleAt < 0 || enableAt > roleAt {
+		t.Fatalf("DNS service network NAT44 role runs before plugin enable (enable=%d role=%d): %#v", enableAt, roleAt, commands)
 	}
 }
 

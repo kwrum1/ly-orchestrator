@@ -81,10 +81,24 @@ func (adapter *productionGatewayAdapter) runPrior(ctx context.Context, input pro
 		result, err := adapter.reconciler.adapter.ApplyACLQoS(ctx, vpp.ACLQoSPlan{TransactionID: transactionID, IngressVPPInterface: vppGatewayLANInterface(gateway), QoS: gateway.Flow.VPPGroups}, prior, attempted.QoS)
 		return result.Readback, err
 	case "nat44":
-		result, err := adapter.reconciler.adapter.ApplyNAT44(ctx, vpp.NAT44Plan{TransactionID: transactionID, Behavior: gateway.NAT.Behavior, IngressVPPInterface: vppGatewayLANInterface(gateway), StaticMappings: gateway.NAT.StaticMappings}, prior, attempted.NAT44)
+		result, err := adapter.reconciler.adapter.ApplyNAT44(ctx, vpp.NAT44Plan{
+			TransactionID:       transactionID,
+			Behavior:            gateway.NAT.Behavior,
+			IngressVPPInterface: vppGatewayLANInterface(gateway),
+			PoolAddresses:       attempted.NAT44.PreviousPoolAddresses,
+			DeletePoolAddresses: vpp.NAT44PoolAddressStrings(attempted.NAT44.PoolAddresses),
+			StaticMappings:      gateway.NAT.StaticMappings,
+		}, prior, attempted.NAT44)
 		return result.Readback, err
 	case "port-maps":
-		result, err := adapter.reconciler.adapter.ApplyNAT44(ctx, vpp.NAT44Plan{TransactionID: transactionID, Behavior: gateway.NAT.Behavior, IngressVPPInterface: vppGatewayLANInterface(gateway), PortMappings: gateway.NAT.PortMappings}, prior, attempted.PortMaps)
+		result, err := adapter.reconciler.adapter.ApplyNAT44(ctx, vpp.NAT44Plan{
+			TransactionID:       transactionID,
+			Behavior:            gateway.NAT.Behavior,
+			IngressVPPInterface: vppGatewayLANInterface(gateway),
+			PoolAddresses:       attempted.PortMaps.PreviousPoolAddresses,
+			DeletePoolAddresses: vpp.NAT44PoolAddressStrings(attempted.PortMaps.PoolAddresses),
+			PortMappings:        gateway.NAT.PortMappings,
+		}, prior, attempted.PortMaps)
 		return result.Readback, err
 	default:
 		return vpp.Snapshot{}, fmt.Errorf("unsupported production gateway resource %q", adapter.name)

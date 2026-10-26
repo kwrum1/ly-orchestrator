@@ -138,6 +138,15 @@ func ReconcileGatewayPlan(input GatewayReconciliationInput) (GatewayDiff, error)
 	if err != nil {
 		return GatewayDiff{}, err
 	}
+	var poolAddresses, previousPoolAddresses []NAT44PoolAddress
+	var deletePoolAddresses []string
+	if planRequiresNAT(desired) {
+		poolAddresses = nat44PoolAddresses(desired.AddressAssignments)
+		deletePoolAddresses = staleNAT44PoolAddresses(prior.AddressAssignments, desired.AddressAssignments)
+	}
+	if planRequiresNAT(prior) {
+		previousPoolAddresses = nat44PoolAddresses(prior.AddressAssignments)
+	}
 	return GatewayDiff{
 		Interfaces: InterfaceBondPlan{TransactionID: transactionID, ManagementInterface: desired.NativePath.ManagementInterface, Interfaces: interfaces.apply, DeleteInterfaces: interfaces.delete},
 		Bonds:      InterfaceBondPlan{TransactionID: transactionID, ManagementInterface: desired.NativePath.ManagementInterface, Bonds: bonds.apply, DeleteBonds: bonds.delete},
@@ -151,10 +160,32 @@ func ReconcileGatewayPlan(input GatewayReconciliationInput) (GatewayDiff, error)
 			WANGroupsContext:    NewWANGroupsContext(prior.Policy.WANGroups, desired.Policy.WANGroups),
 			DeleteRoutes:        routes.delete,
 		},
-		ACLs:     ACLQoSPlan{TransactionID: transactionID, IngressVPPInterface: routeIngressVPPInterface, ACLs: acls.apply, DeleteACLs: acls.delete},
-		QoS:      ACLQoSPlan{TransactionID: transactionID, IngressVPPInterface: routeIngressVPPInterface, QoS: qos.apply, DeleteQoS: qos.delete},
-		NAT44:    NAT44Plan{TransactionID: transactionID, Behavior: desired.NAT.Behavior, IngressVPPInterface: routeIngressVPPInterface, WANIngressInterface: wanIngressVPPInterface(desired), IngressLANPrefix: routeIngressLANPrefix, StaticMappings: staticMappings.apply, DeleteStaticMappings: staticMappings.delete},
-		PortMaps: NAT44Plan{TransactionID: transactionID, Behavior: desired.NAT.Behavior, IngressVPPInterface: routeIngressVPPInterface, WANIngressInterface: wanIngressVPPInterface(desired), IngressLANPrefix: routeIngressLANPrefix, PortMappings: portMappings.apply, DeletePortMappings: portMappings.delete},
+		ACLs: ACLQoSPlan{TransactionID: transactionID, IngressVPPInterface: routeIngressVPPInterface, ACLs: acls.apply, DeleteACLs: acls.delete},
+		QoS:  ACLQoSPlan{TransactionID: transactionID, IngressVPPInterface: routeIngressVPPInterface, QoS: qos.apply, DeleteQoS: qos.delete},
+		NAT44: NAT44Plan{
+			TransactionID:         transactionID,
+			Behavior:              desired.NAT.Behavior,
+			IngressVPPInterface:   routeIngressVPPInterface,
+			WANIngressInterface:   wanIngressVPPInterface(desired),
+			IngressLANPrefix:      routeIngressLANPrefix,
+			PoolAddresses:         poolAddresses,
+			DeletePoolAddresses:   deletePoolAddresses,
+			PreviousPoolAddresses: previousPoolAddresses,
+			StaticMappings:        staticMappings.apply,
+			DeleteStaticMappings:  staticMappings.delete,
+		},
+		PortMaps: NAT44Plan{
+			TransactionID:         transactionID,
+			Behavior:              desired.NAT.Behavior,
+			IngressVPPInterface:   routeIngressVPPInterface,
+			WANIngressInterface:   wanIngressVPPInterface(desired),
+			IngressLANPrefix:      routeIngressLANPrefix,
+			PoolAddresses:         poolAddresses,
+			DeletePoolAddresses:   deletePoolAddresses,
+			PreviousPoolAddresses: previousPoolAddresses,
+			PortMappings:          portMappings.apply,
+			DeletePortMappings:    portMappings.delete,
+		},
 	}, nil
 }
 

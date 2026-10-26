@@ -49,11 +49,23 @@ func TestNAT44InitializeBindsEveryStaticWANAddressToInsideVRF(t *testing.T) {
 		"?set interface nat44 in lyroute-enp0s4",
 		"set interface nat44 out lyroute-enp0s3 output-feature",
 		"set interface nat44 out lyroute-enp0s5 output-feature",
-		"?nat44 add interface address lyroute-enp0s3",
-		"?nat44 add interface address lyroute-enp0s5",
+		"?nat44 add interface address lyroute-enp0s3 del",
+		"?nat44 add interface address lyroute-enp0s5 del",
+		"?nat44 add address 100.77.0.2 tenant-vrf 0",
+		"?nat44 add address 100.78.0.2 tenant-vrf 0",
 	} {
 		if !strings.Contains(initialize, required) {
 			t.Fatalf("NAT44 initialize is missing %q:\n%s", required, initialize)
+		}
+	}
+	// The interface-address form must not be (re)installed for a static WAN:
+	// that form keeps fib_index ~0 and reintroduces the failover bug.
+	for _, forbidden := range []string{
+		"\n?nat44 add interface address lyroute-enp0s3\n",
+		"\n?nat44 add interface address lyroute-enp0s5\n",
+	} {
+		if strings.Contains(initialize, forbidden) {
+			t.Fatalf("NAT44 initialize kept the interface-address pool form %q:\n%s", forbidden, initialize)
 		}
 	}
 	for _, required := range []string{
