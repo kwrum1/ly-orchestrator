@@ -82,9 +82,9 @@ func TestBuildACLQoSOperationsDeletesReplacementBeforeCreate(t *testing.T) {
 	prior := flow.VPPObjectGroup{Kind: "vpp.behavior.rate", Objects: []flow.VPPObject{{RuleID: "flow-30", Action: flow.ActionPolicer}}}
 	desired := flow.VPPObjectGroup{Kind: "vpp.behavior.rate", Objects: []flow.VPPObject{{RuleID: "flow-30", Action: flow.ActionPolicer, Policer: &flow.Policer{RateBPS: 1_000_000}}}}
 	operations, err := BuildACLQoSOperations(ACLQoSPlan{
-		TransactionID: "txn-qos-replace",
-		QoS:           []flow.VPPObjectGroup{desired},
-		DeleteQoS:     []string{prior.Kind},
+		TransactionID:  "txn-qos-replace",
+		QoS:            []flow.VPPObjectGroup{desired},
+		DeleteQoS:      []string{prior.Kind},
 		DeleteQoSState: []flow.VPPObjectGroup{prior},
 	})
 	if err != nil {

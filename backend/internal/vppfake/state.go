@@ -133,9 +133,9 @@ type PreNATRule struct {
 
 // PreNAT is the emulated native pre-NAT classifier inventory.
 type PreNAT struct {
-	Enabled   bool        `json:"enabled"`
-	Interface string      `json:"interface,omitempty"`
-	LANPrefix string      `json:"lan_prefix,omitempty"`
+	Enabled   bool         `json:"enabled"`
+	Interface string       `json:"interface,omitempty"`
+	LANPrefix string       `json:"lan_prefix,omitempty"`
 	Rules     []PreNATRule `json:"rules,omitempty"`
 }
 
@@ -149,25 +149,25 @@ type DNSIntercept struct {
 // State is the complete emulated device state. It is JSON-serializable so a
 // process-per-command fake keeps one coherent data plane across invocations.
 type State struct {
-	Interfaces   []*Interface         `json:"interfaces,omitempty"`
-	Bonds        []*Bond              `json:"bonds,omitempty"`
-	Tables       []*Table             `json:"tables,omitempty"`
-	ACLs         []*ACL               `json:"acls,omitempty"`
-	ABFs         []*ABFPolicy         `json:"abfs,omitempty"`
-	NATStatic    []NATStatic          `json:"nat_static,omitempty"`
-	NATPorts     []NATPort            `json:"nat_ports,omitempty"`
-	NATAddresses []string             `json:"nat_addresses,omitempty"`
-	QoSMaps      map[string][]int     `json:"qos_maps,omitempty"`
-	LCP          []LCPPair            `json:"lcp,omitempty"`
-	Taps         []string             `json:"taps,omitempty"`
-	PreNAT       PreNAT               `json:"pre_nat"`
-	DNS          DNSIntercept         `json:"dns"`
-	Policers     []string             `json:"policers,omitempty"`
-	FlowRates    []string             `json:"flow_rates,omitempty"`
-	GuardRules   []string             `json:"security_guard,omitempty"`
-	NextACL      int                  `json:"next_acl"`
-	NextIfIndex  int                  `json:"next_if_index"`
-	Broadcast    bool                 `json:"broadcast_local"`
+	Interfaces   []*Interface     `json:"interfaces,omitempty"`
+	Bonds        []*Bond          `json:"bonds,omitempty"`
+	Tables       []*Table         `json:"tables,omitempty"`
+	ACLs         []*ACL           `json:"acls,omitempty"`
+	ABFs         []*ABFPolicy     `json:"abfs,omitempty"`
+	NATStatic    []NATStatic      `json:"nat_static,omitempty"`
+	NATPorts     []NATPort        `json:"nat_ports,omitempty"`
+	NATAddresses []string         `json:"nat_addresses,omitempty"`
+	QoSMaps      map[string][]int `json:"qos_maps,omitempty"`
+	LCP          []LCPPair        `json:"lcp,omitempty"`
+	Taps         []string         `json:"taps,omitempty"`
+	PreNAT       PreNAT           `json:"pre_nat"`
+	DNS          DNSIntercept     `json:"dns"`
+	Policers     []string         `json:"policers,omitempty"`
+	FlowRates    []string         `json:"flow_rates,omitempty"`
+	GuardRules   []string         `json:"security_guard,omitempty"`
+	NextACL      int              `json:"next_acl"`
+	NextIfIndex  int              `json:"next_if_index"`
+	Broadcast    bool             `json:"broadcast_local"`
 }
 
 // NewState returns an empty, initialized device.

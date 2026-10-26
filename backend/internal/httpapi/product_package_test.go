@@ -107,7 +107,7 @@ func TestProductConfigImportAcceptsExportedRedactionMetadataDuringDryRun(t *test
 		Product:       product.Gateway().ID(),
 		DeviceMode:    "gateway",
 		Resources: map[string][]json.RawMessage{
-			"wan_link": {json.RawMessage(`{"id":"wan-pppoe","credential_ref":"local-secret:pppoe:wan-pppoe","pppoe_password_redacted":"redacted"}`)},
+			"wan_link":   {json.RawMessage(`{"id":"wan-pppoe","credential_ref":"local-secret:pppoe:wan-pppoe","pppoe_password_redacted":"redacted"}`)},
 			"proxy_node": {json.RawMessage(`{"id":"proxy-node","credential_ref":"local-secret:proxy_node:proxy-node:secret","secret_redacted":"redacted","uri_redacted":"redacted"}`)},
 		},
 	}

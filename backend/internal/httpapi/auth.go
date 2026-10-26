@@ -15,11 +15,11 @@ import (
 const sessionCookieName = "ly_route_session"
 
 type AuthConfig struct {
-	AdminUsername    string
-	AdminPassword    string
-	ReadonlyUsername string
-	ReadonlyPassword string
-	CookieSecure     bool
+	AdminUsername       string
+	AdminPassword       string
+	ReadonlyUsername    string
+	ReadonlyPassword    string
+	CookieSecure        bool
 	ForcePasswordChange bool
 }
 

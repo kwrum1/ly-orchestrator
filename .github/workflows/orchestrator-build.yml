@@ -163,8 +163,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: pnpm
-          cache-dependency-path: ui-source-src/frontend/gateway/pnpm-lock.yaml
       - name: Build the orchestrator bundle from the pinned source
         run: |
           git worktree add ui-source-src "${{ steps.pin.outputs.source_commit }}"

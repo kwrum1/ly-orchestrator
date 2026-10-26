@@ -10,12 +10,12 @@ import (
 )
 
 type aclCandidateProof struct {
-	numericID        int
-	id               string
-	action           string
-	match            trafficpolicy.Match
+	numericID         int
+	id                string
+	action            string
+	match             trafficpolicy.Match
 	localDestinations []string
-	allowUnmatched bool
+	allowUnmatched    bool
 }
 
 func decodeVPPCTLACLs(request SnapshotRequest, results []VPPCTLCommandResult) (ACLReadback, error) {
