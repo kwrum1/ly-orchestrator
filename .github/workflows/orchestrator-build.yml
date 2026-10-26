@@ -80,10 +80,8 @@ jobs:
             ./internal/runtime/trafficpolicy
           go test -count=1 ./internal/runtime/vpp -run \
             'TestCompileSecurityGenerationExpandsBidirectionalACL|TestSecurityDirectionsExpandsOnlyBoth|TestSecurityACLCommandsAttachBidirectionalACL|TestRoutePolicyCommandsUseResolvedDirectWANPath|TestBuildOperationsIncludesNAT44Mappings'
-      - name: Product builders and rootfs scaffold
-        run: |
-          ./scripts/test-product-builders.sh
-          ./scripts/validate-rootfs-scaffold.sh
+      - name: Orchestrator product contracts
+        run: bash scripts/ci-orchestrator-verify.sh
 
   backend:
     name: Backend build and tests
