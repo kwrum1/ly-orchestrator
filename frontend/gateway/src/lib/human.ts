@@ -7,10 +7,18 @@
 const INTERNAL_DETAIL =
   /(dataplane_locked|af_fallback_required|runtime_capability_proof|desired_not_applied|apply_in_progress|failed prerequisites|prerequisite[s]?\b|requires_runtime_proof|transaction\s+runtime-|runtime-[0-9a-f]{8,}|snapshot-[0-9a-f]{8,})/gi;
 
+// Machine identifiers must never reach a page. Keep the rule in one place so
+// every page (and its tests) applies the same definition.
+const INTERNAL_ID = /(?:snapshot|runtime|txn|transaction|req|request)[-_][a-z0-9][a-z0-9-]{5,}|[0-9a-f]{32}/i;
+
+export function hasInternalId(value: unknown): boolean {
+  return INTERNAL_ID.test(String(value ?? ""));
+}
+
 export function hasInternalDetail(value: unknown): boolean {
   const text = String(value ?? "");
   INTERNAL_DETAIL.lastIndex = 0;
-  return INTERNAL_DETAIL.test(text);
+  return INTERNAL_DETAIL.test(text) || hasInternalId(text);
 }
 
 /** Remove internal control-plane tokens from a free-text reason. */
@@ -92,6 +100,14 @@ function takeoverClassOf(item: any): "native" | "compatibility" | "" {
   return "";
 }
 
+function hasTakeoverContract(item: any): boolean {
+  if (!item) return false;
+  if (item.takeover_state || item.takeover_mode || item.takeover_class) return true;
+  if (typeof item.takeover === "string" && item.takeover.trim()) return true;
+  if (item.takeover && typeof item.takeover === "object" && Object.keys(item.takeover).length) return true;
+  return legacyTokens(item).trim().length > 0;
+}
+
 function takeoverStateOf(item: any): string {
   const explicit = normalized(item?.takeover_state);
   if (explicit) return explicit;
@@ -103,7 +119,7 @@ function takeoverStateOf(item: any): string {
   if (/af[_-]?packet|compat|dpdk|af[_-]?xdp|rdma/.test(tokens)) return "taken_over";
   // Capability-first fallback: without an explicit state, assume the port is
   // assignable instead of making a down link look unsupported.
-  return "available";
+  return hasTakeoverContract(item) ? "available" : "not_taken_over";
 }
 
 /**
@@ -153,6 +169,16 @@ export function takeoverInfo(item: any): TakeoverInfo {
       detail: "该网卡暂不支持接管，不能分配给线路或聚合组。",
     };
   }
+  if (state === "not_taken_over") {
+    return {
+      kind: "available",
+      label: "未接管",
+      tone: "neutral",
+      assignable: true,
+      state,
+      detail: "该网卡尚未完成接管；可由数据面接管后再分配给线路。",
+    };
+  }
   return {
     kind: "available",
     label: "可接管（高性能）",
@@ -186,6 +212,122 @@ export function linkInfo(item: any): LinkInfo {
   }
   const speed = String(item?.speed || "").trim();
   return { label: speed || "链路正常", down: false, pending: false };
+}
+
+const LOGICAL_KINDS = new Set(["lan_bridge", "bridge", "vlan", "wan", "proxy", "egress", "subscription", "logical", "bond", "bond_member"]);
+const LOGICAL_ID = /^(lan-|lan_|lan-bridge-|br-|wan-|wan_|proxy-|egress-|bond-)/i;
+
+/**
+ * The NIC page only owns physical ports. Logical LAN/WAN objects (bridges,
+ * proxy egresses, bonds) are managed by their own pages. A missing
+ * system_name is *not* evidence that a port is logical.
+ */
+export function isLogicalPort(item: any): boolean {
+  if (!item) return false;
+  const kind = String(item?.kind || item?.type || "").toLowerCase();
+  if (LOGICAL_KINDS.has(kind)) return true;
+  const id = String(item?.id || "");
+  const name = String(item?.name || "");
+  return LOGICAL_ID.test(id) || LOGICAL_ID.test(name);
+}
+
+/** A port that carries data traffic and is expected to be taken over. */
+export function isConfiguredDataPort(item: any): boolean {
+  if (!item || item.__bond || isLogicalPort(item)) return false;
+  if (item.management === true) return false;
+  const role = String(item.gateway_role || item.role || item.mode_role?.gateway || "").toLowerCase();
+  return role === "lan" || role === "wan";
+}
+
+/** Whether the dataplane has actually realized this port. */
+export function portRealized(item: any): boolean {
+  const info = takeoverInfo(item);
+  if (info.kind === "native" || info.kind === "compat") return true;
+  const virtual = String(item?.vpp_interface || item?.host_interface || "").trim();
+  const runtime = normalized(item?.runtime_state);
+  return Boolean(virtual) && /committed|applied|running|up|taken_over/.test(runtime);
+}
+
+export function snapshotDisplayName(snapshot: any, index = 0): string {
+  const name = String(snapshot?.name || "").trim();
+  if (name && !hasInternalId(name)) return name;
+  return index === 0 ? "最近一次保存" : "系统配置快照";
+}
+
+export function snapshotKindLabel(value: unknown): string {
+  const raw = String(value ?? "").toLowerCase();
+  if (!raw || hasInternalId(raw)) return "快照";
+  if (/manual|user|手动/.test(raw)) return "手动快照";
+  if (/auto|runtime|rollback|scheduled|自动/.test(raw)) return "自动快照";
+  return "快照";
+}
+
+export interface DeviceStatusSummary {
+  tone: "success" | "warning" | "neutral" | "danger";
+  label: string;
+  sidebarLabel: string;
+  reason: string;
+}
+
+/**
+ * Single status line for the shell. It is normal only when the last apply is
+ * settled and every configured data port has been realized; otherwise it
+ * explains the actionable state in operator language.
+ */
+export function deviceStatusSummary(input: {
+  phase?: string;
+  lastApply?: any;
+  ports?: any[];
+  loading?: boolean;
+  error?: boolean;
+}): DeviceStatusSummary {
+  const phase = String(input.phase || "").toLowerCase();
+  const last = input.lastApply || {};
+  const status = String(last.status || last.runtime_state || "").toLowerCase();
+  const applying = phase === "applying" || ["applying", "apply_in_progress", "in_progress"].includes(status);
+  if (applying) {
+    return { tone: "neutral", label: "配置应用中", sidebarLabel: "配置应用中", reason: "正在应用配置，请稍候" };
+  }
+  if (input.loading) {
+    return { tone: "neutral", label: "读取中", sidebarLabel: "状态读取中", reason: "正在读取设备状态" };
+  }
+  if (input.error) {
+    return { tone: "neutral", label: "状态未知", sidebarLabel: "状态未知", reason: "暂时无法读取设备状态" };
+  }
+  if (!last || !Object.keys(last).length) {
+    return { tone: "neutral", label: "状态未知", sidebarLabel: "状态未知", reason: "尚未读取到应用记录" };
+  }
+  if (phase === "failed" || /failed|apply_failed|dataplane_locked|rejected|error/.test(status)) {
+    return {
+      tone: "neutral",
+      label: "配置未生效",
+      sidebarLabel: "需要处理",
+      reason: applyFailureMessage(last),
+    };
+  }
+  if (phase === "degraded" || status.includes("degraded")) {
+    return {
+      tone: "neutral",
+      label: "部分配置未生效",
+      sidebarLabel: "需要处理",
+      reason: "部分配置尚未生效，请检查设备状态",
+    };
+  }
+  const committed = status === "committed" || status === "applied";
+  if (!committed) {
+    return { tone: "neutral", label: "配置未生效", sidebarLabel: "需要处理", reason: "配置尚未完成应用" };
+  }
+  const configured = (input.ports || []).filter(isConfiguredDataPort);
+  const unrealized = configured.filter((item) => !portRealized(item));
+  if (unrealized.length) {
+    return {
+      tone: "neutral",
+      label: "需要处理",
+      sidebarLabel: "需要处理",
+      reason: `${unrealized.length} 张已配置网卡尚未完成接管，请检查网卡设置`,
+    };
+  }
+  return { tone: "success", label: "运行正常", sidebarLabel: "设备正常", reason: "配置已生效，网卡接管正常" };
 }
 
 export interface TakeoverSummary {

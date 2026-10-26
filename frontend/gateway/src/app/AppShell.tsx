@@ -18,10 +18,11 @@ import {
 import { ALL_PAGES, COMMAND_ACTIONS, NAV_GROUPS, type NavGroup, type NavPage } from "./nav";
 import { CURRENT_PRODUCT } from "../product";
 import { useAuth, useApply, useConfirm } from "../state/providers";
-import { useHealth } from "../api/hooks";
+import { useHealth, useInterfacesResource, useRuntime } from "../api/hooks";
 import { Badge, Button, Drawer, Field, IconButton, Input, Modal, useToast } from "../components/ui";
 import { ApplyBanner } from "../state/providers";
 import { classNames, stateLabel } from "../lib/format";
+import { deviceStatusSummary } from "../lib/human";
 
 interface AppShellProps {
   navGroups?: NavGroup[];
@@ -44,6 +45,8 @@ export function AppShell({
   const { toast } = useToast();
   const confirm = useConfirm();
   const health = useHealth();
+  const runtime = useRuntime();
+  const interfaces = useInterfacesResource();
   const apply = useApply();
 
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("lyroute.sidebar.collapsed") === "1");
@@ -102,9 +105,29 @@ export function AppShell({
     });
   };
 
-  const degraded = (health.data?.dependencies || []).filter((item) => item.available === false);
-  const healthTone = health.isError ? "danger" : degraded.length ? "warning" : health.data?.status === "ok" ? "success" : "warning";
-  const healthText = health.isLoading ? "读取中" : health.isError ? "状态未知" : degraded.length ? "存在异常" : "运行正常";
+  const deviceStatus = useMemo(
+    () =>
+      deviceStatusSummary({
+        phase: apply.phase,
+        lastApply: apply.result || runtime.data?.last_apply,
+        ports: interfaces.data?.items || [],
+        loading: (health.isLoading || runtime.isLoading || interfaces.isLoading) && !apply.result,
+        error: health.isError || runtime.isError,
+      }),
+    [
+      apply.phase,
+      apply.result,
+      health.isError,
+      health.isLoading,
+      interfaces.data,
+      interfaces.isLoading,
+      runtime.data,
+      runtime.isError,
+      runtime.isLoading,
+    ]
+  );
+  const healthTone = deviceStatus.tone;
+  const healthText = deviceStatus.label;
 
   const submitPassword = async () => {
     if (newPassword.length < 8) {
@@ -178,9 +201,10 @@ export function AppShell({
             <span>搜索页面或动作</span>
             <kbd><Command size={11} /> K</kbd>
           </button>
-          <button className={`health-pill health-${healthTone}`} type="button" onClick={() => setHealthOpen(true)}>
-            <i className="status-dot" />
+          <button className={`health-pill health-${healthTone}`} type="button" title={deviceStatus.reason} onClick={() => setHealthOpen(true)}>
+            <i className={`status-dot status-dot-${healthTone === "success" ? "success" : healthTone === "danger" ? "danger" : healthTone === "warning" ? "warning" : "neutral"}`} />
             <span>{healthText}</span>
+            {healthTone !== "success" && <span className="health-reason">{deviceStatus.reason}</span>}
           </button>
           {apply.running && (
             <Badge tone="info" dot>应用中</Badge>
@@ -238,8 +262,8 @@ export function AppShell({
           ))}
         </nav>
         <div className="sidebar-foot">
-          <span className={classNames("status-dot", degraded.length || health.isError ? "status-dot-warning" : "status-dot-success")} />
-          {!collapsed && <span>{degraded.length || health.isError ? "设备状态异常" : "设备正常"}</span>}
+          <span className={classNames("status-dot", healthTone === "success" ? "status-dot-success" : healthTone === "danger" ? "status-dot-danger" : healthTone === "warning" ? "status-dot-warning" : "status-dot-neutral")} />
+          {!collapsed && <span title={deviceStatus.reason}>{deviceStatus.sidebarLabel}</span>}
         </div>
       </aside>
 
@@ -260,11 +284,12 @@ export function AppShell({
         width="sm"
       >
         <div className="health-summary">
-          <Badge tone={healthTone === "success" ? "success" : healthTone === "danger" ? "danger" : "warning"} dot>
+          <Badge tone={healthTone === "success" ? "success" : healthTone === "danger" ? "danger" : healthTone === "warning" ? "warning" : "neutral"} dot>
             {healthText}
           </Badge>
           <span>版本 {health.data?.version || "--"}</span>
         </div>
+        <p className="muted">{deviceStatus.reason}</p>
         <div className="health-list">
           {(health.data?.dependencies || []).map((item) => (
             <div className="health-row" key={item.name}>

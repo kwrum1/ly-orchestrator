@@ -11,7 +11,7 @@ import { DataTable } from "../components/DataTable";
 import { Badge, Button, Card, Field, Input, Modal, PageHeader, Select, useToast } from "../components/ui";
 import { useApply, useAuth, useConfirm } from "../state/providers";
 import { formatRate, roleLabel, text } from "../lib/format";
-import { humanErrorMessage, linkInfo, takeoverInfo, takeoverSummary, type TakeoverInfo } from "../lib/human";
+import { humanErrorMessage, isLogicalPort, linkInfo, takeoverInfo, takeoverSummary, type TakeoverInfo } from "../lib/human";
 
 function interfaceRole(item: InterfaceItem) {
   return item.gateway_role || item.role || item.mode_role?.gateway || "";
@@ -19,27 +19,6 @@ function interfaceRole(item: InterfaceItem) {
 
 function isManagement(item: InterfaceItem) {
   return Boolean(item.management) || interfaceRole(item) === "management" || String(item.name || "").toLowerCase() === "eth0";
-}
-
-const LOGICAL_KINDS = new Set(["lan_bridge", "bridge", "vlan", "wan", "proxy", "egress", "subscription", "logical", "bond", "bond_member"]);
-const LOGICAL_ID = /^(lan-|lan_|lan-bridge-|br-|wan-|wan_|proxy-|egress-|bond-)/i;
-
-/**
- * The NIC page only owns physical ports. Logical LAN/WAN objects (bridges,
- * display-name overrides, proxy egresses) are managed by their own pages.
- */
-function isLogicalInterface(item: any) {
-  const kind = String(item?.kind || item?.type || "").toLowerCase();
-  if (LOGICAL_KINDS.has(kind)) return true;
-  const id = String(item?.id || "");
-  const name = String(item?.name || "");
-  if (LOGICAL_ID.test(id) || LOGICAL_ID.test(name)) return true;
-  if (item?.display_name && !item?.system_name && !item?.mac && !item?.speed) return true;
-  return false;
-}
-
-function portKey(item: any) {
-  return String(item?.system_name || item?.id || item?.name || "");
 }
 
 function memberKeys(bond: InterfaceBond) {
@@ -127,7 +106,7 @@ export function InterfacesPage() {
   const allMembers = useMemo(() => bonds.flatMap(memberKeys), [bonds]);
 
   const physicalPorts = useMemo(
-    () => merged.filter((item) => !isLogicalInterface(item) && !isBondRow(item)),
+    () => merged.filter((item) => !isLogicalPort(item) && !isBondRow(item)),
     [merged]
   );
 

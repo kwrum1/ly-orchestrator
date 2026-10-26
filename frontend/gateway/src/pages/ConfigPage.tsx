@@ -6,6 +6,7 @@ import { useHealth, useInterfacesResource, useManagementNetwork, useSummary } fr
 import { Badge, Button, Card, Field, Input, Modal, PageHeader, Select, useToast } from "../components/ui";
 import { useApply, useAuth, useConfirm } from "../state/providers";
 import { formatDateTime, formatDuration, text } from "../lib/format";
+import { snapshotDisplayName, snapshotKindLabel } from "../lib/human";
 
 export function ConfigPage() {
   const { toast } = useToast();
@@ -102,8 +103,8 @@ export function ConfigPage() {
     }
   };
 
-  const restoreSnapshot = async (snapshot: any) => {
-    const ok = await confirm({ title: `恢复快照 ${snapshot.name || snapshot.id}？`, message: "当前配置会被替换；恢复后需要应用配置。", confirmLabel: "恢复", danger: true });
+  const restoreSnapshot = async (snapshot: any, displayName: string) => {
+    const ok = await confirm({ title: `恢复快照“${displayName}”？`, message: "当前配置会被替换；恢复后需要应用配置。", confirmLabel: "恢复", danger: true });
     if (!ok) return;
     try {
       await postJson(API.config.snapshot(snapshot.id), {});
@@ -226,13 +227,16 @@ export function ConfigPage() {
             <Button size="sm" onClick={createSnapshot} disabled={session?.role === "readonly"}>创建快照</Button>
           </div>
           <div className="snapshot-list">
-            {snapshots.slice(0, 6).map((snapshot) => (
-              <div className="snapshot-row" key={snapshot.id}>
-                <div><strong>{text(snapshot.name || snapshot.id)}</strong><small>{formatDateTime(snapshot.created_at || snapshot.timestamp)}</small></div>
-                <Badge tone="neutral">{text(snapshot.kind, "快照")}</Badge>
-                <Button size="sm" variant="ghost" icon={<RotateCcw size={13} />} onClick={() => restoreSnapshot(snapshot)} disabled={session?.role === "readonly"}>恢复</Button>
-              </div>
-            ))}
+            {snapshots.slice(0, 6).map((snapshot, index) => {
+              const displayName = snapshotDisplayName(snapshot, index);
+              return (
+                <div className="snapshot-row" key={snapshot.id || index}>
+                  <div><strong>{displayName}</strong><small>{formatDateTime(snapshot.created_at || snapshot.timestamp)}</small></div>
+                  <Badge tone="neutral">{snapshotKindLabel(snapshot.kind)}</Badge>
+                  <Button size="sm" variant="ghost" icon={<RotateCcw size={13} />} onClick={() => restoreSnapshot(snapshot, displayName)} disabled={session?.role === "readonly"}>恢复</Button>
+                </div>
+              );
+            })}
             {!snapshots.length && <p className="muted">暂无快照。</p>}
           </div>
         </Card>

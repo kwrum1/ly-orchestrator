@@ -69,6 +69,7 @@ kbd { display: inline-flex; align-items: center; gap: 2px; padding: 1px 5px; bor
 .health-pill.health-success { border-color: #bfe8d7; background: var(--success-soft); color: #087b54; }
 .health-pill.health-warning { border-color: #f1d7a5; background: var(--warning-soft); color: #a45d06; }
 .health-pill.health-danger { border-color: #f2c0c0; background: var(--danger-soft); color: #b91c1c; }
+.health-pill .health-reason { max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-tertiary); font-size: 11px; }
 .user-menu { position: relative; }
 .user-button { display: flex; align-items: center; gap: 8px; border: 0; background: transparent; padding: 2px 4px; border-radius: 6px; }
 .user-button:hover { background: var(--surface-sunken); }
