@@ -1,0 +1,68 @@
+==== gateway/dist
+total 1.2M
+-rw-r--r-- 1 root root 1.1M Oct 23 15:12 app.js
+-rw-r--r-- 1 root root  567 Oct 23 15:12 capabilities.json
+-rw-r--r-- 1 root root  123 Oct 23 15:12 commercial.css
+-rw-r--r-- 1 root root  828 Oct 23 15:12 index.html
+-rw-r--r-- 1 root root  158 Oct 23 15:12 shell.js
+-rw-r--r-- 1 root root  50K Oct 23 15:12 styles.css
+capabilities.product=gateway
+<title>Ly Route 出口网关</title>
+5f30ed4db99e061bb847c8a642f6da3d1464ca9a7f7fb3851aed9f2a5cb06227  app.js
+6b58f3314c216019af7c721a6de29af7e193d52595a2ea3f10d8abaa6641cbfe  styles.css
+bcdc708b2a9f56f002b7ff22841e87b508f121ab2333de66d8cf1274b4d8bb7a  shell.js
+0f901e4b534ec1e8cc7ea8c292141d2412303369dbe68810a5bfa35e77a947fd  commercial.css
+95bd19e5cd48b071e26a6b8606208e7659ec67ea09a48879924acfa2547b4b80  index.html
+12e67b55278788e22472a2e54e23744abdd53664a319fc5d8a1ddeacb74fb75f  capabilities.json
+
+==== gateway/controller-shell
+total 1.2M
+-rw-r--r-- 1 root root 1.1M Oct 23 15:14 app.js
+-rw-r--r-- 1 root root  567 Oct 23 15:14 capabilities.json
+-rw-r--r-- 1 root root  123 Oct 23 15:14 commercial.css
+-rw-r--r-- 1 root root  828 Oct 23 15:14 index.html
+-rw-r--r-- 1 root root  158 Oct 23 15:14 shell.js
+-rw-r--r-- 1 root root  50K Oct 23 15:14 styles.css
+capabilities.product=gateway
+<title>Ly Route 出口网关</title>
+5f30ed4db99e061bb847c8a642f6da3d1464ca9a7f7fb3851aed9f2a5cb06227  app.js
+6b58f3314c216019af7c721a6de29af7e193d52595a2ea3f10d8abaa6641cbfe  styles.css
+bcdc708b2a9f56f002b7ff22841e87b508f121ab2333de66d8cf1274b4d8bb7a  shell.js
+0f901e4b534ec1e8cc7ea8c292141d2412303369dbe68810a5bfa35e77a947fd  commercial.css
+95bd19e5cd48b071e26a6b8606208e7659ec67ea09a48879924acfa2547b4b80  index.html
+12e67b55278788e22472a2e54e23744abdd53664a319fc5d8a1ddeacb74fb75f  capabilities.json
+
+==== orchestrator/dist
+total 1.1M
+-rw-r--r-- 1 root root 972K Oct 23 15:13 app.js
+-rw-r--r-- 1 root root  326 Oct 23 15:13 capabilities.json
+-rw-r--r-- 1 root root  123 Oct 23 15:13 commercial.css
+-rw-r--r-- 1 root root  831 Oct 23 15:13 index.html
+-rw-r--r-- 1 root root  158 Oct 23 15:13 shell.js
+-rw-r--r-- 1 root root  50K Oct 23 15:13 styles.css
+capabilities.product=orchestrator
+<title>Ly Route 流量编排器</title>
+dba17962b33a27dd5c7c617e3b7ff978daa93bb459423c75230763e931c3aad8  app.js
+6b58f3314c216019af7c721a6de29af7e193d52595a2ea3f10d8abaa6641cbfe  styles.css
+bcdc708b2a9f56f002b7ff22841e87b508f121ab2333de66d8cf1274b4d8bb7a  shell.js
+0f901e4b534ec1e8cc7ea8c292141d2412303369dbe68810a5bfa35e77a947fd  commercial.css
+b64fb9a1278409234494ba2ce5413c51ae5b000d720df2b989586f9792782130  index.html
+7e0a88f454c2750b44d36a717d4a66bca6f7e63a27ba488f8d82ce06ffaba91d  capabilities.json
+
+==== orchestrator/controller-shell
+total 1.1M
+-rw-r--r-- 1 root root 972K Oct 23 15:15 app.js
+-rw-r--r-- 1 root root  326 Oct 23 15:15 capabilities.json
+-rw-r--r-- 1 root root  123 Oct 23 15:15 commercial.css
+-rw-r--r-- 1 root root  831 Oct 23 15:15 index.html
+-rw-r--r-- 1 root root  158 Oct 23 15:15 shell.js
+-rw-r--r-- 1 root root  50K Oct 23 15:15 styles.css
+capabilities.product=orchestrator
+<title>Ly Route 流量编排器</title>
+dba17962b33a27dd5c7c617e3b7ff978daa93bb459423c75230763e931c3aad8  app.js
+6b58f3314c216019af7c721a6de29af7e193d52595a2ea3f10d8abaa6641cbfe  styles.css
+bcdc708b2a9f56f002b7ff22841e87b508f121ab2333de66d8cf1274b4d8bb7a  shell.js
+0f901e4b534ec1e8cc7ea8c292141d2412303369dbe68810a5bfa35e77a947fd  commercial.css
+b64fb9a1278409234494ba2ce5413c51ae5b000d720df2b989586f9792782130  index.html
+7e0a88f454c2750b44d36a717d4a66bca6f7e63a27ba488f8d82ce06ffaba91d  capabilities.json
+

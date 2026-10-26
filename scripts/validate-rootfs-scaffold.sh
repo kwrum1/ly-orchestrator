@@ -64,8 +64,9 @@ $repo_root/backend/orchestrator/main.go
 $repo_root/backend/internal/httpapi/server.go
 $repo_root/backend/internal/httpapi/auth.go
 $repo_root/frontend/gateway/index.html
-$repo_root/frontend/gateway/styles.css
-$repo_root/frontend/gateway/app.js
+$repo_root/frontend/gateway/package.json
+$repo_root/frontend/gateway/vite.config.ts
+$repo_root/frontend/gateway/src/main.tsx
 $repo_root/frontend/orchestrator/index.html
 $repo_root/frontend/orchestrator/styles.css
 $repo_root/frontend/orchestrator/app.js
@@ -117,8 +118,8 @@ sh -n "$repo_root/packaging/rootfs-overlay/usr/lib/ly-route/recover-runtime.sh"
 # retired Linux/pppd fixture contracts into the native-VPP release gate.
 (cd "$repo_root/backend" && go test -run '^$' ./...)
 
-for token in Panabit "assets/" VRRP vrrp login-logo admin-logo login-background "--pa-"; do
-  if grep -R --line-number --fixed-strings --exclude='*.dat' -- "$token" \
+for token in Panabit iKuai UniFi Ubiquiti VRRP vrrp login-logo admin-logo login-background "--pa-"; do
+  if grep -R --line-number --fixed-strings --exclude='*.dat' --exclude-dir=node_modules --exclude-dir=dist -- "$token" \
     "$repo_root/frontend/gateway" \
     "$repo_root/frontend/orchestrator" \
     "$repo_root/Dockerfile" \

@@ -1,0 +1,359 @@
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import {
+  Activity,
+  ChevronDown,
+  ChevronRight,
+  CircleHelp,
+  Command,
+  LogOut,
+  Menu,
+  PanelLeftClose,
+  PanelLeftOpen,
+  RefreshCw,
+  Search,
+  ShieldCheck,
+  UserRound,
+} from "lucide-react";
+import { ALL_PAGES, COMMAND_ACTIONS, NAV_GROUPS, type NavGroup, type NavPage } from "./nav";
+import { CURRENT_PRODUCT } from "../product";
+import { useAuth, useApply, useConfirm } from "../state/providers";
+import { useHealth, useInterfacesResource, useRuntime } from "../api/hooks";
+import { Badge, Button, Drawer, Field, IconButton, Input, Modal, useToast } from "../components/ui";
+import { ApplyBanner } from "../state/providers";
+import { classNames, stateLabel } from "../lib/format";
+import { deviceStatusSummary } from "../lib/human";
+
+interface AppShellProps {
+  navGroups?: NavGroup[];
+  allPages?: NavPage[];
+  commandActions?: { key: string; label: string; description: string; icon: ReactNode }[];
+  productSubtitle?: string;
+  productBadge?: string;
+}
+
+export function AppShell({
+  navGroups = NAV_GROUPS,
+  allPages = ALL_PAGES,
+  commandActions = COMMAND_ACTIONS,
+  productSubtitle = CURRENT_PRODUCT.subtitle,
+  productBadge = CURRENT_PRODUCT.badge,
+}: AppShellProps) {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const { session, logout, changePassword } = useAuth();
+  const { toast } = useToast();
+  const confirm = useConfirm();
+  const health = useHealth();
+  const runtime = useRuntime();
+  const interfaces = useInterfacesResource();
+  const apply = useApply();
+
+  const [collapsed, setCollapsed] = useState(() => localStorage.getItem("lyroute.sidebar.collapsed") === "1");
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [healthOpen, setHealthOpen] = useState(false);
+  const [commandOpen, setCommandOpen] = useState(false);
+  const [commandQuery, setCommandQuery] = useState("");
+  const [userOpen, setUserOpen] = useState(false);
+  const [passwordOpen, setPasswordOpen] = useState(false);
+  const [passwordBusy, setPasswordBusy] = useState(false);
+  const [passwordError, setPasswordError] = useState("");
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+
+  const currentPage = allPages.find((page) => page.path === location.pathname);
+  const currentGroup = navGroups.find((group) => group.pages.some((page) => page.path === location.pathname));
+
+  const filteredGroups = useMemo(() => {
+    const value = query.trim().toLowerCase();
+    if (!value) return navGroups;
+    return navGroups
+      .map((group) => ({
+        ...group,
+        pages: group.pages.filter((page) => `${group.label} ${page.label} ${page.description}`.toLowerCase().includes(value)),
+      }))
+      .filter((group) => group.pages.length > 0);
+  }, [query, navGroups]);
+
+  const commands = useMemo(() => {
+    const value = commandQuery.trim().toLowerCase();
+    const pages = allPages.filter((page) => !value || `${page.label} ${page.description} ${page.path}`.toLowerCase().includes(value));
+    return { pages, actions: commandActions.filter((action) => !value || action.label.toLowerCase().includes(value)) };
+  }, [commandQuery, allPages, commandActions]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setCommandOpen((value) => !value);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  useEffect(() => {
+    setMobileOpen(false);
+  }, [location.pathname]);
+
+  const toggleCollapsed = () => {
+    setCollapsed((value) => {
+      localStorage.setItem("lyroute.sidebar.collapsed", value ? "0" : "1");
+      return !value;
+    });
+  };
+
+  const deviceStatus = useMemo(
+    () =>
+      deviceStatusSummary({
+        phase: apply.phase,
+        lastApply: apply.result || runtime.data?.last_apply,
+        ports: interfaces.data?.items || [],
+        loading: (health.isLoading || runtime.isLoading || interfaces.isLoading) && !apply.result,
+        error: health.isError || runtime.isError,
+      }),
+    [
+      apply.phase,
+      apply.result,
+      health.isError,
+      health.isLoading,
+      interfaces.data,
+      interfaces.isLoading,
+      runtime.data,
+      runtime.isError,
+      runtime.isLoading,
+    ]
+  );
+  const healthTone = deviceStatus.tone;
+  const healthText = deviceStatus.label;
+
+  const submitPassword = async () => {
+    if (newPassword.length < 8) {
+      setPasswordError("新密码至少 8 位");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setPasswordError("两次输入的新密码不一致");
+      return;
+    }
+    setPasswordBusy(true);
+    setPasswordError("");
+    try {
+      await changePassword(currentPassword, newPassword);
+      toast("密码已修改", "success");
+      setPasswordOpen(false);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+    } catch (error: any) {
+      setPasswordError(error?.message || "修改密码失败");
+    } finally {
+      setPasswordBusy(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    if (!(await confirm({ title: "退出登录？", message: "当前会话将立即失效。", confirmLabel: "退出" }))) return;
+    await logout();
+    navigate("/", { replace: true });
+  };
+
+  const runCommand = (key: string, path?: string) => {
+    setCommandOpen(false);
+    if (path) {
+      navigate(path);
+      return;
+    }
+    if (key === "apply") {
+      void apply.apply();
+      return;
+    }
+    if (key === "refresh") {
+      window.dispatchEvent(new CustomEvent("lyroute:refresh"));
+      toast("正在刷新当前页面", "info");
+    }
+  };
+
+  return (
+    <div className={classNames("app-shell", collapsed && "is-collapsed", mobileOpen && "mobile-open")}>
+      <header className="topbar">
+        <div className="topbar-left">
+          <IconButton label="打开菜单" className="mobile-only" onClick={() => setMobileOpen(true)}><Menu size={18} /></IconButton>
+          <button className="brand" type="button" onClick={() => navigate("/")}>
+            <span className="brand-mark">LR</span>
+            <span className="brand-copy">
+              <strong>Ly Route</strong>
+              <small>{productSubtitle}</small>
+            </span>
+            {productBadge && <span className="brand-badge">{productBadge}</span>}
+          </button>
+          <div className="breadcrumb">
+            <span>{currentGroup?.label || "概览"}</span>
+            <ChevronRight size={13} />
+            <strong>{currentPage?.label || "总览"}</strong>
+          </div>
+        </div>
+        <div className="topbar-right">
+          <button className="global-search" type="button" onClick={() => setCommandOpen(true)}>
+            <Search size={15} />
+            <span>搜索页面或动作</span>
+            <kbd><Command size={11} /> K</kbd>
+          </button>
+          <button className={`health-pill health-${healthTone}`} type="button" title={deviceStatus.reason} onClick={() => setHealthOpen(true)}>
+            <i className={`status-dot status-dot-${healthTone === "success" ? "success" : healthTone === "danger" ? "danger" : healthTone === "warning" ? "warning" : "neutral"}`} />
+            <span>{healthText}</span>
+            {healthTone !== "success" && <span className="health-reason">{deviceStatus.reason}</span>}
+          </button>
+          {apply.running && (
+            <Badge tone="info" dot>应用中</Badge>
+          )}
+          <div className="user-menu">
+            <button className="user-button" type="button" onClick={() => setUserOpen((value) => !value)}>
+              <span className="avatar">{session?.username?.slice(0, 1).toUpperCase() || "A"}</span>
+              <span className="user-meta">
+                <strong>{session?.username || "admin"}</strong>
+                <small>{session?.role === "readonly" ? "只读" : "管理员"}</small>
+              </span>
+              <ChevronDown size={14} />
+            </button>
+            {userOpen && (
+              <div className="user-popover" onMouseLeave={() => setUserOpen(false)}>
+                <button type="button" onClick={() => { setUserOpen(false); setPasswordOpen(true); }}>
+                  <ShieldCheck size={15} /> 修改密码
+                </button>
+                <button type="button" onClick={handleLogout}><LogOut size={15} /> 退出登录</button>
+              </div>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <aside className="sidebar">
+        <div className="sidebar-top">
+          {!collapsed && (
+            <label className="side-search">
+              <Search size={14} />
+              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="筛选菜单" />
+            </label>
+          )}
+          <IconButton label={collapsed ? "展开侧栏" : "收起侧栏"} onClick={toggleCollapsed}>
+            {collapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+          </IconButton>
+        </div>
+        <nav className="side-nav" aria-label="主导航">
+          {filteredGroups.map((group) => (
+            <section className="nav-group" key={group.key}>
+              {!collapsed && <h3>{group.label}</h3>}
+              {group.pages.map((page) => (
+                <NavLink
+                  key={page.key}
+                  to={page.path}
+                  end={page.path === "/"}
+                  className={({ isActive }) => classNames("nav-item", isActive && "is-active")}
+                  title={collapsed ? page.label : page.description}
+                >
+                  {page.icon}
+                  {!collapsed && <span>{page.label}</span>}
+                </NavLink>
+              ))}
+            </section>
+          ))}
+        </nav>
+        <div className="sidebar-foot">
+          <span className={classNames("status-dot", healthTone === "success" ? "status-dot-success" : healthTone === "danger" ? "status-dot-danger" : healthTone === "warning" ? "status-dot-warning" : "status-dot-neutral")} />
+          {!collapsed && <span title={deviceStatus.reason}>{deviceStatus.sidebarLabel}</span>}
+        </div>
+      </aside>
+
+      {mobileOpen && <div className="mobile-overlay" onClick={() => setMobileOpen(false)} />}
+
+      <main className="main">
+        <ApplyBanner />
+        <div className="main-inner">
+          <Outlet />
+        </div>
+      </main>
+
+      <Drawer
+        open={healthOpen}
+        onClose={() => setHealthOpen(false)}
+        title="设备健康"
+        subtitle="设备状态与版本"
+        width="sm"
+      >
+        <div className="health-summary">
+          <Badge tone={healthTone === "success" ? "success" : healthTone === "danger" ? "danger" : healthTone === "warning" ? "warning" : "neutral"} dot>
+            {healthText}
+          </Badge>
+          <span>版本 {health.data?.version || "--"}</span>
+        </div>
+        <p className="muted">{deviceStatus.reason}</p>
+        <div className="health-list">
+          {(health.data?.dependencies || []).map((item) => (
+            <div className="health-row" key={item.name}>
+              <div>
+                <strong>{item.name}</strong>
+                {item.available === false && <p>该服务当前不可用</p>}
+              </div>
+              <Badge tone={item.available === false ? "danger" : "success"} dot>{stateLabel(item.state)}</Badge>
+            </div>
+          ))}
+        </div>
+      </Drawer>
+
+      <Modal
+        open={commandOpen}
+        onClose={() => setCommandOpen(false)}
+        title="快速跳转"
+        subtitle="搜索页面或动作；不搜索业务数据"
+        size="md"
+      >
+        <div className="command-input">
+          <Search size={16} />
+          <input autoFocus value={commandQuery} onChange={(event) => setCommandQuery(event.target.value)} placeholder="输入页面名，例如：策略、WAN、接口" />
+        </div>
+        <div className="command-list">
+          {commands.pages.map((page) => (
+            <button type="button" key={page.key} onClick={() => runCommand(page.key, page.path)}>
+              <span className="command-icon">{page.icon}</span>
+              <span><strong>{page.label}</strong><small>{page.description}</small></span>
+              <ChevronRight size={14} />
+            </button>
+          ))}
+          {commands.actions.map((action) => (
+            <button type="button" key={action.key} onClick={() => runCommand(action.key)}>
+              <span className="command-icon">{action.icon}</span>
+              <span><strong>{action.label}</strong><small>{action.description}</small></span>
+              <ChevronRight size={14} />
+            </button>
+          ))}
+          {!commands.pages.length && !commands.actions.length && <p className="muted">没有匹配的页面或动作。</p>}
+        </div>
+      </Modal>
+
+      <Modal
+        open={passwordOpen}
+        onClose={() => !passwordBusy && setPasswordOpen(false)}
+        title="修改密码"
+        subtitle={session?.username}
+        size="sm"
+        busy={passwordBusy}
+        footer={
+          <>
+            <Button onClick={() => setPasswordOpen(false)} disabled={passwordBusy}>取消</Button>
+            <Button variant="primary" loading={passwordBusy} onClick={submitPassword}>保存</Button>
+          </>
+        }
+      >
+        <div className="form-stack">
+          <Field label="当前密码"><Input type="password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} /></Field>
+          <Field label="新密码" hint="至少 8 位，不能包含用户名"><Input type="password" autoComplete="new-password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} /></Field>
+          <Field label="确认新密码"><Input type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} /></Field>
+          {passwordError && <div className="form-error">{passwordError}</div>}
+        </div>
+      </Modal>
+    </div>
+  );
+}
