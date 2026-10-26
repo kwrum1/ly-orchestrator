@@ -8,6 +8,155 @@
 
 # Orchestrator acceptance on ESXi (AF_PACKET mode)
 
+## 最终发布候选 `777fbf6601de` — ESXi `10.1.18.124` 验收（2026-10-26）
+
+Run `20261026T1055Z-orch-rc-777fbf6`. Candidate `/root/work/ly-route-rc` @
+`777fbf6601de0ac59c2a8dd6bb0c7e8f60561fab`（`777fbf6601de`，"merge:
+fix/coldstart-capability"）；dist
+`/root/work/dist-release-orchestrator-777fbf6601de`。产品 `orchestrator`，数据面为
+AF_PACKET 验收模式（`hook=af_packet`、`mode=linux_packet_socket`、
+`tier=vpp_native`、`acceptance_only=true`、`high_performance=false`），不作性能声明。
+该次构建的 UI 为能力优先新包（`app.js` sha256
+`b3e4027e232226541aa77f6225da69005b5279850db7ce73d9c7a5be5ebd0dea`，与
+`packaging/build-profiles/orchestrator.json` 的 pin 一致）。
+
+平台：**独立 ESXi 8.0.3（build-24859861）`10.1.18.124`**，非 vCenter，非 `.121`，
+无 QEMU。复用隔离网络 `vSwitch ORCH-WAN` + `orch-wan-pg`、`vSwitch ORCH-LAN` +
+`orch-lan-pg`（均无上联），仅 `VM Network` 承载管理。保护资源 `lyacc-gw-*`、
+`lyacc-wan`、`lyacc-lan`、`WAN-iso`、`LAN-lab`、`WAN-lab` 与 `Management Network`
+均未改动。上一轮验收 VM `lyacc-orch-1262522`（vmid 53）在部署前关机，避免隔离二层
+上出现第二条转发路径；其磁盘和配置未修改。
+
+### Verdict
+
+| # | Requirement | Verdict | Evidence |
+|---|---|---|---|
+| 1 | 构建身份：manifest/version/UI hash，`--version` = commit | **PASS** | `build/`、`host/identity-dump.txt`、`phase-a/identity-*` |
+| 2 | health、改密 + 登录、产品 profile `orchestrator` | **PASS** | `phase-a.log`、`phase-a/health*.json`、`phase-a/product.json` |
+| 3 | 透明数据面：`hook=af_packet`、`acceptance_only=true`、apply committed、status `running` + generation、≥5 次稳定轮询 | **PASS** | `phase-b.log`、`phase-b/af-env-and-proof.clean.json`、`phase-b/status-stability/polls.jsonl`、`final/stability.txt` |
+| 4 | control-api 与 VPP 重启后 generation 与转发不变 | **PASS** | `restart-persistence-test.log`、`persistence/` |
+| 5 | 双向连通、allow 8080、deny 9000 + VPP 计数、反向 | **PASS** | `datapath-test.log`、`functional/` |
+| 6 | fail-closed：停 VPP → `apply_failed`、无 generation、无直通泄漏；恢复 → 复原并提交 | **PASS** | `failclosed-test.log`、`failclosed/` |
+| 7 | 真实 Chromium UI 11/11、零 404、console 干净、零禁用词 | **PASS** | `ui/`、`ui-capability-labels/`、`ui-forbidden/forbidden-scan.json`、`ui-bundle/` |
+| 8 | 从本 dist 执行升级/回滚；坏包/篡改包被拒且不改文件 | **PASS** | `upgrade-test.log`、`upgrade/`、`upgrade/upgrade-verdict.txt` |
+| — | apply-lock：并发 apply 返回 202 + 真实持有者，绝不出现幻影 id | **PASS** | `applylock-test.log`、`apply-lock/apply-lock-concurrency-verdict.txt` |
+
+总评：**八项全 PASS，apply-lock 亦 PASS**。证据
+`/root/work/orch-acceptance/evidence/20261026T1055Z-orch-rc-777fbf6/`
+（`summary.json`、`README.md`）。
+
+### Build identity
+
+五个 `.sha256` 与 `SHA256SUMS` 全部校验通过；rootfs、upgrade、disk 三处 manifest
+均为 `product=orchestrator`、`source_commit=777fbf6601de`（等于 HEAD）、
+`frontend_app_sha256=b3e4027e…`。部署后的 `/opt/ly-route/admin/app.js` 与 nginx
+实际下发的 `app.js` 均为 `b3e4027e…`；部署的 control 二进制 `--version` 输出
+`777fbf6601de`（rc=0），`/health` 版本 `26.06+lyroute1`。
+
+| Artifact | SHA-256 |
+|---|---|
+| rootfs | `4720e0d79977c6d4a89614cc2b8feb0d18c2f11684d3ff8a7f9ddc971f114aa8` |
+| upgrade | `cbd65c5eb4ae3435548205a95735325e77b344467d4cfc3c2b47fd0ce2f0ec24` |
+| disk image | `aea03a81d00912337d1bfbe27bc0726c6ba6ca9c2f32f8bff206dd89c7193e29` |
+| disk image `.zst` | `10b65b0d1d2c3051853c5979fef00ebd69bc376b669a4e51bdc9b7c396cd4e5b` |
+| control binary（部署） | `35f46aaa9259eed1e5433d3512ca0edf8f93083c371e0a9530750fc5b9640baf` |
+| VPP orchestrator plugin | `29a5617266f5109002b55fa100644bc6c67562dbe41c151978d7a3a5a668236a` |
+| `app.js`（rootfs / upgrade / 部署 / 下发） | `b3e4027e232226541aa77f6225da69005b5279850db7ce73d9c7a5be5ebd0dea` |
+
+### Deployment
+
+- 新建 Orchestrator VM `lyacc-orch-777fbf6`（vmid 61）：4 vCPU / 4 GB，3 ×
+  vmxnet3，`pciBridge4..7 virtualDev=pcieRootPort`；`virt-customize` 在转换前注入
+  root/admin RSA key 与静态管理地址；raw → monolithicSparse → `[data]` thin。
+  mgmt `10.1.18.244/24` `ens192`（`VM Network`，MAC `00:50:56:ac:25:01`）、WAN
+  `ens224`（`orch-wan-pg`，`…:02`）、LAN `ens256`（`orch-lan-pg`，`…:03`）。VMX
+  见 `esxi/vm.txt`。
+- 复用 peer `lyacc-orch-peer-124`（vmid 50）：Debian 12，2 vCPU / 2 GB，mgmt
+  `10.1.18.243/24`；`ens224` 在 netns `wan` = 10.99.0.2/24（服务端），`ens256` 在
+  netns `lan` = 10.99.0.3/24（客户端）。
+
+### Runtime and functional results
+
+拓扑/策略的 generation：
+`fd3afd6b162faed4fe22188ab88cf55295ef096e4c742dad35d7bee9441b28e0`（与同
+拓扑/策略的历史通过轮次一致）。
+
+- 能力证明：两块数据网卡均为 `tier=vpp_native`、`hook=af_packet`、
+  `mode=linux_packet_socket`、`acceptance_only=true`、`high_performance=false`、
+  `kernel_driver=vmxnet3`；VPP 接口 `lyroute-ens224` / `lyroute-ens256` 为
+  `Linux PACKET socket interface v3`；af_xdp/rdma/dpdk 记为失败前置条件。
+- `POST /api/v1/runtime/apply` → 200 `committed`（`runtime-f1235e31…`）；
+  `/runtime/status` → `running`，组件恰为 `vpp` + `persistence`，generation 在
+  reason 中；重启前 6 次、重启后 6 次、收尾 6 次轮询均完全一致。
+- VPP 重启与 control-api 重启：generation 不变，接口 up，各自 ICMP 3/3，
+  状态 `running`/`committed`。
+- ICMP LAN→WAN 5/5、WAN→LAN 5/5。allow TCP/8080：HTTP 200（19 B，30 ms；
+  2 MiB 流已返回 200 响应头，但在 20 s harness 截止时收到 1 275 688 B，属
+  AF_PACKET 慢路径，不是策略失败）。deny TCP/9000：监听在的情况下超时
+  （curl rc 28），VPP 策略计数 `packets 3 bytes 222`，接口 drops 3。反向
+  TCP/8082：HTTP 200。信息性吞吐 2 097 152 B / 40.76 s ≈ 51 kB/s，不作性能声明。
+- fail-closed：停 VPP 后 apply → 202 `apply_failed` / `degraded`，无
+  journal、无新 generation；ping 100% 丢失、TCP 超时（无直通泄漏）；
+  `/config/apply` → 202 `apply_in_progress`（非 423 `dataplane_locked`）。
+  恢复后同一 generation 复原，随后 re-apply → 200 `committed`
+  （`runtime-f0cd002b…`）。恢复瞬间的首次 apply 与 2 s 恢复环竞争返回
+  202 degraded，重跑即提交，见 F2。
+- UI（真实 Chromium，1440×900，已登录）：**11/11**、**0 个 HTTP 404**、
+  唯一 console error 是预期的登录前 `/api/v1/auth/session` 401、**禁用词 0 命中**
+  （`内核`、`驱动`、`gb`、`vmxnet3`、`DPDK`、`UIO`、`VFIO`、`AF_XDP`、
+  `AF_PACKET`、`hook`、`dataplane_locked`、`af_fallback_required`、
+  `/api/v1/`），11 张截图。实际下发 `app.js` 为 `b3e4027e…`。
+- 升级/回滚（本 dist 的 upgrade 包，sha256 `cbd65c5e…`）：stage 201
+  `staged`；install 202 + `Location` + `Retry-After: 2` → `installed`
+  （"orchestrator payload installed and health check passed"），健康、生成、
+  身份哈希与 `--version` 均复验；rollback 202 → `rolled_back`（身份恢复）。
+  无效包上传 422 `invalid_upgrade_package`，未建任务；staged 包篡改（bit flip）
+  后安装终态 `failed`（"package hash mismatch"），文件/健康/身份不变，回滚
+  `rolled_back`。`upgrade/upgrade-verdict.txt` 17/17 PASS。
+- apply-lock：三组、每组 4 个并发 `POST /runtime/apply`，每组恰有 1 个进入门内
+  并 200 `committed`；其余 3 个均 202 `apply_in_progress`，其
+  `in_flight_apply.transaction_id` 等于真实持有者，`in_progress=true`、
+  `retry_after_seconds=2`，**无幻影 id**。顺序重放 8 次中 6 次 200 committed、
+  2 次 202 degraded（F2），非锁语义问题。
+
+### Findings
+
+- **F1（P2，非阻塞）**：`scripts/acceptance/orchestrator-esxi/ui-sweep.mjs`
+  的页面标题 fixture 仍为旧包口径：`/telemetry`、`/runtime`、`/config` 在新包中
+  的 h1 已是 `流量监控`、`系统状态`、`配置管理`。路由、页数、404、console 检查
+  全部不变；仅将这三个期望标题对齐实际包后得到 11/11，差异见
+  `ui-label-adaptation.diff`。原始 harness 结果为 8/11，仅因标题 fixture 过期。
+- **F2（P2，非阻塞，既有问题）**：re-apply 若刚好落在 2 s 透明恢复轮的
+  readback 窗口内，会返回 202 degraded（"transparent orchestrator runtime is
+  applying or recovering"），立即重试即 200 committed；并发 apply 门本身正确。
+- **F3（信息性）**：AF_PACKET 验收模式吞吐约 51 kB/s，大对象超过 harness 的
+  20 s 截止，但 allow 决策与 HTTP 200 已由小对象和响应头证明。
+
+### Gaps
+
+- 不作吞吐/线速/时延声明（AF_PACKET 验收模式）。
+- 未验证 vmxnet3 原生 / DPDK / AF_XDP 挂载（均记录为失败前置条件）。
+- 未覆盖编排组（`via`）多跳、IPv6 策略、host/ESXi 重启。
+- 升级为同 commit 重装（本 dist 只有一个 upgrade 包），无跨版本升级样本。
+- Gateway Gate A/B 由同一主机上的另一 agent 执行，本轮未重跑或替代。
+
+### Reproduce
+
+```bash
+export ORCH_SSH=root@10.1.18.244 PEER_SSH=root@10.1.18.243
+export SSH_KEY=/root/.ssh/esxi124_rsa ORCH_API=https://10.1.18.244
+export ORCH_PASS_FILE=/root/work/orch777/.secrets/orch-admin.pass
+export PEER_WAN_IF=ens224 PEER_LAN_IF=ens256 CLIENT_IP=10.99.0.3 SERVER_IP=10.99.0.2
+export ORCH_OUT=/root/work/orch-acceptance/evidence/20261026T1055Z-orch-rc-777fbf6/functional
+cd /root/work/ly-route-rc/scripts/acceptance/orchestrator-esxi
+./datapath-test.sh && ./restart-persistence-test.sh && ./failclosed-test.sh
+ORCH_BASE=$ORCH_API ORCH_OUT=../ui node ui-sweep.mjs
+```
+
+部署与第 8 项/apply-lock 驱动：`/root/work/esxi124/`（`deploy-orch.sh`、
+`genvmx.py`）与 `/root/work/orch777/`（`phase-a.sh`、`phase-b.sh`、
+`upgrade-test.sh`、`applylock-test.sh`）。
+
 ## Release candidate `1262522` — acceptance on ESXi `10.1.18.124` (2026-10-26)
 
 Run `20261025T1545Z-orch-rc1262522-124`. Candidate `/root/work/ly-route-rc` @
