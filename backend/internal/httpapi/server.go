@@ -5223,12 +5223,29 @@ func (server *Server) executeRuntimeApply(w http.ResponseWriter, r *http.Request
 		// once. This is the first-takeover path; repeated applies see the NICs
 		// already owned by VPP and skip it.
 		if server.bootstrapDataplaneOwnership(applyCtx) {
-			if server.capabilityProber != nil {
-				server.capabilityProber.Invalidate()
-			}
-			_ = server.refreshDataplaneCapability(applyCtx)
-			if retried, retryErr := server.buildRuntimePlan(applyCtx, transactionID); retryErr == nil {
-				plan = retried
+			// The first takeover binds the data NICs and restarts VPP. An
+			// immediate probe races that restart and reports "locked" even
+			// though the ports are correctly attached, so wait (bounded) for a
+			// usable observation before rejecting the operator's first apply.
+			deadline := time.Now().Add(dataplaneReadyWait)
+			for {
+				if server.capabilityProber != nil {
+					server.capabilityProber.Invalidate()
+				}
+				_ = server.refreshDataplaneCapability(applyCtx)
+				if retried, retryErr := server.buildRuntimePlan(applyCtx, transactionID); retryErr == nil {
+					plan = retried
+				}
+				if plan.DataplaneState != "dataplane_locked" && plan.DataplaneState != "dataplane_degraded" {
+					break
+				}
+				if !time.Now().Before(deadline) || applyCtx.Err() != nil {
+					break
+				}
+				select {
+				case <-applyCtx.Done():
+				case <-time.After(dataplaneReadyInterval):
+				}
 			}
 		}
 		// Restore daemons stopped by the VPP restart before any early return.
@@ -5270,13 +5287,7 @@ func (server *Server) executeRuntimeApply(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if (plan.DataplaneState == "dataplane_locked" || plan.DataplaneState == "dataplane_degraded") && len(plan.GatewayPlan.NativePath.Assignments) > 0 {
-		reason := "dataplane prerequisites are not satisfied"
-		if plan.DataplaneState == "dataplane_degraded" {
-			reason = "dataplane capability could not be observed; the previous generation is preserved"
-		}
-		if len(plan.Warnings) > 0 && strings.TrimSpace(plan.Warnings[0]) != "" {
-			reason = plan.Warnings[0]
-		}
+		reason := dataplaneLockReason(plan)
 		result := degradedRuntimeResult(transactionID, reason, server.now().UTC())
 		result.Status = plan.DataplaneState
 		result.GatewayPlan = &plan.GatewayPlan
@@ -5384,6 +5395,36 @@ func (server *Server) executeRuntimeApply(w http.ResponseWriter, r *http.Request
 // path could be selected. It is only true when there is nothing at all to fall
 // back to and real data ports exist: a missing probe must be reported as a
 // degradation, while a genuine prerequisite failure stays dataplane_locked.
+const (
+	// dataplaneReadyWait bounds how long the first-takeover apply waits for VPP
+	// and the capability probe to settle after the data NICs are bound.
+	dataplaneReadyWait = 45 * time.Second
+	// dataplaneReadyInterval is the probe retry cadence inside that window.
+	dataplaneReadyInterval = 3 * time.Second
+)
+
+// dataplaneLockReason reports why the dataplane is not usable. Only dataplane
+// related warnings may explain a lock: a QoS/DNS degradation note must never be
+// presented to the operator as the reason their interfaces were rejected.
+func dataplaneLockReason(plan RuntimePlan) string {
+	for _, warning := range plan.Warnings {
+		text := strings.TrimSpace(warning)
+		if text == "" {
+			continue
+		}
+		lower := strings.ToLower(text)
+		for _, marker := range []string{"dataplane", "interface", "probe", "vpp", "接管", "网卡", "数据面"} {
+			if strings.Contains(lower, marker) {
+				return text
+			}
+		}
+	}
+	if plan.DataplaneState == "dataplane_degraded" {
+		return "dataplane capability could not be observed; the previous generation is preserved"
+	}
+	return "dataplane prerequisites are not satisfied"
+}
+
 func capabilityObservationDegradesDataplane(observation vpp.Observation, assignments int) bool {
 	return observation.Source == vpp.ProbeSourceAbsent && assignments > 0
 }
