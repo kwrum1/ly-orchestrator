@@ -44,19 +44,33 @@ def run(*args, timeout=10):
     return code, out
 
 
-def write_status(path, state, interface="", session_id=0, local="", peer="", ac_mac="", reason=""):
+def write_status(path, state, interface="", session_id=0, local="", peer="", ac_mac="",
+                 reason="", ipv6=None, pd=None):
     if not path:
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {"state": state, "interface": interface}
-    if session_id or local or peer or ac_mac:
-        payload["session"] = {
+    if session_id or local or peer or ac_mac or ipv6 is not None or pd is not None:
+        session = {
             "session_id": int(session_id or 0),
             "local_address": local,
             "peer_address": peer,
         }
         if ac_mac:
-            payload["session"]["ac_mac"] = ac_mac
+            session["ac_mac"] = ac_mac
+        if ipv6 is not None:
+            session["ipv6_ready"] = bool(ipv6.get("ready"))
+            if ipv6.get("local"):
+                session["local_ipv6"] = ipv6["local"]
+            if ipv6.get("peer"):
+                session["remote_ipv6"] = ipv6["peer"]
+            if ipv6.get("global"):
+                session["wan_ipv6_global"] = ipv6["global"]
+        if pd:
+            session["delegated_prefix"] = pd["prefix"]
+            session["prefix_preferred_lifetime"] = int(pd.get("preferred") or 0)
+            session["prefix_valid_lifetime"] = int(pd.get("valid") or 0)
+        payload["session"] = session
     if reason:
         payload["reason"] = reason
     tmp = path + ".tmp"
@@ -70,6 +84,103 @@ def write_status(path, state, interface="", session_id=0, local="", peer="", ac_
 def plugin_name(peer_id):
     digest = hashlib.sha256(peer_id.encode()).hexdigest()[:8]
     return "lyppp-" + digest
+
+
+PD_ENABLED = {}
+
+
+def parse_ipv6_detail(detail):
+    """Map the PPPoE client's IPv6CP/global-address readback to the status contract."""
+    if not detail:
+        return None
+    info = {}
+    match = re.search(r"runtime\s+pppox-interface\s+(\S+)", detail)
+    if match:
+        info["interface"] = match.group(1)
+    match = re.search(r"runtime\s+ipv6cp-link-local\s+local\s+(\S+)\s+peer\s+(\S+)", detail)
+    if match:
+        local, peer = match.group(1), match.group(2)
+        zero = ("::", "0:0:0:0:0:0:0:0")
+        if local not in zero:
+            info["local"] = local
+        if peer not in zero:
+            info["peer"] = peer
+    match = re.search(r"runtime\s+wan-ipv6\s+observed\s+([0-9a-fA-F:]+)/(\d+)", detail)
+    if match:
+        info["global"] = f"{match.group(1)}/{match.group(2)}"
+    match = re.search(r"runtime\s+wan-ipv6-mode\s+(\S+).*default-route6\s+(\d+)", detail)
+    if match:
+        info["mode"] = match.group(1)
+        info["default_route6"] = match.group(2) == "1"
+    info["ready"] = bool(info.get("local"))
+    return info
+
+
+def pd_group_name(peer_id):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", str(peer_id or "wan"))[:40]
+    return "lyroute-pd-" + safe
+
+
+def enable_pd(interface, group):
+    code, err = run("dhcp6", "pd", "client", interface, "prefix", "group", group)
+    if code != 0:
+        log(f"dhcp6 pd client enable on {interface} failed: {err}")
+        return False
+    log(f"dhcp6 pd client enabled on {interface} group {group}")
+    return True
+
+
+def disable_pd(interface):
+    if interface:
+        run("dhcp6", "pd", "client", interface, "disable")
+
+
+def release_pd():
+    for interface in list(PD_ENABLED):
+        disable_pd(interface)
+    PD_ENABLED.clear()
+
+
+def pd_prefix(group):
+    code, out, _ = vppctl("show", "ip6", "prefixes")
+    if code != 0:
+        return None
+    for line in out.splitlines():
+        if f"prefix group: {group}" not in line:
+            continue
+        match = re.search(r"prefix:\s*([0-9a-fA-F:]+)/(\d+)", line)
+        if not match:
+            continue
+        preferred = re.search(r"preferred lifetime:\s*(\d+)", line)
+        valid = re.search(r"valid lifetime:\s*(\d+)", line)
+        return {
+            "prefix": f"{match.group(1)}/{match.group(2)}",
+            "preferred": int(preferred.group(1)) if preferred else 0,
+            "valid": int(valid.group(1)) if valid else 0,
+        }
+    return None
+
+
+def ensure_pd(session, group):
+    """Enable DHCPv6-PD once IPv6CP is up and return the delegated prefix, if any."""
+    ipv6 = (session or {}).get("ipv6") or {}
+    interface = ipv6.get("interface") or (session or {}).get("interface") or ""
+    if not ipv6.get("ready") or not interface:
+        return None
+    if interface not in PD_ENABLED:
+        if not enable_pd(interface, group):
+            return None
+        PD_ENABLED[interface] = group
+    return pd_prefix(PD_ENABLED[interface])
+
+
+def write_session_status(path, state, name, session, reason="", group=""):
+    session = session or {}
+    ipv6 = session.get("ipv6")
+    pd = ensure_pd(session, group) if state == "connected" and group else None
+    write_status(path, state, name, session.get("session_id", 0), session.get("local", ""),
+                 session.get("peer", ""), session.get("ac_mac", ""), reason=reason,
+                 ipv6=ipv6, pd=pd)
 
 
 def parse_detail(detail):
@@ -86,11 +197,14 @@ def parse_detail(detail):
     if local in ("0.0.0.0", "::") or peer in ("0.0.0.0", "::"):
         return None
     ac_match = re.search(r"ac-mac\s+(\S+)", detail)
+    ipv6 = parse_ipv6_detail(detail)
     return {
         "session_id": int(session_match.group(1)),
         "local": local,
         "peer": peer,
         "ac_mac": ac_match.group(1) if ac_match else "",
+        "interface": (ipv6 or {}).get("interface", ""),
+        "ipv6": ipv6,
     }
 
 
@@ -361,6 +475,7 @@ def main():
     name = plugin_name(peer_id)
     status_file = str(plan.get("status_file") or "")
     host_uniq = int(hashlib.sha256(peer_id.encode()).hexdigest()[:8], 16) or 1
+    pd_group = pd_group_name(peer_id)
 
     if not wan.startswith("lyroute-") and wan.startswith("eth"):
         wan = "lyroute-" + wan
@@ -410,12 +525,10 @@ def main():
         last_wan_address = session["local"]
         healthy = session_healthy(name, session["peer"], plan.get("default_route", True))
         if not healthy:
-            write_status(status_file, "degraded", name, session["session_id"],
-                         session["local"], session["peer"], session["ac_mac"],
-                         reason="dataplane probe failed")
+            write_session_status(status_file, "degraded", name, session,
+                                 reason="dataplane probe failed")
         else:
-            write_status(status_file, "connected", name, session["session_id"],
-                         session["local"], session["peer"], session["ac_mac"])
+            write_session_status(status_file, "connected", name, session, group=pd_group)
             reconnect_delay = RECONNECT_DELAY
             log(f"{peer_id} connected session {session['session_id']} {session['local']} peer {session['peer']} on {name}")
 
@@ -439,6 +552,7 @@ def main():
                         write_status(status_file, "degraded", name,
                                      reason="session detail not ready")
                     else:
+                        release_pd()
                         write_status(status_file, "connecting", name, reason="session lost")
                         break
                 else:
@@ -457,8 +571,8 @@ def main():
                         grace_until = 0
                         redials = 0
                         reconnect_delay = RECONNECT_DELAY
-                        write_status(status_file, "connected", name, session["session_id"],
-                                     session["local"], session["peer"], session["ac_mac"])
+                        write_session_status(status_file, "connected", name, session,
+                                             group=pd_group)
                     else:
                         failures += 1
                         write_status(status_file, "degraded", name, session["session_id"],
@@ -477,12 +591,14 @@ def main():
                              reason="waiting for AC dataplane")
                 grace_until = time.time() + DATAPLANE_GRACE
 
+        release_pd()
         remove_identity(current["local"])
         cleanup_stale(wan)
         write_status(status_file, "connecting", name, reason="reconnecting")
         time.sleep(reconnect_delay)
         reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_DELAY)
 
+    release_pd()
     cleanup_stale(wan)
     write_status(status_file, "disconnected", name)
     return 0
