@@ -1,8 +1,8 @@
 # Orchestrator 验收
 
 > **UI 包更新（2026-10-26）**：编排器 UI 已按能力优先契约重建，来源为 `fix/gateway-ui-ux` @
-> `1113170be5c057aeeefb8283e898a7d098bb4e79`，`app.js` sha256 为
-> `b3e4027e232226541aa77f6225da69005b5279850db7ce73d9c7a5be5ebd0dea`。
+> `2b1f6513ed5729ccbc58a35cf07c783a420059fa`，`app.js` sha256 为
+> `2eb7155071328810435681dd3fe18ff7a6aba88be81969e79bab68425798b9c4`。
 > 本文下文出现的 `0787685e…` 属于该次更新之前的**历史**发布记录，不是当前发布口径；
 > 当前发布口径以 `packaging/build-profiles/orchestrator.json` 的 `frontend_app_sha256` 为准。
 
