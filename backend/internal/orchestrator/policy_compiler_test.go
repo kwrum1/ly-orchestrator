@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestCompilePolicy_first_match_per_group_continues_across_groups(t *testing.T) {
+func TestCompilePolicy_first_matching_group_is_terminal(t *testing.T) {
 	// Given
 	input := validPolicyInput()
 	input.Groups[0].Rules = []PolicyRuleInput{
@@ -26,18 +26,17 @@ func TestCompilePolicy_first_match_per_group_continues_across_groups(t *testing.
 	// Then
 	wantDecisions := []GroupDecision{
 		{PolicyGroup: "safety", RuleID: "office-west", Sequence: 10, Action: ActionVia, OrchestrationGroup: "inline-west"},
-		{PolicyGroup: "default", RuleID: "default-east", Sequence: 10, Action: ActionVia, OrchestrationGroup: "inline-east"},
 	}
 	if !reflect.DeepEqual(compiled.Decisions, wantDecisions) {
-		t.Fatalf("decisions = %#v, want %#v", compiled.Decisions, wantDecisions)
+		t.Fatalf("decisions = %#v, want only the first matching group %#v", compiled.Decisions, wantDecisions)
 	}
-	if !reflect.DeepEqual(compiled.Traversal, []string{"inline-west", "inline-east"}) {
-		t.Fatalf("traversal = %#v, want west then east", compiled.Traversal)
+	if !reflect.DeepEqual(compiled.Traversal, []string{"inline-west"}) {
+		t.Fatalf("traversal = %#v, want only west", compiled.Traversal)
 	}
 	if compiled.Exit != PathExitLAN {
 		t.Fatalf("exit = %q, want LAN", compiled.Exit)
 	}
-	wantKinds := []StageKind{StageTrafficControl, StageOrchestration, StageOrchestration, StageDefault}
+	wantKinds := []StageKind{StageTrafficControl, StageOrchestration}
 	if got := stageKinds(compiled.Stages); !reflect.DeepEqual(got, wantKinds) {
 		t.Fatalf("stage kinds = %#v, want %#v", got, wantKinds)
 	}
@@ -130,12 +129,12 @@ func TestCompilePolicy_direct_is_recorded_without_traversal(t *testing.T) {
 	compiled := mustCompilePolicy(t, policy, flow, Prelude{})
 
 	// Then
-	wantKinds := []StageKind{StageOrchestration, StageOrchestration, StageDefault}
+	wantKinds := []StageKind{StageOrchestration}
 	if got := stageKinds(compiled.Stages); !reflect.DeepEqual(got, wantKinds) {
-		t.Fatalf("stage kinds = %#v, want direct, via, default stages", got)
+		t.Fatalf("stage kinds = %#v, want only the terminal direct stage", got)
 	}
-	if compiled.Stages[0].Action != ActionDirect || !reflect.DeepEqual(compiled.Traversal, []string{"inline-west"}) {
-		t.Fatalf("compiled direct = %#v, want no traversal for first decision", compiled)
+	if len(compiled.Decisions) != 1 || compiled.Decisions[0].PolicyGroup != "safety" || compiled.Stages[0].Action != ActionDirect || len(compiled.Traversal) != 0 {
+		t.Fatalf("compiled direct = %#v, want a terminal direct decision with no traversal", compiled)
 	}
 }
 

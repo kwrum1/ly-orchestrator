@@ -47,6 +47,36 @@ func writeAPIError(writer http.ResponseWriter, status int, err error) {
 	writeJSON(writer, status, errorResponse{Error: errorBody{Code: codeForError(err), Message: err.Error()}})
 }
 
+// isPolicyValidationError reports whether err is an operator-input problem that
+// must be answered with 422 and its field/reason, never a generic 500.
+func isPolicyValidationError(err error) bool {
+	for _, target := range []error{
+		orchestrator.ErrInvalidPolicyVersion,
+		orchestrator.ErrInvalidIPObject,
+		orchestrator.ErrDuplicateIPObject,
+		orchestrator.ErrInvalidPolicyGroup,
+		orchestrator.ErrDuplicatePolicyGroup,
+		orchestrator.ErrInvalidPolicyPosition,
+		orchestrator.ErrInvalidPolicyRule,
+		orchestrator.ErrInvalidRuleSequence,
+		orchestrator.ErrDuplicateRuleSequence,
+		orchestrator.ErrInvalidPolicyMatch,
+		orchestrator.ErrInvalidPolicyAction,
+		orchestrator.ErrDeletedPolicyReference,
+		orchestrator.ErrGroupInUse,
+		orchestrator.ErrPolicyLoop,
+		orchestrator.ErrEmptyPolicyDefault,
+		orchestrator.ErrInvalidPolicyFlow,
+		orchestrator.ErrInvalidPolicyPrelude,
+		orchestrator.ErrInvalidPolicyCompile,
+	} {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
+}
+
 func codeForError(err error) string {
 	switch {
 	case errors.Is(err, orchestrator.ErrInvalidSchemaVersion):
@@ -89,6 +119,8 @@ func codeForError(err error) string {
 		return "forbidden"
 	case errors.Is(err, orchestrator.ErrInvalidName), errors.Is(err, orchestrator.ErrInvalidInterface), errors.Is(err, orchestrator.ErrInvalidBond):
 		return "invalid_topology"
+	case isPolicyValidationError(err):
+		return "invalid_policy"
 	case errors.Is(err, ErrTaskNotFound):
 		return "task_not_found"
 	case errors.Is(err, ErrTaskConflict):

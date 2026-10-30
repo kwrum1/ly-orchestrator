@@ -94,6 +94,108 @@ func TestHandler_CRUD_readback_matches_versioned_fixture(t *testing.T) {
 	}
 }
 
+type staticPortResolver map[string]string
+
+func (resolver staticPortResolver) InterfaceLinuxName(_ context.Context, value string) string {
+	if resolved, ok := resolver[value]; ok {
+		return resolved
+	}
+	return value
+}
+
+func TestHandler_topology_write_persists_kernel_netdev_names(t *testing.T) {
+	// Given: the UI submits product ids, the device exposes ens* netdevs.
+	repository, handler, server := newTestHTTPServerWithHandler(t)
+	handler.SetPortResolver(staticPortResolver{
+		"eth0": "ens32", "eth1": "ens192", "eth2": "ens256", "eth3": "ens160", "eth4": "ens224",
+	})
+	body := []byte(`{"schema_version":1,"management_interface":"eth0","interfaces":[{"name":"lan0","role":"lan","port":"eth1"},{"name":"wan0","role":"wan","port":"eth2"}],"orchestration_groups":[{"name":"grp-a","ports":[{"interface":"eth3","direction":"lan_facing"},{"interface":"eth4","direction":"wan_facing"}]}]}`)
+
+	// When
+	put := sendRequest(t, server, http.MethodPut, TopologyPath, body)
+
+	// Then
+	if put.StatusCode != http.StatusOK {
+		t.Fatalf("PUT topology status = %d, want 200: %s", put.StatusCode, put.Body)
+	}
+	var readback topologyResponse
+	decodeResponse(t, put.Body, &readback)
+	if readback.Item.ManagementInterface != "ens32" {
+		t.Fatalf("management interface = %q, want ens32", readback.Item.ManagementInterface)
+	}
+	ports := map[string]string{}
+	for _, item := range readback.Item.Interfaces {
+		ports[item.Name] = item.Port
+	}
+	if ports["lan0"] != "ens192" || ports["wan0"] != "ens256" {
+		t.Fatalf("logical ports = %#v, want kernel netdev names", ports)
+	}
+	if len(readback.Item.Groups) != 1 || len(readback.Item.Groups[0].Ports) != 2 {
+		t.Fatalf("groups = %#v", readback.Item.Groups)
+	}
+	groupPorts := []string{readback.Item.Groups[0].Ports[0].Interface, readback.Item.Groups[0].Ports[1].Interface}
+	if groupPorts[0] != "ens160" || groupPorts[1] != "ens224" {
+		t.Fatalf("group ports = %#v, want ens160/ens224", groupPorts)
+	}
+
+	// The persisted document, not just the response, must speak system_name.
+	topology, _, err := repository.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	stored := topology.View()
+	if stored.ManagementInterface != "ens32" || stored.Interfaces[0].Port != "ens192" || stored.Interfaces[1].Port != "ens256" {
+		t.Fatalf("stored topology = %#v, want kernel netdev names", stored)
+	}
+	if stored.Groups[0].Ports[0].Interface != "ens160" || stored.Groups[0].Ports[1].Interface != "ens224" {
+		t.Fatalf("stored group ports = %#v, want kernel netdev names", stored.Groups[0].Ports)
+	}
+}
+
+func TestHandler_group_write_persists_kernel_netdev_names(t *testing.T) {
+	// Given
+	_, handler, server := newTestHTTPServerWithHandler(t)
+	handler.SetPortResolver(staticPortResolver{"eth0": "ens32", "eth1": "ens192", "eth2": "ens256", "eth3": "ens160", "eth4": "ens224"})
+	topology := []byte(`{"schema_version":1,"management_interface":"eth0","interfaces":[{"name":"lan0","role":"lan","port":"eth1"},{"name":"wan0","role":"wan","port":"eth2"}],"orchestration_groups":[]}`)
+	if put := sendRequest(t, server, http.MethodPut, TopologyPath, topology); put.StatusCode != http.StatusOK {
+		t.Fatalf("PUT topology status = %d: %s", put.StatusCode, put.Body)
+	}
+
+	// When
+	created := sendRequest(t, server, http.MethodPost, OrchestrationGroupsPath, []byte(`{"name":"grp-b","ports":[{"interface":"eth3","direction":"lan_facing"},{"interface":"eth4","direction":"wan_facing"}]}`))
+
+	// Then
+	if created.StatusCode != http.StatusCreated {
+		t.Fatalf("POST group status = %d: %s", created.StatusCode, created.Body)
+	}
+	var group groupResponse
+	decodeResponse(t, created.Body, &group)
+	if group.Item.Ports[0].Interface != "ens160" || group.Item.Ports[1].Interface != "ens224" {
+		t.Fatalf("group ports = %#v, want kernel netdev names", group.Item.Ports)
+	}
+}
+
+func TestHandler_policy_validation_errors_are_422_with_reason(t *testing.T) {
+	// Given: a valid topology and a policy whose protocol is unknown.
+	_, server := newTestHTTPServer(t)
+	topology := []byte(`{"schema_version":1,"management_interface":"eth0","interfaces":[{"name":"lan0","role":"lan","port":"eth1"},{"name":"wan0","role":"wan","port":"eth2"}],"orchestration_groups":[]}`)
+	if put := sendRequest(t, server, http.MethodPut, TopologyPath, topology); put.StatusCode != http.StatusOK {
+		t.Fatalf("PUT topology status = %d: %s", put.StatusCode, put.Body)
+	}
+	policy := []byte(`{"schema_version":1,"ip_objects":[],"policy_groups":[{"id":"g","rules":[{"id":"r","sequence":10,"match":{"sources":["any"],"destinations":["any"],"protocol":"bogus"},"action":{"kind":"direct"}}]}],"default":{"kind":"direct"}}`)
+
+	// When
+	response := sendRequest(t, server, http.MethodPut, PolicyPath, policy)
+
+	// Then
+	if response.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid policy status = %d, want 422: %s", response.StatusCode, response.Body)
+	}
+	if !bytes.Contains(response.Body, []byte(`"code":"invalid_policy"`)) || !bytes.Contains(response.Body, []byte("protocol")) {
+		t.Fatalf("invalid policy response = %s, want invalid_policy with field reason", response.Body)
+	}
+}
+
 func TestHandler_managementSharingResolverControlsLANReuse(t *testing.T) {
 	_, handler, server := newTestHTTPServerWithHandler(t)
 	body := []byte(`{"schema_version":1,"management_interface":"eth0","management_shared":false,"interfaces":[{"name":"lan","role":"lan","port":"eth0"},{"name":"wan","role":"wan","port":"eth1"}],"orchestration_groups":[]}`)

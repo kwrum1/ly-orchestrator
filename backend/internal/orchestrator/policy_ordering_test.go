@@ -71,11 +71,11 @@ func TestPolicy_group_collection_order_controls_group_precedence(t *testing.T) {
 	if before.Decisions[0].PolicyGroup != "safety" || after.Decisions[0].PolicyGroup != "default" {
 		t.Fatalf("group precedence before/after = %#v / %#v", before.Decisions, after.Decisions)
 	}
-	if before.Traversal[0] != "inline-east" || after.Traversal[0] != "inline-west" {
-		t.Fatalf("group reorder did not change traversal: before=%#v after=%#v", before.Traversal, after.Traversal)
+	if len(before.Decisions) != 1 || len(after.Decisions) != 1 {
+		t.Fatalf("group order must select exactly one terminal group: before=%#v after=%#v", before.Decisions, after.Decisions)
 	}
-	if before.Decisions[1].PolicyGroup != "default" || after.Decisions[1].PolicyGroup != "safety" {
-		t.Fatalf("group reorder did not reverse the remaining decision: before=%#v after=%#v", before.Decisions, after.Decisions)
+	if len(before.Traversal) != 1 || len(after.Traversal) != 1 || before.Traversal[0] != "inline-east" || after.Traversal[0] != "inline-west" {
+		t.Fatalf("group reorder did not flip traversal: before=%#v after=%#v", before.Traversal, after.Traversal)
 	}
 }
 

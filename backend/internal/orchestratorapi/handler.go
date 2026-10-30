@@ -34,7 +34,16 @@ type Handler struct {
 	updates          UpdateService
 	operations       OperationTracker
 	managementShared func(context.Context, string) bool
+	ports            PortResolver
 	reconcile        reconcileState
+}
+
+// PortResolver maps a product interface id (eth2) to the kernel netdev that
+// the dataplane actually uses (ens256). Topology writes persist the kernel
+// name so a restart can probe the same interfaces without translating them
+// again.
+type PortResolver interface {
+	InterfaceLinuxName(context.Context, string) string
 }
 
 type ServiceChainRuntime interface {
@@ -67,6 +76,55 @@ type TransparentTransactionRuntime interface {
 
 func (handler *Handler) SetManagementSharingResolver(resolver func(context.Context, string) bool) {
 	handler.managementShared = resolver
+}
+
+// SetPortResolver installs the product-id -> kernel-netdev resolver used when
+// normalizing topology writes.
+func (handler *Handler) SetPortResolver(resolver PortResolver) {
+	handler.ports = resolver
+}
+
+func (handler *Handler) resolvePort(ctx context.Context, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || handler.ports == nil {
+		return value
+	}
+	if resolved := strings.TrimSpace(handler.ports.InterfaceLinuxName(ctx, value)); resolved != "" {
+		return resolved
+	}
+	return value
+}
+
+func (handler *Handler) normalizeBondPorts(ctx context.Context, bond *bondDTO) {
+	if bond == nil {
+		return
+	}
+	for index := range bond.Members {
+		bond.Members[index] = handler.resolvePort(ctx, bond.Members[index])
+	}
+}
+
+func (handler *Handler) normalizeTopologyPorts(ctx context.Context, dto *topologyDTO) {
+	dto.ManagementInterface = handler.resolvePort(ctx, dto.ManagementInterface)
+	for index := range dto.Interfaces {
+		dto.Interfaces[index].Port = handler.resolvePort(ctx, dto.Interfaces[index].Port)
+		handler.normalizeBondPorts(ctx, dto.Interfaces[index].Bond)
+	}
+	for groupIndex := range dto.Groups {
+		for portIndex := range dto.Groups[groupIndex].Ports {
+			port := &dto.Groups[groupIndex].Ports[portIndex]
+			port.Interface = handler.resolvePort(ctx, port.Interface)
+			handler.normalizeBondPorts(ctx, port.Bond)
+		}
+	}
+}
+
+func (handler *Handler) normalizeGroupPorts(ctx context.Context, dto *groupDTO) {
+	for portIndex := range dto.Ports {
+		port := &dto.Ports[portIndex]
+		port.Interface = handler.resolvePort(ctx, port.Interface)
+		handler.normalizeBondPorts(ctx, port.Bond)
+	}
 }
 
 func (handler *Handler) SetUpdateService(service UpdateService) {
@@ -156,6 +214,10 @@ func (handler *Handler) handleTopology(writer http.ResponseWriter, request *http
 		} else {
 			dto.ManagementShared = false
 		}
+		// Persist kernel netdev names. The UI submits product ids (eth2), and
+		// the startup probe / VPP boundary commands need ens256. Accept both
+		// spellings on write but never store the logical alias again.
+		handler.normalizeTopologyPorts(request.Context(), &dto)
 		topology, err := orchestrator.ParseTopology(dto.input())
 		if err != nil {
 			writeAPIError(writer, http.StatusUnprocessableEntity, err)
@@ -255,7 +317,7 @@ func (handler *Handler) handleGroups(writer http.ResponseWriter, request *http.R
 		if !handler.authorize(writer, request, PermissionAdminWrite) {
 			return
 		}
-		group, err := parseGroupRequest(writer, request)
+		group, err := handler.parseGroupRequest(writer, request)
 		if err != nil {
 			return
 		}
@@ -320,7 +382,7 @@ func (handler *Handler) handleGroup(writer http.ResponseWriter, request *http.Re
 	case http.MethodGet:
 		handler.writeGroup(writer, request, name, http.StatusOK)
 	case http.MethodPut:
-		group, parseErr := parseGroupRequest(writer, request)
+		group, parseErr := handler.parseGroupRequest(writer, request)
 		if parseErr != nil {
 			return
 		}
@@ -511,12 +573,13 @@ func (handler *Handler) writeGroup(writer http.ResponseWriter, request *http.Req
 	writeAPIError(writer, http.StatusNotFound, fmt.Errorf("%w: %q", orchestrator.ErrGroupNotFound, name))
 }
 
-func parseGroupRequest(writer http.ResponseWriter, request *http.Request) (orchestrator.Group, error) {
+func (handler *Handler) parseGroupRequest(writer http.ResponseWriter, request *http.Request) (orchestrator.Group, error) {
 	var dto groupDTO
 	if err := decodeStrictJSON(writer, request, &dto); err != nil {
 		writeAPIError(writer, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
 		return orchestrator.Group{}, err
 	}
+	handler.normalizeGroupPorts(request.Context(), &dto)
 	group, err := orchestrator.ParseGroup(dto.input())
 	if err != nil {
 		writeAPIError(writer, http.StatusUnprocessableEntity, err)

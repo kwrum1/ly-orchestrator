@@ -92,6 +92,11 @@ func CompilePolicy(policy Policy, flow PolicyFlow, prelude Prelude) (CompiledPat
 	// Compilation is driven by the persisted ordinals, never by map iteration,
 	// document creation time or database row order. The same policy therefore
 	// always produces the same plan.
+	// Group precedence is first-match terminal. The first group that has a
+	// rule matching the flow decides the packet; direct, via and drop all stop
+	// group evaluation. Continuing after a direct/via match made a later block
+	// group override an earlier allow group, so swapping two groups did not
+	// change real traffic even though the trace decisions reversed.
 	for _, group := range orderedPolicyGroups(policy.groups) {
 		rule, matched := firstMatchingRule(orderedPolicyRules(group.rules), flow)
 		if !matched {
@@ -105,15 +110,16 @@ func CompilePolicy(policy Policy, flow PolicyFlow, prelude Prelude) (CompiledPat
 			stage.Reference = rule.action.group.String()
 			compiled.Traversal = append(compiled.Traversal, rule.action.group.String())
 			compiled.Stages = append(compiled.Stages, stage)
+			compiled.Exit = PathExitLAN
 		case ActionDirect:
 			compiled.Stages = append(compiled.Stages, stage)
+			compiled.Exit = PathExitLAN
 		case ActionDrop:
-			compiled.Decisions = append(compiled.Decisions, decision)
 			compiled.Stages = append(compiled.Stages, stage)
 			compiled.Exit = PathExitDrop
-			return compiled, nil
 		}
 		compiled.Decisions = append(compiled.Decisions, decision)
+		return compiled, nil
 	}
 	compiled.Stages = append(compiled.Stages, CompiledStage{Kind: StageDefault, Action: policy.defaultAction.kind})
 	if policy.defaultAction.kind == ActionDrop {

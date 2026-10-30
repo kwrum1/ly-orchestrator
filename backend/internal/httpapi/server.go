@@ -782,6 +782,7 @@ func (server *Server) Handler() http.Handler {
 		if err != nil {
 			panic(fmt.Sprintf("compose orchestrator API: %v", err))
 		}
+		handler.SetPortResolver(server)
 		handler.SetManagementSharingResolver(func(ctx context.Context, interfaceID string) bool {
 			item := server.managementNetworkState(ctx, false)
 			return normalizeManagementMode(stringField(item, "mode")) == "shared_lan" && stringField(item, "interface_id") == interfaceID
@@ -6802,6 +6803,20 @@ func (server *Server) executeRuntimeApply(w http.ResponseWriter, r *http.Request
 		}
 		components, _ := server.orchestratorTransparentRuntimeComponents(applyCtx)
 		state := runtimeState(components)
+		// ApplyTransparentOrchestrator already verified the committed VPP
+		// generation, but this second live observation can race the CLI
+		// readback. Poll briefly instead of publishing a transient degraded
+		// result that the next /runtime/status poll immediately corrects.
+		for attempt := 0; state != "running" && attempt < 20 && applyCtx.Err() == nil; attempt++ {
+			select {
+			case <-applyCtx.Done():
+			case <-time.After(100 * time.Millisecond):
+				if fresh, handled := server.orchestratorTransparentRuntimeComponents(applyCtx); handled {
+					components = fresh
+					state = runtimeState(components)
+				}
+			}
+		}
 		status := "committed"
 		code := http.StatusOK
 		if state != "running" {

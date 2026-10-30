@@ -118,6 +118,14 @@ func run() error {
 		if repositoryErr != nil {
 			return fmt.Errorf("initialize orchestrator repository: %w", repositoryErr)
 		}
+		// The topology may have been persisted with product ids (eth1) by an
+		// older build. Resolve them before startup reconciliation so the proof
+		// probe and VPP boundary commands see the kernel netdev (ens160).
+		resolveLinuxInterface := httpapi.InterfaceLinuxNameResolver(store)
+		managementInterface := env("LY_ROUTE_MANAGEMENT_INTERFACE", "eth0")
+		if resolved := resolveLinuxInterface(context.Background(), managementInterface); strings.TrimSpace(resolved) != "" {
+			managementInterface = resolved
+		}
 		orchestratorRuntime := &productionOrchestratorRuntime{
 			adapter:             vpp.Adapter{Client: vpp.NewProductionVPPCTLClient(env("LY_ROUTE_VPPCTL", "vppctl"))},
 			dataplane:           dataplaneController,
@@ -125,7 +133,8 @@ func run() error {
 			tracker:             orchestrator.NewHealthTracker(orchestrator.DefaultRecoverySuccesses, time.Now),
 			probe:               icmpHealthProbe{binary: env("LY_ROUTE_PING", "ping")},
 			capabilityReport:    env("LY_ROUTE_VPP_CAPABILITY_PROOF", "/var/lib/ly-route/vpp-native-capabilities.json"),
-			managementInterface: env("LY_ROUTE_MANAGEMENT_INTERFACE", "eth0"),
+			managementInterface: managementInterface,
+			linuxInterface:      resolveLinuxInterface,
 			proofCommand:        env("LY_ROUTE_VPP_PROBE_COMMAND", "/usr/lib/ly-route/runtime-check.sh"),
 			journalPath:         env("LY_ROUTE_ORCHESTRATOR_TRANSACTION_JOURNAL", "/var/lib/ly-route/orchestrator/transparent-transaction.json"),
 		}
@@ -215,6 +224,7 @@ type productionOrchestratorRuntime struct {
 	probe                     orchestrator.HealthProbe
 	capabilityReport          string
 	managementInterface       string
+	linuxInterface            func(context.Context, string) string
 	proofCommand              string
 }
 
@@ -225,8 +235,12 @@ func (runtime *productionOrchestratorRuntime) ApplyTransparent(ctx context.Conte
 }
 
 func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) error {
-	interfaces := transparentTopologyInterfaces(topology.View())
-	path, err := runtime.selectAndPrepare(ctx, requestID, interfaces, topology.View().ManagementShared)
+	// The persisted topology is the operator's intent and may still carry
+	// product ids from an older build. Resolve every port once and use the same
+	// kernel-name view for the probe, the bonds, the generation and VPP.
+	topologyView := runtime.resolveTopologyView(ctx, topology.View())
+	interfaces := transparentTopologyInterfaces(topologyView)
+	path, err := runtime.selectAndPrepare(ctx, requestID, interfaces, topologyView.ManagementShared)
 	if err != nil {
 		return err
 	}
@@ -235,7 +249,7 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 		return err
 	}
 	previousBonds := append([]vpp.BondState(nil), runtime.transparentBonds...)
-	desiredBonds := vpp.TransparentOrchestratorBonds(topology.View())
+	desiredBonds := vpp.TransparentOrchestratorBonds(topologyView)
 	var policyView *orchestrator.PolicyView
 	if policy != nil {
 		view := policy.View()
@@ -244,7 +258,7 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 	payload, err := json.Marshal(struct {
 		Topology orchestrator.TopologyView `json:"topology"`
 		Policy   *orchestrator.PolicyView  `json:"policy,omitempty"`
-	}{Topology: topology.View(), Policy: policyView})
+	}{Topology: topologyView, Policy: policyView})
 	if err != nil {
 		return fmt.Errorf("encode transparent orchestrator generation: %w", err)
 	}
@@ -260,7 +274,7 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 			return err
 		}
 	}
-	_, err = runtime.adapter.ApplyTransparentOrchestrator(ctx, requestID, vpp.TransparentOrchestratorConfig{Generation: generation, Topology: topology.View(), Policy: policyView})
+	_, err = runtime.adapter.ApplyTransparentOrchestrator(ctx, requestID, vpp.TransparentOrchestratorConfig{Generation: generation, Topology: topologyView, Policy: policyView})
 	if err != nil {
 		var rollbackErr error
 		if len(previousBonds) > 0 || len(desiredBonds) > 0 {
@@ -597,6 +611,7 @@ func (runtime *productionOrchestratorRuntime) ApplyServiceChainTransition(ctx co
 }
 
 func (runtime *productionOrchestratorRuntime) refreshRuntimeProof(ctx context.Context, interfaces []string, managementShared bool) error {
+	interfaces = runtime.resolveLinuxInterfaces(ctx, interfaces)
 	if len(interfaces) == 0 {
 		return nil
 	}
@@ -620,6 +635,81 @@ func (runtime *productionOrchestratorRuntime) refreshRuntimeProof(ctx context.Co
 		return fmt.Errorf("refresh VPP runtime capability proof: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+// resolveLinuxInterfaces maps product ids to kernel netdev names and removes
+// duplicates while preserving the first-seen order. A nil resolver is a no-op
+// for fixtures and non-appliance builds.
+func (runtime *productionOrchestratorRuntime) resolveLinuxInterfaces(ctx context.Context, interfaces []string) []string {
+	if runtime.linuxInterface == nil || len(interfaces) == 0 {
+		return interfaces
+	}
+	result := make([]string, 0, len(interfaces))
+	seen := make(map[string]bool, len(interfaces))
+	for _, name := range interfaces {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if resolved := strings.TrimSpace(runtime.linuxInterface(ctx, name)); resolved != "" {
+			name = resolved
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		result = append(result, name)
+	}
+	return result
+}
+
+// resolveTopologyView resolves management, logical ports, bonds and group ports
+// to kernel netdev names so a restart never feeds ethN to the capability probe
+// or to the VPP boundary/group commands.
+func (runtime *productionOrchestratorRuntime) resolveTopologyView(ctx context.Context, view orchestrator.TopologyView) orchestrator.TopologyView {
+	resolve := func(value string) string {
+		value = strings.TrimSpace(value)
+		if value == "" || runtime.linuxInterface == nil {
+			return value
+		}
+		if resolved := strings.TrimSpace(runtime.linuxInterface(ctx, value)); resolved != "" {
+			return resolved
+		}
+		return value
+	}
+	resolved := view
+	resolved.ManagementInterface = resolve(view.ManagementInterface)
+	resolved.Interfaces = make([]orchestrator.InterfaceView, len(view.Interfaces))
+	for index, item := range view.Interfaces {
+		item.Port = resolve(item.Port)
+		if item.Bond != nil {
+			bond := *item.Bond
+			bond.Members = make([]string, len(item.Bond.Members))
+			for memberIndex, member := range item.Bond.Members {
+				bond.Members[memberIndex] = resolve(member)
+			}
+			item.Bond = &bond
+		}
+		resolved.Interfaces[index] = item
+	}
+	resolved.Groups = make([]orchestrator.GroupView, len(view.Groups))
+	for groupIndex, group := range view.Groups {
+		group.Ports = make([]orchestrator.DirectedPortView, len(view.Groups[groupIndex].Ports))
+		for portIndex, port := range view.Groups[groupIndex].Ports {
+			port.Interface = resolve(port.Interface)
+			if port.Bond != nil {
+				bond := *port.Bond
+				bond.Members = make([]string, len(port.Bond.Members))
+				for memberIndex, member := range port.Bond.Members {
+					bond.Members[memberIndex] = resolve(member)
+				}
+				port.Bond = &bond
+			}
+			group.Ports[portIndex] = port
+		}
+		resolved.Groups[groupIndex] = group
+	}
+	return resolved
 }
 
 func (runtime *productionOrchestratorRuntime) attachNativePath(ctx context.Context, requestID string, path vpp.NativePath) error {

@@ -353,7 +353,7 @@ func writePolicyRepositoryError(writer http.ResponseWriter, err error) {
 		writeAPIError(writer, http.StatusNotFound, err)
 		return
 	}
-	if errors.Is(err, orchestrator.ErrInvalidPolicyVersion) || errors.Is(err, orchestrator.ErrInvalidPolicyGroup) || errors.Is(err, orchestrator.ErrInvalidPolicyRule) || errors.Is(err, orchestrator.ErrDeletedPolicyReference) {
+	if isPolicyValidationError(err) {
 		writeAPIError(writer, http.StatusUnprocessableEntity, err)
 		return
 	}

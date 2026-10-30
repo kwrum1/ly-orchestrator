@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"ly-route/backend/internal/persistence"
 	"ly-route/backend/internal/runtime/dataplane"
 )
 
@@ -366,6 +367,25 @@ func (server *Server) interfaceLinuxName(ctx context.Context, value string) stri
 		}
 	}
 	return value
+}
+
+// InterfaceLinuxName is the public form of interfaceLinuxName used by the
+// orchestrator API and runtime. Unknown values are returned unchanged so a
+// caller can pass a value that is already a kernel netdev name.
+func (server *Server) InterfaceLinuxName(ctx context.Context, value string) string {
+	return server.interfaceLinuxName(ctx, value)
+}
+
+// InterfaceLinuxNameResolver builds the product-id -> kernel-netdev resolver
+// from the persisted identity inputs. The orchestrator startup reconcile runs
+// before the HTTP server exists, so it cannot use Server.interfaceLinuxName
+// directly; this constructor only needs the config store and the same sysfs /
+// ownership evidence that the API uses.
+func InterfaceLinuxNameResolver(store *persistence.Store) func(context.Context, string) string {
+	server := &Server{store: store}
+	return func(ctx context.Context, value string) string {
+		return server.interfaceLinuxName(ctx, value)
+	}
 }
 
 // augmentOwnedInterfaceItems adds a synthetic item for a data port that is
