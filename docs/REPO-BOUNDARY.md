@@ -78,3 +78,30 @@ dataplane_locked: runtime_capability_proof ... native_hook ... high_performance
 2. `httpapi` 拆成 `httpapi/core` + `httpapi/gateway` + `httpapi/orchestrator` 三组路由注册器。
 3. `runtime/vpp` 拆成公共 vppctl 客户端与两侧各自的数据面编排。
 4. 两侧改为依赖 `ly-route-core` 的固定版本，`backend/` 副本随之删除，本文件同步改写。
+
+## 同步基线（重要）
+
+本仓库的 `backend/` 是 `kurumi/ly-route` **`7a8ad0e5`**（`release/lyroute2`）时刻的全量快照。
+拆分完成后 `ly-route` 又合入了两个网关数据面提交（`f33f1c3e`、`67f007e8`，
+内容是 AF_PACKET consent 与 Rockchip AF_XDP takeover，涉及
+`backend/internal/runtime/takeover/`、`backend/internal/httpapi/takeover_*.go` 共 14 个文件）。
+
+也就是说：
+
+| 仓库 | `backend/` 对应提交 | 状态 |
+|---|---|---|
+| `ly-orchestrator`（本仓库） | `7a8ad0e5` | 可独立 `go build ./...`，CI 绿 |
+| `ly-route` | `3b348a91`（含上述数据面提交） | 网关 CI 绿 |
+
+这些差异是网关数据面能力，不影响编排器构建与运行，但**共享包的修改必须两边同步**。
+同步方式（在 `ly-route` 仓库执行）：
+
+```bash
+# 查看共享后端相对本仓库快照之后的所有改动
+git diff --name-status 7a8ad0e5 HEAD -- backend
+# 把这些文件复制到本仓库 backend/ 对应路径后，跑一次
+cd backend && go build ./... && go test ./internal/orchestrator/... ./internal/orchestratorapi/... -count=1
+```
+
+在 `ly-route-core` 抽出来之前，建议每次 `ly-route` 合并到 `release/lyroute2` 后同步一次，
+并把上表的 `backend/` 提交号更新为最新值。
