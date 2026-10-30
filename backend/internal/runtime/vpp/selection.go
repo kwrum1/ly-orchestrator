@@ -1,0 +1,578 @@
+package vpp
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"sort"
+	"strings"
+	"time"
+)
+
+type NativeHook string
+
+const (
+	NativeHookAFXDP     NativeHook = "af_xdp"
+	NativeHookAFPacket  NativeHook = "af_packet"
+	NativeHookTapBridge NativeHook = "tap_bridge"
+	NativeHookRDMA      NativeHook = "rdma"
+	NativeHookDPDK      NativeHook = "dpdk"
+)
+
+type NativeMode string
+
+const (
+	NativeModeZeroCopy  NativeMode = "zero_copy"
+	NativeModeRDMADV    NativeMode = "rdma_dv"
+	NativeModeCopy      NativeMode = "copy"
+	NativeModeAFPacket  NativeMode = "linux_packet_socket"
+	NativeModeTapBridge NativeMode = "linux_bridge"
+	NativeModeDPDKVFIO  NativeMode = "vfio_pci"
+	NativeModeDPDKUIO   NativeMode = "uio_pci_generic"
+)
+
+type DataplaneTier string
+
+const (
+	DataplaneTierNative DataplaneTier = "vpp_native"
+	DataplaneTierDPDK   DataplaneTier = "vpp_dpdk"
+)
+
+func approvedNativeMode(hook NativeHook, mode NativeMode) bool {
+	return hook == NativeHookAFXDP && (mode == NativeModeZeroCopy || mode == NativeModeCopy) ||
+		hook == NativeHookRDMA && mode == NativeModeRDMADV
+}
+
+func acceptedNativePerformance(proof CapabilityProof) bool {
+	return proof.HighPerformance ||
+		proof.Hook == NativeHookAFXDP && proof.Mode == NativeModeCopy && proof.Native
+}
+
+func proveNativeAttachment(attachment NativeAttachment) NativeAttachment {
+	attachment.capabilityFingerprint = nativeAttachmentFingerprint(attachment)
+	return attachment
+}
+
+func nativeAttachmentFingerprint(attachment NativeAttachment) string {
+	// Hook and mode already distinguish native from DPDK attachments. Keep the
+	// persisted fingerprint stable for pre-tier native receipts during upgrade.
+	digest := sha256.Sum256([]byte(strings.Join([]string{attachment.LinuxInterface, attachment.VPPInterface, string(attachment.Hook), string(attachment.Mode), strings.ToLower(strings.TrimSpace(attachment.MACAddress))}, "\x00")))
+	return fmt.Sprintf("%x", digest)
+}
+
+type ProofSource string
+
+const (
+	ProofSourceRuntimeProbe          ProofSource = "runtime_probe"
+	ProofSourceActiveRuntimeReadback ProofSource = "active_runtime_readback"
+)
+
+type CapabilityProof struct {
+	Tier DataplaneTier `json:"tier,omitempty"`
+	Hook NativeHook    `json:"hook"`
+	Mode NativeMode    `json:"mode"`
+	// Transport is the DPDK PCI binding transport observed for this proof:
+	// "vfio" for an IOMMU-protected vfio-pci device, "uio" for the
+	// uio_pci_generic no-IOMMU fallback. It is intentionally redundant with
+	// Mode so reports and operator evidence can state the transport without
+	// re-deriving it from the driver name.
+	Transport           string      `json:"transport,omitempty"`
+	VPPInterface        string      `json:"vpp_interface,omitempty"`
+	LinkState           string      `json:"link_state,omitempty"`
+	HardwareLink        string      `json:"hardware_link,omitempty"`
+	DriverModel         string      `json:"driver_model,omitempty"`
+	FunctionalVerified  bool        `json:"functional_verified,omitempty"`
+	Verification        string      `json:"verification,omitempty"`
+	FunctionalMethod    string      `json:"functional_method,omitempty"`
+	LinkSpeedMbps       int64       `json:"link_speed_mbps,omitempty"`
+	MACAddress          string      `json:"mac_address,omitempty"`
+	Source              ProofSource `json:"source"`
+	RuntimeVerified     bool        `json:"runtime_verified"`
+	Native              bool        `json:"native"`
+	HighPerformance     bool        `json:"high_performance"`
+	ObservedAt          time.Time   `json:"observed_at"`
+	ValidUntil          time.Time   `json:"valid_until"`
+	PerformanceScore    float64     `json:"performance_score,omitempty"`
+	PCIAddress          string      `json:"pci_address,omitempty"`
+	KernelDriver        string      `json:"kernel_driver,omitempty"`
+	IOMMUGroup          string      `json:"iommu_group,omitempty"`
+	IOMMUProtected      bool        `json:"iommu_protected,omitempty"`
+	VFIOAvailable       bool        `json:"vfio_available,omitempty"`
+	UIOPCIAvailable     bool        `json:"uio_pci_available,omitempty"`
+	HugepagesAvailable  bool        `json:"hugepages_available,omitempty"`
+	DPDKPluginAvailable bool        `json:"dpdk_plugin_available,omitempty"`
+	HQoSAvailable       bool        `json:"hqos_available,omitempty"`
+	// SmartQoSPluginAvailable is retained only so capability reports written by
+	// pre-arch-v1 firmware still decode (the report loader rejects unknown
+	// fields). It never influences eligibility.
+	SmartQoSPluginAvailable bool `json:"smart_qos_plugin_available,omitempty"`
+	AcceptanceOnly          bool `json:"acceptance_only,omitempty"`
+	// CapabilityStatus is the explicit four-state probe result for this
+	// candidate. An empty value keeps the legacy boolean contract: a persisted
+	// proof is re-derived from its runtime-verification fields.
+	CapabilityStatus      CapabilityStatus `json:"capability_status,omitempty"`
+	CapabilityConstraints []string         `json:"capability_constraints,omitempty"`
+	CapabilityReason      string           `json:"capability_reason,omitempty"`
+}
+
+type NativeAssignment struct {
+	LinuxInterface string `json:"linux_interface"`
+	Explicit       bool   `json:"explicit"`
+	// AFPacketConsent is resolved per assignment from the persisted
+	// dataplane_policy ports list. It is never inferred from the transport.
+	AFPacketConsent bool              `json:"af_packet_consent,omitempty"`
+	Proof           CapabilityProof   `json:"proof"`
+	Candidates      []CapabilityProof `json:"candidates,omitempty"`
+}
+
+type NativePathRequest struct {
+	ManagementInterface string `json:"management_interface"`
+	ManagementShared    bool   `json:"management_shared,omitempty"`
+	// RequireSmartQoS is accepted for wire compatibility but ignored. Smart QoS
+	// was removed as a dataplane prerequisite: requiring it turned a missing
+	// optional plugin into dataplane_locked and blocked clean first boot.
+	RequireSmartQoS     bool                 `json:"require_smart_qos,omitempty"`
+	Assignments         []NativeAssignment   `json:"assignments"`
+	ReportPrerequisites []PrerequisiteResult `json:"report_prerequisites,omitempty"`
+	Now                 time.Time            `json:"-"`
+	// AFPacketConsent is the persisted operator consent for the last-resort
+	// AF_PACKET compatibility mode. It participates in the serialized plan so
+	// enabling/disabling the fallback changes the runtime plan hash.
+	AFPacketConsent    bool `json:"af_packet_consent,omitempty"`
+	AcceptanceAFPacket bool `json:"acceptance_af_packet,omitempty"`
+	// AllowUnproven derives the attachment list from declarative assignment
+	// data without re-validating live capability proofs. Reconciliation of a
+	// persisted prior generation needs operation identities and commands, not
+	// a fresh tier decision: its proof window has legitimately expired.
+	AllowUnproven bool `json:"-"`
+}
+
+// declarativeNativePath builds the attachment list a plan already declares.
+// It is only used to derive operations for reconciliation and cleanup.
+func declarativeNativePath(request NativePathRequest) NativePath {
+	attachments := make([]NativeAttachment, 0, len(request.Assignments))
+	tier := DataplaneTierNative
+	for _, assignment := range request.Assignments {
+		name := strings.TrimSpace(assignment.LinuxInterface)
+		if name == "" {
+			continue
+		}
+		proof := assignment.Proof
+		attachmentTier := DataplaneTierNative
+		if proof.Tier == DataplaneTierDPDK || proof.Hook == NativeHookDPDK {
+			attachmentTier = DataplaneTierDPDK
+			tier = DataplaneTierDPDK
+		}
+		vppInterface, hardwareInterface := nativeAttachmentVPPNames(proof, name)
+		hook := proof.Hook
+		mode := proof.Mode
+		if hook == "" {
+			// Never infer the zero-copy AF_XDP hook from a missing field.
+			// A plan rebuilt from a generation whose proof omitted the hook
+			// was previously read back as an AF_XDP attachment, and the
+			// verification then failed with "AF_XDP attachment ... does not
+			// identify Linux netdev ..." on an interface that is actually
+			// DPDK or AF_PACKET. Infer from the mode, and fall back to the
+			// compatibility hook, which works on every driver.
+			switch mode {
+			case NativeModeZeroCopy, NativeModeCopy:
+				hook = NativeHookAFXDP
+			case NativeModeDPDKUIO, NativeModeDPDKVFIO:
+				hook = NativeHookDPDK
+			case NativeModeTapBridge:
+				hook = NativeHookTapBridge
+			default:
+				hook = NativeHookAFPacket
+			}
+		}
+		if mode == "" {
+			switch hook {
+			case NativeHookAFXDP:
+				mode = NativeModeZeroCopy
+			case NativeHookDPDK:
+				mode = NativeModeDPDKUIO
+			case NativeHookTapBridge:
+				mode = NativeModeTapBridge
+			default:
+				mode = NativeModeAFPacket
+			}
+		}
+		if hook == NativeHookDPDK {
+			attachmentTier = DataplaneTierDPDK
+			tier = DataplaneTierDPDK
+		}
+		attachments = append(attachments, NativeAttachment{
+			LinuxInterface:       name,
+			VPPInterface:         vppInterface,
+			HardwareVPPInterface: hardwareInterface,
+			MACAddress:           proof.MACAddress,
+			Tier:                 attachmentTier,
+			Hook:                 hook,
+			Mode:                 mode,
+			PCIAddress:           proof.PCIAddress,
+			KernelDriver:         proof.KernelDriver,
+			IOMMUGroup:           proof.IOMMUGroup,
+			Verification:         attachmentVerification(proof),
+		})
+	}
+	return NativePath{Tier: tier, SmartQoS: false, Attachments: attachments, Degradations: []Degradation{smartQoSRetiredDegradation()}}
+}
+
+type NativeAttachment struct {
+	LinuxInterface string `json:"linux_interface"`
+	// VPPInterface is the product-owned interface name. Every operation,
+	// readback and status contract addresses the port by this name.
+	VPPInterface string `json:"vpp_interface"`
+	// HardwareVPPInterface is the name the PMD assigned when it attached the
+	// device before the product rename (DPDK: GigabitEthernet0/3/0). It is
+	// consumed once by the attach/dataplane rename and never used by later
+	// operations. Hooks that create the interface with the product name leave
+	// it empty.
+	HardwareVPPInterface string        `json:"hardware_vpp_interface,omitempty"`
+	MACAddress           string        `json:"mac_address,omitempty"`
+	Tier                 DataplaneTier `json:"tier,omitempty"`
+	Hook                 NativeHook    `json:"hook"`
+	Mode                 NativeMode    `json:"mode"`
+	PCIAddress           string        `json:"pci_address,omitempty"`
+	KernelDriver         string        `json:"kernel_driver,omitempty"`
+	IOMMUGroup           string        `json:"iommu_group,omitempty"`
+	// Verification is the link-independent takeover proof state. A down link
+	// is reported as pending_link: the port is still owned by VPP.
+	Verification          string `json:"verification,omitempty"`
+	capabilityFingerprint string
+}
+
+type PrerequisiteResult struct {
+	Name      string `json:"name"`
+	Interface string `json:"interface,omitempty"`
+	Passed    bool   `json:"passed"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// Degradation records an optional feature that is unavailable while the
+// dataplane keeps forwarding. Degradations are deliberately separate from
+// Prerequisites: a degraded optional feature must never produce
+// dataplane_locked.
+type Degradation struct {
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
+	Impact string `json:"impact"`
+}
+
+// SmartQoSRetiredReason is the operator-facing explanation returned whenever a
+// caller asks about built-in Smart QoS. The feature is retired; ordinary
+// traffic-control (rate limiting and blocking) remains the supported QoS path.
+const SmartQoSRetiredReason = "built-in Smart QoS is retired; dataplane eligibility depends only on interface presence, FIB/routing and NAT, and QoS degrades to traffic-control"
+
+// smartQoSRetiredDegradation is reported on every selected path so operators
+// can see that QoS shaping was dropped without mistaking it for a forwarding
+// failure.
+func smartQoSRetiredDegradation() Degradation {
+	return Degradation{Name: "smart_qos", Reason: SmartQoSRetiredReason, Impact: "qos"}
+}
+
+type NativePath struct {
+	Tier DataplaneTier `json:"tier,omitempty"`
+	// Degraded is true when a selected attachment uses the AF_PACKET
+	// compatibility fallback. The dataplane is committed and forwarding still
+	// runs through VPP, but the runtime state must be reported as degraded.
+	Degraded bool `json:"degraded,omitempty"`
+	// SmartQoS is retained for wire compatibility with pre-arch-v1 plans and
+	// receipts. It is always false: the retired feature never participates in
+	// dataplane selection or operation building.
+	SmartQoS      bool                  `json:"smart_qos,omitempty"`
+	Attachments   []NativeAttachment    `json:"attachments"`
+	Prerequisites []PrerequisiteResult  `json:"prerequisites"`
+	Candidates    []CandidateEvaluation `json:"candidates,omitempty"`
+	Degradations  []Degradation         `json:"degradations,omitempty"`
+}
+
+type CandidateEvaluation struct {
+	LinuxInterface   string        `json:"linux_interface"`
+	Tier             DataplaneTier `json:"tier"`
+	Hook             NativeHook    `json:"hook"`
+	Mode             NativeMode    `json:"mode"`
+	PerformanceScore float64       `json:"performance_score,omitempty"`
+	Eligible         bool          `json:"eligible"`
+	// Capability is the four-state probe result, never a boolean shortcut.
+	Capability  CapabilityStatus `json:"capability,omitempty"`
+	Constraints []string         `json:"constraints,omitempty"`
+	Reasons     []string         `json:"reasons,omitempty"`
+}
+
+type CapabilityReport struct {
+	ManagementInterface string           `json:"management_interface"`
+	Proofs              []InterfaceProof `json:"proofs"`
+}
+
+type InterfaceProof struct {
+	LinuxInterface string             `json:"linux_interface"`
+	Proof          CapabilityProof    `json:"proof"`
+	Candidates     []CapabilityProof  `json:"candidates,omitempty"`
+	Failures       []CandidateFailure `json:"failures,omitempty"`
+}
+
+// CandidateFailure records why a probed fallback hook could not be used. It is
+// evidence only: selection never treats a failure entry as approval.
+type CandidateFailure struct {
+	Hook   NativeHook `json:"hook"`
+	Mode   NativeMode `json:"mode"`
+	Reason string     `json:"reason"`
+}
+
+type DataplaneLockedError struct {
+	Prerequisites []PrerequisiteResult  `json:"prerequisites"`
+	Candidates    []CandidateEvaluation `json:"candidates,omitempty"`
+}
+
+func (err *DataplaneLockedError) Error() string {
+	failed := make([]string, 0, len(err.Prerequisites))
+	for _, result := range err.Prerequisites {
+		if !result.Passed {
+			failed = append(failed, result.Name)
+		}
+	}
+	return fmt.Sprintf("dataplane_locked: failed prerequisites: %s", strings.Join(failed, ", "))
+}
+
+func (*DataplaneLockedError) Code() string { return "dataplane_locked" }
+
+// AFFallbackRequiredError is the machine-readable consent gate for the
+// last-resort AF_PACKET compatibility mode. It is not a dataplane lock: the UI
+// can ask the operator for consent and retry the same apply.
+type AFFallbackRequiredError struct {
+	Interfaces []string `json:"interfaces"`
+	Reason     string   `json:"reason"`
+}
+
+func (err *AFFallbackRequiredError) Error() string {
+	return "af_fallback_required: AF_PACKET compatibility mode requires explicit operator consent for " + strings.Join(err.Interfaces, ", ")
+}
+
+func (*AFFallbackRequiredError) Code() string { return "af_fallback_required" }
+
+const AFPacketDegradedReason = "AF_PACKET 兼容模式（性能受限）"
+
+func SelectNativePath(request NativePathRequest) (NativePath, error) {
+	if request.AllowUnproven {
+		return declarativeNativePath(request), nil
+	}
+	for _, assignment := range request.Assignments {
+		if len(assignment.Candidates) > 0 {
+			return selectCommonDataplanePath(request)
+		}
+	}
+	management := strings.TrimSpace(request.ManagementInterface)
+	results := append([]PrerequisiteResult(nil), request.ReportPrerequisites...)
+	// Smart QoS is not a dataplane prerequisite. A device without the plugin
+	// must still be able to commit forwarding; the absence is reported as a
+	// QoS degradation on the selected path instead of locking the dataplane.
+	results = append(results,
+		prerequisite("management_identified", "", management != "", "management interface is required"),
+		prerequisite("data_assignment_present", "", len(request.Assignments) > 0, "at least one explicit data interface assignment is required"),
+	)
+	assignments := append([]NativeAssignment(nil), request.Assignments...)
+	sort.Slice(assignments, func(left, right int) bool {
+		return strings.TrimSpace(assignments[left].LinuxInterface) < strings.TrimSpace(assignments[right].LinuxInterface)
+	})
+	attachments := make([]NativeAttachment, 0, len(assignments))
+	seen := make(map[string]struct{}, len(assignments))
+	for _, assignment := range assignments {
+		name := strings.TrimSpace(assignment.LinuxInterface)
+		proof := assignment.Proof
+		_, duplicate := seen[name]
+		seen[name] = struct{}{}
+		runtimeProof := isRuntimeCapabilityProof(proof) && proof.RuntimeVerified && !proof.ObservedAt.IsZero()
+		freshProof := runtimeProof && !request.Now.IsZero() && !proof.ValidUntil.Before(request.Now) && !proof.ObservedAt.After(request.Now)
+		proofLifetime := proof.ValidUntil.Sub(proof.ObservedAt)
+		validProofLifetime := runtimeProof && proofLifetime > 0
+		approvedMode := approvedNativeMode(proof.Hook, proof.Mode)
+		results = append(results,
+			prerequisite("interface_assigned", name, name != "", "data interface name is required"),
+			prerequisite("interface_name_safe", name, interfaceNameSafe(name), "data interface name contains unsupported characters"),
+			prerequisite("assignment_unique", name, !duplicate, "data interface assignment is duplicated"),
+			prerequisite("explicit_assignment", name, assignment.Explicit, "automatic interface assignment is forbidden"),
+			prerequisite("management_excluded", name, management != "" && (request.ManagementShared || name != management), "management interface is permanently excluded"),
+			prerequisite("runtime_capability_proof", name, runtimeProof, "runtime capability proof is required"),
+			prerequisite("fresh_runtime_proof", name, freshProof, "runtime capability proof is missing or stale"),
+			prerequisite("valid_runtime_proof_lifetime", name, validProofLifetime, "runtime capability proof validity must end after observation"),
+			prerequisite("approved_native_mode", name, approvedMode || acceptanceAFPacketProof(request.AcceptanceAFPacket, proof), "hook and mode are not an approved VPP-native high-performance path"),
+			prerequisite("native_hook", name, proof.Native, "proof does not identify a native hook"),
+			prerequisite("high_performance", name, acceptedNativePerformance(proof) || acceptanceAFPacketProof(request.AcceptanceAFPacket, proof), "proof does not establish an accepted VPP user-space data path"),
+		)
+		if acceptanceAFPacketProof(request.AcceptanceAFPacket, proof) {
+			results = append(results, prerequisite("af_packet_mac_address", name, hardwareAddressSafe(proof.MACAddress), "AF_PACKET attachment requires the current Linux interface MAC address"))
+		}
+		// Preserve the legacy attachment payload shape until a multi-candidate
+		// report opts this interface into explicit tier negotiation.
+		vppInterface := strings.TrimSpace(proof.VPPInterface)
+		if vppInterface == "" {
+			vppInterface = "lyroute-" + name
+		}
+		attachments = append(attachments, proveNativeAttachment(NativeAttachment{
+			LinuxInterface: name,
+			VPPInterface:   vppInterface,
+			MACAddress:     strings.TrimSpace(proof.MACAddress),
+			Tier:           proof.Tier,
+			Hook:           proof.Hook,
+			Mode:           proof.Mode,
+			PCIAddress:     strings.TrimSpace(proof.PCIAddress),
+			KernelDriver:   strings.TrimSpace(proof.KernelDriver),
+			IOMMUGroup:     strings.TrimSpace(proof.IOMMUGroup),
+		}))
+	}
+	for _, result := range results {
+		if !result.Passed {
+			return NativePath{}, &DataplaneLockedError{Prerequisites: results}
+		}
+	}
+	return NativePath{Tier: DataplaneTierNative, SmartQoS: false, Attachments: attachments, Prerequisites: results, Degradations: []Degradation{smartQoSRetiredDegradation()}}, nil
+}
+
+func isRuntimeCapabilityProof(proof CapabilityProof) bool {
+	switch proof.Source {
+	case ProofSourceRuntimeProbe, ProofSourceActiveRuntimeReadback:
+		return true
+	default:
+		return false
+	}
+}
+
+func LoadNativePathRequest(path, management string, interfaces []string, now time.Time) NativePathRequest {
+	return LoadNativePathRequestWithSharedManagement(path, management, interfaces, now, false)
+}
+
+func LoadNativePathRequestWithSharedManagement(path, management string, interfaces []string, now time.Time, managementShared bool) NativePathRequest {
+	reportPrerequisites := []PrerequisiteResult{}
+	report := CapabilityReport{}
+	loaded := false
+	file, err := os.Open(path)
+	if err != nil {
+		reportPrerequisites = append(reportPrerequisites, prerequisite("capability_report_loaded", "", false, "runtime capability report is unavailable"))
+	} else {
+		defer file.Close()
+		info, statErr := file.Stat()
+		securePermissions := statErr == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o022 == 0
+		reportPrerequisites = append(reportPrerequisites, prerequisite("capability_report_permissions", "", securePermissions, "runtime capability report must not be group or world writable"))
+		decoder := json.NewDecoder(file)
+		decoder.DisallowUnknownFields()
+		decodeErr := decoder.Decode(&report)
+		if decodeErr == nil {
+			var trailing json.RawMessage
+			if trailingErr := decoder.Decode(&trailing); trailingErr != io.EOF {
+				decodeErr = fmt.Errorf("capability report has trailing data")
+			}
+		}
+		reportPrerequisites = append(reportPrerequisites, prerequisite("capability_report_loaded", "", decodeErr == nil, "runtime capability report is malformed"))
+		managementMatches := decodeErr == nil && securePermissions && strings.TrimSpace(report.ManagementInterface) == strings.TrimSpace(management)
+		reportPrerequisites = append(reportPrerequisites, prerequisite("capability_report_management_matches", "", managementMatches, "runtime capability report belongs to a different management interface"))
+		loaded = managementMatches
+	}
+	if !loaded {
+		report = CapabilityReport{}
+	}
+	return nativePathRequestFromReport(report, reportPrerequisites, management, interfaces, now, managementShared)
+}
+
+// nativePathRequestFromReport turns a validated observed capability report into
+// a selection request. It is shared by the report-file loader and the active
+// capability prober so both paths apply identical eligibility rules.
+func nativePathRequestFromReport(report CapabilityReport, reportPrerequisites []PrerequisiteResult, management string, interfaces []string, now time.Time, managementShared bool) NativePathRequest {
+	proofs := map[string]CapabilityProof{}
+	candidates := map[string][]CapabilityProof{}
+	proofCounts := map[string]int{}
+	for _, item := range report.Proofs {
+		name := strings.TrimSpace(item.LinuxInterface)
+		proofCounts[name]++
+		if proofCounts[name] > 1 {
+			continue
+		}
+		if len(item.Candidates) > 0 {
+			candidates[name] = append([]CapabilityProof(nil), item.Candidates...)
+		} else {
+			// Older runtime reports emit one proof instead of a candidate array.
+			// A single data interface must not be rejected merely because the
+			// report has one candidate.
+			proofs[name] = item.Proof
+			candidates[name] = []CapabilityProof{item.Proof}
+		}
+	}
+	assignments := make([]NativeAssignment, 0, len(interfaces))
+	for _, interfaceName := range interfaces {
+		name := strings.TrimSpace(interfaceName)
+		if name == "" {
+			continue
+		}
+		reportPrerequisites = append(reportPrerequisites, prerequisite("capability_report_interface_unique", name, proofCounts[name] <= 1, "runtime capability report contains duplicate interface entries"))
+		assignments = append(assignments, NativeAssignment{LinuxInterface: name, Explicit: true, Proof: proofs[name], Candidates: candidates[name]})
+	}
+	return NativePathRequest{
+		ManagementInterface: strings.TrimSpace(management),
+		ManagementShared:    managementShared,
+		Assignments:         assignments,
+		ReportPrerequisites: reportPrerequisites,
+		Now:                 now,
+		AcceptanceAFPacket:  os.Getenv("LY_ROUTE_VMXNET3_AF_PACKET_ACCEPTANCE") == "true" || os.Getenv("LY_ROUTE_VMNET_AF_PACKET_ACCEPTANCE") == "true",
+	}
+}
+
+func acceptanceAFPacketProof(enabled bool, proof CapabilityProof) bool {
+	return enabled && proof.AcceptanceOnly &&
+		((proof.Hook == NativeHookAFPacket && proof.Mode == NativeModeAFPacket) ||
+			(proof.Hook == NativeHookTapBridge && proof.Mode == NativeModeTapBridge))
+}
+
+func interfaceNameSafe(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, char := range name {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '_' || char == '-' || char == '.' || char == ':' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func hardwareAddressSafe(value string) bool {
+	hardwareAddress, err := net.ParseMAC(strings.TrimSpace(value))
+	if err != nil || len(hardwareAddress) != 6 || hardwareAddress[0]&1 != 0 {
+		return false
+	}
+	for _, octet := range hardwareAddress {
+		if octet != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func prerequisite(name, interfaceName string, passed bool, reason string) PrerequisiteResult {
+	if passed {
+		reason = ""
+	}
+	return PrerequisiteResult{Name: name, Interface: interfaceName, Passed: passed, Reason: reason}
+}
+
+// attachmentVerification keeps capability and link state orthogonal: an
+// approved takeover with a down link is pending_link, never rejected.
+func attachmentVerification(proof CapabilityProof) string {
+	switch strings.ToLower(strings.TrimSpace(proof.Verification)) {
+	case "verified", "pending_link", "failed":
+		return strings.ToLower(strings.TrimSpace(proof.Verification))
+	}
+	if proof.FunctionalVerified {
+		return "verified"
+	}
+	if link := strings.ToLower(strings.TrimSpace(proof.HardwareLink)); link == "down" {
+		return "pending_link"
+	}
+	if link := strings.ToLower(strings.TrimSpace(proof.LinkState)); link == "down" {
+		return "pending_link"
+	}
+	return "verified"
+}

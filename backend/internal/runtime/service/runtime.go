@@ -1,0 +1,3242 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"ly-route/backend/internal/runtime/dns"
+	"ly-route/backend/internal/runtime/nat"
+	"ly-route/backend/internal/runtime/proxy"
+	"ly-route/backend/internal/runtime/vpp"
+)
+
+type ServiceName string
+
+const (
+	SmartDNS ServiceName = "smartdns"
+	Dnsmasq  ServiceName = "dnsmasq"
+	Xray     ServiceName = "xray"
+	// PPPoE is the product runtime. The dialer is ly-route-pppoe-client;
+	// pppd is not part of the appliance runtime.
+	PPPoE ServiceName = "pppoe"
+	// PPPd is a deprecated source-compatibility alias for old test helpers.
+	// It resolves to the native PPPoE service name and is not used for
+	// package, unit, or process discovery.
+	PPPd         ServiceName = PPPoE
+	VPP          ServiceName = "vpp"
+	Nftables     ServiceName = "nftables"
+	LinuxRouting ServiceName = "linux-routing"
+	IPv6RA       ServiceName = "ipv6-ra"
+)
+
+const linuxRoutingResetMarker = "# ly-route-linux-routing-reset"
+
+type RenderedArtifact struct {
+	Service      ServiceName `json:"service"`
+	Path         string      `json:"path"`
+	Content      string      `json:"content"`
+	ContentHash  string      `json:"content_hash"`
+	AuditSummary string      `json:"audit_summary"`
+	ReloadMode   string      `json:"reload_mode"`
+}
+
+type Health struct {
+	Service   ServiceName `json:"service"`
+	Available bool        `json:"available"`
+	// TimedOut marks a probe that could not establish the real unit state
+	// before its deadline.  It is deliberately distinct from "inactive":
+	// callers may report degraded/unknown, but must not claim the service is
+	// stopped when PID1 itself is slow.
+	TimedOut bool   `json:"timed_out,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+type ProcessController interface {
+	ReloadOrRestart(context.Context, ServiceName, []RenderedArtifact) error
+	Status(context.Context, ServiceName) (Health, error)
+	Rollback(context.Context, ServiceName, []RenderedArtifact) error
+}
+
+type StopController interface {
+	Stop(context.Context, ServiceName, []RenderedArtifact) error
+}
+
+// ServiceRestarter recovers a daemon that was stopped as a side effect of a
+// dataplane transition (for example VPP restart with PartOf=). It is separate
+// from ProcessController so existing test doubles do not need to implement it.
+type ServiceRestarter interface {
+	Restart(context.Context, ServiceName) error
+}
+
+type LogController interface {
+	Logs(context.Context, ServiceName, int) (string, error)
+}
+
+type CommandRunner interface {
+	Run(context.Context, string, ...string) error
+	Output(context.Context, string, ...string) (string, error)
+	Status(context.Context, ServiceName) (Health, error)
+}
+
+// EnvironmentCommandRunner is implemented by runners that can pass a
+// per-invocation environment to a helper. The production systemctl runner
+// implements it so vpp-apply receives the caller transaction identity.
+type EnvironmentCommandRunner interface {
+	RunEnv(context.Context, []string, string, ...string) error
+}
+
+type SystemctlRunner struct{}
+
+func (runner SystemctlRunner) Run(ctx context.Context, name string, args ...string) error {
+	return runner.run(ctx, nil, name, args...)
+}
+
+func (runner SystemctlRunner) RunEnv(ctx context.Context, environment []string, name string, args ...string) error {
+	return runner.run(ctx, environment, name, args...)
+}
+
+func (SystemctlRunner) run(ctx context.Context, environment []string, name string, args ...string) error {
+	timeout := 2 * time.Minute
+	if name == "systemctl" {
+		// Enable/restart talks to PID1, which can be slow while VPP is
+		// polling a core or a unit is waiting for a VPP TAP. Keep this larger
+		// than the unit's own TimeoutStartSec so a valid slow start is not
+		// misreported as a component failure. The outer apply transaction
+		// remains bounded by runtimeApplyTimeout.
+		timeout = 4 * time.Minute
+	}
+	if strings.HasSuffix(name, "/policy-routing-apply-default") {
+		// The helper is a synchronous one-shot script. Its own readiness loop is
+		// bounded to about ten seconds, so a longer wall-clock bound only turns a
+		// deterministic script failure into the five-minute apply timeout seen on
+		// the J1900. Keep it short; the failure output is captured below.
+		timeout = 60 * time.Second
+	}
+	output, err := runCommandBoundedEnv(ctx, timeout, environment, name, args...)
+	if err != nil {
+		message := strings.TrimSpace(output)
+		if errors.Is(err, ErrCommandTimeout) {
+			return fmt.Errorf("%s %s timed out after %s", name, strings.Join(args, " "), timeout)
+		}
+		if message == "" {
+			message = err.Error()
+		}
+		if name == "systemctl" && len(args) >= 2 && !errors.Is(ctx.Err(), context.Canceled) {
+			if statusOutput, statusErr := runCommandBounded(context.WithoutCancel(ctx), 2*time.Second, "systemctl", "status", "--no-pager", "-l", args[len(args)-1]); statusErr == nil || statusOutput != "" {
+				if statusMessage := strings.TrimSpace(statusOutput); statusMessage != "" {
+					message += "\n" + statusMessage
+				}
+			}
+		}
+		return fmt.Errorf("%s %s failed: %s", name, strings.Join(args, " "), message)
+	}
+	return nil
+}
+
+func (SystemctlRunner) Status(ctx context.Context, service ServiceName) (Health, error) {
+	// PID1 can have a stuck job while a runtime apply is in progress.  The
+	// hard bound is enforced by runCommandBounded (process-group kill), not
+	// just by the child context.  A timeout is reported as unknown/degraded,
+	// never as "the unit is not active".
+	unit := serviceUnit(service)
+	_, err := runCommandBounded(ctx, 20*time.Second, "systemctl", "is-active", "--quiet", unit)
+	if err == nil {
+		return Health{Service: service, Available: true}, nil
+	}
+	if errors.Is(err, ErrCommandTimeout) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return Health{Service: service, Available: false, TimedOut: true, Reason: unit + " status check timed out"}, nil
+	}
+	reason := unit + " is not active"
+	// Diagnostics are best-effort and receive their own short budget.  They
+	// must not reuse an expired context (the old code ran them after the
+	// status deadline and always returned an empty diagnostic).
+	if statusOutput, statusErr := runCommandBounded(context.WithoutCancel(ctx), 2*time.Second, "systemctl", "status", "--no-pager", "-l", unit); statusErr == nil || statusOutput != "" {
+		if status := strings.TrimSpace(statusOutput); status != "" {
+			reason += ": " + status
+		}
+	}
+	if journalOutput, journalErr := runCommandBounded(context.WithoutCancel(ctx), 2*time.Second, "journalctl", "-u", unit, "--no-pager", "-n", "20"); journalErr == nil || journalOutput != "" {
+		if journal := strings.TrimSpace(journalOutput); journal != "" {
+			reason += "\n" + journal
+		}
+	}
+	return Health{Service: service, Available: false, Reason: reason}, nil
+}
+
+type Runtime struct {
+	Controller ProcessController
+	// health caches short-lived health results and collapses concurrent
+	// probes.  It is pointer-backed so copying a Runtime value does not copy
+	// a mutex.
+	health *runtimeHealthCache
+}
+
+var runtimeHealthInitMu sync.Mutex
+
+func (runtime *Runtime) healthCache() *runtimeHealthCache {
+	runtimeHealthInitMu.Lock()
+	defer runtimeHealthInitMu.Unlock()
+	if runtime.health == nil {
+		runtime.health = newRuntimeHealthCache()
+	}
+	return runtime.health
+}
+
+func (runtime *Runtime) invalidateHealth() {
+	if runtime != nil && runtime.health != nil {
+		runtime.health.invalidate()
+	}
+}
+
+// InvalidateHealth drops the short-lived per-service health cache. It is used
+// by reconcilers and tests that must observe a state change immediately
+// instead of waiting for the one-second cache TTL.
+func (runtime *Runtime) InvalidateHealth() {
+	runtime.invalidateHealth()
+}
+
+func NewArtifact(service ServiceName, path, content, reloadMode string) RenderedArtifact {
+	digest := sha256.Sum256([]byte(content))
+	return RenderedArtifact{
+		Service:      service,
+		Path:         strings.TrimSpace(path),
+		Content:      content,
+		ContentHash:  hex.EncodeToString(digest[:]),
+		AuditSummary: Redact(content),
+		ReloadMode:   strings.TrimSpace(reloadMode),
+	}
+}
+
+func LinuxRoutingResetArtifact() RenderedArtifact {
+	return NewArtifact(
+		LinuxRouting,
+		"/var/lib/ly-route/policy-routing/apply.sh",
+		"#!/bin/sh\nset -eu\n"+linuxRoutingResetMarker+"\n",
+		"restart",
+	)
+}
+
+// SmartDNSRejectGroup is a resolver group that is intentionally never defined.
+// A `nameserver /./<group>` rule pointing at it selects a group with zero
+// upstream servers, so the shipped SmartDNS answers SERVFAIL immediately
+// instead of falling back to the default group (verified on smartdns
+// 1.20261019). The colon cannot appear in an upstream id, so a configured
+// upstream can never collide with it.
+const SmartDNSRejectGroup = "lyroute-reject:no-upstream"
+
+// smartDNSReservedServerGroup keeps at least one `server` directive in a
+// reject-miss configuration. SmartDNS imports /etc/resolv.conf servers when
+// the configuration declares none, which would leak rejected domains to the
+// host resolver. The reserved server is excluded from the default group and no
+// nameserver rule selects it, so it never receives a query.
+const (
+	smartDNSReservedServerGroup   = "lyroute-reserved:no-use"
+	smartDNSReservedServerAddress = "127.0.0.1:1"
+)
+
+type SmartDNSPlan struct {
+	ID         string
+	Render     dns.SmartDNSRender
+	Upstreams  []SmartDNSUpstream
+	Cache      SmartDNSCache
+	DomainSets map[string][]string
+	// ProxyDNSEndpoints is the endpoint generation that serves proxy outcomes.
+	// A plan without it keeps the fail-closed behavior from E4: a proxy rule
+	// refuses to render instead of leaking the query to a direct resolver.
+	ProxyDNSEndpoints ProxyDNSEndpointPlan
+}
+
+type smartDNSDomainSetArtifact struct {
+	Path    string
+	Content string
+}
+
+type smartDNSDomainSelector struct {
+	matchKind string
+	domain    string
+	domainSet string
+}
+
+// SmartDNSUpstream is a validated resolver group. A WAN-pinned upstream uses
+// SocketMark to select a dedicated Linux peer of a VPP DNS service network,
+// never the physical WAN device that VPP owns.
+type SmartDNSUpstream struct {
+	ID               string
+	Servers          []string
+	BootstrapServers []string
+	ResolvedHostIPs  map[string][]string
+	Interface        string
+	WANEgressID      string
+	SocketMark       uint32
+}
+
+type SmartDNSCache struct {
+	Size     int
+	TTLMin   int
+	TTLMax   int
+	Prefetch bool
+}
+
+type DnsmasqPlan struct {
+	ID           string               `json:"id"`
+	InterfaceID  string               `json:"interface_id"`
+	Subnet       string               `json:"subnet,omitempty"`
+	Pools        []string             `json:"pools,omitempty"`
+	Routers      []string             `json:"routers,omitempty"`
+	NameServers  []string             `json:"name_servers,omitempty"`
+	LeaseTime    int                  `json:"lease_time_seconds,omitempty"`
+	Reservations []DnsmasqReservation `json:"reservations,omitempty"`
+	Logging      map[string]string    `json:"logging,omitempty"`
+	Options      map[string][]string  `json:"options,omitempty"`
+	// DNSOnly renders just the LAN listener: dnsmasq serves :53 on this
+	// interface and forwards to SmartDNS, without a DHCP range. It is used for
+	// multi-LAN plans, where VPP's single-interface dns-intercept plugin cannot
+	// cover every LAN and the nftables redirect needs a listener on each LAN
+	// gateway address.
+	DNSOnly bool `json:"dns_only,omitempty"`
+	// ServeDNS enables dnsmasq's DNS listener on the LAN LCP interfaces.
+	// It is used when VPP transparent interception is unavailable (multi-LAN
+	// gateways); DNS is then forwarded to the local SmartDNS stub.
+	ServeDNS bool `json:"serve_dns,omitempty"`
+	// IPv6Prefix is the LAN /64 (or a shorter prefix whose first /64 is used)
+	// advertised by dnsmasq. It is empty when no IPv6 prefix has been
+	// delegated or configured yet; in that case dnsmasq only serves IPv4 and
+	// the daemon still starts with a valid configuration.
+	IPv6Prefix string `json:"ipv6_prefix,omitempty"`
+	// IPv6Mode selects the DHCPv6 assignment model. "slaac" (the default)
+	// emits ra-stateless, so clients build addresses from RA and use DHCPv6
+	// only for DNS/other options. "stateful" allocates addresses from a
+	// deterministic pool inside the prefix.
+	IPv6Mode string `json:"ipv6_mode,omitempty"`
+	// IPv6NameServers is advertised with option6:dns-server. When empty the
+	// first address of the LAN prefix (the gateway) is used.
+	IPv6NameServers []string `json:"ipv6_name_servers,omitempty"`
+	// RAInterval is the maximum RA interval in seconds. Zero means the
+	// dnsmasq default of 30 seconds.
+	RAInterval int `json:"ra_interval_seconds,omitempty"`
+	// RARouterLifetime is the RA router lifetime in seconds. A nil value
+	// keeps dnsmasq's default (1800). A zero value advertises the prefix but
+	// does not make dnsmasq the default router; the VPP PPPoE dataplane
+	// remains the router in that case.
+	RARouterLifetime *int `json:"ra_router_lifetime_seconds,omitempty"`
+}
+
+type DnsmasqReservation struct {
+	HWAddress string `json:"hw_address"`
+	IPAddress string `json:"ip_address"`
+	Hostname  string `json:"hostname,omitempty"`
+}
+
+type PPPoEPeer struct {
+	ID                  string   `json:"id"`
+	Interface           string   `json:"interface"`
+	Username            string   `json:"username"`
+	Password            string   `json:"password"`
+	MTU                 int      `json:"mtu,omitempty"`
+	MRU                 int      `json:"mru,omitempty"`
+	NATInsideInterfaces []string `json:"nat_inside_interfaces,omitempty"`
+	NATBehavior         string   `json:"nat_behavior,omitempty"`
+	IPv6PrefixGroup     string   `json:"ipv6_prefix_group,omitempty"`
+	IPv6LANInterfaces   []string `json:"ipv6_lan_interfaces,omitempty"`
+}
+
+type PPPoEState string
+
+const (
+	PPPoEDisconnected PPPoEState = "disconnected"
+	PPPoEConnecting   PPPoEState = "connecting"
+	PPPoEConnected    PPPoEState = "connected"
+	PPPoEFailed       PPPoEState = "failed"
+)
+
+type PPPoEStatus struct {
+	PeerID          string     `json:"peer_id"`
+	Interface       string     `json:"interface"`
+	State           PPPoEState `json:"state"`
+	AssignedIPv4    string     `json:"assigned_ipv4,omitempty"`
+	AssignedIPv6    string     `json:"assigned_ipv6,omitempty"`
+	ACMAC           string     `json:"ac_mac,omitempty"`
+	RouteReady      bool       `json:"route_ready"`
+	VPPTableID      int        `json:"vpp_table_id,omitempty"`
+	VPPRouteHandoff string     `json:"vpp_route_handoff,omitempty"`
+	LastError       string     `json:"last_error,omitempty"`
+}
+
+type PPPoERouteHandoff struct {
+	PeerID      string `json:"peer_id"`
+	Interface   string `json:"interface"`
+	VPPTableID  int    `json:"vpp_table_id"`
+	Destination string `json:"destination"`
+	NextHop     string `json:"next_hop,omitempty"`
+	Ready       bool   `json:"ready"`
+}
+
+func RenderVPPOperations(operations []vpp.Operation) ([]RenderedArtifact, error) {
+	// An empty generation is still authoritative: it must overwrite a stale
+	// operations.json left by an earlier WAN/LAN generation. Returning no
+	// artifact here let the old replay plan survive (the wedge where apply
+	// reported committed while vpp-apply kept restoring the previous address).
+	if operations == nil {
+		operations = []vpp.Operation{}
+	}
+	// RequestID is per-transaction and must not leak into the persisted
+	// generation.  Otherwise every status/next-apply re-render has a different
+	// hash and the previous apply receipt looks corrupt forever.
+	stable := make([]vpp.Operation, len(operations))
+	for index, operation := range operations {
+		operation.RequestID = ""
+		stable[index] = operation
+	}
+	content, err := marshalIndented(map[string]any{"operations": stable})
+	if err != nil {
+		return nil, err
+	}
+	return []RenderedArtifact{
+		NewArtifact(VPP, "/var/lib/ly-route/vpp/operations.json", content, "restart"),
+	}, nil
+}
+
+func RenderSmartDNS(plan SmartDNSPlan) ([]RenderedArtifact, error) {
+	return RenderSmartDNSBundle([]SmartDNSPlan{plan})
+}
+
+// RenderSmartDNSBundle writes one deterministic active configuration. SmartDNS
+// evaluates rules globally, so individual policy fragments are not isolated
+// safely from each other.
+func RenderSmartDNSBundle(plans []SmartDNSPlan) ([]RenderedArtifact, error) {
+	if len(plans) == 0 {
+		return nil, fmt.Errorf("smartdns requires at least one policy plan")
+	}
+	content, sourceRoutes, domainSetArtifacts, err := renderSmartDNSBundle(plans)
+	if err != nil {
+		return nil, err
+	}
+	artifacts := []RenderedArtifact{
+		NewArtifact(SmartDNS, "/etc/smartdns/conf.d/ly-route-active.conf", content, "reload"),
+		NewArtifact(SmartDNS, "/etc/ly-route/dns-source-routes.conf", sourceRoutes, "reload"),
+	}
+	for _, artifact := range domainSetArtifacts {
+		artifacts = append(artifacts, NewArtifact(SmartDNS, artifact.Path, artifact.Content, "reload"))
+	}
+	return artifacts, nil
+}
+
+func renderSmartDNSBundle(plans []SmartDNSPlan) (string, string, []smartDNSDomainSetArtifact, error) {
+	seenPlans := map[string]struct{}{}
+	upstreams := make(map[string]SmartDNSUpstream)
+	wanUpstreams := make(map[string]string)
+	for _, plan := range plans {
+		planID := strings.TrimSpace(plan.ID)
+		if planID == "" {
+			return "", "", nil, fmt.Errorf("smartdns plan id is required")
+		}
+		if _, exists := seenPlans[planID]; exists {
+			return "", "", nil, fmt.Errorf("duplicate smartdns policy plan %q", planID)
+		}
+		seenPlans[planID] = struct{}{}
+		for _, upstream := range plan.Upstreams {
+			if err := validateSmartDNSUpstream(upstream); err != nil {
+				return "", "", nil, err
+			}
+			if existing, exists := upstreams[upstream.ID]; exists && !sameSmartDNSUpstream(existing, upstream) {
+				return "", "", nil, fmt.Errorf("smartdns upstream %q is defined inconsistently", upstream.ID)
+			}
+			upstreams[upstream.ID] = upstream
+			if upstream.WANEgressID != "" {
+				wanUpstreams[upstream.WANEgressID] = upstream.ID
+			}
+		}
+	}
+	domainSets, domainSetNames, domainSetArtifacts, err := collectSmartDNSDomainSets(plans)
+	if err != nil {
+		return "", "", nil, err
+	}
+	proxyEndpoints, err := mergeProxyDNSEndpointPlans(plans)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	var builder strings.Builder
+	builder.WriteString("# Generated by Ly Route. Do not edit.\n")
+	cache := plans[0].Cache
+	if err := writeSmartDNSCache(&builder, cache); err != nil {
+		return "", "", nil, err
+	}
+	ids := make([]string, 0, len(upstreams))
+	for id := range upstreams {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	var bootstrapRules strings.Builder
+	for _, id := range ids {
+		if err := writeSmartDNSUpstream(&builder, &bootstrapRules, upstreams[id]); err != nil {
+			return "", "", nil, err
+		}
+	}
+	if rejectMissConfigured(plans) && len(upstreams) == 0 {
+		builder.WriteString("# No DNS upstream is configured. SmartDNS imports /etc/resolv.conf\n")
+		builder.WriteString("# servers when a configuration declares none, which would leak rejected\n")
+		builder.WriteString("# domains to the host resolver. This reserved server is excluded from the\n")
+		builder.WriteString("# default group and no nameserver rule selects it.\n")
+		fmt.Fprintf(&builder, "server %s -group %s -exclude-default-group\n\n", smartDNSReservedServerAddress, smartDNSReservedServerGroup)
+	}
+	if err := writeSmartDNSProxyDNSEndpoints(&builder, proxyEndpoints); err != nil {
+		return "", "", nil, err
+	}
+	writeSmartDNSDomainSetDeclarations(&builder, domainSets, domainSetNames)
+	var sourceRoutes strings.Builder
+	sourceRoutes.WriteString("# source-prefix match-kind domain smartdns-port\n")
+	nextSourcePort := 12000
+	for _, plan := range plans {
+		if err := writeSmartDNSRender(&builder, &sourceRoutes, &nextSourcePort, plan.ID, plan.Render, upstreams, wanUpstreams, domainSets, domainSetNames, proxyEndpoints); err != nil {
+			return "", "", nil, err
+		}
+	}
+	if bootstrapRules.Len() > 0 {
+		builder.WriteString("# Bootstrap hostname resolution takes precedence over policy miss rules.\n")
+		builder.WriteString(bootstrapRules.String())
+	}
+	return builder.String(), sourceRoutes.String(), domainSetArtifacts, nil
+}
+
+func writeSmartDNSRender(builder, sourceRoutes *strings.Builder, nextSourcePort *int, planID string, render dns.SmartDNSRender, upstreams map[string]SmartDNSUpstream, wanUpstreams map[string]string, domainSets map[string][]string, domainSetNames map[string]string, proxyEndpoints ProxyDNSEndpointPlan) error {
+	if strings.TrimSpace(render.Engine) != "smartdns" {
+		return fmt.Errorf("smartdns render requires smartdns engine")
+	}
+	builder.WriteString("# Generated by Ly Route.\n")
+	builder.WriteString("# Decision precedence: ")
+	builder.WriteString(strings.TrimSpace(render.DecisionPrecedence))
+	builder.WriteString("\n\n")
+
+	for _, rule := range render.Rules {
+		if err := writeSmartDNSRule(builder, sourceRoutes, nextSourcePort, planID, rule, upstreams, wanUpstreams, domainSets, domainSetNames, proxyEndpoints); err != nil {
+			return err
+		}
+	}
+	if err := writeSmartDNSMissRule(builder, render.Miss, upstreams, wanUpstreams, proxyEndpoints); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeSmartDNSRule(builder, sourceRoutes *strings.Builder, nextSourcePort *int, planID string, rule dns.SmartDNSRule, upstreams map[string]SmartDNSUpstream, wanUpstreams map[string]string, domainSets map[string][]string, domainSetNames map[string]string, proxyEndpoints ProxyDNSEndpointPlan) error {
+	ruleID := strings.TrimSpace(rule.RuleID)
+	if ruleID == "" {
+		return fmt.Errorf("smartdns rule id is required")
+	}
+	if !smartDNSRuleIDToken(ruleID) {
+		return fmt.Errorf("smartdns rule id %q is unsafe; only letters, digits, '_', '-', '.' and ':' are allowed", ruleID)
+	}
+	selectors, err := smartDNSDomainSelectors(rule, domainSets, domainSetNames)
+	if err != nil {
+		return fmt.Errorf("smartdns rule %q: %w", ruleID, err)
+	}
+	if len(selectors) == 0 {
+		return nil
+	}
+	if len(rule.SourcePrefixes) != 0 {
+		if nextSourcePort == nil || *nextSourcePort > 19999 {
+			return fmt.Errorf("smartdns source-rule listener range is exhausted")
+		}
+		port := *nextSourcePort
+		*nextSourcePort = port + 1
+		group := smartDNSClientGroupName(strings.TrimSpace(planID) + "/" + ruleID)
+		builder.WriteString("group-begin ")
+		builder.WriteString(group)
+		builder.WriteString(" -inherit none\n")
+		sourceSelectors, err := smartDNSSourceSelectors(selectors, domainSets)
+		if err != nil {
+			return fmt.Errorf("smartdns rule %q source selectors: %w", ruleID, err)
+		}
+		for _, prefix := range rule.SourcePrefixes {
+			prefix = strings.TrimSpace(prefix)
+			if prefix == "" || strings.ContainsAny(prefix, " \t\n\r") {
+				return fmt.Errorf("smartdns rule %q has invalid source prefix %q", ruleID, prefix)
+			}
+			for _, selector := range sourceSelectors {
+				fmt.Fprintf(sourceRoutes, "%s %s %s %d\n", prefix, selector.matchKind, selector.domain, port)
+			}
+		}
+		if err := writeSmartDNSRuleContent(builder, rule, selectors, upstreams, wanUpstreams, proxyEndpoints); err != nil {
+			return err
+		}
+		builder.WriteString("group-end\n")
+		fmt.Fprintf(builder, "bind 127.0.0.1:%d -group %s -no-cache -no-speed-check\n", port, group)
+		fmt.Fprintf(builder, "bind-tcp 127.0.0.1:%d -group %s -no-cache -no-speed-check\n\n", port, group)
+		return nil
+	}
+	return writeSmartDNSRuleContent(builder, rule, selectors, upstreams, wanUpstreams, proxyEndpoints)
+}
+
+func smartDNSDomainSelectors(rule dns.SmartDNSRule, domainSets map[string][]string, domainSetNames map[string]string) ([]smartDNSDomainSelector, error) {
+	selectors := make([]smartDNSDomainSelector, 0, len(rule.Domains)+len(rule.DomainSuffixes))
+	seen := map[string]struct{}{}
+	add := func(value, matchKind string) error {
+		var err error
+		value, err = normalizeSmartDNSDomain(value, matchKind)
+		if err != nil {
+			return err
+		}
+		key := matchKind + "\x00" + value
+		if _, exists := seen[key]; exists {
+			return nil
+		}
+		seen[key] = struct{}{}
+		selectors = append(selectors, smartDNSDomainSelector{matchKind: matchKind, domain: value})
+		return nil
+	}
+	for _, domain := range rule.Domains {
+		if err := add(domain, "exact"); err != nil {
+			return nil, err
+		}
+	}
+	for _, domain := range rule.DomainSuffixes {
+		if err := add(domain, "suffix"); err != nil {
+			return nil, err
+		}
+	}
+	for _, setID := range rule.DomainSetIDs {
+		setID = strings.TrimSpace(setID)
+		_, exists := domainSets[setID]
+		if !exists {
+			return nil, fmt.Errorf("domain set %q is unavailable", setID)
+		}
+		setName, exists := domainSetNames[setID]
+		if !exists || !smartDNSToken(setName) {
+			return nil, fmt.Errorf("domain set %q has no valid SmartDNS name", setID)
+		}
+		key := "domain-set\x00" + setID
+		if _, exists := seen[key]; !exists {
+			seen[key] = struct{}{}
+			selectors = append(selectors, smartDNSDomainSelector{
+				matchKind: "domain-set",
+				domain:    "domain-set:" + setName,
+				domainSet: setID,
+			})
+		}
+	}
+	return selectors, nil
+}
+
+func collectSmartDNSDomainSets(plans []SmartDNSPlan) (map[string][]string, map[string]string, []smartDNSDomainSetArtifact, error) {
+	sets := map[string][]string{}
+	for _, plan := range plans {
+		for rawID, rawEntries := range plan.DomainSets {
+			setID := strings.TrimSpace(rawID)
+			if setID == "" {
+				return nil, nil, nil, fmt.Errorf("smartdns domain set id is required")
+			}
+			entries, err := normalizeSmartDNSDomainSetEntries(rawEntries)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("domain set %q: %w", setID, err)
+			}
+			if existing, exists := sets[setID]; exists && !slices.Equal(existing, entries) {
+				return nil, nil, nil, fmt.Errorf("smartdns domain set %q is defined inconsistently", setID)
+			}
+			sets[setID] = entries
+		}
+	}
+
+	for setID, entries := range sets {
+		if len(entries) == 0 {
+			delete(sets, setID)
+		}
+	}
+	ids := make([]string, 0, len(sets))
+	for setID := range sets {
+		ids = append(ids, setID)
+	}
+	slices.Sort(ids)
+	names := make(map[string]string, len(ids))
+	artifacts := make([]smartDNSDomainSetArtifact, 0, len(ids))
+	for _, setID := range ids {
+		if len(sets[setID]) == 0 {
+			continue
+		}
+		name := smartDNSDomainSetName(setID)
+		names[setID] = name
+		artifacts = append(artifacts, smartDNSDomainSetArtifact{
+			Path:    "/etc/smartdns/domain-sets/" + name + ".list",
+			Content: renderSmartDNSDomainSetFile(sets[setID]),
+		})
+	}
+	return sets, names, artifacts, nil
+}
+
+func normalizeSmartDNSDomainSetEntries(entries []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(entries))
+	result := make([]string, 0, len(entries))
+	for _, rawEntry := range entries {
+		entry := strings.TrimSpace(rawEntry)
+		if entry == "" {
+			continue
+		}
+		kind := "exact"
+		if strings.HasPrefix(entry, ".") || strings.HasPrefix(entry, "*.") {
+			kind = "suffix"
+		}
+		domain, err := normalizeSmartDNSDomain(entry, kind)
+		if err != nil {
+			return nil, err
+		}
+		// Keep the match kind in the in-memory representation. The list file
+		// is rendered separately, so source-prefix routing can still expand
+		// the set without guessing whether an entry was exact or a suffix.
+		encoded := kind + "\x00" + domain
+		if _, exists := seen[encoded]; exists {
+			continue
+		}
+		seen[encoded] = struct{}{}
+		result = append(result, encoded)
+	}
+	slices.Sort(result)
+	return result, nil
+}
+
+func renderSmartDNSDomainSetFile(entries []string) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(entries))
+	for _, encoded := range entries {
+		kind, domain, ok := strings.Cut(encoded, "\x00")
+		if !ok {
+			continue
+		}
+		if kind == "exact" {
+			domain = "-." + domain
+		}
+		lines = append(lines, domain)
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func smartDNSDomainSetName(setID string) string {
+	digest := sha256.Sum256([]byte(strings.TrimSpace(setID)))
+	return fmt.Sprintf("lyroute-set-%x", digest[:8])
+}
+
+func writeSmartDNSDomainSetDeclarations(builder *strings.Builder, domainSets map[string][]string, domainSetNames map[string]string) {
+	if len(domainSets) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(domainSets))
+	for setID := range domainSets {
+		ids = append(ids, setID)
+	}
+	slices.Sort(ids)
+	declared := 0
+	for _, setID := range ids {
+		name := strings.TrimSpace(domainSetNames[setID])
+		if name == "" {
+			continue
+		}
+		if declared == 0 {
+			builder.WriteString("# Domain sets are kept in separate list files to avoid per-domain rule expansion.\n")
+		}
+		fmt.Fprintf(builder, "domain-set -name %s -type list -file /etc/smartdns/domain-sets/%s.list\n", name, name)
+		declared++
+	}
+	if declared > 0 {
+		builder.WriteByte('\n')
+	}
+}
+
+func normalizeSmartDNSDomain(value, matchKind string) (string, error) {
+	value = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(value), "."))
+	value = strings.TrimPrefix(value, "*.")
+	if matchKind == "suffix" {
+		value = strings.TrimPrefix(value, ".")
+	}
+	if value == "" || strings.ContainsAny(value, "/ \t\n\r") || !smartDNSDomainName(value) {
+		return "", fmt.Errorf("invalid %s domain %q", matchKind, value)
+	}
+	return value, nil
+}
+
+func smartDNSSourceSelectors(selectors []smartDNSDomainSelector, domainSets map[string][]string) ([]smartDNSDomainSelector, error) {
+	result := make([]smartDNSDomainSelector, 0, len(selectors))
+	seen := map[string]struct{}{}
+	add := func(value, kind string) error {
+		normalized, err := normalizeSmartDNSDomain(value, kind)
+		if err != nil {
+			return err
+		}
+		key := kind + "\x00" + normalized
+		if _, exists := seen[key]; exists {
+			return nil
+		}
+		seen[key] = struct{}{}
+		result = append(result, smartDNSDomainSelector{matchKind: kind, domain: normalized})
+		return nil
+	}
+	for _, selector := range selectors {
+		if selector.matchKind != "domain-set" {
+			if err := add(selector.domain, selector.matchKind); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		entries, exists := domainSets[selector.domainSet]
+		if !exists {
+			return nil, fmt.Errorf("domain set %q is unavailable", selector.domainSet)
+		}
+		for _, entry := range entries {
+			kind, domain, ok := strings.Cut(entry, "\x00")
+			if !ok || (kind != "exact" && kind != "suffix") {
+				return nil, fmt.Errorf("domain set %q contains malformed entry", selector.domainSet)
+			}
+			if err := add(domain, kind); err != nil {
+				return nil, fmt.Errorf("domain set %q: %w", selector.domainSet, err)
+			}
+		}
+	}
+	return result, nil
+}
+
+func smartDNSClientGroupName(ruleID string) string {
+	digest := sha256.Sum256([]byte(ruleID))
+	return fmt.Sprintf("lyroute-client-%x", digest[:6])
+}
+
+// ProxyDNSEndpointUnavailableError is returned when a policy selects the
+// proxy DNS resolver path but this build has no proxy DNS transport. It is a
+// hard, actionable failure: rendering a direct or empty answer instead would
+// silently leak or blackhole the query.
+type ProxyDNSEndpointUnavailableError struct {
+	RuleID        string
+	Miss          bool
+	ProxyEgressID string
+	UpstreamID    string
+	FailureMode   dns.FailureMode
+	// Reason carries the planner's precise cause (missing upstream, no
+	// resolved DoH address, egress runtime not compiled, ...).
+	Reason string
+}
+
+func (failure *ProxyDNSEndpointUnavailableError) Error() string {
+	if failure == nil {
+		return ""
+	}
+	target := fmt.Sprintf("rule %q", failure.RuleID)
+	if failure.Miss {
+		target = "miss policy"
+	}
+	upstream := strings.TrimSpace(failure.UpstreamID)
+	upstreamText := "default resolver"
+	if upstream != "" {
+		upstreamText = fmt.Sprintf("upstream %q", upstream)
+	}
+	mode := failure.FailureMode
+	if mode == "" {
+		mode = dns.FailureModeFailClosed
+	}
+	reason := strings.TrimSpace(failure.Reason)
+	if reason == "" {
+		reason = "no local proxy DNS endpoint was planned for this egress/upstream combination"
+	}
+	return fmt.Sprintf("smartdns %s requires proxy DNS endpoint for egress %q (%s, failure_mode %q): %s. Refusing to render a direct or empty answer instead of silently falling back to direct or leaking the query. Check that the DNS upstream exists and uses a supported protocol (udp, tcp, DoH, DoT), and that the proxy egress compiled in this generation. Use outcome=direct with an upstream_id, outcome=reject for an explicit block, or remove the proxy rule. See docs/DNS-PROXY-SEMANTICS.md", target, failure.ProxyEgressID, upstreamText, mode, reason)
+}
+
+func writeSmartDNSRuleContent(builder *strings.Builder, rule dns.SmartDNSRule, selectors []smartDNSDomainSelector, upstreams map[string]SmartDNSUpstream, wanUpstreams map[string]string, proxyEndpoints ProxyDNSEndpointPlan) error {
+	ruleID := strings.TrimSpace(rule.RuleID)
+	builder.WriteString("# rule ")
+	builder.WriteString(ruleID)
+	builder.WriteString("\n")
+	for _, selector := range selectors {
+		domain := selector.domain
+		if selector.matchKind == "exact" {
+			domain = "-." + domain
+		}
+		switch rule.OutcomeKind {
+		case dns.ResolverOutcomeDirect:
+			// A nameserver rule is required here: an `address /domain/...`
+			// entry replaces the answer instead of resolving it. A global
+			// `address #` would also outrank every nameserver rule on the
+			// shipped SmartDNS, which is why the reject miss uses an empty
+			// nameserver group instead (docs/DNS-PROXY-SEMANTICS.md §2.7).
+			group, err := smartDNSGroupForRule(rule, upstreams, wanUpstreams)
+			if err != nil {
+				return fmt.Errorf("smartdns rule %q: %w", ruleID, err)
+			}
+			if group != "" {
+				builder.WriteString(fmt.Sprintf("nameserver /%s/%s\n", domain, group))
+			}
+			if rule.IPSetName != "" {
+				if !smartDNSToken(rule.IPSetName) {
+					return fmt.Errorf("smartdns rule %q has invalid IP set name", ruleID)
+				}
+				builder.WriteString(fmt.Sprintf("ipset /%s/%s\n", domain, rule.IPSetName))
+			}
+		case dns.ResolverOutcomeReject:
+			builder.WriteString(fmt.Sprintf("address /%s/#\n", domain))
+		case dns.ResolverOutcomeFixedAnswer:
+			for _, answer := range rule.FixedAnswers {
+				answer = strings.TrimSpace(answer)
+				if answer == "" || strings.ContainsAny(answer, "/ \t\n\r") {
+					return fmt.Errorf("smartdns rule %q has invalid fixed answer %q", ruleID, answer)
+				}
+				builder.WriteString(fmt.Sprintf("address /%s/%s\n", domain, answer))
+			}
+		case dns.ResolverOutcomeProxyResolution:
+			if err := writeSmartDNSProxyNameserver(builder, rule, domain, upstreams, proxyEndpoints); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("smartdns rule %q has unsupported outcome %q", ruleID, rule.OutcomeKind)
+		}
+	}
+	builder.WriteString("\n")
+	return nil
+}
+
+func writeSmartDNSMissRule(builder *strings.Builder, rule dns.SmartDNSRule, upstreams map[string]SmartDNSUpstream, wanUpstreams map[string]string, proxyEndpoints ProxyDNSEndpointPlan) error {
+	switch rule.OutcomeKind {
+	case dns.ResolverOutcomeDirect:
+		group, err := smartDNSGroupForRule(rule, upstreams, wanUpstreams)
+		if err != nil {
+			return fmt.Errorf("smartdns miss policy: %w", err)
+		}
+		if group != "" {
+			builder.WriteString("nameserver /./")
+			builder.WriteString(group)
+			builder.WriteByte('\n')
+		}
+		return nil
+	case dns.ResolverOutcomeReject:
+		// Reject unmatched domains without a global `address #`.
+		//
+		// The shipped SmartDNS evaluates a global address rule before any
+		// domain nameserver rule (verified on smartdns 1.20261019), so
+		// `address #` here would also suppress every explicit direct/proxy
+		// rule in the same policy: one global rule turned the whole deployment
+		// into SERVFAIL.
+		//
+		// A `nameserver /./<reject group>` rule has the same (lowest) domain
+		// specificity as a normal default rule, so explicit domain rules keep
+		// winning, while the reject group has no servers at all: SmartDNS
+		// answers SERVFAIL immediately and never touches a default upstream.
+		writeSmartDNSRejectDefault(builder)
+		return nil
+	case dns.ResolverOutcomeProxyResolution:
+		endpoint, err := proxyDNSEndpointForRule(rule, proxyEndpoints)
+		if err != nil {
+			var unavailable *ProxyDNSEndpointUnavailableError
+			if !errors.As(err, &unavailable) || proxyRuleFailureMode(rule) != dns.FailureModeReject {
+				return err
+			}
+			// An all-domain proxy miss policy with failure_mode=reject must not
+			// fall back to a direct resolver. A global `address #` would also
+			// suppress explicit domain rules on this SmartDNS (address rules
+			// outrank nameserver rules), so the default rule points at the empty
+			// reject group instead: unmatched queries get SERVFAIL.
+			builder.WriteString("# proxy DNS endpoint unavailable; failure_mode=reject leaves unmatched domains unresolved (SERVFAIL)\n")
+			writeSmartDNSRejectDefault(builder)
+			return nil
+		}
+		builder.WriteString("nameserver /./")
+		builder.WriteString(endpoint.Group())
+		builder.WriteByte('\n')
+		return writeSmartDNSProxyFallback(builder, rule, "./", upstreams)
+	default:
+		return fmt.Errorf("smartdns miss policy has unsupported outcome %q", rule.OutcomeKind)
+	}
+}
+
+// writeSmartDNSRejectDefault renders the fail-closed default rule. It is a
+// normal `/./` nameserver rule, not a global address rule, so a more specific
+// direct/proxy rule still wins.
+func writeSmartDNSRejectDefault(builder *strings.Builder) {
+	builder.WriteString("# miss policy: reject unmatched domains (fail closed)\n")
+	builder.WriteString("# The reject group below has no servers: SmartDNS answers SERVFAIL instead of\n")
+	builder.WriteString("# falling back to the default group or to /etc/resolv.conf. A global\n")
+	builder.WriteString("# `address #` would also suppress explicit domain rules.\n")
+	fmt.Fprintf(builder, "nameserver /./%s\n", SmartDNSRejectGroup)
+}
+
+// rejectMissConfigured reports whether any rendered policy asks for a
+// fail-closed default. It is used to keep the reserved server guard in the
+// bundle when no upstream exists.
+func rejectMissConfigured(plans []SmartDNSPlan) bool {
+	for _, plan := range plans {
+		if plan.Render.Miss.OutcomeKind == dns.ResolverOutcomeReject {
+			return true
+		}
+	}
+	return false
+}
+
+// proxyRuleFailureMode normalizes the failure behavior of a proxy rule. The
+// compiler always sets it, but a plan built by hand must keep the same default
+// instead of silently behaving like "whatever is configured first".
+func proxyRuleFailureMode(rule dns.SmartDNSRule) dns.FailureMode {
+	mode := dns.FailureMode(strings.TrimSpace(string(rule.FailureMode)))
+	if mode == "" {
+		return dns.FailureModeFailClosed
+	}
+	return mode
+}
+
+// proxyDNSEndpointForRule resolves the local endpoint of one proxy rule. The
+// error is the E4 fail-closed contract: no endpoint means no rendered answer,
+// never a direct fallback.
+func proxyDNSEndpointForRule(rule dns.SmartDNSRule, plan ProxyDNSEndpointPlan) (ProxyDNSEndpoint, error) {
+	endpoint, found := plan.Endpoint(rule.ProxyEgressID, rule.UpstreamID)
+	if found {
+		if err := validateProxyDNSEndpoint(endpoint); err != nil {
+			return ProxyDNSEndpoint{}, err
+		}
+		return endpoint, nil
+	}
+	reason := ""
+	if problem, exists := plan.Problem(rule.ProxyEgressID, rule.UpstreamID); exists {
+		reason = problem.Reason
+	}
+	target := strings.TrimSpace(rule.RuleID)
+	return ProxyDNSEndpoint{}, &ProxyDNSEndpointUnavailableError{
+		RuleID:        target,
+		Miss:          target == "miss",
+		ProxyEgressID: rule.ProxyEgressID,
+		UpstreamID:    rule.UpstreamID,
+		FailureMode:   rule.FailureMode,
+		Reason:        reason,
+	}
+}
+
+// writeSmartDNSProxyNameserver renders the per-domain nameserver of a proxy
+// outcome. Only domains matched by the rule reach the endpoint: the endpoint
+// server group is excluded from the default group, so an unrelated query can
+// never be answered through the proxy DNS path by accident.
+func writeSmartDNSProxyNameserver(builder *strings.Builder, rule dns.SmartDNSRule, domain string, upstreams map[string]SmartDNSUpstream, plan ProxyDNSEndpointPlan) error {
+	endpoint, err := proxyDNSEndpointForRule(rule, plan)
+	if err != nil {
+		var unavailable *ProxyDNSEndpointUnavailableError
+		if !errors.As(err, &unavailable) || proxyRuleFailureMode(rule) != dns.FailureModeReject {
+			return err
+		}
+		// failure_mode=reject: the operator explicitly asked for a block rather
+		// than a direct answer when the proxied resolver cannot be reached. The
+		// endpoint problem is reported by the runtime status component, so this
+		// is visible and not a silent success.
+		builder.WriteString("# proxy DNS endpoint unavailable; failure_mode=reject blocks this domain instead of resolving it directly\n")
+		builder.WriteString(fmt.Sprintf("address /%s/#\n", domain))
+		return nil
+	}
+	builder.WriteString(fmt.Sprintf("nameserver /%s/%s\n", domain, endpoint.Group()))
+	return writeSmartDNSProxyFallback(builder, rule, domain, upstreams)
+}
+
+// writeSmartDNSProxyFallback renders an explicit, operator-named direct
+// resolver for failure_mode=fallback_direct. It is never implicit: the
+// compiler requires fallback_upstream_id, and a stale reference fails here.
+func writeSmartDNSProxyFallback(builder *strings.Builder, rule dns.SmartDNSRule, domain string, upstreams map[string]SmartDNSUpstream) error {
+	fallback := strings.TrimSpace(rule.FallbackUpstreamID)
+	if fallback == "" {
+		return nil
+	}
+	if proxyRuleFailureMode(rule) != dns.FailureModeFallbackDirect {
+		return fmt.Errorf("smartdns rule %q names fallback upstream %q with failure_mode %q", rule.RuleID, fallback, proxyRuleFailureMode(rule))
+	}
+	if _, exists := upstreams[fallback]; !exists {
+		return fmt.Errorf("smartdns rule %q fallback upstream %q is unavailable", rule.RuleID, fallback)
+	}
+	builder.WriteString("# explicit direct fallback (failure_mode=fallback_direct): SmartDNS queries both resolvers\n")
+	builder.WriteString(fmt.Sprintf("nameserver /%s/%s\n", domain, fallback))
+	return nil
+}
+
+// writeSmartDNSProxyDNSEndpoints declares the loopback resolver groups. The
+// group is the only place the endpoint port appears, so the rule renderer and
+// the Xray inbound share one identity.
+func writeSmartDNSProxyDNSEndpoints(builder *strings.Builder, plan ProxyDNSEndpointPlan) error {
+	if len(plan.Endpoints) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(plan.Endpoints))
+	builder.WriteString("# Proxy DNS endpoints: loopback listeners owned by Xray and bound to one proxy egress.\n")
+	builder.WriteString("# SmartDNS terminates TLS for DoH/DoT; Xray only forwards the transport through the egress.\n")
+	for _, endpoint := range plan.Endpoints {
+		if err := validateProxyDNSEndpoint(endpoint); err != nil {
+			return err
+		}
+		group := endpoint.Group()
+		if _, exists := seen[group]; exists {
+			continue
+		}
+		seen[group] = struct{}{}
+		mode := endpoint.FailureMode
+		if mode == "" {
+			mode = dns.FailureModeFailClosed
+		}
+		fmt.Fprintf(builder, "# endpoint %s egress=%s upstream=%s protocol=%s failure_mode=%s\n", endpoint.ID, endpoint.ProxyEgressID, endpoint.UpstreamID, endpoint.Protocol, mode)
+		listen := endpoint.Listen()
+		switch endpoint.Protocol {
+		case proxy.ProxyDNSEndpointUDP:
+			fmt.Fprintf(builder, "server %s -group %s -exclude-default-group\n", listen, group)
+		case proxy.ProxyDNSEndpointTCP:
+			fmt.Fprintf(builder, "server-tcp %s -group %s -exclude-default-group\n", listen, group)
+		case proxy.ProxyDNSEndpointDoT:
+			fmt.Fprintf(builder, "server-tls %s -group %s -exclude-default-group -host-name %s -tls-host-verify %s\n", listen, group, endpoint.ServerName, endpoint.ServerName)
+		case proxy.ProxyDNSEndpointDoH:
+			fmt.Fprintf(builder, "server-https https://%s/dns-query -group %s -exclude-default-group -host-name %s -http-host %s -tls-host-verify %s\n", listen, group, endpoint.ServerName, endpoint.ServerName, endpoint.ServerName)
+		default:
+			return fmt.Errorf("proxy DNS endpoint %q has unsupported protocol %q", endpoint.ID, endpoint.Protocol)
+		}
+	}
+	builder.WriteByte('\n')
+	return nil
+}
+
+// validateProxyDNSEndpoint keeps user-authored upstream data out of SmartDNS
+// and Xray directives. The endpoint is always loopback and the target is a
+// literal address, so a crafted upstream cannot create an open resolver.
+func validateProxyDNSEndpoint(endpoint ProxyDNSEndpoint) error {
+	if endpoint.ListenAddress != ProxyDNSEndpointListenAddress {
+		return fmt.Errorf("proxy DNS endpoint %q must listen on %s, not %q", endpoint.ID, ProxyDNSEndpointListenAddress, endpoint.ListenAddress)
+	}
+	if endpoint.Port < ProxyDNSEndpointPortBase || endpoint.Port >= ProxyDNSEndpointPortBase+ProxyDNSEndpointPortSpan {
+		return fmt.Errorf("proxy DNS endpoint %q port %d is outside the reserved range", endpoint.ID, endpoint.Port)
+	}
+	if !smartDNSToken(endpoint.Group()) {
+		return fmt.Errorf("proxy DNS endpoint %q has an invalid SmartDNS group name", endpoint.ID)
+	}
+	if address, err := netip.ParseAddr(strings.TrimSpace(endpoint.ServerAddress)); err != nil || !address.IsValid() || address.IsUnspecified() || address.IsLoopback() || address.IsMulticast() {
+		return fmt.Errorf("proxy DNS endpoint %q target address %q is not a routable literal address", endpoint.ID, endpoint.ServerAddress)
+	}
+	if endpoint.ServerPort < 1 || endpoint.ServerPort > 65535 {
+		return fmt.Errorf("proxy DNS endpoint %q target port %d is invalid", endpoint.ID, endpoint.ServerPort)
+	}
+	if _, err := proxy.ParseProxyDNSEndpointProtocol(string(endpoint.Protocol)); err != nil {
+		return err
+	}
+	if endpoint.Protocol == proxy.ProxyDNSEndpointDoH || endpoint.Protocol == proxy.ProxyDNSEndpointDoT {
+		if !smartDNSDomainName(endpoint.ServerName) && net.ParseIP(endpoint.ServerName) == nil {
+			return fmt.Errorf("proxy DNS endpoint %q has an invalid TLS server name %q", endpoint.ID, endpoint.ServerName)
+		}
+	}
+	return nil
+}
+
+// mergeProxyDNSEndpointPlans unions the endpoint sets of all rendered plans.
+// SmartDNS is one process-wide configuration, so two plans must not claim the
+// same endpoint with different settings.
+func mergeProxyDNSEndpointPlans(plans []SmartDNSPlan) (ProxyDNSEndpointPlan, error) {
+	var merged ProxyDNSEndpointPlan
+	seen := make(map[string]ProxyDNSEndpoint)
+	for _, plan := range plans {
+		for _, endpoint := range plan.ProxyDNSEndpoints.Endpoints {
+			if existing, exists := seen[endpoint.ID]; exists {
+				if existing != endpoint {
+					return ProxyDNSEndpointPlan{}, fmt.Errorf("proxy DNS endpoint %q is defined inconsistently", endpoint.ID)
+				}
+				continue
+			}
+			seen[endpoint.ID] = endpoint
+			merged.Endpoints = append(merged.Endpoints, endpoint)
+		}
+		for _, problem := range plan.ProxyDNSEndpoints.Problems {
+			merged.Problems = append(merged.Problems, problem)
+		}
+	}
+	slices.SortFunc(merged.Endpoints, func(left, right ProxyDNSEndpoint) int {
+		return strings.Compare(left.ID, right.ID)
+	})
+	return merged, nil
+}
+
+func writeSmartDNSCache(builder *strings.Builder, cache SmartDNSCache) error {
+	// Policy rules can change while cache entries retain their previous group.
+	// Keep the runtime cache, but never restore entries from an older policy.
+	builder.WriteString("cache-persist no\n")
+	// DNS-to-VPP handoff reads the kernel timeout so expired answers can be
+	// removed without retaining stale policy routes.
+	builder.WriteString("ipset-timeout yes\n")
+	if cache == (SmartDNSCache{}) {
+		return nil
+	}
+	if cache.Size < 128 || cache.Size > 1048576 {
+		return fmt.Errorf("smartdns cache size must be between 128 and 1048576")
+	}
+	if cache.TTLMin < 1 || cache.TTLMax < cache.TTLMin || cache.TTLMax > 86400 {
+		return fmt.Errorf("smartdns TTL range must satisfy 1 <= min <= max <= 86400")
+	}
+	builder.WriteString(fmt.Sprintf("cache-size %d\nrr-ttl-min %d\nrr-ttl-max %d\n", cache.Size, cache.TTLMin, cache.TTLMax))
+	if cache.Prefetch {
+		builder.WriteString("prefetch-domain yes\n")
+	}
+	return nil
+}
+
+func validateSmartDNSUpstream(upstream SmartDNSUpstream) error {
+	if !smartDNSToken(upstream.ID) {
+		return fmt.Errorf("smartdns upstream id is invalid")
+	}
+	if len(upstream.Servers) == 0 {
+		return fmt.Errorf("smartdns upstream %q requires at least one server", upstream.ID)
+	}
+	if upstream.Interface != "" && !smartDNSToken(upstream.Interface) {
+		return fmt.Errorf("smartdns upstream %q has invalid interface", upstream.ID)
+	}
+	if upstream.WANEgressID != "" && !smartDNSToken(upstream.WANEgressID) {
+		return fmt.Errorf("smartdns upstream %q has invalid WAN egress id", upstream.ID)
+	}
+	if upstream.WANEgressID != "" && upstream.Interface == "" {
+		return fmt.Errorf("smartdns upstream %q pins a WAN egress but has no interface", upstream.ID)
+	}
+	for _, server := range upstream.Servers {
+		if strings.TrimSpace(server) == "" || strings.ContainsAny(server, " \t\r\n") {
+			return fmt.Errorf("smartdns upstream %q has invalid server", upstream.ID)
+		}
+	}
+	for _, server := range upstream.BootstrapServers {
+		address, err := netip.ParseAddr(strings.TrimSpace(server))
+		if err != nil || !address.IsValid() {
+			return fmt.Errorf("smartdns upstream %q has invalid bootstrap DNS server %q", upstream.ID, server)
+		}
+	}
+	for host, addresses := range upstream.ResolvedHostIPs {
+		if !smartDNSDomainName(host) || len(addresses) == 0 {
+			return fmt.Errorf("smartdns upstream %q has invalid resolved DoH host %q", upstream.ID, host)
+		}
+		for _, address := range addresses {
+			parsed, err := netip.ParseAddr(strings.TrimSpace(address))
+			if err != nil || !parsed.Is4() {
+				return fmt.Errorf("smartdns upstream %q has invalid resolved DoH address %q", upstream.ID, address)
+			}
+		}
+	}
+	return nil
+}
+
+func writeSmartDNSUpstream(builder, bootstrapRules *strings.Builder, upstream SmartDNSUpstream) error {
+	bootstrapGroup := upstream.ID + "-bootstrap"
+	if len(upstream.BootstrapServers) > 0 {
+		builder.WriteString("# Bootstrap DNS for ")
+		builder.WriteString(upstream.ID)
+		builder.WriteByte('\n')
+		for _, server := range upstream.BootstrapServers {
+			builder.WriteString("server ")
+			builder.WriteString(strings.TrimSpace(server))
+			builder.WriteString(" -group ")
+			builder.WriteString(bootstrapGroup)
+			builder.WriteString(" -exclude-default-group")
+			writeSmartDNSRoutingSelector(builder, upstream)
+			builder.WriteByte('\n')
+		}
+		for _, server := range upstream.Servers {
+			host := smartDNSUpstreamHostname(server)
+			if host != "" {
+				fmt.Fprintf(bootstrapRules, "nameserver /%s/%s\n", host, bootstrapGroup)
+			}
+		}
+	}
+	for _, server := range upstream.Servers {
+		directive := "server"
+		lower := strings.ToLower(strings.TrimSpace(server))
+		if strings.HasPrefix(lower, "https://") {
+			directive = "server-https"
+		} else if strings.HasPrefix(lower, "h3://") {
+			directive = "server-h3"
+		}
+		host := smartDNSUpstreamHostname(server)
+		endpoints := []string{strings.TrimSpace(server)}
+		if directive != "server" && host != "" && len(upstream.ResolvedHostIPs[host]) > 0 {
+			endpoints = make([]string, 0, len(upstream.ResolvedHostIPs[host]))
+			for _, address := range upstream.ResolvedHostIPs[host] {
+				endpoint, err := smartDNSDoHEndpointWithHostIP(server, address)
+				if err != nil {
+					return fmt.Errorf("smartdns upstream %q: %w", upstream.ID, err)
+				}
+				endpoints = append(endpoints, endpoint)
+			}
+		}
+		for _, endpoint := range endpoints {
+			builder.WriteString(directive)
+			builder.WriteByte(' ')
+			builder.WriteString(endpoint)
+			builder.WriteString(" -group ")
+			builder.WriteString(upstream.ID)
+			builder.WriteString(" -exclude-default-group")
+			if endpoint != strings.TrimSpace(server) {
+				fmt.Fprintf(builder, " -host-name %s -http-host %s -tls-host-verify %s", host, host, host)
+			}
+			writeSmartDNSRoutingSelector(builder, upstream)
+			builder.WriteByte('\n')
+		}
+	}
+	return nil
+}
+
+func writeSmartDNSRoutingSelector(builder *strings.Builder, upstream SmartDNSUpstream) {
+	if upstream.SocketMark != 0 {
+		// SmartDNS parses -set-mark as decimal. A hexadecimal literal is
+		// accepted syntactically but resolves to mark zero at runtime.
+		fmt.Fprintf(builder, " -set-mark %d", upstream.SocketMark)
+	}
+	if upstream.Interface != "" {
+		builder.WriteString(" -interface ")
+		builder.WriteString(upstream.Interface)
+	}
+}
+
+func smartDNSUpstreamHostname(server string) string {
+	parsed, err := url.Parse(strings.TrimSpace(server))
+	if err != nil || parsed.Hostname() == "" {
+		return ""
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if _, err := netip.ParseAddr(host); err == nil {
+		return ""
+	}
+	if !smartDNSDomainName(host) {
+		return ""
+	}
+	return host
+}
+
+func smartDNSDoHEndpointWithHostIP(server, address string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(server))
+	if err != nil || parsed.Hostname() == "" {
+		return "", fmt.Errorf("invalid DoH server %q", server)
+	}
+	ip, err := netip.ParseAddr(strings.TrimSpace(address))
+	if err != nil || !ip.Is4() {
+		return "", fmt.Errorf("invalid DoH host address %q", address)
+	}
+	host := ip.String()
+	if port := parsed.Port(); port != "" {
+		host = net.JoinHostPort(host, port)
+	}
+	parsed.Host = host
+	return parsed.String(), nil
+}
+
+func smartDNSDomainName(value string) bool {
+	if value == "" || len(value) > 253 || strings.ContainsAny(value, " /\t\r\n") {
+		return false
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') || character == '-' || character == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func smartDNSGroupForRule(rule dns.SmartDNSRule, upstreams map[string]SmartDNSUpstream, wanUpstreams map[string]string) (string, error) {
+	if rule.UpstreamID != "" {
+		if _, ok := upstreams[rule.UpstreamID]; !ok {
+			return "", fmt.Errorf("references missing upstream %q", rule.UpstreamID)
+		}
+		return rule.UpstreamID, nil
+	}
+	if rule.WANEgressID != "" {
+		group, ok := wanUpstreams[rule.WANEgressID]
+		if !ok {
+			return "", fmt.Errorf("references WAN %q without a pinned DNS upstream", rule.WANEgressID)
+		}
+		return group, nil
+	}
+	return "", nil
+}
+
+func smartDNSToken(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+func smartDNSRuleIDToken(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.' || r == ':' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func sameSmartDNSUpstream(left, right SmartDNSUpstream) bool {
+	if left.ID != right.ID || left.Interface != right.Interface || left.WANEgressID != right.WANEgressID || !slices.Equal(left.Servers, right.Servers) || !slices.Equal(left.BootstrapServers, right.BootstrapServers) || len(left.ResolvedHostIPs) != len(right.ResolvedHostIPs) {
+		return false
+	}
+	for host, addresses := range left.ResolvedHostIPs {
+		if !slices.Equal(addresses, right.ResolvedHostIPs[host]) {
+			return false
+		}
+	}
+	return true
+}
+
+func RenderDnsmasq(plan DnsmasqPlan) ([]RenderedArtifact, error) {
+	return RenderDnsmasqConfig([]DnsmasqPlan{plan})
+}
+
+// RenderDnsmasqConfig renders one dnsmasq drop-in for every configured DHCP
+// service. dnsmasq owns DHCPv4 and, when a LAN /64 is available, also owns
+// IPv6 router advertisements and DHCPv6. DNS is disabled with port=0 because
+// SmartDNS serves port 53.
+//
+// An empty plan set still renders a drop-in. The installed image ships a static
+// factory drop-in bound to a build-time interface name; when a generation had
+// no DHCP plan and the renderer returned no artifact, that stale file survived
+// and dnsmasq kept serving (or failing to serve) the old port. Writing the file
+// on every plan makes the runtime own it: no plan means an explicit "serve no
+// DHCP" configuration instead of an install-time leftover.
+func RenderDnsmasqConfig(plans []DnsmasqPlan) ([]RenderedArtifact, error) {
+	hasIPv6 := false
+	for _, plan := range plans {
+		if strings.TrimSpace(plan.IPv6Prefix) != "" {
+			hasIPv6 = true
+			break
+		}
+	}
+	serveDNS := false
+	for _, plan := range plans {
+		if plan.ServeDNS {
+			serveDNS = true
+			break
+		}
+	}
+	servesDHCP := false
+	for _, plan := range plans {
+		if plan.DNSOnly {
+			continue
+		}
+		if strings.TrimSpace(plan.Subnet) != "" && len(plan.Pools) > 0 || strings.TrimSpace(plan.IPv6Prefix) != "" {
+			servesDHCP = true
+			break
+		}
+	}
+	var content strings.Builder
+	content.WriteString("# Generated by Ly Route. Do not edit.\n")
+	if len(plans) == 0 {
+		// No DHCP plan means no LAN is served. Keep dnsmasq running (the
+		// service also owns DNS in redirect mode) but bind it to nothing so a
+		// stale install-time interface/range cannot offer leases on the wrong
+		// port.
+		content.WriteString("# ly-route-dhcp-disabled: no DHCP plan for the current LAN set\n")
+		content.WriteString("port=0\n")
+		content.WriteString("dhcp-authoritative\n")
+		content.WriteString("log-dhcp\n")
+		content.WriteString("dhcp-leasefile=" + DefaultDnsmasqLeaseFile + "\n")
+		return []RenderedArtifact{NewArtifact(Dnsmasq, "/etc/dnsmasq.d/ly-route-dhcp.conf", content.String(), "restart")}, nil
+	}
+	if !servesDHCP {
+		// DNS-only generation (nftables capture without a DHCP server object):
+		// keep dnsmasq alive as the LAN resolver but state explicitly that no
+		// DHCP range is served, so nobody mistakes the interface= lines for a
+		// DHCP service.
+		content.WriteString("# ly-route-dhcp-disabled: DNS listeners only; no DHCP range is configured\n")
+	}
+	if serveDNS {
+		content.WriteString("port=53\n")
+		content.WriteString("bind-dynamic\n")
+		content.WriteString("no-resolv\n")
+		content.WriteString("server=127.0.0.1#1053\n")
+		content.WriteString("cache-size=0\n")
+	} else {
+		content.WriteString("port=0\n")
+	}
+	content.WriteString("dhcp-authoritative\n")
+	content.WriteString("log-dhcp\n")
+	content.WriteString("dhcp-leasefile=" + DefaultDnsmasqLeaseFile + "\n")
+	if hasIPv6 {
+		// enable-ra is global; it is emitted only when at least one LAN has a
+		// usable prefix so a gateway without IPv6 still starts with a
+		// configuration that contains no RA or DHCPv6 directives.
+		content.WriteString("enable-ra\n")
+	}
+	for _, plan := range plans {
+		lines, err := dnsmasqPlanLines(plan)
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range lines {
+			content.WriteString(line)
+			content.WriteString("\n")
+		}
+	}
+	return []RenderedArtifact{NewArtifact(Dnsmasq, "/etc/dnsmasq.d/ly-route-dhcp.conf", content.String(), "restart")}, nil
+}
+
+func dnsmasqPlanLines(plan DnsmasqPlan) ([]string, error) {
+	if strings.TrimSpace(plan.ID) == "" || strings.TrimSpace(plan.InterfaceID) == "" {
+		return nil, fmt.Errorf("dnsmasq plan requires id and interface_id")
+	}
+	if plan.DNSOnly {
+		// bind-dynamic (emitted by RenderDnsmasqConfig) makes dnsmasq follow the
+		// interface address, so a LAN that gets its address after dnsmasq starts
+		// is still served.
+		return []string{"interface=" + strings.TrimSpace(plan.InterfaceID)}, nil
+	}
+	ipv4Configured := strings.TrimSpace(plan.Subnet) != "" || len(plan.Pools) > 0
+	ipv6Configured := strings.TrimSpace(plan.IPv6Prefix) != ""
+	if !ipv4Configured && !ipv6Configured {
+		return nil, fmt.Errorf("dnsmasq plan requires an IPv4 subnet/pool or an IPv6 prefix")
+	}
+	lease := "12h"
+	if plan.LeaseTime > 0 {
+		lease = strconv.Itoa(plan.LeaseTime) + "s"
+	}
+	tag := dnsmasqTag(plan.ID)
+	lines := []string{"interface=" + strings.TrimSpace(plan.InterfaceID)}
+	if ipv4Configured {
+		if strings.TrimSpace(plan.Subnet) == "" || len(plan.Pools) == 0 {
+			return nil, fmt.Errorf("dnsmasq plan requires both subnet and pools when IPv4 is configured")
+		}
+		netmask, err := dnsmasqNetmask(plan.Subnet)
+		if err != nil {
+			return nil, err
+		}
+		for _, pool := range plan.Pools {
+			start, end, found := strings.Cut(strings.TrimSpace(pool), "-")
+			if !found || strings.TrimSpace(start) == "" || strings.TrimSpace(end) == "" {
+				return nil, fmt.Errorf("dnsmasq pool %q must be a start-end range", pool)
+			}
+			start = strings.TrimSpace(start)
+			end = strings.TrimSpace(end)
+			startAddress, err := netip.ParseAddr(start)
+			if err != nil || !startAddress.Is4() {
+				return nil, fmt.Errorf("dnsmasq pool %q has an invalid start address", pool)
+			}
+			endAddress, err := netip.ParseAddr(end)
+			if err != nil || !endAddress.Is4() {
+				return nil, fmt.Errorf("dnsmasq pool %q has an invalid end address", pool)
+			}
+			lines = append(lines, fmt.Sprintf("dhcp-range=set:%s,%s,%s,%s,%s", tag, start, end, netmask, lease))
+		}
+		if len(plan.Routers) > 0 {
+			lines = append(lines, fmt.Sprintf("dhcp-option=tag:%s,3,%s", tag, strings.Join(plan.Routers, ",")))
+		}
+		if len(plan.NameServers) > 0 {
+			lines = append(lines, fmt.Sprintf("dhcp-option=tag:%s,6,%s", tag, strings.Join(plan.NameServers, ",")))
+		}
+	}
+	if ipv6Configured {
+		ipv6Lines, err := dnsmasqIPv6Lines(plan, tag, lease)
+		if err != nil {
+			return nil, err
+		}
+		lines = append(lines, ipv6Lines...)
+	}
+	for _, reservation := range plan.Reservations {
+		mac := strings.TrimSpace(reservation.HWAddress)
+		ip := strings.TrimSpace(reservation.IPAddress)
+		if mac == "" || ip == "" {
+			return nil, fmt.Errorf("dnsmasq reservation requires hw_address and ip_address")
+		}
+		if _, err := net.ParseMAC(mac); err != nil {
+			return nil, fmt.Errorf("dnsmasq reservation has an invalid hardware address %q", mac)
+		}
+		if _, err := netip.ParseAddr(ip); err != nil {
+			return nil, fmt.Errorf("dnsmasq reservation has an invalid address %q", ip)
+		}
+		entry := "dhcp-host=" + mac + ",set:" + tag + "," + ip
+		if hostname := dnsmasqHostname(reservation.Hostname); hostname != "" {
+			entry += "," + hostname
+		}
+		lines = append(lines, entry)
+	}
+	return lines, nil
+}
+
+func dnsmasqIPv6Lines(plan DnsmasqPlan, tag, lease string) ([]string, error) {
+	prefix, err := dnsmasqIPv6Prefix(plan.IPv6Prefix)
+	if err != nil {
+		return nil, err
+	}
+	mode := strings.ToLower(strings.TrimSpace(plan.IPv6Mode))
+	var rangeLine string
+	switch mode {
+	case "", "slaac", "stateless", "ra-stateless":
+		// RA provides the address; DHCPv6 is stateless and supplies DNS and
+		// other configuration only.
+		rangeLine = fmt.Sprintf("dhcp-range=set:%s,%s,ra-stateless,64,%s", tag, prefix.Addr(), lease)
+	case "stateful", "dhcpv6":
+		start := ipv6AddressOffset(prefix, 0x100)
+		end := ipv6AddressOffset(prefix, 0x1ff)
+		rangeLine = fmt.Sprintf("dhcp-range=set:%s,%s,%s,64,%s", tag, start, end, lease)
+	default:
+		return nil, fmt.Errorf("dnsmasq IPv6 mode %q must be slaac or stateful", plan.IPv6Mode)
+	}
+	lines := []string{rangeLine}
+	nameServers := plan.IPv6NameServers
+	if len(nameServers) == 0 {
+		nameServers = []string{ipv6AddressOffset(prefix, 1).String()}
+	}
+	renderedServers := make([]string, 0, len(nameServers))
+	seenServers := map[netip.Addr]bool{}
+	for _, raw := range nameServers {
+		address, err := netip.ParseAddr(strings.TrimSpace(raw))
+		if err != nil || !address.Is6() || address.IsUnspecified() || address.IsMulticast() {
+			return nil, fmt.Errorf("dnsmasq IPv6 DNS server %q is invalid", raw)
+		}
+		if !seenServers[address] {
+			seenServers[address] = true
+			renderedServers = append(renderedServers, "["+address.String()+"]")
+		}
+	}
+	lines = append(lines, fmt.Sprintf("dhcp-option=tag:%s,option6:dns-server,%s", tag, strings.Join(renderedServers, ",")))
+	interval := plan.RAInterval
+	if interval <= 0 {
+		interval = 30
+	}
+	lifetime := 1800
+	if plan.RARouterLifetime != nil {
+		lifetime = *plan.RARouterLifetime
+	}
+	if lifetime < 0 {
+		return nil, fmt.Errorf("dnsmasq IPv6 RA router lifetime must not be negative")
+	}
+	if !serviceTokenSafe(strings.TrimSpace(plan.InterfaceID)) || strings.ContainsAny(plan.InterfaceID, ", ") {
+		return nil, fmt.Errorf("dnsmasq IPv6 interface %q is invalid", plan.InterfaceID)
+	}
+	lines = append(lines, fmt.Sprintf("ra-param=%s,%d,%d", strings.TrimSpace(plan.InterfaceID), interval, lifetime))
+	return lines, nil
+}
+
+// dnsmasqIPv6Prefix normalizes a delegated or static prefix to the LAN /64
+// that dnsmasq will advertise.
+func dnsmasqIPv6Prefix(raw string) (netip.Prefix, error) {
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
+	if err != nil || !prefix.Addr().Is6() || prefix.Addr().IsUnspecified() || prefix.Addr().IsMulticast() {
+		return netip.Prefix{}, fmt.Errorf("dnsmasq IPv6 prefix %q is invalid", raw)
+	}
+	if prefix.Bits() > 64 {
+		return netip.Prefix{}, fmt.Errorf("dnsmasq IPv6 prefix %q is too small for a LAN /64", raw)
+	}
+	return netip.PrefixFrom(prefix.Masked().Addr(), 64), nil
+}
+
+func dnsmasqNetmask(cidr string) (string, error) {
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
+	if err != nil || !prefix.Addr().Is4() {
+		return "", fmt.Errorf("dnsmasq plan subnet %q must be an IPv4 CIDR", cidr)
+	}
+	return net.IP(net.CIDRMask(prefix.Bits(), 32)).String(), nil
+}
+
+func dnsmasqTag(id string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(id)) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	tag := strings.Trim(b.String(), "-")
+	if tag == "" {
+		return "lyroute-dhcp"
+	}
+	return "lyroute-" + tag
+}
+
+func dnsmasqHostname(value string) string {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(value) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		}
+	}
+	return strings.Trim(b.String(), ".-_")
+}
+
+func RenderXray(compiled proxy.CompiledEgress) ([]RenderedArtifact, error) {
+	if strings.TrimSpace(compiled.ID) == "" || compiled.XrayRuntime.Engine != proxy.Xray {
+		return nil, fmt.Errorf("compiled proxy egress with xray runtime is required")
+	}
+	content, err := marshalIndented(compiled.XrayRuntime.ConfigPayload)
+	if err != nil {
+		return nil, err
+	}
+	return []RenderedArtifact{NewArtifact(Xray, compiled.XrayRuntime.ConfigPath, content, "restart")}, nil
+}
+
+// RenderXrayWithProxyDNS renders the Xray configuration with the loopback DNS
+// endpoints of the same generation. A restart that skipped them would leave
+// SmartDNS pointing at a closed port while the control plane reported success.
+func RenderXrayWithProxyDNS(compiled proxy.CompiledEgress, plan ProxyDNSEndpointPlan) ([]RenderedArtifact, error) {
+	if len(plan.Endpoints) > 0 {
+		specs := make([]proxy.ProxyDNSEndpointSpec, 0, len(plan.Endpoints))
+		for _, endpoint := range plan.Endpoints {
+			if err := validateProxyDNSEndpoint(endpoint); err != nil {
+				return nil, err
+			}
+			specs = append(specs, endpoint.Spec())
+		}
+		if err := proxy.AttachProxyDNSEndpoints(&compiled.XrayRuntime.ConfigPayload, specs); err != nil {
+			return nil, err
+		}
+	}
+	return RenderXray(compiled)
+}
+
+// ValidateProxyDNSRender applies the same endpoint decision as the SmartDNS
+// renderer without writing a configuration. Callers that only need a verdict
+// (xray restart, health) must not re-implement the failure matrix.
+func ValidateProxyDNSRender(render dns.SmartDNSRender, plan ProxyDNSEndpointPlan) error {
+	for _, rule := range render.Rules {
+		if rule.OutcomeKind != dns.ResolverOutcomeProxyResolution {
+			continue
+		}
+		if _, err := proxyDNSEndpointForRule(rule, plan); err != nil {
+			if proxyRuleFailureMode(rule) == dns.FailureModeReject {
+				continue
+			}
+			return err
+		}
+	}
+	if render.Miss.OutcomeKind == dns.ResolverOutcomeProxyResolution {
+		if _, err := proxyDNSEndpointForRule(render.Miss, plan); err != nil {
+			if proxyRuleFailureMode(render.Miss) != dns.FailureModeReject {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func RenderNftablesCapture(plan proxy.NftablesCapturePlan) ([]RenderedArtifact, error) {
+	return RenderGatewayNftablesCapture(plan, DNSInterceptionPlan{})
+}
+
+type DNSInterceptionPlan struct {
+	LANInterfaces []string `json:"lan_interfaces"`
+	// LCPGuardAddresses are LAN gateway addresses whose Linux LCP copy must be
+	// dropped. The drop is scoped to LCPGuardInterfaces; a normal LAN or DNS
+	// service TAP input to the same address must stay deliverable to SmartDNS.
+	LCPGuardAddresses  []string `json:"lcp_guard_addresses,omitempty"`
+	LCPGuardInterfaces []string `json:"lcp_guard_interfaces,omitempty"`
+	// LCPGuardTapInterfaces are the Linux LCP tap names. AF_PACKET leaves the
+	// physical interface owned by VPP up in the kernel, so every frame
+	// addressed to the LAN gateway reaches the host stack twice: once through
+	// the physical interface and once through the LCP tap that VPP uses to
+	// hand local traffic over. Echo requests must be answered exactly once
+	// (VPP owns them); echo replies must reach the host ping socket exactly
+	// once. The request copy is dropped on both interfaces, the duplicate
+	// reply only on the tap, because the physical copy is the one the kernel
+	// socket consumes.
+	LCPGuardTapInterfaces []string `json:"lcp_guard_tap_interfaces,omitempty"`
+	// BypassAddresses are destinations that must never be redirected. The LAN
+	// gateway address is the normal resolver target (dnsmasq listens there),
+	// so capturing it would loop the query back into the same listener.
+	BypassAddresses []string `json:"bypass_addresses,omitempty"`
+	// BypassPrefixes are destination prefixes that must stay outside the LAN
+	// capture: the LAN prefixes themselves and the proxy/DNS service /30 peers.
+	// The renderer adds loopback, link-local, multicast, reserved and broadcast
+	// ranges itself.
+	BypassPrefixes []string `json:"bypass_prefixes,omitempty"`
+	// LocalResolver is true when dnsmasq serves :53 on the LAN control-plane
+	// interfaces. The dns_lcp_guard drop for the gateway address then has to be
+	// omitted: it would discard the very copy the local listener must answer.
+	LocalResolver bool `json:"local_resolver,omitempty"`
+	ListenPort    int  `json:"listen_port"`
+}
+
+func RenderGatewayNftablesCapture(plan proxy.NftablesCapturePlan, dns DNSInterceptionPlan) ([]RenderedArtifact, error) {
+	hasProxy := strings.TrimSpace(plan.Family) != "" || strings.TrimSpace(plan.Table) != ""
+	hasDNS := len(dns.LANInterfaces) > 0
+	// A guard address without an ingress interface would drop legitimate DNS
+	// delivered on the LAN or DNS service TAP, so it is deliberately ignored
+	// (fail-open) until the caller supplies the Linux LCP interface.
+	hasLCPGuard := len(dns.LCPGuardAddresses) > 0 && len(dns.LCPGuardInterfaces) > 0
+	if !hasProxy && !hasDNS && !hasLCPGuard {
+		// A no-proxy generation still owns the teardown generation: remove the
+		// stale proxy-only table from a previous egress without touching any
+		// other host firewall state.
+		return []RenderedArtifact{NewArtifact(
+			Nftables,
+			"/etc/nftables.conf",
+			"#!/usr/sbin/nft -f\n\n"+
+				"add table inet ly_route_proxy_capture\n"+
+				"delete table inet ly_route_proxy_capture\n"+
+				"add table inet ly_route_dns_capture\n"+
+				"delete table inet ly_route_dns_capture\n"+
+				"table inet ly_route_dns_capture {\n"+
+				"  chain dns_prerouting {\n"+
+				"    type nat hook prerouting priority -150; policy accept;\n"+
+				"    iifname \"lo\" udp dport 53 counter return\n"+
+				"    iifname \"lo\" tcp dport 53 counter return\n"+
+				"  }\n"+
+				"}\n",
+			"reload",
+		)}, nil
+	}
+	if hasProxy && (strings.TrimSpace(plan.Family) == "" || strings.TrimSpace(plan.Table) == "") {
+		return nil, fmt.Errorf("nftables capture plan requires family and table")
+	}
+	port := dns.ListenPort
+	if port == 0 {
+		port = 53
+	}
+	if port < 1 || port > 65535 {
+		return nil, fmt.Errorf("DNS interception listen port is invalid")
+	}
+	family, table := plan.Family, plan.Table
+	if !hasProxy {
+		family, table = "inet", "ly_route_dns_capture"
+	}
+	seen := map[string]bool{}
+	lanInterfaces := make([]string, 0, len(dns.LANInterfaces))
+	for _, name := range dns.LANInterfaces {
+		name = strings.TrimSpace(name)
+		if name == "" || !serviceTokenSafe(name) {
+			return nil, fmt.Errorf("DNS interception LAN interface %q is unsafe", name)
+		}
+		if !seen[name] {
+			seen[name] = true
+			lanInterfaces = append(lanInterfaces, name)
+		}
+	}
+	slices.Sort(lanInterfaces)
+	guardAddresses := make([]netip.Addr, 0, len(dns.LCPGuardAddresses))
+	seenGuardAddresses := map[netip.Addr]bool{}
+	for _, raw := range dns.LCPGuardAddresses {
+		address, err := netip.ParseAddr(strings.TrimSpace(raw))
+		if err != nil || address.IsUnspecified() || address.IsMulticast() {
+			return nil, fmt.Errorf("DNS LCP guard address %q is invalid", raw)
+		}
+		if !seenGuardAddresses[address] {
+			seenGuardAddresses[address] = true
+			guardAddresses = append(guardAddresses, address)
+		}
+	}
+	slices.SortFunc(guardAddresses, func(left, right netip.Addr) int { return left.Compare(right) })
+	seenGuardInterfaces := map[string]bool{}
+	guardInterfaces := make([]string, 0, len(dns.LCPGuardInterfaces))
+	for _, name := range dns.LCPGuardInterfaces {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !serviceTokenSafe(name) {
+			return nil, fmt.Errorf("DNS LCP guard interface %q is unsafe", name)
+		}
+		if !seenGuardInterfaces[name] {
+			seenGuardInterfaces[name] = true
+			guardInterfaces = append(guardInterfaces, name)
+		}
+	}
+	slices.Sort(guardInterfaces)
+	seenTapInterfaces := map[string]bool{}
+	tapInterfaces := make([]string, 0, len(dns.LCPGuardTapInterfaces))
+	for _, name := range dns.LCPGuardTapInterfaces {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !serviceTokenSafe(name) {
+			return nil, fmt.Errorf("ICMP LCP tap interface %q is unsafe", name)
+		}
+		if !seenTapInterfaces[name] {
+			seenTapInterfaces[name] = true
+			tapInterfaces = append(tapInterfaces, name)
+		}
+	}
+	slices.Sort(tapInterfaces)
+	if len(tapInterfaces) > 0 && len(guardAddresses) == 0 {
+		return nil, fmt.Errorf("ICMP LCP tap interfaces require guard addresses")
+	}
+	bypassAddresses := make([]netip.Addr, 0, len(dns.BypassAddresses))
+	seenBypassAddresses := map[netip.Addr]bool{}
+	for _, raw := range dns.BypassAddresses {
+		address, err := netip.ParseAddr(strings.TrimSpace(raw))
+		if err != nil || address.IsUnspecified() || address.IsMulticast() {
+			return nil, fmt.Errorf("DNS capture bypass address %q is invalid", raw)
+		}
+		if !seenBypassAddresses[address] {
+			seenBypassAddresses[address] = true
+			bypassAddresses = append(bypassAddresses, address)
+		}
+	}
+	slices.SortFunc(bypassAddresses, func(left, right netip.Addr) int { return left.Compare(right) })
+	bypassPrefixes := make([]netip.Prefix, 0, len(dns.BypassPrefixes)+8)
+	seenBypassPrefixes := map[netip.Prefix]bool{}
+	addBypassPrefix := func(raw string) error {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil {
+			return fmt.Errorf("DNS capture bypass prefix %q is invalid", raw)
+		}
+		prefix = prefix.Masked()
+		if !seenBypassPrefixes[prefix] {
+			seenBypassPrefixes[prefix] = true
+			bypassPrefixes = append(bypassPrefixes, prefix)
+		}
+		return nil
+	}
+	for _, raw := range dns.BypassPrefixes {
+		if err := addBypassPrefix(raw); err != nil {
+			return nil, err
+		}
+	}
+	// Never capture traffic that can only terminate locally or that cannot be a
+	// unicast resolver destination. 255.255.255.255/32 and 0.0.0.0/8 keep DHCP
+	// and early-boot probes out of the redirect.
+	for _, raw := range []string{
+		"0.0.0.0/8",
+		"127.0.0.0/8",
+		"169.254.0.0/16",
+		"224.0.0.0/4",
+		"240.0.0.0/4",
+		"255.255.255.255/32",
+		"::1/128",
+		"fe80::/10",
+		"ff00::/8",
+	} {
+		if err := addBypassPrefix(raw); err != nil {
+			return nil, err
+		}
+	}
+	slices.SortFunc(bypassPrefixes, func(left, right netip.Prefix) int {
+		if order := left.Addr().Compare(right.Addr()); order != 0 {
+			return order
+		}
+		return left.Bits() - right.Bits()
+	})
+	var builder strings.Builder
+	builder.WriteString("#!/usr/sbin/nft -f\n\n")
+	if !hasProxy {
+		// Deleting the last proxy egress leaves the table behind unless the
+		// next no-proxy generation removes it.  `add` makes the delete
+		// idempotent even on a clean boot where the table never existed.
+		builder.WriteString("add table inet ly_route_proxy_capture\n")
+		builder.WriteString("delete table inet ly_route_proxy_capture\n\n")
+	}
+	if plan.FailOpen {
+		builder.WriteString("# ly-route-proxy-fail-open: capture table is intentionally empty; selected traffic stays on the direct path\n")
+	}
+	// This artifact owns only its dedicated table. `add table` is idempotent on
+	// Debian 12's nftables, then `flush table` clears only Ly Route's prior
+	// generation. Host firewall, container, and management rules remain intact.
+	builder.WriteString(fmt.Sprintf("add table %s %s\n", family, table))
+	builder.WriteString(fmt.Sprintf("flush table %s %s\n\n", family, table))
+	builder.WriteString(fmt.Sprintf("table %s %s {\n", family, table))
+	if len(lanInterfaces) > 0 {
+		// The chain owns LAN DNS capture: redirect any query from a current LAN
+		// interface to the local resolver, but never touch loopback, a LAN
+		// address (the resolver itself), another LAN prefix, a proxy/DNS service
+		// peer, multicast or broadcast. The bypass rules must stay in front of
+		// the redirects.
+		builder.WriteString("  chain dns_prerouting {\n")
+		builder.WriteString("    type nat hook prerouting priority -150; policy accept;\n")
+		builder.WriteString("    iifname \"lo\" udp dport 53 counter return\n")
+		builder.WriteString("    iifname \"lo\" tcp dport 53 counter return\n")
+		for _, address := range bypassAddresses {
+			family := "ip"
+			if address.Is6() {
+				family = "ip6"
+			}
+			builder.WriteString(fmt.Sprintf("    %s daddr %s udp dport 53 counter return\n", family, address))
+			builder.WriteString(fmt.Sprintf("    %s daddr %s tcp dport 53 counter return\n", family, address))
+		}
+		for _, prefix := range bypassPrefixes {
+			family := "ip"
+			if prefix.Addr().Is6() {
+				family = "ip6"
+			}
+			builder.WriteString(fmt.Sprintf("    %s daddr %s udp dport 53 counter return\n", family, prefix))
+			builder.WriteString(fmt.Sprintf("    %s daddr %s tcp dport 53 counter return\n", family, prefix))
+		}
+		for _, name := range lanInterfaces {
+			builder.WriteString(fmt.Sprintf("    iifname %q udp dport 53 counter redirect to :%d\n", name, port))
+			builder.WriteString(fmt.Sprintf("    iifname %q tcp dport 53 counter redirect to :%d\n", name, port))
+		}
+		builder.WriteString("  }\n")
+	}
+	for _, chain := range plan.Chains {
+		builder.WriteString(fmt.Sprintf("  chain %s {\n", chain.Name))
+		builder.WriteString(fmt.Sprintf("    type %s hook %s priority %d; policy %s;\n", chain.Type, chain.Hook, chain.Priority, chain.Policy))
+		for _, rule := range plan.Rules {
+			if rule.Chain == chain.Name {
+				builder.WriteString(fmt.Sprintf("    %s %s\n", rule.Expression, rule.Action))
+			}
+		}
+		builder.WriteString("  }\n")
+	}
+	if len(guardAddresses) > 0 && len(guardInterfaces) > 0 && !dns.LocalResolver {
+		builder.WriteString("  chain dns_lcp_guard {\n")
+		builder.WriteString("    type filter hook input priority -300; policy accept;\n")
+		for _, interfaceName := range guardInterfaces {
+			for _, address := range guardAddresses {
+				family := "ip"
+				if address.Is6() {
+					family = "ip6"
+				}
+				// The LCP tap and the VPP host-stack punt tap both
+				// deliver a duplicate of the LAN query. SmartDNS only
+				// binds the loopback stub, so the kernel copy must be
+				// dropped instead of refusing it with ICMP unreachable
+				// while the VPP DNS adapter is still resolving.
+				builder.WriteString(fmt.Sprintf("    iifname %q %s daddr %s udp dport 53 counter drop\n", interfaceName, family, address))
+				builder.WriteString(fmt.Sprintf("    iifname %q %s daddr %s tcp dport 53 counter drop\n", interfaceName, family, address))
+			}
+		}
+		builder.WriteString("  }\n")
+	}
+	if len(guardAddresses) > 0 && len(guardInterfaces) > 0 {
+		// VPP owns the LAN gateway address for the data plane, but the host
+		// kernel is configured with the same address so that DHCP, DNS and
+		// the UI can bind it. Without this guard both stacks answer an ICMP
+		// echo request and the LAN host sees one reply plus one (DUP!) per
+		// request. Drop the kernel request copy; VPP answers from the
+		// dataplane path. Echo replies are additionally dropped on the LCP
+		// tap so a gateway-originated diagnostic ping does not receive the
+		// same reply twice (physical copy and punted tap copy).
+		builder.WriteString("  chain lan_icmp_guard {\n")
+		builder.WriteString("    type filter hook input priority -290; policy accept;\n")
+		for _, interfaceName := range guardInterfaces {
+			for _, address := range guardAddresses {
+				family, icmpType := "ip", "icmp"
+				if address.Is6() {
+					family, icmpType = "ip6", "icmpv6"
+				}
+				builder.WriteString(fmt.Sprintf("    iifname %q %s daddr %s %s type echo-request counter drop\n", interfaceName, family, address, icmpType))
+			}
+		}
+		tapSet := make(map[string]bool, len(tapInterfaces))
+		for _, name := range tapInterfaces {
+			tapSet[name] = true
+		}
+		for _, interfaceName := range guardInterfaces {
+			if tapSet[interfaceName] {
+				// The tap copy is the only copy the host stack gets when the
+				// NIC is bound to a native driver (DPDK/AF_XDP). Never drop a
+				// reply there; dropping the duplicate physical copy below is
+				// enough in AF_PACKET mode and is a no-op otherwise.
+				continue
+			}
+			for _, address := range guardAddresses {
+				family, icmpType := "ip", "icmp"
+				if address.Is6() {
+					family, icmpType = "ip6", "icmpv6"
+				}
+				builder.WriteString(fmt.Sprintf("    iifname %q %s daddr %s %s type echo-reply counter drop\n", interfaceName, family, address, icmpType))
+			}
+		}
+		builder.WriteString("  }\n")
+	}
+	builder.WriteString("}\n")
+	return []RenderedArtifact{NewArtifact(Nftables, "/etc/nftables.conf", builder.String(), "reload")}, nil
+}
+
+func serviceTokenSafe(value string) bool {
+	for _, char := range value {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '_' || char == '-' || char == '.' || char == ':' {
+			continue
+		}
+		return false
+	}
+	return value != ""
+}
+
+// proxyNAT44VRFShellHelpers is embedded verbatim in the generated
+// policy-routing script and exercised directly by unit tests. VPP's NAT44 pool
+// inventory is tenant-scoped: an address present in VRF 0 does not make the
+// same address usable by a proxy egress in its own tenant VRF. Matching only
+// the address text therefore both skips a required add and falsely proves the
+// pool. These helpers parse the address followed by its tenant VRF and ignore
+// the twice-nat section.
+const proxyNAT44VRFShellHelpers = `nat44_pool_has_vrf() {
+  address=$1
+  vrf=$2
+  "$VPPCTL" show nat44 addresses 2>/dev/null | awk -v addr="$address" -v vrf="$vrf" '
+    function trim(s) { gsub(/\r/, "", s); sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+    {
+      line=trim($0)
+      if (tolower(line) ~ /twice-nat/) { twice=1; next }
+      if (twice) { next }
+      if (line ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+        found = (line == addr)
+        next
+      }
+      if (found && tolower(line) ~ /^tenant vrf:/) {
+        value=trim(substr(line, index(line, ":") + 1))
+        if (value == vrf) { ok=1; exit }
+        found=0
+      }
+    }
+    END { exit ok ? 0 : 1 }
+  '
+}
+nat44_wait_vrf() {
+  desc=$1
+  address=$2
+  vrf=$3
+  attempt=1
+  while [ "$attempt" -le 10 ]; do
+    if nat44_pool_has_vrf "$address" "$vrf"; then
+      return 0
+    fi
+    sleep 0.2
+    attempt=$((attempt + 1))
+  done
+  echo "policy-routing: $desc missing '$address' in tenant VRF $vrf; last inventory:" >&2
+  "$VPPCTL" show nat44 addresses >&2 2>&1 || true
+  return 1
+}
+`
+
+func RenderLinuxPolicyRouting(plan proxy.LinuxPolicyRoutingPlan, natBehavior nat.Behavior, dnsNetworks ...vpp.DNSServiceNetwork) ([]RenderedArtifact, error) {
+	if strings.TrimSpace(plan.Mark) == "" || plan.TableID <= 0 || plan.RulePriority <= 0 || strings.TrimSpace(plan.DefaultRoute.Device) == "" {
+		return nil, fmt.Errorf("linux policy routing plan requires mark, table, priority, and default route device")
+	}
+	if strings.TrimSpace(plan.Network.EgressID) != "" {
+		artifacts, err := renderProxyServiceNetwork(plan, natBehavior)
+		if err != nil {
+			return nil, err
+		}
+		return appendDNSServiceRouting(artifacts, dnsNetworks, plan.Network.EgressID, natBehavior)
+	}
+	var builder strings.Builder
+	builder.WriteString("#!/bin/sh\nset -eu\n\n")
+	builder.WriteString(fmt.Sprintf("ip rule del fwmark %s/%s table %d priority %d 2>/dev/null || true\n", plan.Mark, plan.MarkMask, plan.TableID, plan.RulePriority))
+	builder.WriteString(fmt.Sprintf("ip rule add fwmark %s/%s table %d priority %d\n", plan.Mark, plan.MarkMask, plan.TableID, plan.RulePriority))
+	if strings.TrimSpace(plan.DefaultRoute.Via) != "" {
+		builder.WriteString(fmt.Sprintf("ip route replace %s via %s dev %s table %d\n", plan.DefaultRoute.Destination, plan.DefaultRoute.Via, plan.DefaultRoute.Device, plan.TableID))
+	} else {
+		builder.WriteString(fmt.Sprintf("ip route replace %s dev %s scope %s table %d\n", plan.DefaultRoute.Destination, plan.DefaultRoute.Device, plan.DefaultRoute.Scope, plan.TableID))
+	}
+	return appendDNSServiceRouting([]RenderedArtifact{NewArtifact(LinuxRouting, "/var/lib/ly-route/policy-routing/apply.sh", builder.String(), "restart")}, dnsNetworks, "", natBehavior)
+}
+
+// RenderDNSServiceRouting creates the Linux half of VPP-owned DNS egress when
+// no proxy policy-routing handoff is present. It has no default route and no
+// client traffic rule: only the configured resolver addresses are reachable
+// through the service TAPs.
+func RenderDNSServiceRouting(natBehavior nat.Behavior, networks []vpp.DNSServiceNetwork) ([]RenderedArtifact, error) {
+	if len(networks) == 0 {
+		return nil, fmt.Errorf("DNS service routing requires at least one network")
+	}
+	var builder strings.Builder
+	builder.WriteString("#!/bin/sh\nset -eu\n")
+	return appendDNSServiceRouting([]RenderedArtifact{NewArtifact(LinuxRouting, "/var/lib/ly-route/policy-routing/apply.sh", builder.String(), "restart")}, networks, "", natBehavior)
+}
+
+func appendDNSServiceRouting(artifacts []RenderedArtifact, networks []vpp.DNSServiceNetwork, proxyEgressID string, natBehavior nat.Behavior) ([]RenderedArtifact, error) {
+	if len(artifacts) != 1 || artifacts[0].Service != LinuxRouting || artifacts[0].Path != "/var/lib/ly-route/policy-routing/apply.sh" {
+		return nil, fmt.Errorf("DNS service routing requires the primary Linux routing artifact")
+	}
+	section, err := renderDNSServiceRoutingSection(networks, proxyEgressID, natBehavior)
+	if err != nil {
+		return nil, err
+	}
+	artifacts[0] = NewArtifact(LinuxRouting, artifacts[0].Path, artifacts[0].Content+section, artifacts[0].ReloadMode)
+	return artifacts, nil
+}
+
+func renderDNSServiceRoutingSection(networks []vpp.DNSServiceNetwork, proxyEgressID string, natBehavior nat.Behavior) (string, error) {
+	ordered := append([]vpp.DNSServiceNetwork(nil), networks...)
+	slices.SortFunc(ordered, func(left, right vpp.DNSServiceNetwork) int {
+		return strings.Compare(left.UpstreamID, right.UpstreamID)
+	})
+	seenUpstreams := map[string]bool{}
+	seenInterfaces := map[string]bool{}
+	for _, network := range ordered {
+		if !serviceTokenSafe(network.UpstreamID) || !serviceTokenSafe(network.VPPInterface) || !serviceTokenSafe(network.HostInterface) {
+			return "", fmt.Errorf("DNS service network contains an unsafe identifier")
+		}
+		if seenUpstreams[network.UpstreamID] || seenInterfaces[network.HostInterface] {
+			return "", fmt.Errorf("duplicate DNS service network %q", network.UpstreamID)
+		}
+		seenUpstreams[network.UpstreamID] = true
+		seenInterfaces[network.HostInterface] = true
+		for label, value := range map[string]string{"VPP address": network.VPPAddress, "host address": network.HostAddress} {
+			address, err := netip.ParseAddr(strings.TrimSpace(value))
+			if err != nil || !address.Is4() {
+				return "", fmt.Errorf("DNS service network %q %s is invalid", network.UpstreamID, label)
+			}
+		}
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(network.CIDR))
+		if err != nil || !prefix.Addr().Is4() || prefix.Bits() != 30 {
+			return "", fmt.Errorf("DNS service network %q CIDR is invalid", network.UpstreamID)
+		}
+		if len(network.ResolverServers) == 0 {
+			return "", fmt.Errorf("DNS service network %q has no resolver servers", network.UpstreamID)
+		}
+		if network.MTU < 576 || network.MTU > 9000 {
+			return "", fmt.Errorf("DNS service network %q has invalid MTU %d", network.UpstreamID, network.MTU)
+		}
+		if network.SocketMark == 0 {
+			return "", fmt.Errorf("DNS service network %q has no socket mark", network.UpstreamID)
+		}
+		if strings.TrimSpace(network.UnderlayRoute) == "" || !serviceCommandTokensSafe(network.UnderlayRoute) {
+			return "", fmt.Errorf("DNS service network %q has an unsafe underlay route", network.UpstreamID)
+		}
+		for _, resolver := range network.ResolverServers {
+			address, err := netip.ParseAddr(strings.TrimSpace(resolver))
+			if err != nil || !address.Is4() {
+				return "", fmt.Errorf("DNS service network %q resolver %q is invalid", network.UpstreamID, resolver)
+			}
+		}
+	}
+
+	var builder strings.Builder
+	builder.WriteString("\n# VPP-owned DNS resolver service routes.\n")
+	underlayInterfaces := make([]string, 0, len(ordered))
+	for _, network := range ordered {
+		if name := serviceUnderlayInterface(network.UnderlayRoute); name != "" {
+			underlayInterfaces = append(underlayInterfaces, name)
+		} else if isRuntimePPPoEUnderlay(network.UnderlayRoute) {
+			underlayInterfaces = append(underlayInterfaces, network.UnderlayRoute)
+		}
+	}
+	readiness, err := renderVPPUnderlayReadinessMode(underlayInterfaces, false)
+	if err != nil {
+		return "", err
+	}
+	builder.WriteString(readiness)
+	builder.WriteString("DNS_STATE_DIR=/var/lib/ly-route/dns-service-routing\n")
+	builder.WriteString("DNS_STATE_FILE=$DNS_STATE_DIR/active\n")
+	builder.WriteString("mkdir -p $DNS_STATE_DIR\n")
+	builder.WriteString("if [ -f $DNS_STATE_FILE ]; then\n")
+	builder.WriteString("  while IFS=' ' read -r kind one two three four five; do\n")
+	builder.WriteString("    [ -n \"$kind\" ] || continue\n")
+	builder.WriteString("    case \"$kind\" in\n")
+	builder.WriteString("      route) if [ -n \"${four:-}\" ]; then ip route del \"$one/32\" via \"$three\" dev \"$two\" table \"$four\" 2>/dev/null || true; else ip route del \"$one/32\" via \"$three\" dev \"$two\" 2>/dev/null || true; fi ;;\n")
+	builder.WriteString("      policy) ip rule del priority \"$three\" from \"$one/32\" lookup \"$two\" 2>/dev/null || true; ip route flush table \"$two\" 2>/dev/null || true ;;\n")
+	builder.WriteString("      mark) ip rule del priority \"$three\" fwmark \"$one\"/0xffffffff lookup \"$two\" 2>/dev/null || true ;;\n")
+	builder.WriteString("      vpp-return) \"$VPPCTL\" ip route del \"$one/32\" via \"$one\" \"$two\" 2>/dev/null || true ;;\n")
+	builder.WriteString("      *) ip route del \"$kind/32\" via \"$two\" dev \"$one\" 2>/dev/null || true ;;\n")
+	builder.WriteString("    esac\n")
+	builder.WriteString("  done < $DNS_STATE_FILE\n")
+	builder.WriteString("fi\n")
+	builder.WriteString("DNS_STATE_TMP=$DNS_STATE_FILE.tmp.$$\n")
+	builder.WriteString(": > $DNS_STATE_TMP\n")
+	builder.WriteString("cleanup_dns_state_tmp() {\n")
+	builder.WriteString("  if [ -n \"${DNS_STATE_TMP:-}\" ]; then rm -f \"$DNS_STATE_TMP\"; fi\n")
+	builder.WriteString("}\n")
+	builder.WriteString("trap cleanup_dns_state_tmp 0 1 2 15\n")
+	builder.WriteString("warm_vpp_resolver() {\n")
+	builder.WriteString("  host_address=$1\n  resolver=$2\n")
+	builder.WriteString("  command -v ping >/dev/null 2>&1 || return 0\n")
+	builder.WriteString("  attempt=1\n")
+	builder.WriteString("  while [ \"$attempt\" -le 5 ]; do\n")
+	builder.WriteString("    ping -I \"$host_address\" -c 1 -W 1 \"$resolver\" >/dev/null 2>&1 && return 0\n")
+	builder.WriteString("    attempt=$((attempt + 1))\n")
+	builder.WriteString("  done\n  return 0\n}\n")
+	builder.WriteString("ensure_dns_tap() {\n")
+	builder.WriteString("  tap_id=$1\n  host_if=$2\n  vpp_if=$3\n")
+	builder.WriteString("  if ! ip link show dev \"$host_if\" >/dev/null 2>&1; then\n")
+	builder.WriteString("    if \"$VPPCTL\" show tap 2>/dev/null | grep -Fq \"name \\\"$host_if\\\"\"; then\n")
+	builder.WriteString("      \"$VPPCTL\" delete tap \"$vpp_if\" 2>/dev/null || true\n")
+	builder.WriteString("    fi\n")
+	builder.WriteString("  fi\n")
+	builder.WriteString("  if ! \"$VPPCTL\" show interface | awk 'NR > 1 {print $1}' | grep -Fxq \"$vpp_if\"; then\n")
+	builder.WriteString("    case \"$host_if\" in lydnsh*) ;; *) echo \"refusing to replace unmanaged DNS TAP $host_if\" >&2; return 1 ;; esac\n")
+	builder.WriteString("    # VPP restart removes its TAP object but not always the Linux peer.\n")
+	builder.WriteString("    # Remove only the generated service peer before recreating the TAP.\n")
+	builder.WriteString("    ip link delete dev \"$host_if\" 2>/dev/null || true\n")
+	builder.WriteString("    \"$VPPCTL\" create tap id \"$tap_id\" host-if-name \"$host_if\" no-gso\n")
+	builder.WriteString("    \"$VPPCTL\" set interface name \"tap${tap_id}\" \"$vpp_if\"\n")
+	builder.WriteString("  fi\n")
+	builder.WriteString("  \"$VPPCTL\" set interface state \"$vpp_if\" up\n")
+	builder.WriteString("}\n\n")
+	for _, network := range ordered {
+		underlayPath := serviceVPPRoutePath(network.UnderlayRoute)
+		dynamicUnderlay := isRuntimePPPoEUnderlay(network.UnderlayRoute)
+		linuxTableID := network.TableID
+		rulePriority := 10000 + network.TapID
+		markPriority := 20000 + network.TapID
+		// A clean install starts the PPPoE helper asynchronously.  Defer this
+		// service network instead of failing the whole policy-routing artifact;
+		// the next reconciliation installs it once the session interface exists.
+		readinessTarget := serviceUnderlayInterface(network.UnderlayRoute)
+		if strings.TrimSpace(readinessTarget) == "" {
+			readinessTarget = network.UnderlayRoute
+		}
+		builder.WriteString(fmt.Sprintf("if wait_vpp_underlay %s; then\n", readinessTarget))
+		builder.WriteString(fmt.Sprintf("ensure_dns_tap %d %s %s\n", network.TapID, network.HostInterface, network.VPPInterface))
+		if dynamicUnderlay {
+			builder.WriteString(fmt.Sprintf("UNDERLAY_IF=$(resolve_underlay %s)\n", underlayPath))
+		}
+		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface mtu packet %d %s\n", network.MTU, network.VPPInterface))
+		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface ip address del %s %s 2>/dev/null || true\n", network.VPPInterface, network.CIDR))
+		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip table add %d 2>/dev/null || true\n", network.TableID))
+		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface ip table %s %d\n", network.VPPInterface, network.TableID))
+		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface ip address %s %s 2>/dev/null || true\n", network.VPPInterface, network.CIDR))
+		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip route del table %d 0.0.0.0/0 2>/dev/null || true\n", network.TableID))
+		if dynamicUnderlay {
+			builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip route add table %d 0.0.0.0/0 via \"$UNDERLAY_IF\"\n", network.TableID))
+		} else {
+			builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip route add table %d 0.0.0.0/0 via %s\n", network.TableID, underlayPath))
+		}
+		name := serviceUnderlayInterface(network.UnderlayRoute)
+		if name != "" || dynamicUnderlay {
+			if natBehavior == nat.BehaviorFullCone {
+				builder.WriteString("\"$VPPCTL\" nat44 plugin disable >/dev/null 2>&1 || true\n")
+				builder.WriteString("\"$VPPCTL\" nat44 ei plugin enable >/dev/null 2>&1 || true\n")
+				if dynamicUnderlay {
+					builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface nat44 ei in %s out \"$UNDERLAY_IF\"\n", network.VPPInterface))
+					builder.WriteString("\"$VPPCTL\" nat44 ei add interface address \"$UNDERLAY_IF\" >/dev/null 2>&1 || true\n")
+				} else {
+					builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface nat44 ei in %s out %s\n", network.VPPInterface, name))
+					builder.WriteString(fmt.Sprintf("\"$VPPCTL\" nat44 ei add interface address %s >/dev/null 2>&1 || true\n", name))
+				}
+				builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip route add %s/32 via %s %s\n", network.HostAddress, network.HostAddress, network.VPPInterface))
+				builder.WriteString(fmt.Sprintf("\"$VPPCTL\" show nat44 ei interfaces | grep -Fq %s\n", network.VPPInterface))
+			} else {
+				builder.WriteString("\"$VPPCTL\" nat44 ei plugin disable 2>/dev/null || true\n")
+				builder.WriteString("\"$VPPCTL\" nat44 plugin enable 2>/dev/null || true\n")
+				if dynamicUnderlay {
+					builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface nat44 in %s out \"$UNDERLAY_IF\" output-feature del 2>/dev/null || true\n", network.VPPInterface))
+					builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface nat44 in %s out \"$UNDERLAY_IF\"\n", network.VPPInterface))
+				} else {
+					builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface nat44 in %s out %s output-feature del 2>/dev/null || true\n", network.VPPInterface, name))
+					builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface nat44 in %s out %s\n", network.VPPInterface, name))
+				}
+				builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip route add %s/32 via %s %s\n", network.HostAddress, network.HostAddress, network.VPPInterface))
+				builder.WriteString(fmt.Sprintf("\"$VPPCTL\" show nat44 interfaces | grep -Fq %s\n", network.VPPInterface))
+			}
+			if dynamicUnderlay {
+				builder.WriteString(fmt.Sprintf("\"$VPPCTL\" show ip fib table %d | grep -F \"$UNDERLAY_IF\" >/dev/null\n", network.TableID))
+			} else {
+				builder.WriteString(fmt.Sprintf("\"$VPPCTL\" show ip fib table %d | grep -F %s >/dev/null\n", network.TableID, name))
+			}
+		}
+		if strings.TrimSpace(proxyEgressID) != "" && strings.TrimSpace(network.WANEgressID) == strings.TrimSpace(proxyEgressID) {
+			builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip route del %s/32 via %s %s 2>/dev/null || true\n", network.HostAddress, network.HostAddress, network.VPPInterface))
+			builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip route add %s/32 via %s %s\n", network.HostAddress, network.HostAddress, network.VPPInterface))
+			builder.WriteString(fmt.Sprintf("printf '%%s %%s %%s\\n' vpp-return %s %s >> $DNS_STATE_TMP\n", network.HostAddress, network.VPPInterface))
+		}
+		builder.WriteString(fmt.Sprintf("ip link set dev %s mtu %d up\n", network.HostInterface, network.MTU))
+		builder.WriteString(fmt.Sprintf("ip address replace %s/30 dev %s\n", network.HostAddress, network.HostInterface))
+		builder.WriteString(fmt.Sprintf("sysctl -q -w net.ipv4.conf.%s.rp_filter=0\n", network.HostInterface))
+		builder.WriteString(fmt.Sprintf("ip rule del priority %d from %s/32 lookup %d 2>/dev/null || true\n", rulePriority, network.HostAddress, linuxTableID))
+		builder.WriteString(fmt.Sprintf("ip route flush table %d 2>/dev/null || true\n", linuxTableID))
+		builder.WriteString(fmt.Sprintf("ip route replace default via %s dev %s table %d\n", network.VPPAddress, network.HostInterface, linuxTableID))
+		builder.WriteString(fmt.Sprintf("ip rule add from %s/32 lookup %d priority %d\n", network.HostAddress, linuxTableID, rulePriority))
+		builder.WriteString(fmt.Sprintf("printf '%%s %%s %%s %%s\\n' policy %s %d %d >> $DNS_STATE_TMP\n", network.HostAddress, linuxTableID, rulePriority))
+		builder.WriteString(fmt.Sprintf("ip rule del priority %d fwmark 0x%x/0xffffffff lookup %d 2>/dev/null || true\n", markPriority, network.SocketMark, linuxTableID))
+		builder.WriteString(fmt.Sprintf("ip rule add fwmark 0x%x/0xffffffff lookup %d priority %d\n", network.SocketMark, linuxTableID, markPriority))
+		builder.WriteString(fmt.Sprintf("printf '%%s %%s %%s %%s\\n' mark 0x%x %d %d >> $DNS_STATE_TMP\n", network.SocketMark, linuxTableID, markPriority))
+		for _, resolver := range network.ResolverServers {
+			// DNS resolver traffic originates from the service TAP address. Keep
+			// its route in that TAP's source-policy table: a resolver may be
+			// intentionally reused by several policies or WANs, where a main-table
+			// /32 route would be overwritten by the last rendered service network.
+			builder.WriteString(fmt.Sprintf("ip route replace %s/32 via %s dev %s table %d\n", resolver, network.VPPAddress, network.HostInterface, linuxTableID))
+			builder.WriteString(fmt.Sprintf("printf '%%s %%s %%s %%s\\n' route %s %s %s %d >> $DNS_STATE_TMP\n", resolver, network.HostInterface, network.VPPAddress, linuxTableID))
+		}
+		builder.WriteString(fmt.Sprintf("warm_vpp_resolver %s %s\n", network.HostAddress, network.ResolverServers[0]))
+		builder.WriteString("else\n")
+		builder.WriteString(fmt.Sprintf("  echo \"DNS service network %s deferred until %s is ready\" >&2\n", network.UpstreamID, readinessTarget))
+		builder.WriteString("fi\n")
+	}
+	builder.WriteString("mv $DNS_STATE_TMP $DNS_STATE_FILE\n")
+	builder.WriteString("DNS_STATE_TMP=\n")
+	builder.WriteString("ip route flush cache\n")
+	return builder.String(), nil
+}
+
+func renderProxyServiceNetwork(plan proxy.LinuxPolicyRoutingPlan, natBehavior nat.Behavior) ([]RenderedArtifact, error) {
+	network := plan.Network
+	for label, value := range map[string]string{
+		"egress id":              network.EgressID,
+		"ingress VPP interface":  network.IngressVPPInterface,
+		"ingress host interface": network.IngressHostInterface,
+		"egress VPP interface":   network.EgressVPPInterface,
+		"egress host interface":  network.EgressHostInterface,
+	} {
+		if !serviceTokenSafe(value) {
+			return nil, fmt.Errorf("proxy service network %s %q is unsafe", label, value)
+		}
+	}
+	for label, value := range map[string]string{
+		"ingress VPP address":  network.IngressVPPAddress,
+		"ingress host address": network.IngressHostAddress,
+		"egress VPP address":   network.EgressVPPAddress,
+		"egress host address":  network.EgressHostAddress,
+	} {
+		address, err := netip.ParseAddr(strings.TrimSpace(value))
+		if err != nil || !address.Is4() {
+			return nil, fmt.Errorf("proxy service network %s %q is invalid", label, value)
+		}
+	}
+	for label, value := range map[string]string{"ingress CIDR": network.IngressCIDR, "egress CIDR": network.EgressCIDR} {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
+		if err != nil || !prefix.Addr().Is4() || prefix.Bits() != 30 {
+			return nil, fmt.Errorf("proxy service network %s %q is invalid", label, value)
+		}
+	}
+	if network.IngressTapID <= 0 || network.EgressTapID <= 0 || network.IngressTableID <= 0 || network.OutboundTableID <= 0 || network.IngressRulePriority <= 0 || network.OutboundRulePriority <= 0 || network.IngressMark == 0 || network.OutboundMark == 0 {
+		return nil, fmt.Errorf("proxy service network numeric identities are incomplete")
+	}
+	if network.MTU < 576 || network.MTU > 9000 {
+		return nil, fmt.Errorf("proxy service network MTU %d is outside 576-9000", network.MTU)
+	}
+	underlay := strings.TrimSpace(plan.UnderlayRoute)
+	if underlay == "" {
+		underlay = strings.TrimSpace(network.UnderlayRoute)
+	}
+	if underlay == "" || !serviceCommandTokensSafe(underlay) {
+		return nil, fmt.Errorf("proxy service network underlay route %q is unsafe", underlay)
+	}
+	underlayPath := serviceVPPRoutePath(underlay)
+	dynamicUnderlay := isRuntimePPPoEUnderlay(underlay)
+	lanRoutes := make([]string, 0, len(plan.LANRoutes))
+	for _, route := range plan.LANRoutes {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(route))
+		if err != nil || !prefix.Addr().Is4() {
+			return nil, fmt.Errorf("proxy service network LAN route %q is invalid", route)
+		}
+		lanRoutes = append(lanRoutes, prefix.Masked().String())
+	}
+
+	var builder strings.Builder
+	builder.WriteString("#!/bin/sh\nset -eu\n\n")
+	builder.WriteString("VPPCTL=${LY_ROUTE_VPPCTL:-vppctl}\n")
+	// Clear any previous readiness marker before proving the underlay.  A
+	// failed run must not leave a marker that lets the systemd unit report a
+	// half-installed proxy generation as ready.
+	builder.WriteString("rm -f /run/ly-route/proxy-policy-ready\n")
+	builder.WriteString("policy_routing_fail() { echo \"policy-routing: $*\" >&2; exit 1; }\n")
+	builder.WriteString("vpp_require() {\n  desc=$1\n  shift\n  out=$(\"$VPPCTL\" \"$@\" 2>&1) || policy_routing_fail \"$desc failed: $out\"\n  case \"$out\" in *failed*|*\"not found\"*|*invalid*) policy_routing_fail \"$desc failed: $out\" ;; esac\n}\n")
+	builder.WriteString("vpp_wait_pattern() {\n  desc=$1\n  pattern=$2\n  shift 2\n  attempt=1\n  while [ \"$attempt\" -le 10 ]; do\n    out=$(\"$@\" 2>&1) || true\n    printf '%s\\n' \"$out\" | grep -Fq \"$pattern\" && return 0\n    sleep 0.2\n    attempt=$((attempt + 1))\n  done\n  echo \"policy-routing: $desc missing '$pattern'; last output:\" >&2\n  printf '%s\\n' \"$out\" >&2\n  return 1\n}\n")
+	readinessTarget := serviceUnderlayInterface(underlay)
+	if dynamicUnderlay {
+		readinessTarget = underlay
+	}
+	readiness, err := renderVPPUnderlayReadiness([]string{readinessTarget})
+	if err != nil {
+		return nil, err
+	}
+	strictReadiness := fmt.Sprintf("if ! wait_vpp_underlay %s; then\n  echo \"VPP underlay %s is unavailable; retrying dependent policy routing\" >&2\n  exit 1\nfi\n", readinessTarget, readinessTarget)
+	if !strings.Contains(readiness, strictReadiness) {
+		return nil, fmt.Errorf("proxy readiness block is missing")
+	}
+	// A selected proxy egress must never commit with its policy routing
+	// silently skipped.  The previous optional branch exited 0 after leaving
+	// the Linux egress table and the capture generation uninstalled, which made
+	// the apply report committed while LAN traffic fell through to the direct
+	// WAN path.  Fail instead so the transaction rolls back and systemd retries
+	// once the native underlay is ready.
+	builder.WriteString(readiness)
+	if dynamicUnderlay {
+		builder.WriteString(fmt.Sprintf("UNDERLAY_IF=$(resolve_underlay %s)\n", underlayPath))
+	}
+	builder.WriteString("ensure_tap() {\n")
+	builder.WriteString("  tap_id=$1\n  host_if=$2\n  vpp_if=$3\n")
+	// A VPP TAP can survive while its Linux peer disappeared (for example
+	// after a failed service restart).  Treat that as stale state and recreate
+	// the managed TAP instead of continuing with an interface index that can
+	// resolve to the wrong proxy side.
+	builder.WriteString("  if ! ip link show dev \"$host_if\" >/dev/null 2>&1; then\n")
+	builder.WriteString("    if \"$VPPCTL\" show tap 2>/dev/null | grep -Fq \"name \\\"$host_if\\\"\"; then\n")
+	builder.WriteString("      \"$VPPCTL\" delete tap \"$vpp_if\" 2>/dev/null || true\n")
+	builder.WriteString("    fi\n")
+	builder.WriteString("  fi\n")
+	builder.WriteString("  if ! \"$VPPCTL\" show interface | awk 'NR > 1 {print $1}' | grep -Fxq \"$vpp_if\"; then\n")
+	builder.WriteString("    case \"$host_if\" in lypxhin*|lypxhout*) ;; *) echo \"refusing to replace unmanaged proxy TAP $host_if\" >&2; return 1 ;; esac\n")
+	builder.WriteString("    # VPP restart removes its TAP object but not always the Linux peer.\n")
+	builder.WriteString("    # Remove only the generated service peer before recreating the TAP.\n")
+	builder.WriteString("    ip link delete dev \"$host_if\" 2>/dev/null || true\n")
+	builder.WriteString("    \"$VPPCTL\" create tap id \"$tap_id\" host-if-name \"$host_if\" no-gso\n")
+	builder.WriteString("    \"$VPPCTL\" set interface name \"tap${tap_id}\" \"$vpp_if\"\n")
+	builder.WriteString("  fi\n")
+	builder.WriteString("  \"$VPPCTL\" set interface state \"$vpp_if\" up\n")
+	builder.WriteString("}\n\n")
+	builder.WriteString(fmt.Sprintf("ensure_tap %d %s %s\n", network.IngressTapID, network.IngressHostInterface, network.IngressVPPInterface))
+	builder.WriteString(fmt.Sprintf("ensure_tap %d %s %s\n", network.EgressTapID, network.EgressHostInterface, network.EgressVPPInterface))
+	builder.WriteString(fmt.Sprintf("vpp_require \"ingress TAP MTU\" set interface mtu packet %d %s\n", network.MTU, network.IngressVPPInterface))
+	builder.WriteString(fmt.Sprintf("vpp_require \"egress TAP MTU\" set interface mtu packet %d %s\n", network.MTU, network.EgressVPPInterface))
+	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface ip address del %s %s 2>/dev/null || true\n", network.IngressVPPInterface, network.IngressCIDR))
+	builder.WriteString(fmt.Sprintf("vpp_require \"ingress TAP address\" set interface ip address %s %s\n", network.IngressVPPInterface, network.IngressCIDR))
+	// VPP's delete form places `del` before the interface. Keeping address
+	// removal idempotent is essential while this script is retried during a
+	// runtime transaction.
+	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface ip address del %s %s 2>/dev/null || true\n", network.EgressVPPInterface, network.EgressCIDR))
+	// NAT44-ED keys its inside session on the ingress FIB.  Moving the egress
+	// TAP into a private table makes the SYN translate but every later packet
+	// miss the session, so Xray cannot complete a TCP handshake with its node.
+	// A tenant NAT pool means the egress TAP owns the proxy FIB and the
+	// underlay is installed as an explicit default route there. Without a
+	// tenant pool (dynamic WAN or WAN group), keep the legacy global-FIB
+	// handoff and only prove that underlay is resolvable.
+	tenantTable := natBehavior != nat.BehaviorFullCone && strings.TrimSpace(network.NATPoolAddress) != ""
+	if tenantTable {
+		pool, err := netip.ParseAddr(strings.TrimSpace(network.NATPoolAddress))
+		if err != nil || !pool.Is4() {
+			return nil, fmt.Errorf("proxy service network NAT pool address %q is invalid", network.NATPoolAddress)
+		}
+	}
+	if tenantTable {
+		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip table add %d 2>/dev/null || true\n", network.OutboundTableID))
+		builder.WriteString(fmt.Sprintf("vpp_require \"egress TAP tenant table\" set interface ip table %s %d\n", network.EgressVPPInterface, network.OutboundTableID))
+	} else {
+		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface ip table %s 0\n", network.EgressVPPInterface))
+	}
+	builder.WriteString(fmt.Sprintf("vpp_require \"egress TAP address\" set interface ip address %s %s\n", network.EgressVPPInterface, network.EgressCIDR))
+	if tenantTable {
+		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip route del table %d 0.0.0.0/0 2>/dev/null || true\n", network.OutboundTableID))
+		if dynamicUnderlay {
+			builder.WriteString(fmt.Sprintf("vpp_require \"proxy underlay default route\" ip route add table %d 0.0.0.0/0 via \"$UNDERLAY_IF\"\n", network.OutboundTableID))
+		} else {
+			builder.WriteString(fmt.Sprintf("vpp_require \"proxy underlay default route\" ip route add table %d 0.0.0.0/0 via %s\n", network.OutboundTableID, underlayPath))
+		}
+		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip route add table %d %s/32 via %s 2>/dev/null || true\n", network.OutboundTableID, network.EgressHostAddress, network.EgressVPPInterface))
+		builder.WriteString(fmt.Sprintf("\"$VPPCTL\" ip route add table %d %s/32 via %s 2>/dev/null || true\n", network.OutboundTableID, network.IngressHostAddress, network.IngressVPPInterface))
+	}
+	if dynamicUnderlay {
+		if tenantTable {
+			builder.WriteString(fmt.Sprintf("vpp_wait_pattern \"proxy underlay route\" \"$UNDERLAY_IF\" \"$VPPCTL\" show ip fib table %d\n", network.OutboundTableID))
+		} else {
+			builder.WriteString("vpp_wait_pattern \"proxy underlay route\" \"$UNDERLAY_IF\" \"$VPPCTL\" show ip fib table 0\n")
+		}
+	} else if name := serviceUnderlayInterface(underlay); name != "" {
+		if tenantTable {
+			builder.WriteString(fmt.Sprintf("vpp_wait_pattern \"proxy underlay route\" %s \"$VPPCTL\" show ip fib table %d\n", name, network.OutboundTableID))
+		} else {
+			builder.WriteString(fmt.Sprintf("vpp_wait_pattern \"proxy underlay route\" %s \"$VPPCTL\" show ip fib table 0\n", name))
+		}
+	}
+	// Proxy traffic enters VPP again from the Linux/Xray egress TAP. It must be
+	// the NAT inside interface for the selected WAN; otherwise the proxy node
+	// sees the private 198.18/30 source and cannot return the connection.
+	if natBehavior == nat.BehaviorFullCone {
+		builder.WriteString("\"$VPPCTL\" nat44 plugin disable >/dev/null 2>&1 || true\n")
+		builder.WriteString("\"$VPPCTL\" nat44 ei plugin enable >/dev/null 2>&1 || true\n")
+		if dynamicUnderlay {
+			builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface nat44 ei in %s out \"$UNDERLAY_IF\"\n", network.EgressVPPInterface))
+			builder.WriteString("\"$VPPCTL\" nat44 ei add interface address \"$UNDERLAY_IF\" >/dev/null 2>&1 || true\n\n")
+		} else {
+			builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface nat44 ei in %s out %s\n", network.EgressVPPInterface, serviceUnderlayInterface(underlay)))
+			builder.WriteString(fmt.Sprintf("\"$VPPCTL\" nat44 ei add interface address %s >/dev/null 2>&1 || true\n\n", serviceUnderlayInterface(underlay)))
+		}
+	} else if tenantTable {
+		// The script is re-run by the policy-routing unit on every apply. Only
+		// mutate the pool/interface roles when the live inventory says they are
+		// missing; otherwise VPP logs "already in use"/"del failed" on every
+		// re-apply, which is the NAT44 noise that preceded the J1900 crash.
+		builder.WriteString(proxyNAT44VRFShellHelpers)
+		builder.WriteString(fmt.Sprintf("if ! nat44_pool_has_vrf %s %d; then\n", network.NATPoolAddress, network.OutboundTableID))
+		builder.WriteString("  \"$VPPCTL\" nat44 ei plugin disable 2>/dev/null || true\n")
+		builder.WriteString("  \"$VPPCTL\" nat44 plugin enable 2>/dev/null || true\n")
+		builder.WriteString(fmt.Sprintf("  add_out=$(\"$VPPCTL\" nat44 add address %s tenant-vrf %d 2>&1) || true\n", network.NATPoolAddress, network.OutboundTableID))
+		builder.WriteString("  case \"$add_out\" in\n")
+		builder.WriteString("    *\"already in use\"*|*\"already exists\"*)\n")
+		builder.WriteString(fmt.Sprintf("      if ! nat44_pool_has_vrf %s %d; then\n", network.NATPoolAddress, network.OutboundTableID))
+		builder.WriteString(fmt.Sprintf("        policy_routing_fail \"tenant NAT pool %s cannot be installed in VRF %d: the address is already present in another VRF (the WAN interface address normally lives in VRF 0). The interface address cannot be reused across VRFs; configure proxy egress snat_addresses with a spare address on the WAN subnet. VPP returned: $add_out\"\n", network.NATPoolAddress, network.OutboundTableID))
+		builder.WriteString("      fi\n")
+		builder.WriteString("      ;;\n")
+		builder.WriteString("    *failed*|*\"not found\"*|*invalid*)\n")
+		builder.WriteString("      policy_routing_fail \"tenant NAT pool add failed: $add_out\"\n")
+		builder.WriteString("      ;;\n")
+		builder.WriteString("  esac\n")
+		builder.WriteString(fmt.Sprintf("  if ! nat44_pool_has_vrf %s %d; then\n", network.NATPoolAddress, network.OutboundTableID))
+		builder.WriteString(fmt.Sprintf("    policy_routing_fail \"tenant NAT pool %s was not installed in VRF %d (VPP returned: $add_out). If the WAN interface address is only present in VRF 0, configure proxy egress snat_addresses with a spare WAN address\"\n", network.NATPoolAddress, network.OutboundTableID))
+		builder.WriteString("  fi\n")
+		builder.WriteString("fi\n")
+		builder.WriteString(fmt.Sprintf("if \"$VPPCTL\" show nat44 interfaces | grep -Eq \"%s (in|out)\" ; then\n", network.EgressVPPInterface))
+		builder.WriteString(fmt.Sprintf("  \"$VPPCTL\" set interface nat44 in %s del 2>/dev/null || true\n", network.EgressVPPInterface))
+		builder.WriteString(fmt.Sprintf("  \"$VPPCTL\" set interface nat44 in %s output-feature del 2>/dev/null || true\n", network.EgressVPPInterface))
+		builder.WriteString(fmt.Sprintf("  \"$VPPCTL\" set interface nat44 out %s del 2>/dev/null || true\n", network.EgressVPPInterface))
+		builder.WriteString(fmt.Sprintf("  \"$VPPCTL\" set interface nat44 out %s output-feature del 2>/dev/null || true\n", network.EgressVPPInterface))
+		builder.WriteString("fi\n")
+		// VPP 26.06 rejects `out <wan> output-feature` while the WAN already
+		// owns the plain outside role: the CLI prints
+		// `set interface nat44: add <wan> failed` ("interface already
+		// configured") and still exits 0. The plain role is therefore replaced,
+		// and the reason is reported immediately instead of surfacing later as
+		// a generic readback failure.
+		builder.WriteString("proxy_ensure_wan_output_feature() {\n")
+		builder.WriteString("  wan_if=$1\n")
+		builder.WriteString("  if \"$VPPCTL\" show nat44 interfaces | grep -Fq \"$wan_if output-feature\"; then\n")
+		builder.WriteString("    return 0\n")
+		builder.WriteString("  fi\n")
+		builder.WriteString("  \"$VPPCTL\" set interface nat44 out \"$wan_if\" del 2>/dev/null || true\n")
+		builder.WriteString("  wan_out=$(\"$VPPCTL\" set interface nat44 out \"$wan_if\" output-feature 2>&1) || true\n")
+		builder.WriteString("  case \"$wan_out\" in *failed*|*error*|*\"not found\"*|*invalid*) policy_routing_fail \"WAN NAT output-feature failed: $wan_out\" ;; esac\n")
+		builder.WriteString("}\n")
+		if dynamicUnderlay {
+			builder.WriteString("proxy_ensure_wan_output_feature \"$UNDERLAY_IF\"\n")
+			builder.WriteString("vpp_wait_pattern \"WAN NAT output-feature\" \"$UNDERLAY_IF output-feature\" \"$VPPCTL\" show nat44 interfaces\n")
+		} else {
+			builder.WriteString(fmt.Sprintf("proxy_ensure_wan_output_feature %s\n", serviceUnderlayInterface(underlay)))
+			builder.WriteString(fmt.Sprintf("vpp_wait_pattern \"WAN NAT output-feature\" \"%s output-feature\" \"$VPPCTL\" show nat44 interfaces\n", serviceUnderlayInterface(underlay)))
+		}
+		builder.WriteString(fmt.Sprintf("nat44_wait_vrf \"tenant NAT pool\" %s %d || policy_routing_fail \"tenant NAT pool %s is not present in tenant VRF %d; if the WAN interface address only exists in VRF 0, configure proxy egress snat_addresses with a spare WAN address\"\n", network.NATPoolAddress, network.OutboundTableID, network.NATPoolAddress, network.OutboundTableID))
+	} else {
+		builder.WriteString("\"$VPPCTL\" nat44 plugin enable 2>/dev/null || true\n")
+		if dynamicUnderlay {
+			builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface nat44 in %s out \"$UNDERLAY_IF\" output-feature del 2>/dev/null || true\n", network.EgressVPPInterface))
+			builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface nat44 in %s out \"$UNDERLAY_IF\"\n\n", network.EgressVPPInterface))
+		} else {
+			builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface nat44 in %s out %s output-feature del 2>/dev/null || true\n", network.EgressVPPInterface, serviceUnderlayInterface(underlay)))
+			builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set interface nat44 in %s out %s\n\n", network.EgressVPPInterface, serviceUnderlayInterface(underlay)))
+		}
+	}
+
+	builder.WriteString(fmt.Sprintf("ip link set dev %s mtu %d up\n", network.IngressHostInterface, network.MTU))
+	builder.WriteString(fmt.Sprintf("ip link set dev %s mtu %d up\n", network.EgressHostInterface, network.MTU))
+	// TAP peers use deterministic point-to-point L3 addresses. Install both
+	// neighbor entries explicitly so proxy handoff does not depend on ARP
+	// learning across a VPP/Linux TAP boundary.
+	builder.WriteString(fmt.Sprintf("IN_TAP_MAC=\"$($VPPCTL show hardware %s | awk '/Ethernet address/{print $3; exit}')\"\n", network.IngressVPPInterface))
+	builder.WriteString(fmt.Sprintf("OUT_TAP_MAC=\"$($VPPCTL show hardware %s | awk '/Ethernet address/{print $3; exit}')\"\n", network.EgressVPPInterface))
+	builder.WriteString(fmt.Sprintf("[ -n \"$IN_TAP_MAC\" ] && ip neigh replace %s lladdr \"$IN_TAP_MAC\" nud permanent dev %s\n", network.IngressVPPAddress, network.IngressHostInterface))
+	builder.WriteString(fmt.Sprintf("[ -n \"$OUT_TAP_MAC\" ] && ip neigh replace %s lladdr \"$OUT_TAP_MAC\" nud permanent dev %s\n", network.EgressVPPAddress, network.EgressHostInterface))
+	builder.WriteString(fmt.Sprintf("IN_HOST_MAC=\"$(cat /sys/class/net/%s/address)\"\n", network.IngressHostInterface))
+	builder.WriteString(fmt.Sprintf("OUT_HOST_MAC=\"$(cat /sys/class/net/%s/address)\"\n", network.EgressHostInterface))
+	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set ip neighbor %s %s \"$IN_HOST_MAC\" static\n", network.IngressVPPInterface, network.IngressHostAddress))
+	builder.WriteString(fmt.Sprintf("\"$VPPCTL\" set ip neighbor %s %s \"$OUT_HOST_MAC\" static\n", network.EgressVPPInterface, network.EgressHostAddress))
+	builder.WriteString(fmt.Sprintf("ip address replace %s/30 dev %s\n", network.IngressHostAddress, network.IngressHostInterface))
+	builder.WriteString(fmt.Sprintf("ip address replace %s/30 dev %s\n", network.EgressHostAddress, network.EgressHostInterface))
+	builder.WriteString(fmt.Sprintf("sysctl -q -w net.ipv4.conf.%s.rp_filter=0\n", network.IngressHostInterface))
+	builder.WriteString(fmt.Sprintf("sysctl -q -w net.ipv4.conf.%s.rp_filter=0\n", network.EgressHostInterface))
+	// TPROXY listeners must be allowed to bind to original client addresses.
+	builder.WriteString("sysctl -q -w net.ipv4.ip_nonlocal_bind=1\n")
+	// DNS service sockets use host-owned source addresses, cross VPP, and
+	// re-enter Linux on this interface for transparent proxying.
+	builder.WriteString(fmt.Sprintf("sysctl -q -w net.ipv4.conf.%s.accept_local=1\n", network.IngressHostInterface))
+	builder.WriteString(fmt.Sprintf("while ip rule del fwmark 0x%x/0xffffffff table %d priority %d 2>/dev/null; do :; done\n", network.IngressMark, network.IngressTableID, network.IngressRulePriority))
+	builder.WriteString(fmt.Sprintf("ip rule add fwmark 0x%x/0xffffffff table %d priority %d\n", network.IngressMark, network.IngressTableID, network.IngressRulePriority))
+	builder.WriteString(fmt.Sprintf("ip route replace local 0.0.0.0/0 dev lo table %d\n", network.IngressTableID))
+	builder.WriteString(fmt.Sprintf("while ip rule del fwmark 0x%x/0xffffffff table %d priority %d 2>/dev/null; do :; done\n", network.OutboundMark, network.OutboundTableID, network.OutboundRulePriority))
+	builder.WriteString(fmt.Sprintf("ip rule add fwmark 0x%x/0xffffffff table %d priority %d\n", network.OutboundMark, network.OutboundTableID, network.OutboundRulePriority))
+	builder.WriteString(fmt.Sprintf("ip route replace default via %s dev %s table %d\n", network.EgressVPPAddress, network.EgressHostInterface, network.OutboundTableID))
+	for _, route := range lanRoutes {
+		builder.WriteString(fmt.Sprintf("ip route replace %s via %s dev %s\n", route, network.IngressVPPAddress, network.IngressHostInterface))
+	}
+	builder.WriteString("ip route flush cache\n\n")
+	builder.WriteString(fmt.Sprintf("vpp_wait_pattern \"ingress TAP address readback\" %s \"$VPPCTL\" show interface address %s\n", network.IngressVPPAddress, network.IngressVPPInterface))
+	builder.WriteString(fmt.Sprintf("vpp_wait_pattern \"egress TAP address readback\" %s \"$VPPCTL\" show interface address %s\n", network.EgressVPPAddress, network.EgressVPPInterface))
+	builder.WriteString(fmt.Sprintf("ip route show table %d | grep -Fq %s || policy_routing_fail \"egress host route missing from table %d: $(ip route show table %d)\"\n", network.OutboundTableID, network.EgressVPPAddress, network.OutboundTableID, network.OutboundTableID))
+	// Marker consumed by the systemd unit's ExecStartPost. A boot-time apply
+	// can run before PPPoE has an address; the unit must retry instead of
+	// reporting success with no TPROXY policy rules installed.
+	builder.WriteString("mkdir -p /run/ly-route\n")
+	builder.WriteString("printf 'ready\\n' > /run/ly-route/proxy-policy-ready\n")
+	return []RenderedArtifact{NewArtifact(LinuxRouting, "/var/lib/ly-route/policy-routing/apply.sh", builder.String(), "restart")}, nil
+}
+
+func serviceCommandTokensSafe(value string) bool {
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return false
+	}
+	for _, field := range fields {
+		if !serviceTokenSafe(field) {
+			return false
+		}
+	}
+	return true
+}
+
+func serviceUnderlayInterface(value string) string {
+	fields := strings.Fields(strings.TrimSpace(value))
+	candidates := make([]string, 0, 2)
+	for index := 0; index < len(fields); index++ {
+		token := strings.TrimSpace(fields[index])
+		lower := strings.ToLower(token)
+		if lower == "ip4-lookup-in-table" {
+			return ""
+		}
+		if strings.HasPrefix(lower, "pppoe") || strings.HasPrefix(lower, "pppox") || strings.HasPrefix(lower, "lyppp-") {
+			return token
+		}
+		switch lower {
+		case "via":
+			if index+1 >= len(fields) {
+				return ""
+			}
+			next := strings.TrimSpace(fields[index+1])
+			index++
+			if address, err := netip.ParseAddr(next); err == nil && address.Is4() {
+				continue
+			}
+			candidates = append(candidates, next)
+		case "dev":
+			if index+1 >= len(fields) {
+				return ""
+			}
+			index++
+			candidates = append(candidates, strings.TrimSpace(fields[index]))
+		case "table", "metric", "scope", "src", "proto", "preference":
+			if index+1 < len(fields) {
+				index++
+			}
+		default:
+			if address, err := netip.ParseAddr(token); err == nil && address.Is4() {
+				continue
+			}
+			candidates = append(candidates, token)
+		}
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+	return candidates[0]
+}
+
+func serviceVPPRoutePath(value string) string {
+	fields := strings.Fields(strings.TrimSpace(value))
+	if len(fields) == 1 && (strings.HasPrefix(strings.ToLower(fields[0]), "pppoe_session") ||
+		strings.HasPrefix(strings.ToLower(fields[0]), "pppox") ||
+		strings.HasPrefix(strings.ToLower(fields[0]), "lyppp-") ||
+		isRuntimePPPoEUnderlay(fields[0])) {
+		// PPPoE is a point-to-point VPP interface. VPP resolves the peer
+		// through the session; an artificial 0.0.0.0 next hop is invalid.
+		return fields[0]
+	}
+	return strings.TrimSpace(value)
+}
+
+func isRuntimePPPoEUnderlay(value string) bool {
+	return strings.HasPrefix(strings.TrimSpace(value), "pppoe-runtime:")
+}
+
+func renderRuntimeUnderlayResolver(underlays []string) (string, error) {
+	for _, underlay := range underlays {
+		if !isRuntimePPPoEUnderlay(underlay) {
+			continue
+		}
+		peerID := strings.TrimPrefix(strings.TrimSpace(underlay), "pppoe-runtime:")
+		if !serviceTokenSafe(peerID) || peerID == "" {
+			return "", fmt.Errorf("PPPoE runtime underlay %q has an unsafe peer id", underlay)
+		}
+	}
+	for _, underlay := range underlays {
+		if isRuntimePPPoEUnderlay(underlay) {
+			return "resolve_underlay() {\n" +
+				"  case \"$1\" in\n" +
+				"    pppoe-runtime:*)\n" +
+				"      peer_id=${1#pppoe-runtime:}\n" +
+				"      status_file=/run/ly-route/pppoe/$peer_id.json\n" +
+				"      [ -r \"$status_file\" ] || { echo \"PPPoE status $status_file is unavailable\" >&2; return 1; }\n" +
+				"      interface=$(sed -n 's/.*\"interface\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$status_file\" | head -n 1)\n" +
+				"      case \"$interface\" in pppoe_session[0-9]*|pppox[0-9]*|lyppp-*) printf '%s\\n' \"$interface\" ;; *) echo \"invalid PPPoE runtime interface\" >&2; return 1 ;; esac\n" +
+				"      ;;\n" +
+				"    *) printf '%s\\n' \"$1\" ;;\n" +
+				"  esac\n" +
+				"}\n", nil
+		}
+	}
+	return "resolve_underlay() { printf '%s\\n' \"$1\"; }\n", nil
+}
+
+func renderVPPUnderlayReadiness(interfaces []string) (string, error) {
+	return renderVPPUnderlayReadinessMode(interfaces, true)
+}
+
+// renderVPPUnderlayReadinessMode renders the resolver and readiness helper used
+// by Linux policy-routing artifacts.  strict=false must be used by artifacts
+// whose underlay may legitimately be unavailable during an apply (a clean
+// install starts PPPoE asynchronously): they defer the dependent section and
+// let the next reconciliation install it once the session exists.
+func renderVPPUnderlayReadinessMode(interfaces []string, strict bool) (string, error) {
+	unique := map[string]struct{}{}
+	for _, name := range interfaces {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !serviceTokenSafe(name) {
+			return "", fmt.Errorf("VPP underlay interface %q is unsafe", name)
+		}
+		unique[name] = struct{}{}
+	}
+	if len(unique) == 0 {
+		return "", nil
+	}
+	ordered := make([]string, 0, len(unique))
+	for name := range unique {
+		ordered = append(ordered, name)
+	}
+	slices.Sort(ordered)
+	var builder strings.Builder
+	builder.WriteString("VPPCTL=${LY_ROUTE_VPPCTL:-vppctl}\n")
+	resolver, err := renderRuntimeUnderlayResolver(ordered)
+	if err != nil {
+		return "", err
+	}
+	builder.WriteString(resolver)
+	builder.WriteString("wait_vpp_underlay() {\n")
+	builder.WriteString("  attempts=${LY_ROUTE_VPP_UNDERLAY_READY_ATTEMPTS:-10}\n")
+	builder.WriteString("  interval=${LY_ROUTE_VPP_UNDERLAY_READY_INTERVAL:-1}\n")
+	builder.WriteString("  case \"$attempts:$interval\" in *[!0-9:]*|0:*|*:0) echo \"VPP underlay readiness settings must be positive integers\" >&2; return 1 ;; esac\n")
+	builder.WriteString("  attempt=1\n")
+	builder.WriteString("  while :; do\n")
+	builder.WriteString("    underlay_if=$(resolve_underlay \"$1\" 2>/dev/null || true)\n")
+	builder.WriteString("    case \"$1\" in\n")
+	// A native PPPoE session interface exists as soon as the client is
+	// created; it does not need an IPCP address before routes/NAT can attach.
+	builder.WriteString("      pppoe-runtime:*)\n")
+	builder.WriteString("        if [ -n \"$underlay_if\" ] && \"$VPPCTL\" show interface 2>/dev/null | awk 'NR > 1 {print $1}' | grep -Fxq \"$underlay_if\"; then return 0; fi\n")
+	builder.WriteString("        ;;\n")
+	builder.WriteString("      *)\n")
+	builder.WriteString("        if [ -n \"$underlay_if\" ] && \"$VPPCTL\" show interface address 2>/dev/null | tr -d '\\r' | grep -A1 -E \"^$underlay_if \" | grep -Eq '^  L3 [0-9]'; then return 0; fi\n")
+	builder.WriteString("        ;;\n")
+	builder.WriteString("    esac\n")
+	builder.WriteString("    [ \"$attempt\" -lt \"$attempts\" ] || { echo \"VPP underlay ${underlay_if:-$1} did not become ready\" >&2; return 1; }\n")
+	builder.WriteString("    sleep \"$interval\"\n")
+	builder.WriteString("    attempt=$((attempt + 1))\n")
+	builder.WriteString("  done\n")
+	builder.WriteString("}\n")
+	// A missing PPPoE/proxy underlay is normal during boot or link
+	// renegotiation.  Strict artifacts ask systemd to retry after the native
+	// session has obtained an address; non-strict artifacts defer the section
+	// so an apply can still commit the rest of the generation.
+	for _, name := range ordered {
+		builder.WriteString(fmt.Sprintf("if ! wait_vpp_underlay %s; then\n", name))
+		if strict {
+			builder.WriteString(fmt.Sprintf("  echo \"VPP underlay %s is unavailable; retrying dependent policy routing\" >&2\n", name))
+			builder.WriteString("  exit 1\n")
+		} else {
+			builder.WriteString(fmt.Sprintf("  echo \"VPP underlay %s is unavailable; deferring dependent policy routing\" >&2\n", name))
+		}
+		builder.WriteString("fi\n")
+	}
+	return builder.String(), nil
+}
+
+func RenderPPPoE(peer PPPoEPeer) ([]RenderedArtifact, error) {
+	return RenderPPPoEConfig([]PPPoEPeer{peer})
+}
+
+func RenderPPPoEConfig(peers []PPPoEPeer) ([]RenderedArtifact, error) {
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("pppoe config requires at least one peer")
+	}
+	artifacts := make([]RenderedArtifact, 0, len(peers))
+	seenIDs := map[string]bool{}
+	for _, peer := range peers {
+		if strings.TrimSpace(peer.ID) == "" || strings.TrimSpace(peer.Interface) == "" || strings.TrimSpace(peer.Username) == "" {
+			return nil, fmt.Errorf("pppoe peer requires id, interface, and username")
+		}
+		if err := requirePPPoEToken(peer.ID, "id"); err != nil {
+			return nil, err
+		}
+		if err := requirePPPoEToken(peer.Interface, "interface"); err != nil {
+			return nil, err
+		}
+		if err := requirePPPoEToken(peer.Username, "username"); err != nil {
+			return nil, err
+		}
+		if strings.ContainsAny(peer.Password, "\x00\n\r") {
+			return nil, fmt.Errorf("pppoe password contains unsupported control characters")
+		}
+		if seenIDs[peer.ID] {
+			return nil, fmt.Errorf("duplicate pppoe peer id %q", peer.ID)
+		}
+		seenIDs[peer.ID] = true
+		mtu := peer.MTU
+		if mtu == 0 {
+			mtu = 1492
+		}
+		mru := peer.MRU
+		if mru == 0 {
+			mru = 1492
+		}
+		if mtu < 1280 || mtu > 1492 || mru < 1280 || mru > 1492 {
+			return nil, fmt.Errorf("pppoe mtu and mru must be between 1280 and 1492")
+		}
+		digest := sha256.Sum256([]byte(peer.ID))
+		tapID := 500 + int(binary.BigEndian.Uint16(digest[:2]))%3000
+		controlInterface := "lyppp-" + hex.EncodeToString(digest[:4])
+		wanInterface := peer.Interface
+		if !strings.HasPrefix(wanInterface, "lyroute-") {
+			wanInterface = "lyroute-" + wanInterface
+		}
+		natInside := peer.NATInsideInterfaces
+		if natInside == nil {
+			natInside = []string{}
+		}
+		ipv6LAN := peer.IPv6LANInterfaces
+		if ipv6LAN == nil {
+			ipv6LAN = []string{}
+		}
+		content, err := marshalIndented(map[string]any{
+			"id":                    peer.ID,
+			"control_interface":     controlInterface,
+			"wan_interface":         wanInterface,
+			"username":              peer.Username,
+			"password":              peer.Password,
+			"mru":                   mru,
+			"tap_id":                tapID,
+			"vppctl":                "vppctl",
+			"status_file":           "/run/ly-route/pppoe/" + peer.ID + ".json",
+			"default_route":         true,
+			"nat":                   true,
+			"nat_inside_interfaces": natInside,
+			"nat_behavior":          peer.NATBehavior,
+			"ipv6_prefix_group":     peer.IPv6PrefixGroup,
+			"ipv6_lan_interfaces":   ipv6LAN,
+		})
+		if err != nil {
+			return nil, err
+		}
+		artifacts = append(artifacts, NewArtifact(PPPoE, "/etc/ly-route/pppoe/ly-route-"+peer.ID+".json", content, "restart"))
+	}
+	return artifacts, nil
+}
+
+func PPPoEInterfaceName(id string) string {
+	digest := sha256.Sum256([]byte(strings.TrimSpace(id)))
+	return "pppoe_session_ly" + hex.EncodeToString(digest[:4])
+}
+
+func NewPPPoEStatus(peer PPPoEPeer, state PPPoEState, assignedIPv4, assignedIPv6 string, tableID int, lastError string) (PPPoEStatus, error) {
+	if strings.TrimSpace(peer.ID) == "" || strings.TrimSpace(peer.Interface) == "" {
+		return PPPoEStatus{}, fmt.Errorf("pppoe status requires peer id and interface")
+	}
+	if err := requirePPPoEToken(peer.ID, "id"); err != nil {
+		return PPPoEStatus{}, err
+	}
+	if err := requirePPPoEToken(peer.Interface, "interface"); err != nil {
+		return PPPoEStatus{}, err
+	}
+	switch state {
+	case PPPoEDisconnected, PPPoEConnecting, PPPoEConnected, PPPoEFailed:
+	default:
+		return PPPoEStatus{}, fmt.Errorf("unsupported pppoe state %q", state)
+	}
+	status := PPPoEStatus{PeerID: peer.ID, Interface: peer.Interface, State: state, AssignedIPv4: strings.TrimSpace(assignedIPv4), AssignedIPv6: strings.TrimSpace(assignedIPv6), VPPTableID: tableID, LastError: strings.TrimSpace(lastError)}
+	// VPP's default FIB is table 0.  A connected PPPoE peer using the
+	// default table is fully routable and must not be reported as pending.
+	status.RouteReady = state == PPPoEConnected && status.AssignedIPv4 != "" && tableID >= 0
+	if status.RouteReady {
+		status.VPPRouteHandoff = "vpp.fib.route"
+	}
+	return status, nil
+}
+
+func PPPoEVPPRouteHandoff(status PPPoEStatus, requestID string) ([]vpp.Operation, error) {
+	if !status.RouteReady {
+		return nil, fmt.Errorf("pppoe route handoff is not ready")
+	}
+	handoff := PPPoERouteHandoff{PeerID: status.PeerID, Interface: status.Interface, VPPTableID: status.VPPTableID, Destination: "0.0.0.0/0", Ready: true}
+	return []vpp.Operation{{Name: "vpp.fib.route", RequestID: requestID, Resource: status.PeerID, Payload: handoff}}, nil
+}
+
+func requirePPPoEToken(value, field string) error {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return fmt.Errorf("pppoe %s is required", field)
+	}
+	if trimmed != value || strings.ContainsAny(trimmed, "\x00\n\r\t ;|&$()<>\\\"") {
+		return fmt.Errorf("pppoe %s contains unsupported characters", field)
+	}
+	return nil
+}
+
+func marshalIndented(value any) (string, error) {
+	payload, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(payload) + "\n", nil
+}
+
+type FilesystemController struct {
+	RootDir            string
+	Runner             CommandRunner
+	Now                func() time.Time
+	XrayAPIAddress     string
+	XrayMetricsAddress string
+}
+
+func (controller FilesystemController) ReloadOrRestart(ctx context.Context, service ServiceName, artifacts []RenderedArtifact) error {
+	return controller.applyWithRecovery(ctx, service, artifacts)
+}
+
+// Restart starts a stopped/failed daemon without touching its rendered files.
+// reset-failed clears systemd start-limit state after a VPP-induced failure.
+func (controller FilesystemController) Restart(ctx context.Context, service ServiceName) error {
+	if controller.Runner == nil {
+		return fmt.Errorf("%s restart requires a daemon command runner", service)
+	}
+	unit := serviceUnit(service)
+	_ = controller.Runner.Run(ctx, "systemctl", "reset-failed", unit)
+	return controller.Runner.Run(ctx, "systemctl", "start", unit)
+}
+
+func (controller FilesystemController) Status(ctx context.Context, service ServiceName) (Health, error) {
+	if controller.Runner == nil {
+		return Health{Service: service, Available: false, Reason: "service command runner is not configured"}, nil
+	}
+	return controller.Runner.Status(ctx, service)
+}
+
+func (controller FilesystemController) Rollback(ctx context.Context, service ServiceName, artifacts []RenderedArtifact) error {
+	return controller.rollbackWithSnapshot(ctx, service, artifacts)
+}
+
+func (controller FilesystemController) Logs(ctx context.Context, service ServiceName, lines int) (string, error) {
+	if lines <= 0 {
+		lines = 100
+	}
+	output, err := exec.CommandContext(ctx, "journalctl", "-u", serviceUnit(service), "--no-pager", "-n", strconv.Itoa(lines)).CombinedOutput()
+	text := Redact(strings.TrimSpace(string(output)))
+	if err != nil {
+		if text == "" {
+			text = err.Error()
+		}
+		return text, err
+	}
+	return text, nil
+}
+
+func (controller FilesystemController) writeArtifacts(service ServiceName, artifacts []RenderedArtifact) error {
+	if service == SmartDNS {
+		if err := controller.removeStaleSmartDNSArtifacts(artifacts); err != nil {
+			return err
+		}
+	}
+	for _, artifact := range artifacts {
+		path, err := controller.resolvePath(artifact.Path)
+		if err != nil {
+			return err
+		}
+		mode := os.FileMode(0640)
+		if service == Dnsmasq {
+			// dnsmasq drops privileges after binding, but the drop-in must stay
+			// readable after an atomic replace and carries no credentials.
+			mode = 0644
+		}
+		if strings.HasSuffix(path, ".sh") {
+			mode = 0750
+		}
+		if service == PPPoE && strings.HasPrefix(artifact.Path, "/etc/ly-route/pppoe/") {
+			mode = 0600
+		}
+		if err := writeFileAtomically(path, []byte(artifact.Content), mode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (controller FilesystemController) removeStaleSmartDNSArtifacts(artifacts []RenderedArtifact) error {
+	keep := map[string]bool{}
+	for _, artifact := range artifacts {
+		if artifact.Service == SmartDNS {
+			keep[filepath.Base(artifact.Path)] = true
+		}
+	}
+	removeFromDir := func(path, prefix, suffix string) error {
+		dir, err := controller.resolvePath(path)
+		if err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+				continue
+			}
+			if keep[name] {
+				continue
+			}
+			if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := removeFromDir("/etc/smartdns/conf.d", "ly-route-", ".conf"); err != nil {
+		return err
+	}
+	return removeFromDir("/etc/smartdns/domain-sets", "lyroute-", ".list")
+}
+
+func (controller FilesystemController) resolvePath(path string) (string, error) {
+	clean := filepath.Clean("/" + strings.TrimSpace(path))
+	if clean == "/" || strings.Contains(clean, "..") {
+		return "", fmt.Errorf("invalid artifact path %q", path)
+	}
+	if controller.RootDir == "" {
+		return clean, nil
+	}
+	return filepath.Join(controller.RootDir, strings.TrimPrefix(clean, "/")), nil
+}
+
+func serviceUnit(service ServiceName) string {
+	return healthUnit(service)
+}
+
+func applyUnit(service ServiceName) string {
+	switch service {
+	case SmartDNS:
+		return "smartdns.service"
+	case Dnsmasq:
+		return "dnsmasq.service"
+	case Xray:
+		return "xray.service"
+	case PPPoE:
+		return "ly-route-pppoe.target"
+	case VPP:
+		return "ly-route-vpp-apply.service"
+	case Nftables:
+		return "nftables.service"
+	case LinuxRouting:
+		return "ly-route-policy-routing.service"
+	case IPv6RA:
+		return "radvd.service"
+	default:
+		return string(service) + ".service"
+	}
+}
+
+func applyCommand(service ServiceName) string {
+	switch service {
+	case VPP, LinuxRouting:
+		return "restart"
+	default:
+		return "reload-or-restart"
+	}
+}
+
+func directApplyHelper(service ServiceName) string {
+	switch service {
+	case VPP:
+		return "/usr/lib/ly-route/vpp-apply-default"
+	case LinuxRouting:
+		return "/usr/lib/ly-route/policy-routing-apply-default"
+	default:
+		return ""
+	}
+}
+
+func healthUnit(service ServiceName) string {
+	switch service {
+	case VPP:
+		return "vpp.service"
+	default:
+		return applyUnit(service)
+	}
+}
+
+func (runtime Runtime) Apply(ctx context.Context, artifacts []RenderedArtifact) error {
+	return runtime.ApplyCapabilities(ctx, artifacts).Err()
+}
+
+func (runtime Runtime) Stop(ctx context.Context, service ServiceName, artifacts []RenderedArtifact) error {
+	defer runtime.invalidateHealth()
+	if runtime.Controller == nil {
+		return fmt.Errorf("%s stop requires a service controller", service)
+	}
+	controller, ok := runtime.Controller.(StopController)
+	if !ok {
+		return fmt.Errorf("%s service controller does not support verified stop", service)
+	}
+	return controller.Stop(ctx, service, artifacts)
+}
+
+func (runtime *Runtime) HealthCheck(ctx context.Context, services ...ServiceName) ([]Health, error) {
+	if runtime == nil || runtime.Controller == nil {
+		return nil, fmt.Errorf("service controller is not configured")
+	}
+	cache := runtime.healthCache()
+	results := make([]Health, len(services))
+	errs := make([]error, len(services))
+	var wait sync.WaitGroup
+	for index, service := range services {
+		wait.Add(1)
+		go func(index int, service ServiceName) {
+			defer wait.Done()
+			results[index], errs[index] = cache.check(ctx, service, func(checkCtx context.Context) (Health, error) {
+				return runtime.Controller.Status(checkCtx, service)
+			})
+		}(index, service)
+	}
+	wait.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	return results, nil
+}
+
+func (runtime Runtime) Rollback(ctx context.Context, artifacts []RenderedArtifact) error {
+	defer runtime.invalidateHealth()
+	byService := groupByService(artifacts)
+	order := serviceOrder()
+	rollbackErrors := make([]error, 0)
+	for i := len(order) - 1; i >= 0; i-- {
+		service := order[i]
+		items := byService[service]
+		if len(items) == 0 {
+			continue
+		}
+		if err := runtime.Controller.Rollback(ctx, service, items); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("rollback %s: %w", service, err))
+		}
+	}
+	return errors.Join(rollbackErrors...)
+}
+
+func Redact(value string) string {
+	redacted := value
+	for _, marker := range []string{"xray://", "vmess://", "vless://", "trojan://", "ss://", "subscription", "credential", "password", "token", "secret", "private_key"} {
+		for {
+			index := strings.Index(strings.ToLower(redacted), marker)
+			if index < 0 {
+				break
+			}
+			end := index + len(marker)
+			for end < len(redacted) && !strings.ContainsRune(" \n\t\r\"'", rune(redacted[end])) {
+				end++
+			}
+			redacted = redacted[:index] + "[redacted]" + redacted[end:]
+		}
+	}
+	return redacted
+}
+
+func groupByService(artifacts []RenderedArtifact) map[ServiceName][]RenderedArtifact {
+	grouped := map[ServiceName][]RenderedArtifact{}
+	for _, artifact := range artifacts {
+		grouped[artifact.Service] = append(grouped[artifact.Service], artifact)
+	}
+	return grouped
+}
+
+func serviceOrder() []ServiceName {
+	// PPPoE establishes the VPP WAN session and its notifier refreshes policy
+	// routing. Start it before routing and dependent daemons so that refresh
+	// cannot stop an already-validated SmartDNS or proxy service mid-apply.
+	// Install transparent capture only after Xray accepts full-proxy ingress.
+	return []ServiceName{VPP, PPPoE, LinuxRouting, SmartDNS, Dnsmasq, Xray, Nftables, IPv6RA}
+}

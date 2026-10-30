@@ -1,0 +1,135 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  API: http://127.0.0.1:10000/api/v1
+  REPO: ${{ github.repository }}
+  GITEA_TOKEN: 7f7638a8da4d6782c869a786cf8e218d3db08364
+  GOPROXY: https://goproxy.cn,direct
+  npm_config_registry: https://registry.npmmirror.com
+  GOFLAGS: -mod=mod
+  GOTOOLCHAIN: local
+
+jobs:
+  control-binary:
+    runs-on: x86-physical
+    timeout-minutes: 45
+    steps:
+      - name: checkout
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "http://127.0.0.1:10000/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+
+      - name: resolve version
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/tags/*) VERSION="${GITHUB_REF_NAME#v}" ;;
+            *) VERSION="dev-$(git rev-parse --short HEAD)" ;;
+          esac
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "release version: $VERSION"
+
+      - name: go build ./...
+        run: |
+          set -euo pipefail
+          cd backend
+          go build ./...
+
+      - name: orchestrator contracts
+        run: |
+          set -euo pipefail
+          cd backend
+          go test ./internal/orchestrator/... ./internal/orchestratorapi/... -count=1 -timeout 600s
+          cd ..
+          sh scripts/test-orchestrator-policy-contract.sh
+          sh scripts/test-orchestrator-negative-contract.sh
+
+      - name: build orchestrator-control (amd64, arm64)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ldflags="-s -w -X ly-route/backend/orchestrator.buildVersion=${VERSION}"
+          cd backend
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$ldflags" \
+            -o ../dist/orchestrator-control-linux-amd64 ./cmd/orchestrator-control
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$ldflags" \
+            -o ../dist/orchestrator-control-linux-arm64 ./cmd/orchestrator-control
+          cd ..
+          ./dist/orchestrator-control-linux-amd64 --version
+          file dist/orchestrator-control-linux-amd64 dist/orchestrator-control-linux-arm64
+          ( cd dist && sha256sum orchestrator-control-linux-* > SHA256SUMS && cat SHA256SUMS )
+
+      - name: upload control binaries
+        run: |
+          set -euo pipefail
+          bash scripts/ci-upload-release.sh "$VERSION" dist/orchestrator-control-linux-amd64
+          bash scripts/ci-upload-release.sh "$VERSION" dist/orchestrator-control-linux-arm64
+          bash scripts/ci-upload-release.sh "$VERSION" dist/SHA256SUMS
+
+  frontend-bundle:
+    runs-on: x86-physical
+    timeout-minutes: 20
+    steps:
+      - name: checkout
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "http://127.0.0.1:10000/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+
+      - name: resolve version
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/tags/*) VERSION="${GITHUB_REF_NAME#v}" ;;
+            *) VERSION="dev-$(git rev-parse --short HEAD)" ;;
+          esac
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: verify pinned bundle hash and UI contract
+        run: |
+          set -euo pipefail
+          sh scripts/test-orchestrator-ui-bundle-contract.sh
+          python3 - <<'PY'
+          import hashlib, json, pathlib, sys
+          profile = json.loads(pathlib.Path("packaging/build-profiles/orchestrator.json").read_text())
+          pin = profile["frontend_app_sha256"]
+          bundle = pathlib.Path(profile["frontend_bundle"])
+          digest = hashlib.sha256((bundle / "app.js").read_bytes()).hexdigest()
+          if digest != pin:
+              sys.exit(f"orchestrator bundle app.js sha256 {digest} != pinned {pin}")
+          manifest = json.loads((bundle.parent / "manifest.json").read_text())
+          for name, expected in manifest["files"].items():
+              actual = hashlib.sha256((bundle / name).read_bytes()).hexdigest()
+              if actual != expected:
+                  sys.exit(f"bundle file {name} sha256 mismatch: {actual} != {expected}")
+          print(f"orchestrator bundle verified against pin {pin}")
+          PY
+
+      - name: package frontend bundle
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          out="dist/ly-orchestrator-frontend-${VERSION}.tar.zst"
+          tar --zstd -cf "$out" -C packaging/orchestrator-frontend .
+          ( cd dist && sha256sum "$(basename "$out")" > "ly-orchestrator-frontend-${VERSION}.sha256" )
+          ls -l dist
+
+      - name: upload frontend bundle
+        run: |
+          set -euo pipefail
+          bash scripts/ci-upload-release.sh "$VERSION" "dist/ly-orchestrator-frontend-${VERSION}.tar.zst"
+          bash scripts/ci-upload-release.sh "$VERSION" "dist/ly-orchestrator-frontend-${VERSION}.sha256"

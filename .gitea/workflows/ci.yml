@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOPROXY: https://goproxy.cn,direct
+  npm_config_registry: https://registry.npmmirror.com
+  GOFLAGS: -mod=mod
+  GOTOOLCHAIN: local
+
+jobs:
+  verify:
+    runs-on: x86-physical
+    timeout-minutes: 45
+    steps:
+      - name: checkout
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add origin "http://127.0.0.1:10000/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+
+      - name: go build ./...
+        run: |
+          set -euo pipefail
+          cd backend
+          go build ./...
+
+      - name: orchestrator unit tests
+        run: |
+          set -euo pipefail
+          cd backend
+          go test ./internal/orchestrator/... ./internal/orchestratorapi/... ./orchestrator/... ./cmd/orchestrator-control/... \
+            -count=1 -timeout 600s
+
+      - name: orchestrator HTTP boundary contracts
+        run: |
+          set -euo pipefail
+          cd backend
+          go test ./internal/httpapi \
+            -run 'TestOrchestrator|TestGatewayConversion|TestFirmwareUpgradeInstaller' \
+            -count=1 -timeout 600s
+
+      - name: shared product/persistence contracts
+        run: |
+          set -euo pipefail
+          cd backend
+          go test ./internal/product ./internal/persistence ./internal/productupdate -count=1 -timeout 600s
+
+      - name: orchestrator policy and negative contracts
+        run: |
+          set -euo pipefail
+          sh scripts/test-orchestrator-policy-contract.sh
+          sh scripts/test-orchestrator-negative-contract.sh
+
+      - name: orchestrator dataplane contracts
+        run: |
+          set -euo pipefail
+          sh scripts/test-orchestrator-dataplane-contract.sh
+
+      - name: orchestrator UI bundle contract
+        run: |
+          set -euo pipefail
+          node --version
+          sh scripts/test-orchestrator-ui-bundle-contract.sh
+
+      - name: orchestrator-control builds
+        run: |
+          set -euo pipefail
+          cd backend
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" \
+            -o "$GITHUB_WORKSPACE/dist/orchestrator-control" ./cmd/orchestrator-control
+          "$GITHUB_WORKSPACE/dist/orchestrator-control" --version || true
+          file "$GITHUB_WORKSPACE/dist/orchestrator-control" || true

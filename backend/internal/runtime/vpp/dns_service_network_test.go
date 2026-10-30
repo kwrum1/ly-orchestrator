@@ -1,0 +1,158 @@
+package vpp
+
+import (
+	"fmt"
+	"reflect"
+	"strings"
+	"testing"
+
+	"ly-route/backend/internal/runtime/nat"
+)
+
+func TestDNSServiceNetworkUsesStableDedicatedVPPHandoff(t *testing.T) {
+	network, err := DNSServiceNetworkForUpstreamID("dns-media", "wan-primary", []string{"9.9.9.9", "1.1.1.1", "9.9.9.9"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := DNSServiceNetworkForUpstreamID("dns-media", "wan-primary", []string{"1.1.1.1", "9.9.9.9"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(network, again) {
+		t.Fatalf("network is not stable: %#v != %#v", network, again)
+	}
+	if !strings.HasPrefix(network.VPPInterface, "lydns") || !strings.HasPrefix(network.HostInterface, "lydnsh") || network.TapID < dnsServiceTapIDBase || network.TapID >= dnsServiceTapIDBase+dnsServiceTapIDSpan {
+		t.Fatalf("DNS service network identities are invalid: %#v", network)
+	}
+	if network.MTU != defaultDNSServiceMTU {
+		t.Fatalf("DNS service network default MTU = %d", network.MTU)
+	}
+	if err := BindDNSServiceNetwork(&network, "192.0.2.1 lyroute-wan0", 1492); err != nil {
+		t.Fatal(err)
+	}
+	plan := validPlan(t, "dns-service-network")
+	plan.AddressAssignments = append(plan.AddressAssignments, AddressAssignment{ID: "wan-wan0", LinuxInterface: "wan0", VPPInterface: "lyroute-wan0", CIDR: "203.0.113.2/24", Role: "wan"})
+	plan = provenPlan(plan, "enp2s0", "wan0")
+	plan.DNSServiceNetworks = []DNSServiceNetwork{network}
+	pools, err := dnsServiceNetworkNATPoolAddresses(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pools) != 1 || pools[0] == "203.0.113.2" {
+		t.Fatalf("service NAT pool = %#v, want a spare WAN address", pools)
+	}
+	operations := mustBuildOperations(t, plan)
+	assertOperationCommand(t, operations, "vpp.dns-service.network", "create tap id")
+	assertOperationCommand(t, operations, "vpp.dns-service.network", "set interface mtu packet 1492 "+network.VPPInterface)
+	assertOperationCommand(t, operations, "vpp.dns-service.network", "ip route add table")
+	assertOperationCommand(t, operations, "vpp.dns-service.network", "set interface nat44 in "+network.VPPInterface+" out lyroute-wan0")
+	assertOperationCommand(t, operations, "vpp.dns-service.network", "?nat44 add address "+pools[0]+" tenant-vrf")
+	assertDNSServiceNetworkEnablesNATBeforeRole(t, operations, network)
+	// The global LAN->WAN pool must still own the WAN interface address.
+	assertOperationCommand(t, operations, "vpp.nat44.initialize", "?nat44 add address 203.0.113.2 tenant-vrf 0")
+	plan.NAT.Behavior = nat.BehaviorFullCone
+	operations = mustBuildOperations(t, plan)
+	assertOperationCommand(t, operations, "vpp.dns-service.network", "set interface nat44 ei in "+network.VPPInterface+" out lyroute-wan0")
+	assertOperationCommand(t, operations, "vpp.dns-service.network", "?nat44 ei add address "+pools[0]+" tenant-vrf")
+}
+
+func TestAllocateDNSServiceTapIDsResolvesStableHashCollision(t *testing.T) {
+	first, err := DNSServiceNetworkForUpstreamID("dns-policy-e2e-gateway-dns-mt2u5hdk-upstream", "wan-ens33-ipv4", []string{"223.5.5.5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := DNSServiceNetworkForUpstreamID("dns-policy-foreign-dns-default-upstream", "wan-ens33-ipv4", []string{"1.1.1.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.TapID != second.TapID {
+		t.Fatalf("fixture does not collide: %d != %d", first.TapID, second.TapID)
+	}
+
+	networks := []DNSServiceNetwork{second, first}
+	if err := AllocateDNSServiceTapIDs(networks); err != nil {
+		t.Fatal(err)
+	}
+	if networks[0].TapID == networks[1].TapID {
+		t.Fatalf("allocated TAP ids still collide: %#v", networks)
+	}
+	if got, want := networks[0].TapID, dnsServiceTapIDBase+46; got != want {
+		t.Fatalf("first stable allocation = %d, want %d", got, want)
+	}
+	if got, want := networks[1].TapID, dnsServiceTapIDBase+47; got != want {
+		t.Fatalf("second stable allocation = %d, want %d", got, want)
+	}
+
+	reversed := []DNSServiceNetwork{first, second}
+	if err := AllocateDNSServiceTapIDs(reversed); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]int{}
+	for _, network := range networks {
+		byID[network.UpstreamID] = network.TapID
+	}
+	for _, network := range reversed {
+		if got, want := network.TapID, byID[network.UpstreamID]; got != want {
+			t.Fatalf("allocation for %q changed with input order: %d != %d", network.UpstreamID, got, want)
+		}
+	}
+}
+
+func TestDNSServiceNetworkRejectsNonIPResolver(t *testing.T) {
+	if _, err := DNSServiceNetworkForUpstreamID("dns-bad", "wan-primary", []string{"resolver.example"}); err == nil {
+		t.Fatal("expected non-IP resolver rejection")
+	}
+}
+
+func TestDNSServiceNetworkRejectsInvalidEffectiveMTU(t *testing.T) {
+	network, err := DNSServiceNetworkForUpstreamID("dns-primary", "wan-primary", []string{"9.9.9.9"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := BindDNSServiceNetwork(&network, "lyroute-wan0", 500); err == nil || !strings.Contains(err.Error(), "invalid MTU") {
+		t.Fatalf("invalid MTU error = %v", err)
+	}
+}
+
+func assertDNSServiceNetworkEnablesNATBeforeRole(t *testing.T, operations []Operation, network DNSServiceNetwork) {
+	t.Helper()
+	var commands []string
+	for _, operation := range operations {
+		if operation.Name == "vpp.dns-service.network" {
+			commands = operation.VPPCtlCommands
+			break
+		}
+	}
+	enableAt, roleAt := -1, -1
+	for index, command := range commands {
+		if command == "?nat44 plugin enable" && enableAt < 0 {
+			enableAt = index
+		}
+		if strings.HasPrefix(strings.TrimPrefix(command, "?"), "set interface nat44 in "+network.VPPInterface+" out ") && roleAt < 0 {
+			roleAt = index
+		}
+	}
+	if enableAt < 0 {
+		t.Fatalf("DNS service network does not enable NAT44 on a clean boot: %#v", commands)
+	}
+	if roleAt < 0 || enableAt > roleAt {
+		t.Fatalf("DNS service network NAT44 role runs before plugin enable (enable=%d role=%d): %#v", enableAt, roleAt, commands)
+	}
+}
+
+func TestDNSServiceNetworkReadbackRequiresInputNAT(t *testing.T) {
+	network, err := DNSServiceNetworkForUpstreamID("dns-primary", "wan-primary", []string{"9.9.9.9"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := []VPPCTLCommandResult{
+		{Command: "show interface address " + network.VPPInterface, Stdout: network.VPPInterface + " " + network.VPPAddress},
+		{Command: fmt.Sprintf("show ip fib table %d", network.TableID), Stdout: fmt.Sprintf("table %d", network.TableID)},
+		{Command: "show nat44 interfaces", Stdout: "pppoe_session0 out"},
+		{Command: "show nat44 ei interfaces", Stdout: ""},
+		{Command: "show tap", Stdout: network.VPPInterface},
+	}
+	if err := verifyDNSServiceNetworkReadback(network, results); err == nil || !strings.Contains(err.Error(), "missing its NAT44 input") {
+		t.Fatalf("missing input NAT readback error = %v", err)
+	}
+}

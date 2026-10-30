@@ -1,0 +1,95 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"ly-route/backend/internal/runtime/selfheal"
+)
+
+func liveReadback(ctx context.Context, runner CommandRunner, service ServiceName, artifacts []RenderedArtifact) error {
+	var err error
+	// PPPoE uses one instantiated unit per WAN, while Linux routing is applied by
+	// a verified oneshot helper. Their live network state is authoritative.
+	if service != PPPoE && service != LinuxRouting {
+		health, healthErr := runner.Status(ctx, service)
+		if healthErr != nil {
+			return healthErr
+		}
+		if !health.Available {
+			return errors.New(health.Reason)
+		}
+	}
+
+	switch service {
+	case SmartDNS:
+		_, err = requiredOutput(ctx, runner, "systemctl", "show", applyUnit(service), "--property=ActiveEnterTimestampMonotonic", "--value")
+	case Dnsmasq:
+		_, err = requiredOutput(ctx, runner, "dnsmasq", "--test", "-C", "/etc/dnsmasq.d/ly-route-dhcp.conf")
+	case Xray:
+		_, err = requiredOutput(ctx, runner, "xray", "run", "-test", "-config", "/etc/xray/config.json")
+	case PPPoE:
+		err = validatePPPoEReadback(ctx, runner, artifacts)
+	case Nftables:
+		err = validateNftablesReadback(ctx, runner, artifacts)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errNftablesLiveDrift) {
+			break
+		}
+		drift := err
+		if rebuildErr := rebuildManagedNftables(ctx, runner, artifacts); rebuildErr != nil {
+			err = fmt.Errorf("%w; managed nftables rebuild failed: %v", drift, rebuildErr)
+			break
+		}
+		if retryErr := validateNftablesReadback(ctx, runner, artifacts); retryErr != nil {
+			// The rebuild ran but the kernel still lacks the expected rule.
+			// Report the concrete drift instead of pretending the repair
+			// succeeded or retrying forever.
+			err = fmt.Errorf("managed nftables table was rebuilt but live state still differs: %w", retryErr)
+			break
+		}
+		selfheal.Record(ctx, "nftables")
+		err = nil
+	case LinuxRouting:
+		err = validatePolicyRoutingReadback(ctx, runner, artifacts)
+	case VPP:
+		err = validateVPPReadback(ctx, runner, artifacts)
+	case IPv6RA:
+		err = validateIPv6RAReadback(ctx, runner, artifacts)
+	default:
+		err = fmt.Errorf("%s has no live readback", service)
+	}
+	return err
+}
+
+func requiredOutput(ctx context.Context, runner CommandRunner, name string, args ...string) (string, error) {
+	output, err := runner.Output(ctx, name, args...)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(output) == "" {
+		return "", fmt.Errorf("%s %s returned empty live readback", name, strings.Join(args, " "))
+	}
+	return output, nil
+}
+
+func serviceReadbackCommands(service ServiceName) ([][]string, error) {
+	switch service {
+	case SmartDNS:
+		return [][]string{{"systemctl", "show", applyUnit(service), "--property=ActiveEnterTimestampMonotonic", "--value"}}, nil
+	case Dnsmasq:
+		return [][]string{{"dnsmasq", "--test", "-C", "/etc/dnsmasq.d/ly-route-dhcp.conf"}}, nil
+	case Xray:
+		return [][]string{{"xray", "run", "-test", "-config", "/etc/xray/config.json"}}, nil
+	case PPPoE:
+		return [][]string{{"ip", "-j", "address", "show", "dev", "ppp0"}}, nil
+	case IPv6RA:
+		return [][]string{{"radvdump"}}, nil
+	default:
+		return nil, fmt.Errorf("%s readback commands depend on rendered artifacts", service)
+	}
+}

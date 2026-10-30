@@ -1,0 +1,252 @@
+package vpp
+
+import (
+	"net/netip"
+	"strconv"
+	"strings"
+
+	"ly-route/backend/internal/runtime/nat"
+)
+
+type liveNATStatic struct {
+	internal string
+	external string
+}
+
+type liveNATPort struct {
+	protocol     string
+	internalHost string
+	internalPort int
+	external     string
+	externalPort int
+}
+
+func decodeVPPCTLNAT44(request SnapshotRequest, results []VPPCTLCommandResult) (NAT44Readback, error) {
+	if err := requireNATCandidates(request); err != nil {
+		return NAT44Readback{}, err
+	}
+	showCommand := "show nat44 static mappings"
+	if request.NATBehavior == nat.BehaviorFullCone {
+		showCommand = "show nat44 ei static mappings"
+	}
+	output, err := commandOutput(results, showCommand)
+	if err != nil {
+		return NAT44Readback{}, err
+	}
+	statics, ports, err := parseNAT44Rows(output)
+	if err != nil {
+		return NAT44Readback{}, err
+	}
+	readback := NAT44Readback{Behavior: request.NATBehavior}
+	matchedStatic := make(map[string]struct{})
+	for _, row := range statics {
+		matches := make([]nat.StaticMapping, 0, 1)
+		for _, candidate := range request.Candidates.NATStaticMappings {
+			if candidate.InternalAddress == row.internal && candidate.ExternalAddress == row.external {
+				matches = append(matches, candidate)
+			}
+		}
+		// Gateway resource transactions read back the complete VPP NAT table,
+		// while their candidate set intentionally contains only this resource's
+		// changed, deleted, and required mappings. Leave unrelated live rows
+		// alone; requested mappings are still required below and deleted ones
+		// remain candidates so they are detected if they survive the delete.
+		if len(matches) == 0 {
+			continue
+		}
+		if len(matches) != 1 {
+			return NAT44Readback{}, snapshotDecodeError("NAT44 static row %s -> %s maps to %d candidates", row.internal, row.external, len(matches))
+		}
+		if _, duplicate := matchedStatic[matches[0].ID]; duplicate {
+			return NAT44Readback{}, snapshotDecodeError("NAT44 static mapping %q is ambiguous", matches[0].ID)
+		}
+		matchedStatic[matches[0].ID] = struct{}{}
+		observed := matches[0]
+		if request.VerifyNATReturnGuards {
+			guard := natReturnGuardForStaticMapping(matches[0])
+			guard.ingressVPPInterface = request.NATIngressVPPInterface
+			guardErr := verifyNATReturnGuardReadback(results, guard)
+			if guardErr != nil {
+				if request.AllowMissing && isNATReturnGuardDrift(guardErr) {
+					observed.ReturnPathGuard = false
+					readback.StaticMappings = append(readback.StaticMappings, observed)
+					continue
+				}
+				return NAT44Readback{}, guardErr
+			}
+			observed.ReturnPathGuard = true
+		}
+		readback.StaticMappings = append(readback.StaticMappings, observed)
+	}
+	matchedPorts := make(map[string]struct{})
+	for _, row := range ports {
+		matches := make([]nat.PortMapping, 0, 1)
+		for _, candidate := range request.Candidates.NATPortMappings {
+			if candidate.Protocol == row.protocol && candidate.InternalHost == row.internalHost && candidate.InternalPort == row.internalPort && candidate.ExternalAddress == row.external && candidate.ExternalPort == row.externalPort {
+				matches = append(matches, candidate)
+			}
+		}
+		if len(matches) == 0 {
+			continue
+		}
+		if len(matches) != 1 {
+			return NAT44Readback{}, snapshotDecodeError("NAT44 port row maps to %d candidates", len(matches))
+		}
+		if _, duplicate := matchedPorts[matches[0].ID]; duplicate {
+			return NAT44Readback{}, snapshotDecodeError("NAT44 port mapping %q is ambiguous", matches[0].ID)
+		}
+		matchedPorts[matches[0].ID] = struct{}{}
+		observed := matches[0]
+		if request.VerifyNATReturnGuards {
+			guard := natReturnGuardForPortMapping(matches[0])
+			guard.ingressVPPInterface = request.NATIngressVPPInterface
+			guardErr := verifyNATReturnGuardReadback(results, guard)
+			if guardErr != nil {
+				if request.AllowMissing && isNATReturnGuardDrift(guardErr) {
+					observed.ReturnPathGuard = false
+					readback.PortMappings = append(readback.PortMappings, observed)
+					continue
+				}
+				return NAT44Readback{}, guardErr
+			}
+			observed.ReturnPathGuard = true
+		}
+		readback.PortMappings = append(readback.PortMappings, observed)
+	}
+	if !request.AllowMissing {
+		if err := requireMatchedNAT(request.NATStaticMappings, matchedStatic, "static mapping"); err != nil {
+			return NAT44Readback{}, err
+		}
+		if err := requireMatchedNAT(request.NATPortMappings, matchedPorts, "port mapping"); err != nil {
+			return NAT44Readback{}, err
+		}
+	}
+	if err := requireAbsentNAT(request.AbsentNATStatic, matchedStatic, "static mapping"); err != nil {
+		return NAT44Readback{}, err
+	}
+	if err := requireAbsentNAT(request.AbsentNATPort, matchedPorts, "port mapping"); err != nil {
+		return NAT44Readback{}, err
+	}
+	return readback, nil
+}
+
+func parseNAT44Rows(output string) ([]liveNATStatic, []liveNATPort, error) {
+	lines := nonBlankLines(output)
+	if len(lines) == 0 || lines[0] != "NAT44 static mappings:" {
+		return nil, nil, snapshotDecodeError("NAT44 mapping header is missing")
+	}
+	var statics []liveNATStatic
+	var ports []liveNATPort
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		protocol := ""
+		if len(fields) > 0 {
+			protocol = strings.ToLower(fields[0])
+		}
+		switch {
+		case len(fields) >= 4 && fields[0] == "identity" && fields[1] == "mapping":
+			// VPP prints the outside interface address as an identity mapping
+			// once NAT44 is enabled for a dynamic WAN. It is owned by the
+			// interface, not by a user static/port map, so it must not fail the
+			// snapshot that drives reconciliation and idempotent re-apply.
+			if err := validNATAddress(fields[2]); err != nil {
+				return nil, nil, err
+			}
+			if len(fields) >= 5 && fields[3] == "vrf" {
+				if _, err := strconv.Atoi(fields[4]); err != nil {
+					return nil, nil, snapshotDecodeError("malformed NAT44 identity mapping VRF %q", fields[4])
+				}
+			}
+		case len(fields) == 6 && fields[0] == "local" && fields[2] == "external" && fields[4] == "vrf" && fields[5] == "0":
+			if err := validNATAddress(fields[1]); err != nil {
+				return nil, nil, err
+			}
+			if err := validNATAddress(fields[3]); err != nil {
+				return nil, nil, err
+			}
+			statics = append(statics, liveNATStatic{internal: fields[1], external: fields[3]})
+		case len(fields) == 7 && (protocol == "tcp" || protocol == "udp") && fields[1] == "local" && fields[3] == "external" && fields[5] == "vrf" && fields[6] == "0":
+			internalHost, internalPort, err := parseNATEndpoint(fields[2])
+			if err != nil {
+				return nil, nil, err
+			}
+			external, externalPort, err := parseNATEndpoint(fields[4])
+			if err != nil {
+				return nil, nil, err
+			}
+			ports = append(ports, liveNATPort{protocol: protocol, internalHost: internalHost, internalPort: internalPort, external: external, externalPort: externalPort})
+		default:
+			return nil, nil, snapshotDecodeError("unknown NAT44 mapping grammar %q", line)
+		}
+	}
+	return statics, ports, nil
+}
+
+func parseNATEndpoint(value string) (string, int, error) {
+	separator := strings.LastIndexByte(value, ':')
+	if separator < 1 || separator == len(value)-1 {
+		return "", 0, snapshotDecodeError("malformed NAT44 endpoint %q", value)
+	}
+	host := value[:separator]
+	if err := validNATAddress(host); err != nil {
+		return "", 0, err
+	}
+	port, err := strconv.Atoi(value[separator+1:])
+	if err != nil || port < 1 || port > 65535 {
+		return "", 0, snapshotDecodeError("malformed NAT44 port %q", value[separator+1:])
+	}
+	return host, port, nil
+}
+
+func validNATAddress(value string) error {
+	address, err := netip.ParseAddr(value)
+	if err != nil || !address.Is4() {
+		return snapshotDecodeError("malformed NAT44 address %q", value)
+	}
+	return nil
+}
+
+func requireNATCandidates(request SnapshotRequest) error {
+	statics := make(map[string]struct{}, len(request.Candidates.NATStaticMappings))
+	for _, candidate := range request.Candidates.NATStaticMappings {
+		if candidate.ID == "" {
+			return snapshotDecodeError("NAT44 static candidate ID is empty")
+		}
+		if _, duplicate := statics[candidate.ID]; duplicate {
+			return snapshotDecodeError("NAT44 static candidate %q is ambiguous", candidate.ID)
+		}
+		statics[candidate.ID] = struct{}{}
+	}
+	if err := requireCandidateNames(request.NATStaticMappings, statics, "NAT44 static mapping"); err != nil {
+		return err
+	}
+	ports := make(map[string]struct{}, len(request.Candidates.NATPortMappings))
+	for _, candidate := range request.Candidates.NATPortMappings {
+		if candidate.ID == "" {
+			return snapshotDecodeError("NAT44 port candidate ID is empty")
+		}
+		if _, duplicate := ports[candidate.ID]; duplicate {
+			return snapshotDecodeError("NAT44 port candidate %q is ambiguous", candidate.ID)
+		}
+		ports[candidate.ID] = struct{}{}
+	}
+	return requireCandidateNames(request.NATPortMappings, ports, "NAT44 port mapping")
+}
+
+func requireMatchedNAT(requested []string, matched map[string]struct{}, kind string) error {
+	for _, id := range requested {
+		if _, ok := matched[strings.TrimSpace(id)]; !ok {
+			return snapshotDecodeError("NAT44 %s %q was not returned", kind, id)
+		}
+	}
+	return nil
+}
+
+func requireAbsentNAT(requested []string, matched map[string]struct{}, kind string) error {
+	for _, id := range requested {
+		if _, present := matched[strings.TrimSpace(id)]; present {
+			return snapshotDecodeError("deleted NAT44 %s %q is still present", kind, id)
+		}
+	}
+	return nil
+}

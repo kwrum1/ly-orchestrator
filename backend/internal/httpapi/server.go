@@ -1,0 +1,13642 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	controlapi "ly-route/backend/internal/api"
+	"ly-route/backend/internal/configgraph"
+	"ly-route/backend/internal/geodata"
+	"ly-route/backend/internal/orchestrator"
+	"ly-route/backend/internal/orchestratorapi"
+	"ly-route/backend/internal/persistence"
+	"ly-route/backend/internal/product"
+	"ly-route/backend/internal/productupdate"
+	"ly-route/backend/internal/runtime/apply"
+	"ly-route/backend/internal/runtime/applystate"
+	"ly-route/backend/internal/runtime/dns"
+	"ly-route/backend/internal/runtime/flow"
+	"ly-route/backend/internal/runtime/nat"
+	"ly-route/backend/internal/runtime/pppoeclient"
+	"ly-route/backend/internal/runtime/proxy"
+	"ly-route/backend/internal/runtime/selfheal"
+	serviceRuntime "ly-route/backend/internal/runtime/service"
+	"ly-route/backend/internal/runtime/trafficpolicy"
+	"ly-route/backend/internal/runtime/vpp"
+	"ly-route/backend/internal/thermal"
+)
+
+const (
+	DefaultVersion            = "dev"
+	HeaderRequestID           = "X-Request-ID"
+	HeaderDNSSyncToken        = "X-LY-Route-DNS-Sync-Token"
+	headerConfigApplyWorker   = "X-LY-Route-Apply-Worker"
+	headerConfigApplyTxn      = "X-LY-Route-Apply-Transaction-ID"
+	configApplyAsyncQueryPath = "/api/v1/config/apply/status"
+	runtimeApplyTimeout       = 8 * time.Minute
+)
+
+type HealthResponse struct {
+	Status       string                       `json:"status"`
+	Version      string                       `json:"version"`
+	Degraded     bool                         `json:"degraded"`
+	RequestID    string                       `json:"request_id"`
+	Dependencies []controlapi.CapabilityState `json:"dependencies"`
+	Thermal      thermal.Snapshot             `json:"thermal"`
+}
+
+type ModeResponse struct {
+	Mode                   string   `json:"mode"`
+	Initialized            bool     `json:"initialized"`
+	Switchable             bool     `json:"switchable"`
+	PreserveAdminAccount   bool     `json:"preserve_admin_account"`
+	PreserveManagementPort bool     `json:"preserve_management_port"`
+	Capabilities           []string `json:"capabilities"`
+	RequestID              string   `json:"request_id"`
+}
+
+type ModeInitializeRequest struct {
+	Mode                   string `json:"mode"`
+	ConfirmReset           bool   `json:"confirm_reset"`
+	PreserveAdminAccount   bool   `json:"preserve_admin_account"`
+	PreserveManagementPort bool   `json:"preserve_management_port"`
+}
+
+type ErrorResponse struct {
+	Error ErrorBody `json:"error"`
+}
+
+type ErrorBody struct {
+	Code       string             `json:"code"`
+	Message    string             `json:"message"`
+	RequestID  string             `json:"request_id"`
+	Capability product.Capability `json:"capability,omitempty"`
+	// Referential-integrity details (WS-K). The generic shape keeps the
+	// structured graph types out of this widely imported file; the concrete
+	// payload is built in config_dependency_guard.go.
+	Resource        any    `json:"resource,omitempty"`
+	ReferencedBy    any    `json:"referenced_by,omitempty"`
+	References      any    `json:"references,omitempty"`
+	Impact          any    `json:"impact,omitempty"`
+	Cascade         any    `json:"cascade,omitempty"`
+	Suggestion      string `json:"suggestion,omitempty"`
+	GraphGeneration int64  `json:"graph_generation,omitempty"`
+	ContentHash     string `json:"content_hash,omitempty"`
+	RequiresForce   bool   `json:"requires_force,omitempty"`
+	IdentityChange  bool   `json:"identity_change,omitempty"`
+	// Thermal throttle details. The same snapshot is exposed on /health so an
+	// operator can see the temperature, thresholds and peak that caused the
+	// refusal instead of guessing from a bare 503.
+	TemperatureC *float64 `json:"temperature_c,omitempty"`
+	WarnC        *float64 `json:"warn_c,omitempty"`
+	BlockC       *float64 `json:"block_c,omitempty"`
+	Thermal      any      `json:"thermal,omitempty"`
+}
+
+type DNSPolicyResource struct {
+	ID           string                       `json:"id"`
+	Kind         string                       `json:"kind"`
+	Name         string                       `json:"name"`
+	Priority     int                          `json:"priority"`
+	Enabled      bool                         `json:"enabled"`
+	Policy       dns.Policy                   `json:"policy"`
+	Render       dns.SmartDNSRender           `json:"render"`
+	Capabilities []controlapi.CapabilityState `json:"capabilities,omitempty"`
+	// ProxyDNSEndpoints is the readback of the local endpoint generation for
+	// this policy (loopback port per egress/upstream pair and any endpoint
+	// that could not be established). It is filled on save, where the endpoint
+	// definition is validated, and by /api/v1/dns/proxy-endpoints.
+	ProxyDNSEndpoints *serviceRuntime.ProxyDNSEndpointPlan `json:"proxy_dns_endpoints,omitempty"`
+}
+
+type DNSRuleUpdateRequest struct {
+	PolicyID       string     `json:"policy_id"`
+	ExpectedSHA256 string     `json:"expected_sha256"`
+	Rules          []dns.Rule `json:"rules"`
+}
+
+type DNSIPSetObservationRequest struct {
+	RuleID  string            `json:"rule_id"`
+	SetName string            `json:"set_name"`
+	Members []dns.IPSetMember `json:"members"`
+}
+
+type ProxyEgressWriteRequest struct {
+	ID             string             `json:"id"`
+	Kind           string             `json:"kind"`
+	Name           string             `json:"name"`
+	Enabled        bool               `json:"enabled"`
+	SemanticType   proxy.SemanticType `json:"semantic_type"`
+	DisplayList    string             `json:"display_list"`
+	ProxyProfileID string             `json:"proxy_profile_id"`
+	// Runtime fields are accepted on the write path because the UI performs
+	// one canonical POST followed by a binding PATCH. The compiler still owns
+	// their values and always emits the supported VPP-to-Xray handoff.
+	RuntimeProfile string `json:"runtime_profile,omitempty"`
+	CapturePath    string `json:"capture_path,omitempty"`
+	Engine         string `json:"engine,omitempty"`
+	Handoff        string `json:"handoff,omitempty"`
+	ListenerMode   string `json:"listener_mode,omitempty"`
+	UnderlayWANID  string `json:"underlay_wan_id"`
+	NodeID         string `json:"node_id,omitempty"`
+	SubscriptionID string `json:"subscription_id,omitempty"`
+	GroupID        string `json:"group_id,omitempty"`
+	// SNATAddresses is an optional explicit pool of outside addresses for the
+	// proxy handoff. Empty keeps the preferred WAN-interface-address policy.
+	SNATAddresses []string `json:"snat_addresses,omitempty"`
+	LowCopy       bool     `json:"low_copy"`
+	Description   string   `json:"description,omitempty"`
+}
+
+type ConfigApplyRequest struct {
+	ProxyEgress *proxy.Egress `json:"proxy_egress,omitempty"`
+	FlowIntent  *flow.Intent  `json:"flow_intent,omitempty"`
+	// Force re-applies even when the dependency graph generation is unchanged.
+	// It is also the explicit acknowledgement required to rebuild a referenced
+	// object whose identity changes (see config_dependency_guard.go).
+	Force bool `json:"force,omitempty"`
+}
+
+type ConfigSnapshotRequest struct {
+	Name string `json:"name"`
+}
+
+type Server struct {
+	profile                product.Profile
+	version                string
+	proxyEgress            proxy.Egress
+	flowIntent             flow.Intent
+	runtimeProxyConfigured bool
+	runtimeFlowConfigured  bool
+	auth                   AuthConfig
+	sessions               *sessionStore
+	now                    func() time.Time
+	auditMu                sync.Mutex
+	audit                  []AuditEvent
+	// configGraphMu serializes config_graph generation bookkeeping. The graph
+	// itself is derived on demand; only the counter and last-applied evidence
+	// are persisted, so two concurrent mutations must not lose an increment.
+	configGraphMu                 sync.Mutex
+	store                         *persistence.Store
+	services                      *serviceRuntime.Runtime
+	vppReceiptPath                string
+	gatewayTransaction            apply.GatewayTransactionRunner
+	orchestratorRepository        orchestrator.Orchestrator
+	orchestratorRuntime           orchestratorapi.ServiceChainRuntime
+	orchestratorReconcileInterval time.Duration
+	orchestratorTelemetry         OrchestratorTelemetryCollector
+	interfaceTelemetry            InterfaceTelemetryCollector
+	dhcpLeases                    DHCPLeaseCollector
+	vppCounters                   VPPCounterCollector
+	policyHits                    PolicyHitCollector
+	topTelemetry                  TopTelemetryCollector
+	subscriptionFetch             func(context.Context, string, bool) ([]byte, error)
+	trafficTrend                  TrafficTrendCollector
+	gatewayTelemetry              GatewayTelemetryCollector
+	gatewayState                  *gatewayTelemetryState
+	securityGuardObserver         SecurityGuardRuntimeObserver
+	capabilityProber              *vpp.CapabilityProber
+	// dnsProbeMu guards the cached data-plane DNS verdict. The probe is a real
+	// DNS exchange through VPP, so it must not run once per health poll and a
+	// single timeout must not be seen as a flap by concurrent callers.
+	dnsProbeMu       sync.Mutex
+	dnsProbeCached   *dnsProbeResult
+	dnsDatapathProbe func(context.Context) (dnsProbeResult, error)
+	// proxyDNSEndpointMu guards the cached proxy DNS endpoint verdict. The
+	// endpoint check performs one real query, so status polling must not probe
+	// every endpoint on every request.
+	proxyDNSEndpointMu     sync.Mutex
+	proxyDNSEndpointCached map[string]proxyDNSEndpointProbeResult
+	proxyDNSEndpointProbe  func(context.Context, serviceRuntime.ProxyDNSEndpoint) error
+	dnsDatapathConfigPath  string
+	dnsDatapathStateFile   string
+	// runtimeGenerationVerifier is an injectable live-vs-committed check.
+	// Production uses the VPP snapshot plus the rendered artifact hashes; a
+	// test can override the live probe without a real dataplane.
+	runtimeGenerationVerifier func(context.Context, RuntimeApplyResult) error
+	// qosCapabilityProbe is injectable so plan/validation tests can model a
+	// VPP build with any subset of the traffic-control facilities. Production
+	// probes the live dataplane through vpp.ProbeQoSCapability.
+	qosCapabilityProbe     func(context.Context) (vpp.QoSCapability, error)
+	runtimeMu              sync.Mutex
+	runtimeApplyMu         sync.Mutex
+	applyMu                sync.Mutex
+	applyHolder            *applyLease
+	applyTimeout           time.Duration
+	applyGrace             time.Duration
+	applyWorkOverride      func(context.Context, string, http.ResponseWriter)
+	configApplyAsyncMu     sync.Mutex
+	configApplyAsync       map[string]ConfigApplyAsyncState
+	latestConfigApplyAsync string
+	lastRuntime            *RuntimeApplyResult
+	applyGenerationState   *applystate.Store
+	applyReceiptPath       string
+	applyReceiptReadOnly   bool
+	applyIdentityPath      string
+	lastFailedApply        *RuntimeApplyResult
+	// lastReconcile is a display-only notice produced by startup
+	// reconciliation. It must never replace lastRuntime (the committed
+	// generation) or block a later apply from rebuilding the plan.
+	lastReconcile            *RuntimeApplyResult
+	firmwareMu               sync.Mutex
+	firmwareStageDir         string
+	firmwareStatus           FirmwareUpdateStatus
+	firmwareInstallStart     func(firmwareInstallInvocation) error
+	thermal                  *thermal.Guard
+	orchestratorUpgradeDir   string
+	orchestratorInstallStart func(orchestratorUpgradeInvocation) error
+	conversionServiceState   productupdate.ServiceStateController
+	productTaskMu            sync.Mutex
+	operationMu              sync.Mutex
+	operation                orchestratorapi.OperationState
+	dnsSyncToken             string
+	proxyFailurePage         proxyFailureActuator
+	proxyFailure             *proxyFailureTracker
+}
+
+type InterfaceTelemetryCollector interface {
+	Interfaces(context.Context) ([]map[string]any, error)
+}
+
+type DHCPLeaseCollector interface {
+	Leases(context.Context) ([]map[string]any, error)
+}
+
+type VPPCounterCollector interface {
+	Dashboard(context.Context) (map[string]any, error)
+	PolicyHits(context.Context) ([]map[string]any, error)
+}
+
+type PolicyHitCollector interface {
+	PolicyHits(context.Context) ([]map[string]any, error)
+}
+
+type TopTelemetryCollector interface {
+	TopSessions(context.Context) ([]map[string]any, error)
+	TopDomains(context.Context) ([]map[string]any, error)
+}
+
+type RuntimeComponentState struct {
+	Name      string `json:"name"`
+	State     string `json:"state"`
+	Available bool   `json:"available"`
+	// Unchanged means this transaction did not execute the component and its
+	// live health was verified; an older apply receipt is not a degradation.
+	Unchanged     bool               `json:"unchanged,omitempty"`
+	TransactionID string             `json:"transaction_id"`
+	ApplyReceipt  apply.ApplyReceipt `json:"apply_receipt"`
+	ReadbackAt    time.Time          `json:"readback_at"`
+	Fresh         bool               `json:"fresh"`
+	Capability    string             `json:"affected_capability"`
+	Reason        string             `json:"reason"`
+}
+
+type RuntimePlan struct {
+	ProxyEgress        proxy.Egress                       `json:"proxy_egress"`
+	CompiledProxy      proxy.CompiledEgress               `json:"compiled_proxy"`
+	FlowIntent         flow.Intent                        `json:"flow_intent"`
+	CompiledFlow       flow.CompiledIntent                `json:"compiled_flow"`
+	CompiledNAT        nat.CompiledConfig                 `json:"compiled_nat"`
+	CompiledPolicy     trafficpolicy.Config               `json:"compiled_policy"`
+	DNSPolicies        []DNSPolicyResource                `json:"dns_policies"`
+	ServiceArtifacts   []RuntimeArtifactSummary           `json:"service_artifacts"`
+	RuntimeArtifacts   []serviceRuntime.RenderedArtifact  `json:"-"`
+	VppOperations      []vpp.Operation                    `json:"vpp_operations"`
+	NftablesCapture    proxy.NftablesCapturePlan          `json:"nftables_tproxy_plan"`
+	DNSInterception    serviceRuntime.DNSInterceptionPlan `json:"dns_interception_plan"`
+	LinuxPolicyRouting proxy.LinuxPolicyRoutingPlan       `json:"linux_policy_routing_plan"`
+	DHCPServers        []serviceRuntime.DnsmasqPlan       `json:"dhcp_servers,omitempty"`
+	PPPoEPeers         []RuntimePPPoEPeerSummary          `json:"pppoe_peers,omitempty"`
+	Components         []RuntimeComponentState            `json:"components"`
+	Warnings           []string                           `json:"warnings,omitempty"`
+	DataplaneState     string                             `json:"dataplane_state"`
+	DataplanePolicy    DataplanePolicy                    `json:"dataplane_policy"`
+	DataplaneProof     []vpp.PrerequisiteResult           `json:"dataplane_prerequisites,omitempty"`
+	// SelectedNativePath is the per-interface fallback decision used to build
+	// the apply plan. It is evidence for AF_PACKET degradation and mixed mode.
+	SelectedNativePath vpp.NativePath `json:"selected_native_path,omitempty"`
+	// AFRequiredInterfaces is populated when the only remaining path for an
+	// assigned interface is AF_PACKET and the operator has not consented yet.
+	AFRequiredInterfaces []string `json:"af_required_interfaces,omitempty"`
+	AFRequiredMessage    string   `json:"af_required_message,omitempty"`
+	// DataplaneDegradations lists optional features that are unavailable while
+	// the dataplane keeps forwarding (arch-v1: retired Smart QoS).
+	DataplaneDegradations []vpp.Degradation `json:"dataplane_degradations,omitempty"`
+	// QoSSkipped is set when the running VPP build cannot enforce part of the
+	// desired traffic-control policy. The plan carries only the enforceable
+	// actions; the rest are reported as unsupported instead of failing apply
+	// or leaving dead objects in the generation.
+	QoSSkipped bool   `json:"qos_skipped,omitempty"`
+	QoSReason  string `json:"qos_reason,omitempty"`
+	// CapabilitySource reports where the observed dataplane capability came
+	// from: runtime_probe, cached_report, committed_state or unavailable.
+	CapabilitySource string   `json:"capability_source,omitempty"`
+	GatewayPlan      vpp.Plan `json:"-"`
+	// DependencyPlan is the configuration-level build order and phase view
+	// (WS-K). It is advisory for the UI and evidence for the apply response;
+	// vpp-apply still owns the executable order inside a phase.
+	DependencyPlan *ConfigDependencyPlan `json:"dependency_plan,omitempty"`
+}
+
+type RuntimeArtifactSummary struct {
+	Service     serviceRuntime.ServiceName `json:"service"`
+	Path        string                     `json:"path"`
+	ContentHash string                     `json:"content_hash"`
+	ReloadMode  string                     `json:"reload_mode"`
+}
+
+type RuntimePPPoEPeerSummary struct {
+	ID        string `json:"id"`
+	Interface string `json:"interface"`
+	Username  string `json:"username"`
+	MTU       int    `json:"mtu,omitempty"`
+	MRU       int    `json:"mru,omitempty"`
+}
+
+type RuntimeApplyResult struct {
+	Status                string                            `json:"status"`
+	RuntimeState          string                            `json:"runtime_state"`
+	TransactionID         string                            `json:"transaction_id"`
+	Reason                string                            `json:"reason,omitempty"`
+	Components            []RuntimeComponentState           `json:"components"`
+	Applied               []string                          `json:"applied_services,omitempty"`
+	SnapshotHash          string                            `json:"snapshot_hash,omitempty"`
+	SourceHash            string                            `json:"source_hash,omitempty"`
+	ArtifactHashes        map[string]string                 `json:"artifact_hashes,omitempty"`
+	Recomputed            bool                              `json:"recomputed,omitempty"`
+	Noop                  bool                              `json:"noop,omitempty"`
+	AppliedAt             time.Time                         `json:"applied_at"`
+	Receipt               apply.ApplyReceipt                `json:"apply_receipt"`
+	Readback              apply.Readback                    `json:"readback"`
+	GatewayPlan           *vpp.Plan                         `json:"-"`
+	GatewayEvidence       []apply.GatewayResourceEvidence   `json:"gateway_evidence,omitempty"`
+	RollbackReceipt       apply.RollbackReceipt             `json:"rollback_receipt,omitempty"`
+	ReconciliationReceipt apply.ReconciliationReceipt       `json:"reconciliation_receipt,omitempty"`
+	CapabilityFailures    []apply.CapabilityFailureEvidence `json:"capability_failures,omitempty"`
+	// SelfHealed names the product-owned dataplane scopes an apply had to
+	// rebuild before the generation converged (for example nftables or abf).
+	SelfHealed []string `json:"self_healed,omitempty"`
+}
+
+type ConfigApplyAsyncState struct {
+	TransactionID string    `json:"transaction_id"`
+	Status        string    `json:"status"`
+	RuntimeState  string    `json:"runtime_state"`
+	Reason        string    `json:"reason,omitempty"`
+	HTTPStatus    int       `json:"http_status"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	Query         string    `json:"query,omitempty"`
+}
+
+type FirmwareUpdateStatus struct {
+	Staged           bool      `json:"staged"`
+	Installing       bool      `json:"installing,omitempty"`
+	InstallStatus    string    `json:"install_status,omitempty"`
+	ImagePath        string    `json:"image_path,omitempty"`
+	ChecksumPath     string    `json:"checksum_path,omitempty"`
+	ImageHash        string    `json:"image_hash,omitempty"`
+	ImageSize        int64     `json:"image_size,omitempty"`
+	ConfigBackupPath string    `json:"config_backup_path,omitempty"`
+	ConfigBackupHash string    `json:"config_backup_hash,omitempty"`
+	ConfigBackupSize int64     `json:"config_backup_size,omitempty"`
+	StagedAt         time.Time `json:"staged_at,omitempty"`
+	InstallCommand   string    `json:"install_command,omitempty"`
+	Reason           string    `json:"reason,omitempty"`
+}
+
+type firmwareInstallRequest struct {
+	ConfirmInstall bool   `json:"confirm_install"`
+	TargetDir      string `json:"target_dir"`
+	Reboot         bool   `json:"reboot"`
+}
+
+type Option func(*Server)
+
+func WithVersion(version string) Option {
+	return func(server *Server) {
+		if strings.TrimSpace(version) != "" {
+			server.version = version
+		}
+	}
+}
+
+func WithProxyEgress(egress proxy.Egress) Option {
+	return func(server *Server) {
+		server.proxyEgress = egress
+		server.runtimeProxyConfigured = true
+	}
+}
+
+func WithFlowIntent(intent flow.Intent) Option {
+	return func(server *Server) {
+		server.flowIntent = intent
+		server.runtimeFlowConfigured = true
+	}
+}
+
+func WithAuthConfig(config AuthConfig) Option {
+	return func(server *Server) { server.auth = config }
+}
+
+func WithDNSSyncToken(token string) Option {
+	return func(server *Server) { server.dnsSyncToken = strings.TrimSpace(token) }
+}
+
+func WithClock(now func() time.Time) Option {
+	return func(server *Server) {
+		if now != nil {
+			server.now = now
+			server.sessions.now = now
+		}
+	}
+}
+
+func WithStore(store *persistence.Store) Option {
+	return func(server *Server) { server.store = store }
+}
+
+// WithApplyTimeout overrides the wall-clock bound of one runtime/config apply
+// transaction. Production uses runtimeApplyTimeout; tests use a short bound to
+// exercise the timeout path deterministically.
+func WithApplyTimeout(timeout time.Duration) Option {
+	return func(server *Server) {
+		if timeout > 0 {
+			server.applyTimeout = timeout
+		}
+	}
+}
+
+// withApplyGrace overrides how long a timed-out apply may take to unwind before
+// the gate is released anyway. Tests use a short grace period.
+func withApplyGrace(grace time.Duration) Option {
+	return func(server *Server) {
+		if grace >= 0 {
+			server.applyGrace = grace
+		}
+	}
+}
+
+func WithSubscriptionFetcher(fetch func(context.Context, string, bool) ([]byte, error)) Option {
+	return func(server *Server) {
+		if fetch != nil {
+			server.subscriptionFetch = fetch
+		}
+	}
+}
+
+func WithFirmwareInstallStart(start func(firmwareInstallInvocation) error) Option {
+	return func(server *Server) { server.firmwareInstallStart = start }
+}
+
+// WithThermalGuard replaces the environment-derived thermal policy. Gateway
+// production wiring uses this so boot-time turbo capping and /health share the
+// exact same guard instance.
+func WithThermalGuard(guard *thermal.Guard) Option {
+	return func(server *Server) {
+		if guard != nil {
+			server.thermal = guard
+		}
+	}
+}
+
+func WithServiceRuntime(runtime serviceRuntime.Runtime) Option {
+	return func(server *Server) { server.services = &runtime }
+}
+
+// withProxyFailureActuator replaces the packaged nftables helper. It is used
+// by the state-machine tests; production always uses the packaged helper.
+func withProxyFailureActuator(actuator proxyFailureActuator) Option {
+	return func(server *Server) {
+		if actuator != nil {
+			server.proxyFailurePage = actuator
+		}
+	}
+}
+
+func WithVPPReceiptPath(path string) Option {
+	return func(server *Server) { server.vppReceiptPath = strings.TrimSpace(path) }
+}
+
+// WithApplyStatePath enables the durable desired/applied generation document.
+// The gateway entrypoint sets this to /var/lib/ly-route/state/apply-state.json;
+// tests that do not opt in keep the legacy response shape.
+func WithApplyStatePath(path string) Option {
+	return func(server *Server) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			server.applyGenerationState = nil
+			return
+		}
+		server.applyGenerationState = applystate.NewStore(path)
+		if strings.TrimSpace(server.applyReceiptPath) == "" {
+			server.applyReceiptPath = applyStateReceiptPath(path)
+		}
+		if strings.TrimSpace(server.applyIdentityPath) == "" {
+			server.applyIdentityPath = applyStateIdentityPath(path)
+		}
+	}
+}
+
+// WithApplyReceiptPath makes an external receipt authoritative. If the file is
+// missing or malformed the apply fails; it is never replaced by an inference.
+func WithApplyReceiptPath(path string) Option {
+	return func(server *Server) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		server.applyReceiptPath = path
+		server.applyReceiptReadOnly = true
+	}
+}
+
+func WithGatewayTransaction(transaction apply.GatewayTransactionRunner) Option {
+	return func(server *Server) { server.gatewayTransaction = transaction }
+}
+
+// WithCapabilityProber installs the active dataplane capability prober used by
+// plan building and apply. Without it the control plane falls back to the last
+// observed report and reports a degradation instead of locking the dataplane.
+func WithCapabilityProber(prober *vpp.CapabilityProber) Option {
+	return func(server *Server) { server.capabilityProber = prober }
+}
+
+// withQoSCapabilityProbe injects the observed traffic-control capability for
+// tests. The production default probes the live VPP build.
+func withQoSCapabilityProbe(probe func(context.Context) (vpp.QoSCapability, error)) Option {
+	return func(server *Server) {
+		if probe != nil {
+			server.qosCapabilityProbe = probe
+		}
+	}
+}
+
+// withQoSPluginProbe keeps the legacy all-or-nothing switch used by older
+// tests: true models a dataplane with every traffic-control facility, false
+// models a build with none.
+func withQoSPluginProbe(probe func(context.Context) (bool, error)) Option {
+	return withQoSCapabilityProbe(func(ctx context.Context) (vpp.QoSCapability, error) {
+		available, err := probe(ctx)
+		if err != nil {
+			return vpp.QoSCapability{}, err
+		}
+		if available {
+			return vpp.FullQoSCapability(), nil
+		}
+		return vpp.UnsupportedQoSCapability("test probe reports no traffic-control dataplane"), nil
+	})
+}
+
+func WithSecurityGuardRuntime(observer SecurityGuardRuntimeObserver) Option {
+	return func(server *Server) { server.securityGuardObserver = observer }
+}
+
+func WithOrchestratorRepository(repository orchestrator.Orchestrator) Option {
+	return func(server *Server) { server.orchestratorRepository = repository }
+}
+
+func WithOrchestratorRuntime(runtime orchestratorapi.ServiceChainRuntime) Option {
+	return func(server *Server) { server.orchestratorRuntime = runtime }
+}
+
+func WithOrchestratorReconcileInterval(interval time.Duration) Option {
+	return func(server *Server) { server.orchestratorReconcileInterval = interval }
+}
+
+func WithInterfaceTelemetry(collector InterfaceTelemetryCollector) Option {
+	return func(server *Server) { server.interfaceTelemetry = collector }
+}
+
+func WithDHCPLeases(collector DHCPLeaseCollector) Option {
+	return func(server *Server) { server.dhcpLeases = collector }
+}
+
+func WithVPPCounters(collector VPPCounterCollector) Option {
+	return func(server *Server) { server.vppCounters = collector }
+}
+
+func WithPolicyHitTelemetry(collector PolicyHitCollector) Option {
+	return func(server *Server) { server.policyHits = collector }
+}
+
+func WithTopTelemetry(collector TopTelemetryCollector) Option {
+	return func(server *Server) { server.topTelemetry = collector }
+}
+
+func WithTrafficTrend(collector TrafficTrendCollector) Option {
+	return func(server *Server) { server.trafficTrend = collector }
+}
+
+func WithGatewayTelemetry(collector GatewayTelemetryCollector) Option {
+	return func(server *Server) { server.gatewayTelemetry = collector }
+}
+
+func WithFirmwareStageDir(path string) Option {
+	return func(server *Server) {
+		if strings.TrimSpace(path) != "" {
+			server.firmwareStageDir = path
+		}
+	}
+}
+
+func WithOrchestratorUpgradeDir(path string) Option {
+	return func(server *Server) {
+		if strings.TrimSpace(path) != "" {
+			server.orchestratorUpgradeDir = path
+		}
+	}
+}
+
+func WithOrchestratorInstallStart(start func(orchestratorUpgradeInvocation) error) Option {
+	return func(server *Server) {
+		if start != nil {
+			server.orchestratorInstallStart = start
+		}
+	}
+}
+
+func WithConversionServiceState(controller productupdate.ServiceStateController) Option {
+	return func(server *Server) {
+		if controller != nil {
+			server.conversionServiceState = controller
+		}
+	}
+}
+
+func New(options ...Option) *Server {
+	return newServer(product.Gateway(), options...)
+}
+
+func NewServer(selection *product.Selection, options ...Option) (*Server, error) {
+	if selection == nil {
+		return nil, fmt.Errorf("new server: %w", product.ErrSelectionUninitialized)
+	}
+	profile, err := selection.Profile()
+	if err != nil {
+		return nil, fmt.Errorf("new server: %w", err)
+	}
+	server := newServer(profile, options...)
+	if server.store != nil && server.store.ProductID() != profile.ID() {
+		return nil, &persistence.ProductMismatchError{Expected: profile.ID(), Actual: server.store.ProductID()}
+	}
+	return server, nil
+}
+
+func newServer(profile product.Profile, options ...Option) *Server {
+	server := &Server{
+		profile:          profile,
+		version:          DefaultVersion,
+		vppReceiptPath:   envOrDefault("LY_ROUTE_VPP_RECEIPT", "/var/lib/ly-route/vpp-apply-receipt.json"),
+		firmwareStageDir: envOrDefault("LY_ROUTE_FIRMWARE_STAGE_DIR", "/var/lib/ly-route/firmware-update"),
+		thermal: func() *thermal.Guard {
+			// newServer is also used by unit tests and non-gateway binaries.
+			// They get the environment policy and live sysfs reading, but must
+			// not write host state; gateway production wiring installs a
+			// persisted guard through WithThermalGuard.
+			config := thermal.ConfigFromEnv(os.Getenv)
+			config.StatePath = ""
+			return thermal.New(config)
+		}(),
+		firmwareInstallStart: func(invocation firmwareInstallInvocation) error {
+			// The installer restarts ly-route-control-api.  A plain child
+			// process lives in this service's cgroup and is killed by that
+			// restart halfway through the upgrade, skipping both the health
+			// check and restore_backup.  Launch it as an independent transient
+			// systemd unit so it survives the control service restart.
+			if _, err := exec.LookPath("systemd-run"); err == nil {
+				unit := "ly-route-firmware-install-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+				scriptPath := filepath.Join(os.TempDir(), unit+".sh")
+				if len(invocation.Args) < 4 || invocation.Args[0] != "-c" {
+					return fmt.Errorf("firmware installer invocation is not a bash -c script")
+				}
+				if err := os.WriteFile(scriptPath, []byte(invocation.Args[1]), 0o700); err != nil {
+					return err
+				}
+				// A huge inline -c script makes systemd-run mistake script
+				// lines for unit properties on some systemd versions.  Execute
+				// the script from a file with the -- command separator.
+				args := []string{"--no-block", "--collect", "--unit=" + unit, "--", "bash", scriptPath}
+				args = append(args, invocation.Args[3:]...)
+				return exec.Command("systemd-run", args...).Run()
+			}
+			return exec.Command(invocation.Name, invocation.Args...).Start()
+		},
+		orchestratorUpgradeDir:   envOrDefault("LY_ROUTE_ORCHESTRATOR_UPGRADE_DIR", "/var/lib/ly-route/orchestrator/upgrades"),
+		orchestratorInstallStart: startOrchestratorUpgradeUnit,
+		conversionServiceState:   productupdate.SystemctlController{},
+		subscriptionFetch:        proxy.FetchSubscription,
+		dnsSyncToken:             loadDNSSyncToken(),
+		proxyEgress:              proxy.NewProxyEgress("proxy-egress-default", "xray-tproxy-outbound"),
+		flowIntent: flow.NewIntent("default", []flow.Rule{
+			flow.NewRule("classify-default", flow.RuleGranularity, flow.Classify("best-effort")),
+		}),
+		auth:         defaultAuthConfig(),
+		now:          time.Now,
+		sessions:     newSessionStore(time.Now),
+		gatewayState: newGatewayTelemetryState(),
+		// The failure page is driven by a packaged helper so toggling it never
+		// requires a full gateway apply. The persisted state is also what the
+		// systemd stop/crash path reads.
+		proxyFailurePage: newProxyFailureHelper(
+			envOrDefault("LY_ROUTE_PROXY_FAILURE_HELPER", ""),
+			envOrDefault("LY_ROUTE_PROXY_FAILURE_STATE", ""),
+			time.Now,
+		),
+		proxyFailure: newProxyFailureTracker(),
+	}
+	for _, option := range options {
+		option(server)
+	}
+	server.ingestFirmwareRollbackAudit()
+	server.reconcileRuntime(context.Background())
+	return server
+}
+
+func (server *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	if server.profile.ID() == product.Orchestrator().ID() && server.orchestratorRepository != nil {
+		handler, err := orchestratorapi.New(server.orchestratorRepository, orchestratorSessionAccess{server: server}, server.orchestratorRuntime)
+		if err != nil {
+			panic(fmt.Sprintf("compose orchestrator API: %v", err))
+		}
+		handler.SetManagementSharingResolver(func(ctx context.Context, interfaceID string) bool {
+			item := server.managementNetworkState(ctx, false)
+			return normalizeManagementMode(stringField(item, "mode")) == "shared_lan" && stringField(item, "interface_id") == interfaceID
+		})
+		handler.SetUpdateService(newOrchestratorUpdateService(server))
+		handler.SetOperationTracker(server)
+		handler.RegisterRoutes(mux)
+		if _, transparent := server.orchestratorRuntime.(orchestratorapi.TransparentRuntime); !transparent {
+			handler.StartServiceChainReconciler(context.Background(), server.orchestratorReconcileInterval)
+		}
+	}
+	if server.profile.ID() == product.Gateway().ID() {
+		server.registerGatewayConversionRoutes(mux)
+	}
+	for _, route := range productRoutes() {
+		if server.profile.Allows(route.capability) {
+			mux.HandleFunc(route.pattern, route.handler(server))
+		}
+	}
+	mux.HandleFunc("/api/v1", server.handleNotFound)
+	mux.HandleFunc("/api/v1/", server.handleNotFound)
+	// requestIDMiddleware runs first so the body-limit rejection still carries
+	// a request id; the edge enforces the same limit in front of this process.
+	return requestIDMiddleware(requestBodyLimitMiddleware(mux))
+}
+
+// maxRequestBodyBytes bounds every control-plane request body. It matches the
+// edge's upstream.max_body_bytes so a client that bypasses Pingora cannot make
+// the API buffer an unbounded payload, and both layers answer 413 instead of
+// letting the JSON decoder report a misleading 400.
+const maxRequestBodyBytes int64 = 64 << 20
+
+func requestBodyLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.ContentLength > maxRequestBodyBytes {
+			writeError(writer, request, http.StatusRequestEntityTooLarge, "payload_too_large",
+				fmt.Sprintf("request body exceeds the %d byte limit", maxRequestBodyBytes))
+			return
+		}
+		if request.Body != nil {
+			request.Body = http.MaxBytesReader(writer, request.Body, maxRequestBodyBytes)
+		}
+		next.ServeHTTP(writer, request)
+	})
+}
+
+type orchestratorSessionAccess struct{ server *Server }
+
+func (access orchestratorSessionAccess) Authorize(request *http.Request, permission orchestratorapi.Permission) error {
+	if access.server == nil {
+		return orchestratorapi.ErrAuthenticationRequired
+	}
+	session, ok := access.server.sessionFromRequest(request)
+	if !ok {
+		return orchestratorapi.ErrAuthenticationRequired
+	}
+	if permission == orchestratorapi.PermissionAdminWrite {
+		if session.PasswordChangeRequired {
+			return orchestratorapi.ErrPasswordChangeRequired
+		}
+		if session.Role != "admin" {
+			return orchestratorapi.ErrAdminRequired
+		}
+	}
+	return nil
+}
+
+func (access orchestratorSessionAccess) RecordAudit(request *http.Request, resource, action, status, detail string) {
+	if access.server == nil {
+		return
+	}
+	actor, role, ok := access.Actor(request)
+	if !ok {
+		actor, role = "anonymous", "system"
+	}
+	access.server.recordAuditWithTransaction(actor, role, resource, action, status, detail, requestID(request))
+}
+
+func (access orchestratorSessionAccess) Actor(request *http.Request) (string, string, bool) {
+	if access.server == nil {
+		return "", "", false
+	}
+	session, ok := access.server.sessionFromRequest(request)
+	if !ok {
+		return "", "", false
+	}
+	return session.Username, session.Role, true
+}
+
+func (server *Server) handleDNSPolicies(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		if server.store == nil {
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+			return
+		}
+		documents, err := server.store.Policies(r.Context(), "dns-policy")
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "dns_policy_read_failed", "DNS policies are unavailable")
+			return
+		}
+		items := make([]DNSPolicyResource, 0, len(documents))
+		for _, document := range documents {
+			resource, err := server.dnsPolicyResource(r.Context(), document.PolicyID, document.PolicyID, document.Enabled, document.Payload)
+			if err != nil {
+				writeError(w, r, http.StatusInternalServerError, "dns_policy_invalid", err.Error())
+				return
+			}
+			resource.Priority = normalizedDNSPolicyPriority(document.Priority)
+			items = append(items, resource)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items, "request_id": requestID(r)})
+	case http.MethodPost:
+		session, ok := server.sessionFromRequest(r)
+		if !ok {
+			server.recordAudit("anonymous", "system", "/api/v1/dns/policies", "create", "denied", "authentication required", r)
+			writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		if session.Role != "admin" {
+			server.recordAudit(session.Username, session.Role, "/api/v1/dns/policies", "create", "denied", "readonly mutation denied", r)
+			writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+			return
+		}
+		if server.passwordChangeRequired(w, r, session, "/api/v1/dns/policies", "create") {
+			return
+		}
+		if server.store == nil {
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+			return
+		}
+		var req DNSPolicyResource
+		if err := decodeStrictJSON(r, &req); err != nil {
+			server.recordAudit(session.Username, session.Role, "/api/v1/dns/policies", "create", "failure", err.Error(), r)
+			writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+			return
+		}
+		resource, payload, hash, err := server.compileDNSPolicyResource(r.Context(), req)
+		if err != nil {
+			server.recordAudit(session.Username, session.Role, "/api/v1/dns/policies", "create", "failure", err.Error(), r)
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_dns_policy", err.Error())
+			return
+		}
+		if err := server.store.SavePolicy(r.Context(), persistence.PolicyDocument{Namespace: "dns-policy", PolicyID: resource.ID, Priority: resource.Priority, Enabled: resource.Enabled, Payload: payload, PayloadHash: hash, UpdatedAt: server.now().UTC()}); err != nil {
+			server.recordAudit(session.Username, session.Role, "/api/v1/dns/policies", "create", "failure", err.Error(), r)
+			writeError(w, r, http.StatusInternalServerError, "dns_policy_save_failed", "DNS policy could not be saved")
+			return
+		}
+		server.recordAudit(session.Username, session.Role, "/api/v1/dns/policies", "create", "success", "", r)
+		server.bumpConfigGraphGeneration(r.Context(), "create", "dns_policy", resource.ID, "")
+		writeJSON(w, http.StatusOK, map[string]any{"item": resource, "request_id": requestID(r)})
+	default:
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+	}
+}
+
+func (server *Server) handleDNSPolicyItem(w http.ResponseWriter, r *http.Request) {
+	id, action := splitPathRemainder("/api/v1/dns/policies/", r.URL.Path)
+	if id == "" || action != "" {
+		writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		if server.store == nil {
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+			return
+		}
+		document, err := server.store.Policy(r.Context(), "dns-policy", id)
+		if err != nil {
+			if errors.Is(err, persistence.ErrNotFound) {
+				if id == "default" {
+					resource, err := server.defaultDNSPolicyResource(r.Context())
+					if err != nil {
+						writeError(w, r, http.StatusInternalServerError, "dns_policy_invalid", err.Error())
+						return
+					}
+					writeJSON(w, http.StatusOK, map[string]any{"item": resource, "request_id": requestID(r)})
+					return
+				}
+				writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+				return
+			}
+			writeError(w, r, http.StatusInternalServerError, "dns_policy_read_failed", "DNS policy is unavailable")
+			return
+		}
+		resource, err := server.dnsPolicyResource(r.Context(), document.PolicyID, document.PolicyID, document.Enabled, document.Payload)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "dns_policy_invalid", err.Error())
+			return
+		}
+		resource.Priority = normalizedDNSPolicyPriority(document.Priority)
+		writeJSON(w, http.StatusOK, map[string]any{"item": resource, "request_id": requestID(r)})
+	case http.MethodPost, http.MethodPatch:
+		server.handleDNSPolicyMutation(w, r, id)
+	case http.MethodDelete:
+		server.handleDNSPolicyDelete(w, r, id)
+	default:
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+	}
+}
+
+// handleDNSProxyEndpoints is the readback of the proxy DNS endpoint
+// generation: which loopback port serves which (egress, upstream) pair, and
+// whether the endpoint answers a real query. It is the operator-visible
+// counterpart of the deterministic port allocation.
+func (server *Server) handleDNSProxyEndpoints(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	endpoints, _, err := server.activeProxyDNSEndpoints(r.Context(), nil, nil)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "dns_proxy_endpoints_unavailable", serviceRuntime.Redact(err.Error()))
+		return
+	}
+	skipProbe := r.URL.Query().Get("probe") == "0"
+	items := make([]map[string]any, 0, len(endpoints.Endpoints))
+	unhealthy := 0
+	for _, endpoint := range endpoints.Endpoints {
+		item := map[string]any{
+			"id":                   endpoint.ID,
+			"proxy_egress_id":      endpoint.ProxyEgressID,
+			"upstream_id":          endpoint.UpstreamID,
+			"protocol":             string(endpoint.Protocol),
+			"listen":               endpoint.Listen(),
+			"port":                 endpoint.Port,
+			"server_address":       endpoint.ServerAddress,
+			"server_port":          endpoint.ServerPort,
+			"server_name":          endpoint.ServerName,
+			"outbound_tag":         endpoint.OutboundTag,
+			"failure_mode":         string(endpoint.FailureMode),
+			"fallback_upstream_id": endpoint.Fallback,
+			"healthy":              nil,
+		}
+		if !skipProbe {
+			probe := server.probeProxyDNSEndpoint(r.Context(), endpoint, 10*time.Second)
+			item["healthy"] = probe.Healthy
+			if !probe.Healthy {
+				item["reason"] = probe.Reason
+				unhealthy++
+			}
+		}
+		items = append(items, item)
+	}
+	problems := make([]map[string]any, 0, len(endpoints.Problems))
+	for _, problem := range endpoints.Problems {
+		problems = append(problems, map[string]any{
+			"proxy_egress_id":      problem.ProxyEgressID,
+			"upstream_id":          problem.UpstreamID,
+			"failure_mode":         string(problem.FailureMode),
+			"fallback_upstream_id": problem.FallbackUpstream,
+			"reason":               problem.Reason,
+		})
+	}
+	state := "available"
+	if unhealthy > 0 || len(problems) > 0 {
+		state = "degraded"
+	}
+	if len(items) == 0 && len(problems) == 0 {
+		state = "not_configured"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"state":          state,
+		"listen_address": serviceRuntime.ProxyDNSEndpointListenAddress,
+		"port_range":     fmt.Sprintf("%d-%d", serviceRuntime.ProxyDNSEndpointPortBase, serviceRuntime.ProxyDNSEndpointPortBase+serviceRuntime.ProxyDNSEndpointPortSpan-1),
+		"probe_query":    serviceRuntime.ProxyDNSEndpointProbeQuery,
+		"items":          items,
+		"problems":       problems,
+		"request_id":     requestID(r),
+	})
+}
+
+func (server *Server) handleDNSResolve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	domain := strings.TrimSpace(r.URL.Query().Get("domain"))
+	if domain == "" {
+		writeError(w, r, http.StatusBadRequest, "domain_required", "domain query parameter is required")
+		return
+	}
+	resource, err := server.activeDNSPolicyResource(r.Context())
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "dns_policy_invalid", err.Error())
+		return
+	}
+	// The persisted policy keeps object-group references and UI aliases such as
+	// source "any" so the control-plane representation remains editable.  The
+	// decision endpoint must compile the same expanded policy used by runtime
+	// rendering; compiling the raw payload here makes a valid UI policy fail
+	// closed with an invalid-source error.
+	expandedPolicy, err := server.expandDNSPolicyForDecision(r.Context(), resource.Policy)
+	if err != nil {
+		writeError(w, r, http.StatusUnprocessableEntity, "dns_policy_compile_failed", err.Error())
+		return
+	}
+	compiled, err := dns.CompilePolicy(expandedPolicy, server.dnsPolicyProxyEgresses(r.Context()))
+	if err != nil {
+		writeError(w, r, http.StatusUnprocessableEntity, "dns_policy_compile_failed", err.Error())
+		return
+	}
+	unavailable := map[string]bool{}
+	for _, resolver := range strings.Split(r.URL.Query().Get("unavailable_resolvers"), ",") {
+		resolver = strings.TrimSpace(resolver)
+		if resolver != "" {
+			unavailable[resolver] = true
+		}
+	}
+	decision := dns.DecideForSource(compiled, domain, strings.TrimSpace(r.URL.Query().Get("source_ip")), unavailable)
+	writeJSON(w, http.StatusOK, map[string]any{"policy_id": resource.ID, "decision": decision, "request_id": requestID(r)})
+}
+
+func (server *Server) handleDNSRuleUpdates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", "/api/v1/dns/rule-updates", "update", "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, "/api/v1/dns/rule-updates", "update", "denied", "readonly mutation denied", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, "/api/v1/dns/rule-updates", "update") {
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	var req DNSRuleUpdateRequest
+	if err := decodeStrictJSON(r, &req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+	policyID := strings.TrimSpace(nonEmpty(req.PolicyID, "default"))
+	rulesPayload, rulesHash, err := persistence.MarshalPayload(req.Rules)
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/dns/rule-updates", "update", "failure", err.Error(), r)
+		writeError(w, r, http.StatusBadRequest, "invalid_rules", "rules could not be encoded")
+		return
+	}
+	if strings.TrimSpace(req.ExpectedSHA256) != rulesHash {
+		server.recordAudit(session.Username, session.Role, "/api/v1/dns/rule-updates", "update", "failure", "checksum mismatch", r)
+		writeError(w, r, http.StatusUnprocessableEntity, "checksum_mismatch", "rule update checksum does not match payload")
+		return
+	}
+	previous, err := server.dnsPolicyResourceForID(r.Context(), policyID)
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/dns/rule-updates", "update", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "dns_policy_read_failed", err.Error())
+		return
+	}
+	nextPolicy := previous.Policy
+	nextPolicy.Rules = append([]dns.Rule(nil), req.Rules...)
+	resource, payload, payloadHash, err := server.compileDNSPolicyResource(r.Context(), DNSPolicyResource{ID: policyID, Kind: "policy", Name: nonEmpty(previous.Name, policyID), Enabled: true, Policy: nextPolicy})
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/dns/rule-updates", "update", "failure", err.Error(), r)
+		writeError(w, r, http.StatusUnprocessableEntity, "invalid_dns_policy", err.Error())
+		return
+	}
+	rollbackPayload, rollbackHash, err := persistence.MarshalPayload(map[string]any{"policy_id": previous.ID, "policy": previous.Policy, "rules_sha256": rulesHash, "rules_payload": json.RawMessage(rulesPayload), "retained_at": server.now().UTC()})
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/dns/rule-updates", "update", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "rollback_encode_failed", "rollback metadata could not be encoded")
+		return
+	}
+	if err := server.store.SaveConfig(r.Context(), persistence.ConfigDocument{ResourceType: "dns_rule_update_rollback", ResourceID: policyID, Payload: rollbackPayload, PayloadHash: rollbackHash, UpdatedAt: server.now().UTC()}); err != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/dns/rule-updates", "update", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "rollback_save_failed", "rollback metadata could not be saved")
+		return
+	}
+	if err := server.store.SavePolicy(r.Context(), persistence.PolicyDocument{Namespace: "dns-policy", PolicyID: resource.ID, Priority: resource.Priority, Enabled: resource.Enabled, Payload: payload, PayloadHash: payloadHash, UpdatedAt: server.now().UTC()}); err != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/dns/rule-updates", "update", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "dns_policy_save_failed", "DNS policy could not be saved")
+		return
+	}
+	server.recordAudit(session.Username, session.Role, "/api/v1/dns/rule-updates", "update", "success", "", r)
+	writeJSON(w, http.StatusOK, map[string]any{"item": resource, "rules_sha256": rulesHash, "rollback_retained": true, "request_id": requestID(r)})
+}
+
+func (server *Server) handleDNSIPSetObservations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	if !server.validDNSSyncRequest(r) {
+		writeError(w, r, http.StatusUnauthorized, "dns_sync_unauthorized", "DNS observation endpoint requires a local sync token")
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	var req DNSIPSetObservationRequest
+	if err := decodeStrictJSON(r, &req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+	req.RuleID = strings.TrimSpace(req.RuleID)
+	req.SetName = strings.TrimSpace(req.SetName)
+	policy, err := server.activeDNSPolicyResource(r.Context())
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "dns_policy_read_failed", "active DNS policy is unavailable")
+		return
+	}
+	var rule *dns.Rule
+	for index := range policy.Policy.Rules {
+		candidate := &policy.Policy.Rules[index]
+		if candidate.ID == req.RuleID {
+			rule = candidate
+			break
+		}
+	}
+	if rule == nil || rule.Outcome.Kind != dns.OutcomeDirect || strings.TrimSpace(rule.Outcome.WANEgressID) == "" {
+		writeError(w, r, http.StatusUnprocessableEntity, "dns_sync_rule_invalid", "observation rule must be an enabled direct fixed-WAN DNS rule")
+		return
+	}
+	expectedSet := dns.SmartDNSIPSetName(req.RuleID)
+	if req.SetName != expectedSet {
+		writeError(w, r, http.StatusUnprocessableEntity, "dns_sync_set_mismatch", "observation set does not match the DNS rule")
+		return
+	}
+	now := server.now().UTC()
+	validMembers := make([]dns.IPSetMember, 0, len(req.Members))
+	seen := map[string]struct{}{}
+	for _, member := range req.Members {
+		if member.SetName != expectedSet || !member.ExpiresAt.After(now) {
+			continue
+		}
+		if _, err := netip.ParseAddr(member.IP); err != nil {
+			writeError(w, r, http.StatusUnprocessableEntity, "dns_sync_address_invalid", "observation contains an invalid IP address")
+			return
+		}
+		member.IP = netip.MustParseAddr(member.IP).String()
+		if _, exists := seen[member.IP]; exists {
+			continue
+		}
+		seen[member.IP] = struct{}{}
+		validMembers = append(validMembers, member)
+	}
+	items, err := server.desiredItems(r.Context(), "domain_ip_set")
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "dns_sync_read_failed", "existing DNS observations are unavailable")
+		return
+	}
+	prefix := "dns-observed-" + req.RuleID + "-"
+	// The sync timer refreshes member expiry timestamps frequently.  Those
+	// timestamps are persistence data, but they do not change the VPP route
+	// set.  Re-applying the complete runtime for every timestamp refresh can
+	// serialize indefinitely behind runtimeApplyMu and starve the control API.
+	// Only a change in the observed address set requires a dataplane apply.
+	existingIPs := map[string]struct{}{}
+	for _, item := range items {
+		id := stringField(item, "id")
+		if strings.HasPrefix(id, prefix) {
+			for _, ip := range stringSliceField(item, "ips") {
+				if address, parseErr := netip.ParseAddr(strings.TrimSpace(ip)); parseErr == nil {
+					existingIPs[address.String()] = struct{}{}
+				}
+			}
+			if err := server.store.DeleteConfig(r.Context(), "domain_ip_set", id); err != nil && !errors.Is(err, persistence.ErrNotFound) {
+				writeError(w, r, http.StatusInternalServerError, "dns_sync_delete_failed", "stale DNS observation could not be removed")
+				return
+			}
+		}
+	}
+	observedIPs := make(map[string]struct{}, len(validMembers))
+	for _, member := range validMembers {
+		observedIPs[member.IP] = struct{}{}
+		item := map[string]any{
+			"id":          prefix + strings.ReplaceAll(member.IP, ":", "_"),
+			"kind":        "observed",
+			"enabled":     true,
+			"dns_rule_id": req.RuleID,
+			"ips":         []string{member.IP},
+			"expires_at":  member.ExpiresAt.UTC().Format(time.RFC3339),
+		}
+		payload, hash, marshalErr := persistence.MarshalPayload(item)
+		if marshalErr != nil {
+			writeError(w, r, http.StatusInternalServerError, "dns_sync_encode_failed", "DNS observation could not be encoded")
+			return
+		}
+		if saveErr := server.store.SaveConfig(r.Context(), persistence.ConfigDocument{ResourceType: "domain_ip_set", ResourceID: item["id"].(string), Payload: payload, PayloadHash: hash, UpdatedAt: now}); saveErr != nil {
+			writeError(w, r, http.StatusInternalServerError, "dns_sync_save_failed", "DNS observation could not be saved")
+			return
+		}
+	}
+	runtimeApply := json.RawMessage(`{"status":"unchanged"}`)
+	if !sameStringSet(existingIPs, observedIPs) {
+		applyRequest := httptest.NewRequest(http.MethodPost, "/api/v1/runtime/apply", nil)
+		applyRequest.RemoteAddr = "127.0.0.1:0"
+		applyRequest.Header.Set(HeaderDNSSyncToken, server.dnsSyncToken)
+		applyResponse := httptest.NewRecorder()
+		server.handleRuntimeApply(applyResponse, applyRequest)
+		runtimeApply = json.RawMessage(applyResponse.Body.Bytes())
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"rule_id":         req.RuleID,
+		"set_name":        expectedSet,
+		"members_applied": len(validMembers),
+		"runtime_apply":   runtimeApply,
+		"request_id":      requestID(r),
+	})
+}
+
+func sameStringSet(left, right map[string]struct{}) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for value := range left {
+		if _, ok := right[value]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (server *Server) validDNSSyncRequest(r *http.Request) bool {
+	token := strings.TrimSpace(server.dnsSyncToken)
+	if token == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get(HeaderDNSSyncToken)), []byte(token)) != 1 {
+		return false
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	address, err := netip.ParseAddr(host)
+	return err == nil && address.IsLoopback()
+}
+
+func (server *Server) activeDNSPolicyResource(ctx context.Context) (DNSPolicyResource, error) {
+	if server.store != nil {
+		documents, err := server.store.Policies(ctx, "dns-policy")
+		if err != nil {
+			return DNSPolicyResource{}, err
+		}
+		merged := dns.NewPolicy(dns.Reject(), []dns.Rule{})
+		merged.Engine = "smartdns"
+		found := false
+		lastPriority := 1000
+		defaultMissSelected := false
+		fallbackMissSelected := false
+		for _, document := range documents {
+			if !document.Enabled {
+				continue
+			}
+			var policy dns.Policy
+			if err := json.Unmarshal(document.Payload, &policy); err != nil {
+				return DNSPolicyResource{}, fmt.Errorf("decode DNS policy %q: %w", document.PolicyID, err)
+			}
+			for _, rule := range policy.Rules {
+				if strings.TrimSpace(rule.ID) == "" {
+					continue
+				}
+				// Policy IDs are user-editable. Prefixing only on collision keeps
+				// DNS observation and diagnostics stable while preventing one
+				// policy from shadowing another policy's rule ID.
+				for _, existing := range merged.Rules {
+					if existing.ID == rule.ID {
+						rule.ID = document.PolicyID + ":" + rule.ID
+						break
+					}
+				}
+				merged.Rules = append(merged.Rules, rule)
+			}
+			// SmartDNS has one process-wide miss rule.  A policy without
+			// matching rules is the explicit global fallback selected by the
+			// UI.  A later policy with source-restricted rules must not replace
+			// it with its local fail-closed miss behavior, otherwise creating a
+			// client-specific DNS policy breaks every other client.
+			if len(policy.Rules) == 0 && !defaultMissSelected {
+				merged.Miss = policy.Miss
+				defaultMissSelected = true
+			} else if !defaultMissSelected && policy.Miss.Kind != dns.OutcomeReject && !fallbackMissSelected {
+				// Preserve a usable legacy fallback for configurations created
+				// before the dedicated empty default policy was introduced.
+				merged.Miss = policy.Miss
+				fallbackMissSelected = true
+			}
+			lastPriority = normalizedDNSPolicyPriority(document.Priority)
+			found = true
+		}
+		if found {
+			payload, marshalErr := json.Marshal(merged)
+			if marshalErr != nil {
+				return DNSPolicyResource{}, marshalErr
+			}
+			resource, resourceErr := server.dnsPolicyResource(ctx, "active", "Active DNS Policy", true, payload)
+			if resourceErr != nil {
+				return DNSPolicyResource{}, resourceErr
+			}
+			resource.Priority = lastPriority
+			return resource, nil
+		}
+	}
+	return server.defaultDNSPolicyResource(ctx)
+}
+
+func (server *Server) dnsPolicyResourceForID(ctx context.Context, id string) (DNSPolicyResource, error) {
+	id = strings.TrimSpace(nonEmpty(id, "default"))
+	if server.store != nil {
+		document, err := server.store.Policy(ctx, "dns-policy", id)
+		if err == nil {
+			resource, resourceErr := server.dnsPolicyResource(ctx, document.PolicyID, document.PolicyID, document.Enabled, document.Payload)
+			if resourceErr != nil {
+				return DNSPolicyResource{}, resourceErr
+			}
+			resource.Priority = normalizedDNSPolicyPriority(document.Priority)
+			return resource, nil
+		}
+		if !errors.Is(err, persistence.ErrNotFound) {
+			return DNSPolicyResource{}, err
+		}
+	}
+	resource, err := server.defaultDNSPolicyResource(ctx)
+	if err != nil {
+		return DNSPolicyResource{}, err
+	}
+	resource.ID = id
+	resource.Name = nonEmpty(id, resource.Name)
+	return resource, nil
+}
+
+func (server *Server) defaultDNSPolicyResource(ctx context.Context) (DNSPolicyResource, error) {
+	payload, err := json.Marshal(dns.NewPolicy(dns.Reject(), []dns.Rule{}))
+	if err != nil {
+		return DNSPolicyResource{}, err
+	}
+	resource, err := server.dnsPolicyResource(ctx, "default", "Default DNS Policy", true, payload)
+	if err != nil {
+		return DNSPolicyResource{}, err
+	}
+	resource.Priority = normalizedDNSPolicyPriority(1000)
+	return resource, nil
+}
+
+func normalizedDNSPolicyPriority(priority int) int {
+	if priority <= 0 {
+		return 1000
+	}
+	return priority
+}
+
+func (server *Server) handleDNSPolicyMutation(w http.ResponseWriter, r *http.Request, id string) {
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", r.URL.Path, "update", "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "update", "denied", "readonly mutation denied", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, r.URL.Path, "update") {
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	var req DNSPolicyResource
+	if err := decodeStrictJSON(r, &req); err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "update", "failure", err.Error(), r)
+		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+	req.ID = id
+	resource, payload, hash, err := server.compileDNSPolicyResource(r.Context(), req)
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "update", "failure", err.Error(), r)
+		writeError(w, r, http.StatusUnprocessableEntity, "invalid_dns_policy", err.Error())
+		return
+	}
+	if err := server.store.SavePolicy(r.Context(), persistence.PolicyDocument{Namespace: "dns-policy", PolicyID: resource.ID, Priority: resource.Priority, Enabled: resource.Enabled, Payload: payload, PayloadHash: hash, UpdatedAt: server.now().UTC()}); err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "update", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "dns_policy_save_failed", "DNS policy could not be saved")
+		return
+	}
+	server.recordAudit(session.Username, session.Role, r.URL.Path, "update", "success", "", r)
+	server.bumpConfigGraphGeneration(r.Context(), "update", "dns_policy", resource.ID, "")
+	writeJSON(w, http.StatusOK, map[string]any{"item": resource, "request_id": requestID(r)})
+}
+
+func (server *Server) handleDNSPolicyDelete(w http.ResponseWriter, r *http.Request, id string) {
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", r.URL.Path, "delete", "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "denied", "readonly mutation denied", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, r.URL.Path, "delete") {
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	if err := server.store.DeletePolicy(r.Context(), "dns-policy", id); err != nil {
+		if errors.Is(err, persistence.ErrNotFound) {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "failure", "resource not found", r)
+			writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+			return
+		}
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "dns_policy_delete_failed", "DNS policy could not be deleted")
+		return
+	}
+	server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "success", "", r)
+	server.bumpConfigGraphGeneration(r.Context(), "delete", "dns_policy", id, "")
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id, "request_id": requestID(r)})
+}
+
+func (server *Server) handleMode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	response, err := server.modeResponse(r)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "mode_read_failed", "mode state is unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (server *Server) handleModeInitialize(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", "/api/v1/mode/initialize", "initialize", "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, "/api/v1/mode/initialize", "initialize", "denied", "admin role required", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, "/api/v1/mode/initialize", "initialize") {
+		return
+	}
+	var req ModeInitializeRequest
+	if err := decodeStrictJSON(r, &req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+	if strings.TrimSpace(req.Mode) != "gateway" {
+		server.recordAudit(session.Username, session.Role, "/api/v1/mode/initialize", "initialize", "failure", "only gateway mode is supported", r)
+		writeError(w, r, http.StatusUnprocessableEntity, "unsupported_mode", "only gateway mode is supported")
+		return
+	}
+	if !req.ConfirmReset {
+		server.recordAudit(session.Username, session.Role, "/api/v1/mode/initialize", "initialize", "failure", "configuration reset confirmation is required", r)
+		writeError(w, r, http.StatusUnprocessableEntity, "confirmation_required", "configuration reset confirmation is required")
+		return
+	}
+	response := ModeResponse{Mode: "gateway", Initialized: true, Switchable: false, PreserveAdminAccount: req.PreserveAdminAccount, PreserveManagementPort: req.PreserveManagementPort, Capabilities: []string{"gateway-only", "bridge-rejected", "local-runtime"}, RequestID: requestID(r)}
+	if err := server.saveModeState(r.Context(), response); err != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/mode/initialize", "initialize", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "mode_save_failed", "mode state could not be saved")
+		return
+	}
+	server.recordAudit(session.Username, session.Role, "/api/v1/mode/initialize", "initialize", "success", "", r)
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (server *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, map[string]any{"items": server.capabilities(ctx), "request_id": requestID(r)})
+}
+
+func (server *Server) modeResponse(r *http.Request) (ModeResponse, error) {
+	response := ModeResponse{
+		Mode:                   "gateway",
+		Initialized:            false,
+		Switchable:             false,
+		PreserveAdminAccount:   false,
+		PreserveManagementPort: false,
+		Capabilities:           []string{"gateway-only", "bridge-rejected", "local-runtime"},
+		RequestID:              requestID(r),
+	}
+	if server.store == nil {
+		return response, nil
+	}
+	document, err := server.store.Config(r.Context(), "system_mode", "gateway")
+	if errors.Is(err, persistence.ErrNotFound) {
+		return response, nil
+	}
+	if err != nil {
+		return ModeResponse{}, err
+	}
+	if err := json.Unmarshal(document.Payload, &response); err != nil {
+		return ModeResponse{}, err
+	}
+	response.RequestID = requestID(r)
+	return response, nil
+}
+
+func (server *Server) saveModeState(ctx context.Context, response ModeResponse) error {
+	if server.store == nil {
+		return nil
+	}
+	stored := response
+	stored.RequestID = ""
+	payload, hash, err := persistence.MarshalPayload(stored)
+	if err != nil {
+		return err
+	}
+	return server.store.SaveConfig(ctx, persistence.ConfigDocument{ResourceType: "system_mode", ResourceID: "gateway", Payload: payload, PayloadHash: hash, UpdatedAt: server.now().UTC()})
+}
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type changePasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+type authUserWriteRequest struct {
+	Username string `json:"username"`
+	Role     string `json:"role"`
+	Password string `json:"password"`
+	Enabled  *bool  `json:"enabled"`
+}
+
+func (server *Server) authAvailable(ctx context.Context) bool {
+	if server.auth.configured() {
+		return true
+	}
+	if server.store != nil && strings.TrimSpace(server.auth.AdminUsername) != "" {
+		stored, err := server.store.AuthUser(ctx, server.auth.AdminUsername)
+		return err == nil && stored.PasswordHash != ""
+	}
+	return false
+}
+
+func (server *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	if !server.authAvailable(r.Context()) {
+		writeError(w, r, http.StatusServiceUnavailable, "auth_not_configured", "admin credentials are not configured")
+		return
+	}
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		server.recordAudit("anonymous", "system", "/api/v1/auth/login", "login", "failure", "invalid JSON", r)
+		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+	actor := strings.TrimSpace(req.Username)
+	if actor == "" {
+		actor = "anonymous"
+	}
+	role, username, passwordChangeRequired := "", "", false
+	if constantEqual(req.Username, server.auth.AdminUsername) && server.adminPasswordMatches(r.Context(), req.Password) {
+		role = "admin"
+		username = server.auth.AdminUsername
+		passwordChangeRequired = server.adminPasswordChangeRequired(r.Context(), req.Password)
+	} else if server.auth.readonlyConfigured() && constantEqual(req.Username, server.auth.ReadonlyUsername) && constantEqual(req.Password, server.auth.ReadonlyPassword) {
+		role = "readonly"
+		username = server.auth.ReadonlyUsername
+	} else if server.store != nil {
+		stored, err := server.store.AuthUser(r.Context(), req.Username)
+		if err == nil && stored.PasswordHash != "" && constantEqual(stored.PasswordHash, hashPassword(stored.Username, req.Password)) {
+			role = stored.Role
+			username = stored.Username
+			passwordChangeRequired = stored.PasswordChangeRequired
+		}
+	}
+	if role == "" {
+		server.recordAudit(actor, "system", "/api/v1/auth/login", "login", "failure", "invalid login", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "invalid credentials")
+		return
+	}
+	session := server.sessions.create(username, role, passwordChangeRequired)
+	http.SetCookie(w, sessionCookie(session.ID, server.auth.CookieSecure))
+	server.recordAudit(session.Username, session.Role, "/api/v1/auth/login", "login", "success", "", r)
+	writeJSON(w, http.StatusOK, map[string]any{"session": publicSession(session), "password_change_required": passwordChangeRequired, "request_id": requestID(r)})
+}
+
+func (server *Server) adminPasswordMatches(ctx context.Context, password string) bool {
+	// The database is authoritative once the operator has chosen a password.
+	// This is what keeps the old installer/bootstrap password dead after D7.
+	if server.store != nil {
+		stored, err := server.store.AuthUser(ctx, server.auth.AdminUsername)
+		if err == nil && stored.PasswordHash != "" {
+			// A stale provisioning row that still requires a password change may
+			// coexist with the per-device factory password printed by firstboot.
+			if stored.PasswordChangeRequired && server.auth.AdminPassword != "" && constantEqual(password, server.auth.AdminPassword) {
+				return true
+			}
+			return constantEqual(stored.PasswordHash, hashPassword(server.auth.AdminUsername, password))
+		}
+	}
+	if hash := strings.TrimSpace(server.auth.AdminPasswordHash); hash != "" {
+		return verifyPasswordHash(hash, server.auth.AdminUsername, password)
+	}
+	return constantEqual(password, server.auth.AdminPassword)
+}
+
+func (server *Server) adminPasswordChangeRequired(ctx context.Context, password string) bool {
+	if !server.auth.ForcePasswordChange {
+		return false
+	}
+	if server.store != nil {
+		stored, err := server.store.AuthUser(ctx, server.auth.AdminUsername)
+		if err == nil && stored.Stored {
+			if stored.PasswordChangeRequired && server.auth.AdminPassword != "" && constantEqual(password, server.auth.AdminPassword) {
+				return true
+			}
+			return stored.PasswordChangeRequired
+		}
+	}
+	// An installer-provisioned hash is the password the operator chose during
+	// installation, not a factory secret, so it must not force a change.
+	if strings.TrimSpace(server.auth.AdminPasswordHash) != "" {
+		return false
+	}
+	return constantEqual(password, server.auth.AdminPassword)
+}
+
+func (server *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" || session.Username != server.auth.AdminUsername {
+		server.recordAudit(session.Username, session.Role, "/api/v1/auth/change-password", "change-password", "denied", "admin role required", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	var req changePasswordRequest
+	if err := decodeStrictJSON(r, &req); err != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/auth/change-password", "change-password", "failure", "invalid JSON", r)
+		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+	if !server.adminPasswordMatches(r.Context(), req.CurrentPassword) {
+		server.recordAudit(session.Username, session.Role, "/api/v1/auth/change-password", "change-password", "failure", "invalid current password", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "current password is invalid")
+		return
+	}
+	if constantEqual(req.CurrentPassword, req.NewPassword) {
+		writeError(w, r, http.StatusUnprocessableEntity, "weak_password", "new password must be different from the current password")
+		return
+	}
+	if err := validateNewPassword(session.Username, req.NewPassword); err != nil {
+		writeError(w, r, http.StatusUnprocessableEntity, "weak_password", err.Error())
+		return
+	}
+	if err := server.store.SaveAuthUser(r.Context(), persistence.AuthUser{Username: server.auth.AdminUsername, Role: "admin", PasswordHash: hashPassword(server.auth.AdminUsername, req.NewPassword), PasswordChangeRequired: false, UpdatedAt: server.now().UTC()}); err != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/auth/change-password", "change-password", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "password_save_failed", "password could not be saved")
+		return
+	}
+	server.clearInitialAdminCredentials()
+	server.sessions.delete(session.ID)
+	newSession := server.sessions.create(server.auth.AdminUsername, "admin", false)
+	http.SetCookie(w, sessionCookie(newSession.ID, server.auth.CookieSecure))
+	server.recordAudit(session.Username, session.Role, "/api/v1/auth/change-password", "change-password", "success", "", r)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "password_changed", "session": publicSession(newSession), "password_change_required": false, "request_id": requestID(r)})
+}
+
+func (server *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, map[string]any{"items": server.users(r.Context()), "request_id": requestID(r)})
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	if session.Role != "admin" {
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, "/api/v1/auth/users", "create-user") {
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	var req authUserWriteRequest
+	if err := decodeStrictJSON(r, &req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+	user, err := authUserFromRequest(req, server.now().UTC())
+	if err != nil {
+		writeError(w, r, http.StatusUnprocessableEntity, "invalid_user", err.Error())
+		return
+	}
+	if err := server.store.SaveAuthUser(r.Context(), user); err != nil {
+		writeError(w, r, http.StatusInternalServerError, "user_save_failed", "user could not be saved")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"item": publicAuthUser(user), "request_id": requestID(r)})
+}
+
+func (server *Server) handleUserItem(w http.ResponseWriter, r *http.Request) {
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, "/api/v1/auth/users/", "mutate-user") {
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	username, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/api/v1/auth/users/"))
+	if err != nil || strings.TrimSpace(username) == "" {
+		writeError(w, r, http.StatusBadRequest, "invalid_user", "username is required")
+		return
+	}
+	switch r.Method {
+	case http.MethodPatch:
+		var req authUserWriteRequest
+		if err := decodeStrictJSON(r, &req); err != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+			return
+		}
+		if strings.TrimSpace(req.Username) == "" {
+			req.Username = username
+		}
+		if req.Username != username {
+			writeError(w, r, http.StatusUnprocessableEntity, "username_mismatch", "username path and body must match")
+			return
+		}
+		existing, err := server.store.AuthUser(r.Context(), username)
+		if err != nil {
+			writeError(w, r, http.StatusNotFound, "not_found", "user was not found")
+			return
+		}
+		user, err := updatedAuthUser(existing, req, server.now().UTC())
+		if err != nil {
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_user", err.Error())
+			return
+		}
+		if err := server.store.SaveAuthUser(r.Context(), user); err != nil {
+			writeError(w, r, http.StatusInternalServerError, "user_save_failed", "user could not be saved")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"item": publicAuthUser(user), "request_id": requestID(r)})
+	case http.MethodDelete:
+		if username == server.auth.AdminUsername || username == session.Username {
+			writeError(w, r, http.StatusUnprocessableEntity, "protected_user", "cannot delete the built-in admin or current user")
+			return
+		}
+		if err := server.store.DeleteAuthUser(r.Context(), username); err != nil {
+			writeError(w, r, http.StatusNotFound, "not_found", "user was not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "request_id": requestID(r)})
+	default:
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+	}
+}
+
+func (server *Server) users(ctx context.Context) []User {
+	users := []User{{Username: server.auth.AdminUsername, Role: "admin", Enabled: server.authAvailable(ctx)}}
+	if strings.TrimSpace(server.auth.ReadonlyUsername) != "" {
+		users = append(users, User{Username: server.auth.ReadonlyUsername, Role: "readonly", Enabled: server.auth.readonlyConfigured()})
+	}
+	if server.store != nil {
+		stored, err := server.store.AuthUsers(ctx)
+		if err == nil {
+			for _, user := range stored {
+				if user.Username == server.auth.AdminUsername || user.Username == server.auth.ReadonlyUsername {
+					continue
+				}
+				users = append(users, publicAuthUser(user))
+			}
+		}
+	}
+	return users
+}
+
+func authUserFromRequest(req authUserWriteRequest, updatedAt time.Time) (persistence.AuthUser, error) {
+	username := strings.TrimSpace(req.Username)
+	role := strings.TrimSpace(req.Role)
+	if username == "" {
+		return persistence.AuthUser{}, fmt.Errorf("username is required")
+	}
+	if role == "" {
+		role = "readonly"
+	}
+	if role != "admin" && role != "readonly" {
+		return persistence.AuthUser{}, fmt.Errorf("role must be admin or readonly")
+	}
+	if err := validateNewPassword(username, req.Password); err != nil {
+		return persistence.AuthUser{}, err
+	}
+	return persistence.AuthUser{Username: username, Role: role, PasswordHash: hashPassword(username, req.Password), PasswordChangeRequired: false, UpdatedAt: updatedAt}, nil
+}
+
+func updatedAuthUser(existing persistence.AuthUser, req authUserWriteRequest, updatedAt time.Time) (persistence.AuthUser, error) {
+	user := existing
+	if strings.TrimSpace(req.Role) != "" {
+		if req.Role != "admin" && req.Role != "readonly" {
+			return persistence.AuthUser{}, fmt.Errorf("role must be admin or readonly")
+		}
+		user.Role = req.Role
+	}
+	if strings.TrimSpace(req.Password) != "" {
+		if err := validateNewPassword(user.Username, req.Password); err != nil {
+			return persistence.AuthUser{}, err
+		}
+		user.PasswordHash = hashPassword(user.Username, req.Password)
+		user.PasswordChangeRequired = false
+	}
+	user.UpdatedAt = updatedAt
+	return user, nil
+}
+
+func publicAuthUser(user persistence.AuthUser) User {
+	return User{Username: user.Username, Role: user.Role, Enabled: user.PasswordHash != ""}
+}
+
+func (server *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", "/api/v1/auth/logout", "logout", "failure", "missing session", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	server.sessions.delete(session.ID)
+	http.SetCookie(w, clearSessionCookie(server.auth.CookieSecure))
+	server.recordAudit(session.Username, session.Role, "/api/v1/auth/logout", "logout", "success", "", r)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "logged_out", "request_id": requestID(r)})
+}
+
+func (server *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"session": publicSession(session), "password_change_required": session.PasswordChangeRequired, "request_id": requestID(r)})
+}
+
+func publicSession(session Session) map[string]any {
+	return map[string]any{
+		"username":                 session.Username,
+		"role":                     session.Role,
+		"created_at":               session.CreatedAt,
+		"password_change_required": session.PasswordChangeRequired,
+	}
+}
+
+func (server *Server) passwordChangeRequired(w http.ResponseWriter, r *http.Request, session Session, resource, action string) bool {
+	if !session.PasswordChangeRequired {
+		return false
+	}
+	server.recordAudit(session.Username, session.Role, resource, action, "denied", "password change required", r)
+	writeError(w, r, http.StatusForbidden, "password_change_required", "password change is required before continuing")
+	return true
+}
+
+func (server *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	dependencies := server.capabilities(ctx)
+	if capability := server.orchestratorRuntimeCapability(ctx); capability != nil {
+		dependencies = append(dependencies, *capability)
+	}
+	status := "ok"
+	degraded := false
+	for _, dependency := range dependencies {
+		// Optional capabilities publish State=available even when their unit is
+		// intentionally inactive (for example xray with no proxy egress).
+		if dependency.State == controlapi.CapabilityAvailable {
+			continue
+		}
+		if requiredCapability(dependency.Name) && !dependency.Available {
+			status = "degraded"
+			degraded = true
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, HealthResponse{Status: status, Version: server.version, Degraded: degraded, RequestID: requestID(r), Dependencies: dependencies, Thermal: server.thermalSnapshot()})
+}
+
+func requiredCapability(name string) bool {
+	switch name {
+	case "vpp", "smartdns", "dnsmasq", "xray", "nftables", "linux_routing", "persistence", "orchestrator_runtime", "dataplane", "dns_datapath", "desired_dataplane":
+		return true
+	default:
+		return false
+	}
+}
+
+func (server *Server) handleDashboardSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	if _, ok := server.sessionFromRequest(r); !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	dependencies := server.capabilities(ctx)
+	system, systemCapability := readSystemSummary()
+	status := "ok"
+	degraded := !systemCapability.Available
+	for _, dependency := range dependencies {
+		// Optional capabilities publish State=available even when their unit is
+		// intentionally inactive (for example xray with no proxy egress).
+		if dependency.State == controlapi.CapabilityAvailable {
+			continue
+		}
+		if requiredCapability(dependency.Name) && !dependency.Available {
+			status = "degraded"
+			degraded = true
+			break
+		}
+	}
+	if degraded {
+		status = "degraded"
+	}
+	capabilities := append([]controlapi.CapabilityState{}, dependencies...)
+	capabilities = append(capabilities, systemCapability)
+	writeJSON(w, http.StatusOK, map[string]any{"status": status, "degraded": degraded, "dependencies": dependencies, "system": system, "capabilities": capabilities, "request_id": requestID(r)})
+}
+
+func (server *Server) handleTrafficTrend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	if _, ok := server.sessionFromRequest(r); !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	window := strings.TrimSpace(r.URL.Query().Get("window"))
+	if window == "" {
+		window = "24h"
+	}
+	points := clampIntQuery(r.URL.Query().Get("points"), 288, 1, 288)
+	if server.profile.ID() == product.Orchestrator().ID() {
+		result, capability := server.orchestratorTrafficTrend(r.Context(), TrafficTrendQuery{Window: window, Points: points})
+		writeTrafficTrendResult(w, r, result, capability)
+		return
+	}
+	if server.trafficTrend != nil {
+		result, err := server.trafficTrend.TrafficTrend(r.Context(), TrafficTrendQuery{Window: window, Points: points})
+		if err == nil {
+			writeTrafficTrendResult(w, r, normalizeTrafficTrendResult(result, window, points), controlapi.CapabilityState{Name: "traffic_trend_sampler", Available: true, State: controlapi.CapabilityAvailable})
+			return
+		}
+		capability := controlapi.CapabilityState{Name: "traffic_trend_sampler", Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()}
+		writeTrafficTrendResult(w, r, unavailableTrafficTrend(window, points, capability.Reason), capability)
+		return
+	}
+	if server.gatewayTelemetry != nil {
+		err := server.collectGatewayTelemetry(r.Context())
+		result := server.gatewayTrafficTrend(TrafficTrendQuery{Window: window, Points: points})
+		capability := controlapi.CapabilityState{Name: "gateway_logical_egress", Available: err == nil, State: controlapi.CapabilityAvailable}
+		if result.Degraded {
+			capability.Available = false
+			capability.State = controlapi.CapabilityDegraded
+			capability.Reason = result.DegradedReason
+		}
+		writeTrafficTrendResult(w, r, result, capability)
+		return
+	}
+	capability := controlapi.CapabilityState{Name: "gateway_logical_egress", Available: false, State: controlapi.CapabilityDegraded, Reason: "gateway telemetry collector is not configured"}
+	writeTrafficTrendResult(w, r, unavailableTrafficTrend(window, points, capability.Reason), capability)
+}
+
+func writeTrafficTrendResult(w http.ResponseWriter, r *http.Request, result TrafficTrendResult, capability controlapi.CapabilityState) {
+	writeJSON(w, http.StatusOK, map[string]any{"window": result.Window, "points": result.Points, "sampling_interval_seconds": result.SamplingIntervalSeconds, "state": result.State, "totals": result.Totals, "series": result.Series, "degraded": result.Degraded, "degraded_reason": result.DegradedReason, "capabilities": []controlapi.CapabilityState{capability}, "request_id": requestID(r)})
+}
+
+func normalizeTrafficTrendResult(result TrafficTrendResult, window string, points int) TrafficTrendResult {
+	if result.Window == "" {
+		result.Window = window
+	}
+	if result.Points == 0 {
+		result.Points = points
+	}
+	if result.SamplingIntervalSeconds == 0 {
+		result.SamplingIntervalSeconds = 300
+	}
+	if result.State == "" {
+		result.State = "available"
+	}
+	if result.Series.LogicalEgresses == nil {
+		result.Series.LogicalEgresses = []LogicalEgressSeries{}
+	}
+	return result
+}
+
+func unavailableTrafficTrend(window string, points int, reason string) TrafficTrendResult {
+	return TrafficTrendResult{Window: window, Points: points, SamplingIntervalSeconds: 300, State: "unavailable", Degraded: true, DegradedReason: reason, Series: TrafficTrendSets{LogicalEgresses: []LogicalEgressSeries{}}}
+}
+
+func numberField(item map[string]any, keys ...string) (float64, bool) {
+	for _, key := range keys {
+		switch value := item[key].(type) {
+		case int:
+			return float64(value), true
+		case int64:
+			return float64(value), true
+		case float64:
+			return value, true
+		case json.Number:
+			parsed, err := value.Float64()
+			return parsed, err == nil
+		}
+	}
+	return 0, false
+}
+
+func (server *Server) capabilities(ctx context.Context) []controlapi.CapabilityState {
+	type capabilityEntry struct {
+		service           serviceRuntime.ServiceName
+		name              string
+		unavailableReason string
+		optional          bool
+	}
+	entries := []capabilityEntry{}
+	if server.profile.AllowsService(product.ServiceVPP) {
+		entries = append(entries, capabilityEntry{serviceRuntime.VPP, "vpp", "VPP apply runtime is not configured", false})
+	}
+	if server.profile.AllowsService(product.ServiceSmartDNS) {
+		entries = append(entries, capabilityEntry{serviceRuntime.SmartDNS, "smartdns", "SmartDNS service runtime is not configured", false})
+	}
+	if server.profile.AllowsService(product.ServiceDnsmasq) {
+		entries = append(entries, capabilityEntry{serviceRuntime.Dnsmasq, "dnsmasq", "Dnsmasq service runtime is not configured", false})
+	}
+	if server.profile.AllowsService(product.ServiceXray) {
+		// Xray is an optional capability when a persisted configuration exists
+		// but no proxy egress is selected.  Deleting the last egress deliberately
+		// stops the daemon; /health must then report ok instead of degraded for a
+		// service the product is not using.
+		xrayOptional := false
+		if server.store != nil {
+			if egress, configured, err := server.runtimeProxyEgress(ctx); err == nil {
+				// The product seeds an empty default egress so the UI has a row
+				// to edit. One without a node or subscription cannot carry
+				// traffic, so xray being stopped is not a degradation.
+				if !configured || (strings.TrimSpace(egress.NodeID) == "" && strings.TrimSpace(egress.SubscriptionID) == "" && strings.TrimSpace(egress.GroupID) == "") {
+					xrayOptional = true
+				}
+			}
+		}
+		reason := "xray service runtime is not configured"
+		if xrayOptional {
+			reason = "no proxy egress is configured"
+		}
+		entries = append(entries, capabilityEntry{serviceRuntime.Xray, "xray", reason, xrayOptional})
+	}
+	if server.profile.AllowsService(product.ServicePPPoE) {
+		entries = append(entries, capabilityEntry{serviceRuntime.PPPoE, "pppoe", "PPPoE service runtime is not configured", true})
+	}
+	if server.profile.AllowsService(product.ServiceNftables) {
+		entries = append(entries, capabilityEntry{serviceRuntime.Nftables, "nftables", "nftables service runtime is not configured", false})
+	}
+	if server.profile.AllowsService(product.ServiceLinuxRouting) {
+		entries = append(entries, capabilityEntry{serviceRuntime.LinuxRouting, "linux_routing", "Linux policy routing service runtime is not configured", false})
+	}
+
+	healthByService := map[serviceRuntime.ServiceName]serviceRuntime.Health{}
+	var healthErr error
+	if server.serviceRuntimeConfigured() && len(entries) > 0 {
+		services := make([]serviceRuntime.ServiceName, 0, len(entries))
+		for _, entry := range entries {
+			services = append(services, entry.service)
+		}
+		health, err := server.services.HealthCheck(ctx, services...)
+		healthErr = err
+		for _, item := range health {
+			healthByService[item.Service] = item
+		}
+	}
+
+	states := make([]controlapi.CapabilityState, 0, len(entries)+1)
+	for _, entry := range entries {
+		if !server.serviceRuntimeConfigured() {
+			state := controlapi.CapabilityDegraded
+			if entry.optional {
+				state = controlapi.CapabilityAvailable
+			}
+			states = append(states, controlapi.CapabilityState{Name: entry.name, Available: false, State: state, Reason: entry.unavailableReason})
+			continue
+		}
+		if healthErr != nil {
+			states = append(states, controlapi.CapabilityState{Name: entry.name, Available: false, State: controlapi.CapabilityDegraded, Reason: healthErr.Error()})
+			continue
+		}
+		health := healthByService[entry.service]
+		if !health.Available {
+			reason := serviceUnitReason(entry.service)
+			if strings.TrimSpace(health.Reason) != "" {
+				reason = health.Reason
+			}
+			state := controlapi.CapabilityDegraded
+			if entry.optional {
+				state = controlapi.CapabilityAvailable
+			}
+			states = append(states, controlapi.CapabilityState{Name: entry.name, Available: false, State: state, Reason: reason})
+			continue
+		}
+		states = append(states, controlapi.CapabilityState{Name: entry.name, Available: true, State: controlapi.CapabilityAvailable})
+	}
+	if server.store == nil {
+		states = append(states, controlapi.CapabilityState{Name: "persistence", Available: false, State: controlapi.CapabilityDegraded, Reason: "SQLite store not configured"})
+	} else {
+		states = append(states, controlapi.CapabilityState{Name: "persistence", Available: true, State: controlapi.CapabilityAvailable})
+	}
+	// Dataplane readiness is a forwarding condition, not merely a unit state:
+	// VPP can be "active" while it owns zero data interfaces during a restart.
+	// The dependency is only published when data ports are configured, so an
+	// appliance without a dataplane still reports an honest ok.
+	if capability, ok := dataplaneHealthCapability(server.dataplaneReadiness(ctx)); ok {
+		states = append(states, capability)
+	}
+	// A dataplane that forwards packets can still black-hole DNS: the VPP
+	// interception state is runtime-only and silently disappears on a restart.
+	// Only a round trip through the data plane proves the resolver works.
+	if capability, ok := server.dnsDatapathCapability(ctx); ok {
+		states = append(states, capability)
+	}
+	// Unit state and the port-level dataplane dependency cannot see a failed
+	// role change: the port stays attached while its address, LCP pair,
+	// dnsmasq binding and DNS interception are gone. Prove the desired LAN/WAN
+	// set against the live system so such a gateway reports degraded.
+	if capability, ok := server.desiredDataplaneCapability(ctx); ok {
+		states = append(states, capability)
+	}
+	return states
+}
+
+func (server *Server) optionalCapability(ctx context.Context, service serviceRuntime.ServiceName, name, unavailableReason string) controlapi.CapabilityState {
+	if !server.serviceRuntimeConfigured() {
+		return controlapi.CapabilityState{Name: name, Available: false, State: controlapi.CapabilityAvailable, Reason: unavailableReason}
+	}
+	health, err := server.services.HealthCheck(ctx, service)
+	if err != nil {
+		return controlapi.CapabilityState{Name: name, Available: false, State: controlapi.CapabilityAvailable, Reason: err.Error()}
+	}
+	if len(health) == 0 || !health[0].Available {
+		reason := serviceUnitReason(service)
+		if len(health) > 0 && strings.TrimSpace(health[0].Reason) != "" {
+			reason = health[0].Reason
+		}
+		return controlapi.CapabilityState{Name: name, Available: false, State: controlapi.CapabilityAvailable, Reason: reason}
+	}
+	return controlapi.CapabilityState{Name: name, Available: true, State: controlapi.CapabilityAvailable}
+}
+
+func (server *Server) serviceCapability(ctx context.Context, service serviceRuntime.ServiceName, name, unavailableReason string) controlapi.CapabilityState {
+	if !server.serviceRuntimeConfigured() {
+		return controlapi.CapabilityState{Name: name, Available: false, State: controlapi.CapabilityDegraded, Reason: unavailableReason}
+	}
+	health, err := server.services.HealthCheck(ctx, service)
+	if err != nil {
+		return controlapi.CapabilityState{Name: name, Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()}
+	}
+	if len(health) == 0 || !health[0].Available {
+		reason := serviceUnitReason(service)
+		if len(health) > 0 && strings.TrimSpace(health[0].Reason) != "" {
+			reason = health[0].Reason
+		}
+		return controlapi.CapabilityState{Name: name, Available: false, State: controlapi.CapabilityDegraded, Reason: reason}
+	}
+	return controlapi.CapabilityState{Name: name, Available: true, State: controlapi.CapabilityAvailable}
+}
+
+func (server *Server) runtimeCapability(ctx context.Context, service serviceRuntime.ServiceName, name, unavailableReason string) controlapi.RuntimeCapability {
+	state := server.serviceCapability(ctx, service, name, unavailableReason)
+	return controlapi.RuntimeCapability{Name: name, Available: state.Available, Reason: state.Reason}
+}
+
+func serviceUnitReason(service serviceRuntime.ServiceName) string {
+	return string(service) + " service is not active"
+}
+
+func (server *Server) handleProxyEgresses(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		items, err := server.proxyEgressResources(r.Context())
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "proxy_egress_read_failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items, "request_id": requestID(r)})
+	case http.MethodPost:
+		session, ok := server.sessionFromRequest(r)
+		if !ok {
+			server.recordAudit("anonymous", "system", "/api/v1/proxy/egresses", "create", "denied", "authentication required", r)
+			writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		if session.Role != "admin" {
+			server.recordAudit(session.Username, session.Role, "/api/v1/proxy/egresses", "create", "denied", "readonly mutation denied", r)
+			writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+			return
+		}
+		if server.passwordChangeRequired(w, r, session, "/api/v1/proxy/egresses", "create") {
+			return
+		}
+		if server.store == nil {
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+			return
+		}
+		var req ProxyEgressWriteRequest
+		if err := decodeStrictJSON(r, &req); err != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+			return
+		}
+		resource, payload, hash, err := server.compileProxyEgressResource(r.Context(), req)
+		if err != nil {
+			server.recordAudit(session.Username, session.Role, "/api/v1/proxy/egresses", "create", "failure", err.Error(), r)
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_proxy_egress", err.Error())
+			return
+		}
+		if err := server.validateDesiredNameUniqueAgainst(r.Context(), "proxy_egress", resource.ID, nonEmpty(req.Name, req.ID)); err != nil {
+			server.recordAudit(session.Username, session.Role, "/api/v1/proxy/egresses", "create", "failure", err.Error(), r)
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_desired_resource", err.Error())
+			return
+		}
+		if err := server.store.SaveConfig(r.Context(), persistence.ConfigDocument{ResourceType: "proxy_egress", ResourceID: resource.ID, Payload: payload, PayloadHash: hash, UpdatedAt: server.now().UTC()}); err != nil {
+			server.recordAudit(session.Username, session.Role, "/api/v1/proxy/egresses", "create", "failure", err.Error(), r)
+			writeError(w, r, http.StatusInternalServerError, "proxy_egress_save_failed", "proxy egress could not be saved")
+			return
+		}
+		server.recordAudit(session.Username, session.Role, "/api/v1/proxy/egresses", "create", "success", "", r)
+		server.bumpConfigGraphGeneration(r.Context(), "create", "proxy_egress", resource.ID, "")
+		writeJSON(w, http.StatusOK, map[string]any{"item": resource, "request_id": requestID(r)})
+	default:
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+	}
+}
+
+func (server *Server) proxyEgressResources(ctx context.Context) ([]controlapi.ProxyEgressResource, error) {
+	if server.store != nil {
+		documents, err := server.store.Configs(ctx, "proxy_egress")
+		if err != nil {
+			return nil, err
+		}
+		if len(documents) > 0 {
+			items := make([]controlapi.ProxyEgressResource, 0, len(documents))
+			for _, document := range documents {
+				var payload map[string]any
+				if err := json.Unmarshal(document.Payload, &payload); err != nil {
+					return nil, err
+				}
+				if truthy(payload["deleted"]) {
+					continue
+				}
+				var egress proxy.Egress
+				if err := json.Unmarshal(document.Payload, &egress); err != nil {
+					return nil, err
+				}
+				name := nonEmpty(stringField(payload, "name"), document.ResourceID)
+				enabled := true
+				if configured, ok := payload["enabled"].(bool); ok {
+					enabled = configured
+				}
+				resource, err := server.proxyEgressResource(ctx, egress, name, enabled)
+				if err != nil {
+					return nil, err
+				}
+				resource.UnderlayWANID = stringField(payload, "underlay_wan_id")
+				items = append(items, resource)
+			}
+			return items, nil
+		}
+	}
+	// A proxy egress is a logical port created by a proxy WAN line. Until the
+	// operator creates one there is nothing to list: no placeholder, no
+	// synthesized "default" row that can be edited or deleted.
+	return []controlapi.ProxyEgressResource{}, nil
+}
+
+func (server *Server) proxyEgressResource(ctx context.Context, egress proxy.Egress, name string, enabled bool) (controlapi.ProxyEgressResource, error) {
+	return controlapi.ProxyEgressWANRow(egress, name, enabled,
+		server.runtimeCapability(ctx, serviceRuntime.VPP, "vpp_steering", "VPP apply runtime is not configured"),
+		server.runtimeCapability(ctx, serviceRuntime.Xray, "xray_runtime", "xray service runtime is not configured"),
+	)
+
+}
+
+// proxyDesiredStateEmpty reports whether the operator has created any proxy
+// resource. It separates "nothing configured yet" from "configured but the
+// daemon is down".
+func (server *Server) proxyDesiredStateEmpty(ctx context.Context) bool {
+	for _, resourceType := range []string{"proxy_node", "proxy_group", "proxy_subscription"} {
+		items, err := server.desiredItems(ctx, resourceType)
+		if err != nil {
+			return false
+		}
+		if len(items) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (server *Server) handleProxyXrayRuntime(action string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if action == "restart" && r.Method != http.MethodPost || action != "restart" && r.Method != http.MethodGet {
+			writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+			return
+		}
+		session, ok := server.sessionFromRequest(r)
+		if !ok {
+			server.recordAudit("anonymous", "system", r.URL.Path, action, "denied", "authentication required", r)
+			writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		if action == "restart" && session.Role != "admin" {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "denied", "admin role required", r)
+			writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+			return
+		}
+		if action == "restart" && server.passwordChangeRequired(w, r, session, r.URL.Path, action) {
+			return
+		}
+		if !server.serviceRuntimeConfigured() {
+			payload := map[string]any{"service": "xray", "state": "degraded", "available": false, "reason": "xray service runtime is not configured", "request_id": requestID(r)}
+			for key, value := range proxyFailureStatusFields(server.proxyFailureSnapshot()) {
+				payload[key] = value
+			}
+			writeJSON(w, http.StatusOK, payload)
+			return
+		}
+		switch action {
+		case "status":
+			// An unbound egress with no proxy resources at all is "not
+			// configured": the product seeds an empty placeholder egress, and
+			// reporting its stopped daemon as degraded was misleading. Once the
+			// operator has any proxy resource, the live daemon state is
+			// authoritative again.
+			if egress, configured, err := server.runtimeProxyEgress(r.Context()); err == nil {
+				unbound := !configured || (strings.TrimSpace(egress.NodeID) == "" && strings.TrimSpace(egress.SubscriptionID) == "" && strings.TrimSpace(egress.GroupID) == "")
+				if unbound && server.proxyDesiredStateEmpty(r.Context()) {
+					payload := map[string]any{"service": "xray", "state": "not_configured", "available": false, "reason": "no proxy egress is bound to a node or node group", "balancers": []map[string]any{}, "request_id": requestID(r)}
+					for key, value := range proxyFailureStatusFields(server.proxyFailureSnapshot()) {
+						payload[key] = value
+					}
+					writeJSON(w, http.StatusOK, payload)
+					return
+				}
+			}
+			health, err := server.services.HealthCheck(r.Context(), serviceRuntime.Xray)
+			if err != nil {
+				writeError(w, r, http.StatusInternalServerError, "xray_status_failed", err.Error())
+				return
+			}
+			item := serviceRuntime.Health{Service: serviceRuntime.Xray, Available: false, Reason: "xray status unavailable"}
+			if len(health) > 0 {
+				item = health[0]
+			}
+			balancers := []map[string]any{}
+			if item.Available {
+				balancers, err = server.xrayRuntimeSelections(r.Context())
+				if err != nil {
+					item.Available = false
+					item.Reason = serviceRuntime.Redact(err.Error())
+				}
+			}
+			payload := map[string]any{"service": "xray", "state": availabilityState(item.Available), "available": item.Available, "reason": item.Reason, "balancers": balancers, "nodes": []map[string]any{}, "request_id": requestID(r)}
+			for key, value := range proxyFailureStatusFields(server.proxyFailureSnapshot()) {
+				payload[key] = value
+			}
+			// Live observatory samples are the operator-facing truth for node
+			// latency/health. They deliberately override the reconciler's
+			// last-sampled all_nodes_down/dead_node_ids: a stale failure
+			// snapshot must not outlive a recovered (or newly dead) node.
+			if item.Available {
+				observability, observeErr := server.xrayObservatoryStatus(r.Context())
+				if observeErr != nil {
+					payload["observability_error"] = serviceRuntime.Redact(observeErr.Error())
+				} else {
+					for key, value := range observability {
+						payload[key] = value
+					}
+				}
+			}
+			writeJSON(w, http.StatusOK, payload)
+		case "logs":
+			controller, ok := server.services.Controller.(serviceRuntime.LogController)
+			if !ok {
+				writeJSON(w, http.StatusOK, map[string]any{"service": "xray", "state": "degraded", "available": false, "reason": "xray log reader is not configured", "logs": "", "request_id": requestID(r)})
+				return
+			}
+			logs, err := controller.Logs(r.Context(), serviceRuntime.Xray, 100)
+			if err != nil {
+				writeJSON(w, http.StatusOK, map[string]any{"service": "xray", "state": "degraded", "available": false, "reason": err.Error(), "logs": serviceRuntime.Redact(logs), "request_id": requestID(r)})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"service": "xray", "state": "available", "available": true, "logs": serviceRuntime.Redact(logs), "request_id": requestID(r)})
+		case "restart":
+			egress, configured, err := server.runtimeProxyEgress(r.Context())
+			if err != nil {
+				server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
+				writeError(w, r, http.StatusUnprocessableEntity, "xray_restart_plan_failed", err.Error())
+				return
+			}
+			if !configured {
+				writeError(w, r, http.StatusUnprocessableEntity, "xray_artifacts_missing", "proxy egress is not configured")
+				return
+			}
+			compiled, err := proxy.CompileEgress(egress)
+			if err == nil {
+				if warning := server.compileProxySubscription(r.Context(), egress, &compiled); warning != "" {
+					err = errors.New(warning)
+				}
+			}
+			if err != nil {
+				server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
+				writeError(w, r, http.StatusUnprocessableEntity, "xray_restart_plan_failed", err.Error())
+				return
+			}
+			proxy.ApplyOutboundSocketMark(&compiled.XrayRuntime.ConfigPayload, compiled.ServiceNetwork.OutboundMark)
+			endpoints, activeRender, planErr := server.activeProxyDNSEndpoints(r.Context(), map[string]string{egress.ID: compiled.XrayRuntime.OutboundTag}, map[string]bool{egress.ID: true})
+			if planErr != nil {
+				reason := serviceRuntime.Redact(planErr.Error())
+				server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", reason, r)
+				writeError(w, r, http.StatusUnprocessableEntity, "xray_restart_plan_failed", reason)
+				return
+			}
+			// A restart without the DNS endpoints would leave SmartDNS pointing
+			// at a closed loopback port while the restart reported success.
+			if renderErr := serviceRuntime.ValidateProxyDNSRender(activeRender, endpoints); renderErr != nil {
+				reason := serviceRuntime.Redact(renderErr.Error())
+				server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", reason, r)
+				writeError(w, r, http.StatusUnprocessableEntity, "xray_restart_plan_failed", reason)
+				return
+			}
+			artifacts, err := serviceRuntime.RenderXrayWithProxyDNS(compiled, endpoints)
+			if err != nil || len(artifacts) == 0 {
+				server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", "xray artifacts are not rendered", r)
+				writeError(w, r, http.StatusUnprocessableEntity, "xray_artifacts_missing", "xray artifacts are not rendered")
+				return
+			}
+			if err := server.services.Controller.ReloadOrRestart(r.Context(), serviceRuntime.Xray, artifacts); err != nil {
+				reason := serviceRuntime.Redact(err.Error())
+				server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", reason, r)
+				writeError(w, r, http.StatusServiceUnavailable, "xray_restart_failed", reason)
+				return
+			}
+			balancers, err := server.xrayRuntimeSelections(r.Context())
+			if err != nil {
+				reason := serviceRuntime.Redact(err.Error())
+				server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", reason, r)
+				writeError(w, r, http.StatusServiceUnavailable, "xray_readback_failed", reason)
+				return
+			}
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "success", "", r)
+			writeJSON(w, http.StatusOK, map[string]any{"service": "xray", "status": "restarted", "runtime_state": "running", "balancers": balancers, "artifacts": summarizeRuntimeArtifacts(artifacts), "request_id": requestID(r)})
+		}
+	}
+}
+
+func (server *Server) xrayRuntimeSelections(ctx context.Context) ([]map[string]any, error) {
+	items, err := server.desiredItems(ctx, "proxy_subscription")
+	if err != nil {
+		return nil, fmt.Errorf("read proxy subscriptions for Xray state: %w", err)
+	}
+	tags := make([]string, 0)
+	subscriptionByTag := map[string]string{}
+	result := make([]map[string]any, 0)
+	for _, item := range items {
+		if enabled, exists := item["enabled"].(bool); exists && !enabled {
+			continue
+		}
+		selection := strings.TrimSpace(stringField(item, "selection"))
+		strategy := strings.TrimSpace(stringField(item, "strategy"))
+		if selection != string(proxy.SelectionFastest) && selection != string(proxy.SelectionAdaptive) && strategy != proxy.AdaptiveSubscriptionStrategy {
+			continue
+		}
+		id := strings.TrimSpace(stringField(item, "id"))
+		if id == "" {
+			return nil, fmt.Errorf("enabled fastest proxy subscription has no ID")
+		}
+		if selection == string(proxy.SelectionAdaptive) || strategy == proxy.AdaptiveSubscriptionStrategy {
+			state, err := server.adaptiveRuntimeSelection(ctx, item)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, state)
+			continue
+		}
+		tagSuffix := "fastest"
+		tag := "subscription-" + id + "-" + tagSuffix
+		tags = append(tags, tag)
+		subscriptionByTag[tag] = id
+	}
+	if len(tags) > 0 {
+		controller, ok := server.services.Controller.(serviceRuntime.XrayRoutingStateController)
+		if !ok {
+			return nil, fmt.Errorf("Xray routing state reader is not configured")
+		}
+		states, err := controller.XrayBalancerStates(ctx, tags)
+		if err != nil {
+			return nil, err
+		}
+		for _, state := range states {
+			subscriptionID := subscriptionByTag[state.Tag]
+			prefix := "subscription-" + subscriptionID + "-node-"
+			nodeIDs := make([]string, 0, len(state.SelectedOutboundTags))
+			for _, outboundTag := range state.SelectedOutboundTags {
+				if !strings.HasPrefix(outboundTag, prefix) || strings.TrimPrefix(outboundTag, prefix) == "" {
+					return nil, fmt.Errorf("Xray balancer %s selected unexpected outbound %q", state.Tag, outboundTag)
+				}
+				nodeIDs = append(nodeIDs, strings.TrimPrefix(outboundTag, prefix))
+			}
+			selectionName := "fastest"
+			if strings.HasSuffix(state.Tag, "-adaptive") {
+				selectionName = "adaptive"
+			}
+			result = append(result, map[string]any{"subscription_id": subscriptionID, "balancer_tag": state.Tag, "selection": selectionName, "selected_node_ids": nodeIDs, "selected_outbound_tags": state.SelectedOutboundTags, "live_verified": true})
+		}
+	}
+	return server.appendActiveGroupSelection(ctx, result)
+}
+
+// appendActiveGroupSelection exposes the node-group balancer in /proxy/xray/status.
+// A group is the product's load policy (latency/loadbalance); without this entry
+// the status response reported "balancers": [] even though traffic was flowing
+// through group-grp-main. Selection readback is best-effort: a routing-API
+// problem must not hide the balancer or the observatory samples.
+func (server *Server) appendActiveGroupSelection(ctx context.Context, result []map[string]any) ([]map[string]any, error) {
+	egress, configured, err := server.runtimeProxyEgress(ctx)
+	if err != nil || !configured {
+		return result, err
+	}
+	groupID := strings.TrimSpace(egress.GroupID)
+	if groupID == "" {
+		return result, nil
+	}
+	groups, err := server.desiredItems(ctx, "proxy_group")
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range groups {
+		if strings.TrimSpace(stringField(item, "id")) != groupID {
+			continue
+		}
+		if !desiredEnabled(item) {
+			return result, nil
+		}
+		members := stringSliceField(item, "members")
+		selector := make([]string, 0, len(members))
+		for _, member := range members {
+			if member = strings.TrimSpace(member); member != "" {
+				selector = append(selector, "node-"+member)
+			}
+		}
+		strategy := strings.TrimSpace(stringField(item, "strategy"))
+		if strategy == "" {
+			strategy = string(proxy.GroupStrategyLatency)
+		}
+		balancerTag := proxy.GroupBalancerTag(groupID)
+		entry := map[string]any{
+			"kind":                   "group",
+			"group_id":               groupID,
+			"balancer_tag":           balancerTag,
+			"strategy":               strategy,
+			"selector":               selector,
+			"member_node_ids":        members,
+			"probe_url":              server.proxyObservatoryProbeURL(ctx, egress),
+			"selected_outbound_tags": []string{},
+			"selected_node_ids":      []string{},
+			"live_verified":          false,
+		}
+		var selectionErr error
+		selectedTags := []string{}
+		if controller, ok := server.services.Controller.(serviceRuntime.XrayRoutingStateController); ok {
+			states, stateErr := controller.XrayBalancerStates(ctx, []string{balancerTag})
+			switch {
+			case stateErr != nil:
+				selectionErr = stateErr
+			case len(states) > 0:
+				selectedTags = append([]string(nil), states[0].SelectedOutboundTags...)
+				entry["live_verified"] = true
+				entry["selection_source"] = "routing_api"
+			}
+		}
+		if len(selectedTags) == 0 && strategy == string(proxy.GroupStrategyLatency) {
+			// Xray's leastPing selection is only readable through the routing
+			// API. If that readback is unavailable, still show which node the
+			// observatory would choose instead of returning null fields.
+			if tag, ok := server.observatoryLatencySelection(ctx, selector); ok {
+				selectedTags = []string{tag}
+				entry["selection_source"] = "observatory"
+			}
+		}
+		selectedIDs := make([]string, 0, len(selectedTags))
+		for _, tag := range selectedTags {
+			selectedIDs = append(selectedIDs, xrayNodeIDFromOutboundTag(tag))
+		}
+		if len(selectedTags) > 0 {
+			entry["selected_outbound_tags"] = selectedTags
+			entry["selected_node_ids"] = selectedIDs
+		}
+		if selectionErr != nil {
+			entry["selection_error"] = serviceRuntime.Redact(selectionErr.Error())
+		}
+		return append(result, entry), nil
+	}
+	return result, nil
+}
+
+// observatoryLatencySelection mirrors xray's leastPing choice from the live
+// observatory samples. It is a status fallback only, never a data-plane
+// decision: the balancer still uses Xray's own selection.
+func (server *Server) observatoryLatencySelection(ctx context.Context, selector []string) (string, bool) {
+	observer, ok := server.services.Controller.(serviceRuntime.XrayObservatoryStateController)
+	if !ok {
+		return "", false
+	}
+	states, err := observer.XrayObservatoryStates(ctx)
+	if err != nil {
+		return "", false
+	}
+	bestTag := ""
+	bestDelay := int64(-1)
+	for _, state := range states {
+		if !state.Alive || !containsString(selector, state.OutboundTag) {
+			continue
+		}
+		if bestTag == "" || state.DelayMilliseconds < bestDelay {
+			bestTag = state.OutboundTag
+			bestDelay = state.DelayMilliseconds
+		}
+	}
+	return bestTag, bestTag != ""
+}
+
+// proxyObservatoryProbeURL resolves the probe target exactly like the Xray
+// generation compiler: group override, then the environment override, then the
+// product default.
+func (server *Server) proxyObservatoryProbeURL(ctx context.Context, egress proxy.Egress) string {
+	groupID := strings.TrimSpace(egress.GroupID)
+	if groupID != "" {
+		groups, err := server.desiredItems(ctx, "proxy_group")
+		if err == nil {
+			for _, item := range groups {
+				if strings.TrimSpace(stringField(item, "id")) != groupID {
+					continue
+				}
+				group := proxy.NodeGroup{ProbeURL: strings.TrimSpace(stringField(item, "probe_url"))}
+				return proxy.ObservatoryProbeURLForGroup(group)
+			}
+		}
+	}
+	return proxy.ObservatoryProbeURL()
+}
+
+// xrayObservatoryStatus returns the live latency/health samples that
+// /proxy/xray/status presents to the operator. It never mutates the failure
+// snapshot: the reconciler owns failure_error/all_nodes_down, while this view
+// is a point-in-time observation.
+func (server *Server) xrayObservatoryStatus(ctx context.Context) (map[string]any, error) {
+	egress, configured, err := server.runtimeProxyEgress(ctx)
+	if err != nil || !configured {
+		return map[string]any{}, err
+	}
+	observer, ok := server.services.Controller.(serviceRuntime.XrayObservatoryStateController)
+	if !ok {
+		return nil, fmt.Errorf("Xray observatory state reader is not configured")
+	}
+	states, err := observer.XrayObservatoryStates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	probeURL := server.proxyObservatoryProbeURL(ctx, egress)
+	nodes := make([]map[string]any, 0, len(states))
+	nodeByTag := make(map[string]map[string]any, len(states))
+	byTag := make(map[string]serviceRuntime.XrayObservatoryState, len(states))
+	for _, state := range states {
+		byTag[state.OutboundTag] = state
+		entry := map[string]any{
+			"node_id":       xrayNodeIDFromOutboundTag(state.OutboundTag),
+			"outbound_tag":  state.OutboundTag,
+			"alive":         state.Alive,
+			"delay_ms":      state.DelayMilliseconds,
+			"last_try_time": state.LastTryTime.Format(time.RFC3339),
+			"probe_url":     probeURL,
+			"health_reason": "ok",
+		}
+		if !state.Alive {
+			entry["health_reason"] = "probe_failed_through_node"
+		}
+		if reason := strings.TrimSpace(state.LastErrorReason); reason != "" {
+			entry["last_error_reason"] = serviceRuntime.Redact(reason)
+		}
+		nodes = append(nodes, entry)
+		nodeByTag[state.OutboundTag] = entry
+	}
+	payload := map[string]any{"nodes": nodes, "probe_url": probeURL}
+	expected, err := server.proxyLivenessTags(ctx, egress)
+	if err != nil {
+		return payload, nil
+	}
+	if len(expected) == 0 {
+		return payload, nil
+	}
+	dead := make([]string, 0, len(expected))
+	missing := make([]string, 0, len(expected))
+	alive := 0
+	for _, tag := range expected {
+		state, found := byTag[tag]
+		switch {
+		case !found:
+			missing = append(missing, tag)
+		case state.Alive:
+			alive++
+		default:
+			dead = append(dead, tag)
+		}
+	}
+	sort.Strings(dead)
+	sort.Strings(missing)
+	payload["dead_node_ids"] = dead
+	payload["all_nodes_down"] = alive == 0 && len(missing) == 0
+	if len(missing) > 0 {
+		payload["unobserved_node_ids"] = missing
+	}
+	if len(dead) == 0 && len(missing) == 0 {
+		payload["probe_target_reachable"] = true
+		return payload, nil
+	}
+	// If at least one member is still healthy, the probe target is reachable
+	// through that node. A dead sibling is then node-specific; do not blame the
+	// probe URL (a transient gateway-side probe failure used to mislabel it).
+	allExpectedDead := alive == 0 && len(missing) == 0
+	if !allExpectedDead {
+		payload["probe_target_reachable"] = true
+		payload["health_reason"] = "some_nodes_unhealthy"
+		for _, tag := range append(append([]string(nil), dead...), missing...) {
+			entry := nodeByTag[tag]
+			if entry == nil {
+				continue
+			}
+			if server.proxyNodeEndpointReachable(ctx, tag) {
+				entry["health_reason"] = "probe_failed_through_node"
+			} else {
+				entry["health_reason"] = "node_endpoint_unreachable"
+			}
+		}
+		return payload, nil
+	}
+	// Xray reports only "dead"; it does not say whether the node or the probe
+	// target is at fault. Test the target from the gateway and the node
+	// endpoint directly so the operator can tell a blocked/failed probe URL
+	// from an unreachable proxy node.
+	probeErr := probeObservatoryTarget(ctx, probeURL)
+	payload["probe_target_reachable"] = probeErr == nil
+	if probeErr != nil {
+		payload["probe_error"] = serviceRuntime.Redact(probeErr.Error())
+		payload["health_reason"] = "probe_target_unreachable"
+	} else {
+		payload["health_reason"] = "probe_failed_through_node"
+	}
+	for _, tag := range append(append([]string(nil), dead...), missing...) {
+		entry := nodeByTag[tag]
+		if entry == nil {
+			continue
+		}
+		switch {
+		case probeErr != nil:
+			entry["health_reason"] = "probe_target_unreachable"
+		case server.proxyNodeEndpointReachable(ctx, tag):
+			entry["health_reason"] = "probe_failed_through_node"
+		default:
+			entry["health_reason"] = "node_endpoint_unreachable"
+		}
+	}
+	return payload, nil
+}
+
+// probeObservatoryTarget performs the same kind of HTTP fetch Xray's
+// observatory does, but from the gateway's direct path. Its only purpose is to
+// label a status failure: it is never used to select a proxy node.
+func probeObservatoryTarget(ctx context.Context, raw string) error {
+	if err := proxy.ValidateObservatoryProbeURL(raw); err != nil {
+		return err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, raw, nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			Proxy: nil,
+		},
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	return nil
+}
+
+func (server *Server) proxyNodeEndpointReachable(ctx context.Context, outboundTag string) bool {
+	nodeID := xrayNodeIDFromOutboundTag(outboundTag)
+	items, err := server.desiredItems(ctx, "proxy_node")
+	if err != nil {
+		return false
+	}
+	for _, item := range items {
+		if strings.TrimSpace(stringField(item, "id")) != nodeID || !desiredEnabled(item) {
+			continue
+		}
+		address := strings.TrimSpace(stringField(item, "address"))
+		port := intField(item, "port")
+		if address == "" || port < 1 || port > 65535 {
+			return false
+		}
+		resolved, resolveErr := proxy.ResolveNodeAddress(ctx, proxy.Node{ID: nodeID, Address: address, Port: port})
+		if resolveErr != nil {
+			return false
+		}
+		return probeProxyNodeEndpoint(ctx, net.JoinHostPort(resolved.Address, strconv.Itoa(port))) == nil
+	}
+	return false
+}
+
+func xrayNodeIDFromOutboundTag(tag string) string {
+	tag = strings.TrimSpace(tag)
+	if strings.HasPrefix(tag, "node-") {
+		return strings.TrimPrefix(tag, "node-")
+	}
+	if index := strings.LastIndex(tag, "-node-"); index >= 0 {
+		return tag[index+len("-node-"):]
+	}
+	return tag
+}
+
+func (server *Server) adaptiveRuntimeSelection(ctx context.Context, item map[string]any) (map[string]any, error) {
+	id := strings.TrimSpace(stringField(item, "id"))
+	candidateIDs := stringSliceField(item, "node_refs")
+	observer, ok := server.services.Controller.(serviceRuntime.XrayObservatoryStateController)
+	if !ok {
+		return nil, fmt.Errorf("Xray observatory state reader is not configured")
+	}
+	states, err := observer.XrayObservatoryStates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	subscription := proxy.Subscription{
+		ID: id, Enabled: true, NodeRefs: candidateIDs, Selection: proxy.SelectionAdaptive,
+		Strategy: proxy.AdaptiveSubscriptionStrategy, TopN: intField(item, "top_n"),
+	}
+	lanes, err := adaptiveLanesFromObservations(subscription, states, 1, server.now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	prefix := "subscription-" + id + "-node-"
+	rttByNode := make(map[string]int64, len(states))
+	for _, state := range states {
+		if strings.HasPrefix(state.OutboundTag, prefix) {
+			rttByNode[strings.TrimPrefix(state.OutboundTag, prefix)] = state.DelayMilliseconds
+		}
+	}
+	selectedIDs := make([]string, 0, len(lanes))
+	activeNodes := make([]map[string]any, 0, len(lanes))
+	for _, lane := range lanes {
+		selectedIDs = append(selectedIDs, lane.NodeID)
+		activeNodes = append(activeNodes, map[string]any{
+			"node_id": lane.NodeID, "rtt_ms": rttByNode[lane.NodeID], "weight": lane.Weight,
+		})
+	}
+	return map[string]any{
+		"subscription_id": id, "selection": "adaptive", "algorithm": "rtt_weighted_five_tuple",
+		"candidate_node_ids": candidateIDs, "selected_node_ids": selectedIDs,
+		"active_nodes": activeNodes, "live_verified": true,
+	}, nil
+}
+
+func availabilityState(available bool) string {
+	if available {
+		return "available"
+	}
+	return "degraded"
+}
+
+func artifactsForService(artifacts []serviceRuntime.RenderedArtifact, service serviceRuntime.ServiceName) []serviceRuntime.RenderedArtifact {
+	items := make([]serviceRuntime.RenderedArtifact, 0)
+	for _, artifact := range artifacts {
+		if artifact.Service == service {
+			items = append(items, artifact)
+		}
+	}
+	return items
+}
+
+func (server *Server) compileProxyEgressResource(ctx context.Context, req ProxyEgressWriteRequest) (controlapi.ProxyEgressResource, json.RawMessage, string, error) {
+	if strings.TrimSpace(req.ID) == "" {
+		return controlapi.ProxyEgressResource{}, nil, "", fmt.Errorf("proxy egress id is required")
+	}
+	if req.Kind != "" && req.Kind != controlapi.ResourceKindProxyEgress {
+		return controlapi.ProxyEgressResource{}, nil, "", fmt.Errorf("proxy egress kind must be %q", controlapi.ResourceKindProxyEgress)
+	}
+	if req.SemanticType != "" && req.SemanticType != proxy.ProxyEgress {
+		return controlapi.ProxyEgressResource{}, nil, "", fmt.Errorf("semantic_type must be %q", proxy.ProxyEgress)
+	}
+	if req.DisplayList != "" && req.DisplayList != proxy.WANDisplayList {
+		return controlapi.ProxyEgressResource{}, nil, "", fmt.Errorf("display_list must be %q", proxy.WANDisplayList)
+	}
+	if strings.TrimSpace(req.UnderlayWANID) == "" {
+		return controlapi.ProxyEgressResource{}, nil, "", fmt.Errorf("proxy egress requires underlay_wan_id")
+	}
+	if req.LowCopy {
+		return controlapi.ProxyEgressResource{}, nil, "", fmt.Errorf("poc_failed: low-copy proxy handoff requires Task 16 PASS")
+	}
+	profile := proxy.RuntimeProfile(nonEmpty(req.ProxyProfileID, "xray-tproxy-outbound"))
+	egress := proxy.NewProxyEgress(req.ID, profile)
+	egress.UnderlayWANID = strings.TrimSpace(req.UnderlayWANID)
+	egress.NodeID = strings.TrimSpace(req.NodeID)
+	egress.SubscriptionID = strings.TrimSpace(req.SubscriptionID)
+	egress.GroupID = strings.TrimSpace(req.GroupID)
+	egress.SNATAddresses = normalizeProxySNATAddresses(req.SNATAddresses)
+	if err := proxy.ValidateEgress(egress); err != nil {
+		return controlapi.ProxyEgressResource{}, nil, "", err
+	}
+	if err := server.validateProxyGroupReference(ctx, egress.GroupID); err != nil {
+		return controlapi.ProxyEgressResource{}, nil, "", err
+	}
+	payloadObject := map[string]any{"id": egress.ID, "name": nonEmpty(req.Name, req.ID), "enabled": req.Enabled, "semantic_type": egress.SemanticType, "display_list": egress.DisplayList, "runtime_profile": egress.RuntimeProfile, "capture_path": egress.CapturePath, "engine": egress.Engine, "handoff": egress.Handoff, "listener_mode": egress.ListenerMode, "underlay_wan_id": egress.UnderlayWANID}
+	if len(egress.SNATAddresses) > 0 {
+		payloadObject["snat_addresses"] = egress.SNATAddresses
+	}
+	if egress.NodeID != "" {
+		payloadObject["node_id"] = egress.NodeID
+	}
+	if egress.SubscriptionID != "" {
+		payloadObject["subscription_id"] = egress.SubscriptionID
+	}
+	if egress.GroupID != "" {
+		payloadObject["group_id"] = egress.GroupID
+	}
+	if strings.TrimSpace(req.Description) != "" {
+		payloadObject["description"] = strings.TrimSpace(req.Description)
+	}
+	payload, hash, err := persistence.MarshalPayload(payloadObject)
+	if err != nil {
+		return controlapi.ProxyEgressResource{}, nil, "", err
+	}
+	resource, err := server.proxyEgressResource(ctx, egress, nonEmpty(req.Name, req.ID), req.Enabled)
+	resource.UnderlayWANID = egress.UnderlayWANID
+	resource.NodeID = egress.NodeID
+	resource.SubscriptionID = egress.SubscriptionID
+	resource.GroupID = egress.GroupID
+	return resource, payload, hash, err
+}
+
+func (server *Server) handleDefaultFlowIntent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	resource := controlapi.FlowIntent(server.flowIntent, server.qosRuntimeCapability(r.Context()))
+	writeJSON(w, http.StatusOK, map[string]any{"item": resource, "request_id": requestID(r)})
+}
+
+func (server *Server) handleInterfaceBonds(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		items, err := server.desiredItems(r.Context(), "interface_bond")
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "interface_bond_read_failed", "interface bonds are unavailable")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items, "capabilities": server.degradedRuntimeCapabilities(r.Context()), "request_id": requestID(r)})
+	case http.MethodPost:
+		server.handleInterfaceBondCreate(w, r)
+	default:
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+	}
+}
+
+func (server *Server) handleInterfaceBondCreate(w http.ResponseWriter, r *http.Request) {
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", r.URL.Path, "create", "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "create", "denied", "readonly mutation denied", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, r.URL.Path, "create") {
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	var payload map[string]any
+	if err := decodeStrictJSON(r, &payload); err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "create", "failure", "request body must be valid JSON", r)
+		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+	item, status, err := server.compileInterfaceBond(r.Context(), payload)
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "create", "failure", err.Error(), r)
+		writeError(w, r, status, "invalid_interface_bond", err.Error())
+		return
+	}
+	raw, hash, err := persistence.MarshalPayload(item)
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "create", "failure", err.Error(), r)
+		writeError(w, r, http.StatusBadRequest, "invalid_payload", "interface bond payload could not be encoded")
+		return
+	}
+	if err := server.store.SaveConfig(r.Context(), persistence.ConfigDocument{ResourceType: "interface_bond", ResourceID: stringField(item, "id"), Payload: raw, PayloadHash: hash, UpdatedAt: server.now().UTC()}); err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "create", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "interface_bond_save_failed", "interface bond could not be saved")
+		return
+	}
+	server.recordAudit(session.Username, session.Role, r.URL.Path, "create", "success", "", r)
+	writeJSON(w, http.StatusOK, map[string]any{"item": item, "request_id": requestID(r), "runtime_state": "desired_not_applied"})
+}
+
+func (server *Server) compileInterfaceBond(ctx context.Context, payload map[string]any) (map[string]any, int, error) {
+	id := strings.TrimSpace(nonEmpty(stringField(payload, "id"), stringField(payload, "name")))
+	if id == "" {
+		id = "bond-" + strings.ReplaceAll(newRequestID(), "-", "")[:8]
+	}
+	members := stringSliceField(payload, "members")
+	if len(members) < 2 {
+		return nil, http.StatusBadRequest, fmt.Errorf("interface bond requires at least two members")
+	}
+	interfaces, _, err := server.interfaceRuntimeSnapshot(ctx)
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+	byID := map[string]map[string]any{}
+	for _, item := range interfaces {
+		for _, key := range []string{stringField(item, "id"), stringField(item, "name")} {
+			if key != "" {
+				byID[key] = item
+			}
+		}
+	}
+	used := map[string]bool{}
+	selected := make([]map[string]any, 0, len(members))
+	for _, member := range members {
+		member = strings.TrimSpace(member)
+		if member == "" || used[member] {
+			return nil, http.StatusBadRequest, fmt.Errorf("interface bond members must be non-empty and unique")
+		}
+		used[member] = true
+		item, ok := byID[member]
+		if !ok {
+			return nil, http.StatusBadRequest, fmt.Errorf("interface bond member %q does not exist", member)
+		}
+		if stringField(item, "bond") != "" || stringField(item, "lag") != "" || stringField(item, "bond_id") != "" || stringField(item, "member_of") != "" {
+			return nil, http.StatusConflict, fmt.Errorf("interface bond member %q is already bound", member)
+		}
+		selected = append(selected, item)
+	}
+	speed := stringField(selected[0], "speed")
+	workMode := stringField(selected[0], "work_mode")
+	if workMode == "" {
+		workMode = stringField(selected[0], "active_path")
+	}
+	for _, item := range selected[1:] {
+		if stringField(item, "speed") != speed {
+			return nil, http.StatusBadRequest, fmt.Errorf("interface bond members must have the same speed")
+		}
+		itemWorkMode := stringField(item, "work_mode")
+		if itemWorkMode == "" {
+			itemWorkMode = stringField(item, "active_path")
+		}
+		if itemWorkMode != workMode {
+			return nil, http.StatusBadRequest, fmt.Errorf("interface bond members must have the same work_mode")
+		}
+	}
+	return map[string]any{"id": id, "name": nonEmpty(stringField(payload, "name"), id), "members": members, "mode": "xor", "load_balance": "l34", "speed": speed, "work_mode": workMode, "runtime_state": "desired_not_applied", "vpp_operation": map[string]any{"name": "vpp.interface-bond", "mode": "xor", "load_balance": "l34", "members": members}, "capabilities": server.degradedRuntimeCapabilities(ctx)}, http.StatusOK, nil
+}
+
+func (server *Server) handleDHCPLeases(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	items, capabilities, err := server.dhcpLeaseSnapshot(r.Context())
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "dhcp_leases_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": len(items), "capabilities": capabilities, "request_id": requestID(r)})
+}
+
+func (server *Server) handleDHCPLeaseItem(w http.ResponseWriter, r *http.Request) {
+	id, action := dhcpLeasePath(r.URL.Path)
+	if id == "" || action != "reserve" {
+		writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", r.URL.Path, "reserve", "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "reserve", "denied", "readonly mutation denied", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, r.URL.Path, "reserve") {
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	lease, err := server.dhcpLeaseByID(r.Context(), id)
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "reserve", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "dhcp_lease_read_failed", err.Error())
+		return
+	}
+	if lease == nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "reserve", "failure", "lease not found", r)
+		writeError(w, r, http.StatusNotFound, "not_found", "lease was not found")
+		return
+	}
+	binding, status, err := staticBindingFromLease(lease)
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "reserve", "failure", err.Error(), r)
+		writeError(w, r, status, "invalid_dhcp_lease", err.Error())
+		return
+	}
+	raw, hash, err := persistence.MarshalPayload(binding)
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "reserve", "failure", err.Error(), r)
+		writeError(w, r, http.StatusBadRequest, "invalid_payload", "static reservation could not be encoded")
+		return
+	}
+	if err := server.store.SaveConfig(r.Context(), persistence.ConfigDocument{ResourceType: "dhcp_static_binding", ResourceID: stringField(binding, "id"), Payload: raw, PayloadHash: hash, UpdatedAt: server.now().UTC()}); err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "reserve", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "static_reservation_save_failed", "static reservation could not be saved")
+		return
+	}
+	server.recordAudit(session.Username, session.Role, r.URL.Path, "reserve", "success", "", r)
+	writeJSON(w, http.StatusOK, map[string]any{"item": binding, "request_id": requestID(r)})
+}
+
+func dhcpLeasePath(path string) (string, string) {
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(path, "/api/v1/dhcp/leases/"), "/"), "/")
+	if len(parts) != 2 {
+		return "", ""
+	}
+	id, err := url.PathUnescape(parts[0])
+	if err != nil {
+		return "", ""
+	}
+	return id, parts[1]
+}
+
+func (server *Server) dhcpLeaseByID(ctx context.Context, id string) (map[string]any, error) {
+	items, _, err := server.dhcpLeaseSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		for _, key := range []string{"id", "ip_address", "address", "ip", "mac", "hw_address"} {
+			if stringField(item, key) == id {
+				return item, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+func staticBindingFromLease(lease map[string]any) (map[string]any, int, error) {
+	ip := firstStringField(lease, "ip_address", "address", "ip")
+	mac := firstStringField(lease, "mac", "hw_address", "hwaddr")
+	if ip == "" || mac == "" {
+		return nil, http.StatusUnprocessableEntity, fmt.Errorf("lease requires IP and MAC to reserve")
+	}
+	id := strings.TrimSpace(nonEmpty(stringField(lease, "id"), strings.ReplaceAll(mac, ":", "")))
+	return map[string]any{"id": id, "kind": "dhcp_static_binding", "ip": ip, "ip_address": ip, "mac": mac, "hostname": firstStringField(lease, "hostname", "client_hostname", "name"), "lease_id": stringField(lease, "id"), "enabled": true, "runtime_state": "desired_not_applied"}, http.StatusOK, nil
+}
+
+func (server *Server) compileDNSPolicyResource(ctx context.Context, req DNSPolicyResource) (DNSPolicyResource, json.RawMessage, string, error) {
+	if strings.TrimSpace(req.ID) == "" {
+		return DNSPolicyResource{}, nil, "", fmt.Errorf("dns policy id is required")
+	}
+	priority := normalizedDNSPolicyPriority(req.Priority)
+	if priority < 1 || priority > 65535 {
+		return DNSPolicyResource{}, nil, "", fmt.Errorf("dns policy priority must be between 1 and 65535")
+	}
+	policy := req.Policy
+	if name := strings.TrimSpace(req.Name); name != "" {
+		policy.Name = name
+	}
+	if strings.TrimSpace(policy.Engine) == "" && len(policy.Rules) == 0 && policy.Miss.Kind == "" {
+		policy = dns.NewPolicy(dns.Reject(), []dns.Rule{{ID: req.ID, Domains: []string{}, Outcome: dns.Direct()}})
+		policy.Name = strings.TrimSpace(req.Name)
+	}
+	expandedPolicy, err := server.expandDNSPolicySourceGroups(ctx, policy)
+	if err != nil {
+		return DNSPolicyResource{}, nil, "", err
+	}
+	for _, rule := range expandedPolicy.Rules {
+		if rule.Outcome.Kind == dns.OutcomeDirect &&
+			strings.TrimSpace(rule.Outcome.UpstreamID) != "" &&
+			strings.TrimSpace(rule.Outcome.WANEgressID) != "" {
+			return DNSPolicyResource{}, nil, "", fmt.Errorf("dns rule %q direct outcome must not select both an upstream and WAN egress", rule.ID)
+		}
+	}
+	upstreamIDs, err := server.dnsPolicyUpstreamIDs(ctx)
+	if err != nil {
+		return DNSPolicyResource{}, nil, "", err
+	}
+	compiled, err := dns.CompilePolicyWithOptions(expandedPolicy, dns.CompileOptions{
+		ProxyEgresses:              server.dnsPolicyProxyEgresses(ctx),
+		UpstreamIDs:                upstreamIDs,
+		ValidateUpstreamReferences: true,
+	})
+	if err != nil {
+		return DNSPolicyResource{}, nil, "", err
+	}
+	if err := server.validateProxyDNSDependencies(ctx, compiled); err != nil {
+		return DNSPolicyResource{}, nil, "", err
+	}
+	proxyDNSEndpoints, err := server.proxyDNSPolicyPreflight(ctx, req.ID, compiled)
+	if err != nil {
+		return DNSPolicyResource{}, nil, "", err
+	}
+	domainSets, err := server.currentDNSDomainSetsFor(ctx, []map[string]any{{"policy": policy}})
+	if err != nil {
+		return DNSPolicyResource{}, nil, "", err
+	}
+	for _, setID := range compiled.ReferencedDomainSetIDs {
+		if _, exists := domainSets[setID]; !exists {
+			return DNSPolicyResource{}, nil, "", fmt.Errorf("dns policy references unavailable domain set %q", setID)
+		}
+	}
+	payload, hash, err := persistence.MarshalPayload(policy)
+	if err != nil {
+		return DNSPolicyResource{}, nil, "", err
+	}
+	resource := DNSPolicyResource{ID: req.ID, Kind: "policy", Name: nonEmpty(req.Name, req.ID), Priority: priority, Enabled: req.Enabled, Policy: policy, Render: compiled.RenderSmartDNS(), Capabilities: []controlapi.CapabilityState{server.serviceCapability(context.Background(), serviceRuntime.SmartDNS, "smartdns", "SmartDNS service runtime is not configured")}}
+	if !proxyDNSEndpoints.Empty() {
+		resource.ProxyDNSEndpoints = &proxyDNSEndpoints
+	}
+	return resource, payload, hash, nil
+}
+
+// proxyDNSPolicyPreflight validates that a proxy outcome can be turned into a
+// real endpoint before the policy is persisted. It no longer rejects every
+// proxy outcome: the endpoint is implemented, so the check is about the
+// referenced resources (egress, upstream, protocol) instead of the feature.
+func (server *Server) proxyDNSPolicyPreflight(ctx context.Context, planID string, compiled dns.CompiledPolicy) (serviceRuntime.ProxyDNSEndpointPlan, error) {
+	bindings := dns.ProxyBindingsFromRender(compiled.RenderSmartDNS())
+	if len(bindings) == 0 {
+		return serviceRuntime.ProxyDNSEndpointPlan{}, nil
+	}
+	egresses := server.dnsPolicyProxyEgresses(ctx)
+	known := make(map[string]struct{}, len(egresses))
+	for _, egress := range egresses {
+		known[strings.TrimSpace(egress.ID)] = struct{}{}
+	}
+	for _, binding := range bindings {
+		if _, exists := known[binding.ProxyEgressID]; !exists {
+			return serviceRuntime.ProxyDNSEndpointPlan{}, fmt.Errorf("dns policy %q cannot be saved: rule %q references proxy egress %q, which is not configured", planID, binding.RuleID, binding.ProxyEgressID)
+		}
+	}
+	upstreams, err := server.dnsProxyUpstreamDefinitions(ctx)
+	if err != nil {
+		return serviceRuntime.ProxyDNSEndpointPlan{}, err
+	}
+	// established=nil: the save path cannot know whether Xray will compile in
+	// this generation, so it validates the endpoint definition only.
+	plan := serviceRuntime.PlanProxyDNSEndpoints(bindings, upstreams, nil, nil)
+	if len(plan.Problems) > 0 {
+		return serviceRuntime.ProxyDNSEndpointPlan{}, fmt.Errorf("dns policy %q cannot be saved: %w", planID, plan.Problems[0])
+	}
+	return plan, nil
+}
+
+// dnsProxyUpstreamDefinitions returns every enabled DNS upstream with the
+// protocol-relevant fields (servers and resolved DoH/DoT host addresses).
+func (server *Server) dnsProxyUpstreamDefinitions(ctx context.Context) ([]serviceRuntime.SmartDNSUpstream, error) {
+	items, err := server.desiredItems(ctx, "dns_upstream")
+	if err != nil {
+		return nil, err
+	}
+	// Use the same bootstrap inference as the SmartDNS renderer so a DoH host
+	// resolves identically on the save path and on the apply path.
+	profiles, err := server.dnsBootstrapProfilesFromPolicy(ctx)
+	if err != nil {
+		return nil, err
+	}
+	upstreams := make([]serviceRuntime.SmartDNSUpstream, 0, len(items))
+	for _, item := range items {
+		if enabled, ok := item["enabled"].(bool); ok && !enabled {
+			continue
+		}
+		servers := stringSliceField(item, "servers")
+		bootstrapServers := dnsUpstreamBootstrapFor(item, profiles[stringField(item, "id")])
+		upstreams = append(upstreams, serviceRuntime.SmartDNSUpstream{
+			ID:               stringField(item, "id"),
+			Servers:          servers,
+			BootstrapServers: bootstrapServers,
+			ResolvedHostIPs:  dnsResolvedDoHHosts(ctx, servers, bootstrapServers),
+			WANEgressID:      stringField(item, "wan_egress_id"),
+		})
+	}
+	sort.Slice(upstreams, func(left, right int) bool { return upstreams[left].ID < upstreams[right].ID })
+	return upstreams, nil
+}
+
+// activeProxyDNSEndpoints plans the endpoint generation of the active DNS
+// policy. established defaults to every egress that has an outbound tag.
+func (server *Server) activeProxyDNSEndpoints(ctx context.Context, outboundTags map[string]string, established map[string]bool) (serviceRuntime.ProxyDNSEndpointPlan, dns.SmartDNSRender, error) {
+	active, err := server.activeDNSPolicyResource(ctx)
+	if err != nil {
+		return serviceRuntime.ProxyDNSEndpointPlan{}, dns.SmartDNSRender{}, err
+	}
+	bindings := dns.ProxyBindingsFromRender(active.Render)
+	if len(bindings) == 0 {
+		return serviceRuntime.ProxyDNSEndpointPlan{}, active.Render, nil
+	}
+	upstreams, err := server.dnsProxyUpstreamDefinitions(ctx)
+	if err != nil {
+		return serviceRuntime.ProxyDNSEndpointPlan{}, active.Render, err
+	}
+	if established == nil {
+		established = make(map[string]bool, len(outboundTags))
+		for id := range outboundTags {
+			established[id] = true
+		}
+	}
+	return serviceRuntime.PlanProxyDNSEndpoints(bindings, upstreams, outboundTags, established), active.Render, nil
+}
+
+// proxyDNSEndpointProbeResult is one cached endpoint verdict. It is separate
+// from dnsProbeResult because an endpoint probe may be UDP, TCP, DoT or DoH.
+type proxyDNSEndpointProbeResult struct {
+	Healthy bool
+	Reason  string
+	At      time.Time
+}
+
+// probeProxyDNSEndpoint runs (or returns a cached) endpoint health check. A
+// missing probe function means the endpoint cannot be verified; that is
+// reported as unhealthy so a status response never claims success for an
+// unverified endpoint.
+func (server *Server) probeProxyDNSEndpoint(ctx context.Context, endpoint serviceRuntime.ProxyDNSEndpoint, cacheTTL time.Duration) proxyDNSEndpointProbeResult {
+	server.proxyDNSEndpointMu.Lock()
+	defer server.proxyDNSEndpointMu.Unlock()
+	if cached, exists := server.proxyDNSEndpointCached[endpoint.ID]; exists && time.Since(cached.At) < cacheTTL {
+		return cached
+	}
+	probe := server.proxyDNSEndpointProbe
+	if probe == nil {
+		prober := serviceRuntime.ProxyDNSEndpointProber{}
+		probe = prober.Probe
+	}
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serviceRuntime.ProxyDNSEndpointProbeTimeout)
+	defer cancel()
+	result := proxyDNSEndpointProbeResult{Healthy: true, At: time.Now()}
+	if err := probe(probeCtx, endpoint); err != nil {
+		result.Healthy = false
+		result.Reason = err.Error()
+	}
+	if server.proxyDNSEndpointCached == nil {
+		server.proxyDNSEndpointCached = make(map[string]proxyDNSEndpointProbeResult)
+	}
+	server.proxyDNSEndpointCached[endpoint.ID] = result
+	return result
+}
+
+// dnsUpstreamBootstrapFor applies the same bootstrap inference for the
+// renderer and for endpoint planning, so a DoH upstream resolves identically
+// in both paths.
+func dnsUpstreamBootstrapFor(item map[string]any, profileHint string) []string {
+	servers := stringSliceField(item, "servers")
+	bootstrapProfile := firstStringField(item, "bootstrap_profile", "bootstrap_dns_profile")
+	bootstrapServers := stringSliceField(item, "bootstrap_servers")
+	if len(bootstrapServers) == 0 && bootstrapProfile != "" {
+		bootstrapServers = serviceRuntime.BuiltinDNSBootstrap(bootstrapProfile).BootstrapServers
+	}
+	if bootstrapProfile == "" {
+		bootstrapProfile = strings.TrimSpace(profileHint)
+		if bootstrapProfile == "" {
+			lowerID := strings.ToLower(stringField(item, "id"))
+			if strings.Contains(lowerID, "domestic") || strings.Contains(lowerID, "cn") {
+				bootstrapProfile = string(serviceRuntime.DNSBootstrapDomestic)
+			} else if slices.ContainsFunc(servers, serviceRuntime.IsDoHServer) {
+				bootstrapProfile = string(serviceRuntime.DNSBootstrapForeign)
+			}
+		}
+	}
+	if len(bootstrapServers) == 0 && slices.ContainsFunc(servers, serviceRuntime.IsDoHServer) {
+		bootstrapServers = serviceRuntime.BuiltinDNSBootstrap(bootstrapProfile).BootstrapServers
+	}
+	return bootstrapServers
+}
+
+func (server *Server) dnsPolicyResource(ctx context.Context, id, name string, enabled bool, payload json.RawMessage) (DNSPolicyResource, error) {
+	var policy dns.Policy
+	if err := json.Unmarshal(payload, &policy); err != nil {
+		return DNSPolicyResource{}, err
+	}
+	displayName := strings.TrimSpace(name)
+	if displayName == "" || displayName == id {
+		displayName = nonEmpty(policy.Name, id)
+	}
+	expandedPolicy, err := server.expandDNSPolicySourceGroups(ctx, policy)
+	if err != nil {
+		return DNSPolicyResource{}, err
+	}
+	upstreamIDs, err := server.dnsPolicyUpstreamIDs(ctx)
+	if err != nil {
+		return DNSPolicyResource{}, err
+	}
+	compiled, err := dns.CompilePolicyWithOptions(expandedPolicy, dns.CompileOptions{
+		ProxyEgresses:              server.dnsPolicyProxyEgresses(ctx),
+		UpstreamIDs:                upstreamIDs,
+		ValidateUpstreamReferences: true,
+	})
+	if err != nil {
+		return DNSPolicyResource{}, err
+	}
+	if err := server.validateProxyDNSDependencies(ctx, compiled); err != nil {
+		return DNSPolicyResource{}, err
+	}
+	return DNSPolicyResource{ID: id, Kind: "policy", Name: displayName, Enabled: enabled, Policy: policy, Render: compiled.RenderSmartDNS(), Capabilities: []controlapi.CapabilityState{server.serviceCapability(context.Background(), serviceRuntime.SmartDNS, "smartdns", "SmartDNS service runtime is not configured")}}, nil
+}
+
+// dnsPolicyProxyEgresses returns the proxy egresses a DNS policy may reference.
+// The persisted desired state is authoritative; the in-memory placeholder is
+// only a compatibility fallback for callers that never wrote one. Without this
+// a DNS rule pointing at a real proxy line was rejected as "missing egress".
+func (server *Server) dnsPolicyProxyEgresses(ctx context.Context) []proxy.Egress {
+	if server.store == nil {
+		return []proxy.Egress{server.proxyEgress}
+	}
+	if documents, _, err := server.activeProxyEgressDocuments(ctx); err == nil && len(documents) > 0 {
+		egresses := make([]proxy.Egress, 0, len(documents))
+		for _, document := range documents {
+			var egress proxy.Egress
+			if json.Unmarshal(document.Payload, &egress) == nil && strings.TrimSpace(egress.ID) != "" {
+				egresses = append(egresses, egress)
+			}
+		}
+		if len(egresses) > 0 {
+			return egresses
+		}
+	}
+	return []proxy.Egress{server.proxyEgress}
+}
+
+// dnsPolicyUpstreamIDs lists every configured DNS upstream. The DNS editor uses
+// it to reject an outcome that names an upstream which no longer exists,
+// including the upstream carried by a proxy outcome.
+func (server *Server) dnsPolicyUpstreamIDs(ctx context.Context) ([]string, error) {
+	items, err := server.desiredItems(ctx, "dns_upstream")
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		if id := strings.TrimSpace(stringField(item, "id")); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+// proxyDNSDependencies collects the hostnames each proxy egress must resolve
+// before Xray can dial it. A DNS proxy rule that matches one of these
+// hostnames through the same egress would deadlock: the proxy needs DNS, and
+// DNS needs the proxy.
+func (server *Server) proxyDNSDependencies(ctx context.Context, egresses []proxy.Egress) ([]dns.ProxyDNSDependency, error) {
+	if len(egresses) == 0 {
+		return nil, nil
+	}
+	nodes, err := server.desiredItems(ctx, "proxy_node")
+	if err != nil {
+		return nil, err
+	}
+	groups, err := server.desiredItems(ctx, "proxy_group")
+	if err != nil {
+		return nil, err
+	}
+	subscriptions, err := server.desiredItems(ctx, "proxy_subscription")
+	if err != nil {
+		return nil, err
+	}
+
+	nodeDomains := make(map[string][]string, len(nodes))
+	allNodeDomains := make([]string, 0, len(nodes))
+	for _, item := range nodes {
+		id := strings.TrimSpace(stringField(item, "id"))
+		if id == "" || !desiredEnabled(item) {
+			continue
+		}
+		domain := proxyHostname(stringField(item, "address"))
+		if domain == "" {
+			continue
+		}
+		nodeDomains[id] = append(nodeDomains[id], domain)
+		allNodeDomains = append(allNodeDomains, domain)
+	}
+
+	groupMembers := make(map[string][]string, len(groups))
+	for _, item := range groups {
+		id := strings.TrimSpace(stringField(item, "id"))
+		if id == "" || !desiredEnabled(item) {
+			continue
+		}
+		groupMembers[id] = stringSliceField(item, "members")
+	}
+
+	subscriptionDomains := make(map[string][]string, len(subscriptions))
+	allSubscriptionDomains := make([]string, 0, len(subscriptions))
+	for _, item := range subscriptions {
+		id := strings.TrimSpace(stringField(item, "id"))
+		if id == "" || !desiredEnabled(item) {
+			continue
+		}
+		domains := []string{}
+		if domain := proxyHostname(proxyURLHostname(stringField(item, "url"))); domain != "" {
+			domains = append(domains, domain)
+		}
+		for _, nodeID := range stringSliceField(item, "node_refs") {
+			domains = append(domains, nodeDomains[strings.TrimSpace(nodeID)]...)
+		}
+		subscriptionDomains[id] = domains
+		allSubscriptionDomains = append(allSubscriptionDomains, domains...)
+	}
+
+	dependencies := make([]dns.ProxyDNSDependency, 0, len(egresses))
+	for _, egress := range egresses {
+		egressID := strings.TrimSpace(egress.ID)
+		if egressID == "" {
+			continue
+		}
+		domains := []string{}
+		switch {
+		case strings.TrimSpace(egress.NodeID) != "":
+			domains = append(domains, nodeDomains[strings.TrimSpace(egress.NodeID)]...)
+		case strings.TrimSpace(egress.GroupID) != "":
+			for _, nodeID := range groupMembers[strings.TrimSpace(egress.GroupID)] {
+				domains = append(domains, nodeDomains[strings.TrimSpace(nodeID)]...)
+			}
+		case strings.TrimSpace(egress.SubscriptionID) != "":
+			domains = append(domains, subscriptionDomains[strings.TrimSpace(egress.SubscriptionID)]...)
+		default:
+			// A legacy egress may let the runtime pick the only enabled node
+			// or subscription. Include every candidate so the check cannot be
+			// evaded by an implicit selection.
+			domains = append(domains, allNodeDomains...)
+			domains = append(domains, allSubscriptionDomains...)
+		}
+		dependencies = append(dependencies, dns.ProxyDNSDependency{ProxyEgressID: egressID, Domains: uniqueProxyHostnames(domains)})
+	}
+	return dependencies, nil
+}
+
+func (server *Server) validateProxyDNSDependencies(ctx context.Context, compiled dns.CompiledPolicy) error {
+	if len(compiled.ProxyDNSBindings) == 0 {
+		return nil
+	}
+	dependencies, err := server.proxyDNSDependencies(ctx, server.dnsPolicyProxyEgresses(ctx))
+	if err != nil {
+		return err
+	}
+	return dns.CheckProxyDNSDependencyCyclesFrom(compiled, dependencies, compiled.ReferencedEgressIDs)
+}
+
+func proxyHostname(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	}
+	value = strings.Trim(value, "[]")
+	value = strings.TrimSuffix(strings.ToLower(value), ".")
+	if value == "" {
+		return ""
+	}
+	if _, err := netip.ParseAddr(value); err == nil {
+		return ""
+	}
+	return value
+}
+
+func proxyURLHostname(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return parsed.Hostname()
+}
+
+func uniqueProxyHostnames(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (server *Server) expandDNSPolicySourceGroups(ctx context.Context, policy dns.Policy) (dns.Policy, error) {
+	items, err := server.desiredItems(ctx, "object_group")
+	if err != nil {
+		return dns.Policy{}, err
+	}
+	consumer := map[string]any{"policy": policy}
+	items, err = materializeObjectGroupItems(items, referencedObjectGroupIDs(items, []map[string]any{consumer}))
+	if err != nil {
+		return dns.Policy{}, err
+	}
+	expanded := policy
+	expanded.Rules = append([]dns.Rule(nil), policy.Rules...)
+	for index := range expanded.Rules {
+		rule := &expanded.Rules[index]
+		if len(rule.SourcePrefixes) == 0 {
+			continue
+		}
+		selectors, expandErr := trafficpolicy.ExpandAddressSelectors(rule.SourcePrefixes, items)
+		if expandErr != nil {
+			return dns.Policy{}, fmt.Errorf("dns rule %q source selectors: %w", rule.ID, expandErr)
+		}
+		rule.SourcePrefixes = selectors
+	}
+	return expanded, nil
+}
+
+// expandDNSPolicyForDecision produces the executable decision view used by
+// the diagnostic/preview endpoint. Runtime SmartDNS keeps domain-set IDs in
+// its rendered configuration, but the pure policy evaluator needs the actual
+// domain selectors to make the same first-match decision as SmartDNS.
+func (server *Server) expandDNSPolicyForDecision(ctx context.Context, policy dns.Policy) (dns.Policy, error) {
+	expanded, err := server.expandDNSPolicySourceGroups(ctx, policy)
+	if err != nil {
+		return dns.Policy{}, err
+	}
+	sets, err := server.currentDNSDomainSets(ctx)
+	if err != nil {
+		return dns.Policy{}, err
+	}
+	for index := range expanded.Rules {
+		rule := &expanded.Rules[index]
+		for _, setID := range rule.DomainSetIDs {
+			setID = strings.TrimSpace(setID)
+			entries, exists := sets[setID]
+			if !exists {
+				return dns.Policy{}, fmt.Errorf("dns policy references unavailable domain set %q", setID)
+			}
+			for _, entry := range entries {
+				entry = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(entry)), ".")
+				if entry == "" {
+					continue
+				}
+				if strings.HasPrefix(entry, "*.") {
+					rule.DomainSuffixes = append(rule.DomainSuffixes, strings.TrimPrefix(entry, "*."))
+					continue
+				}
+				if strings.HasPrefix(entry, ".") {
+					rule.DomainSuffixes = append(rule.DomainSuffixes, strings.TrimPrefix(entry, "."))
+					continue
+				}
+				rule.Domains = append(rule.Domains, entry)
+			}
+		}
+	}
+	return expanded, nil
+}
+
+type desiredResourceDef struct {
+	CollectionPath string
+	Defaults       []map[string]any
+}
+
+var desiredResourceDefs = map[string]desiredResourceDef{
+	"interface": {CollectionPath: "/api/v1/interfaces", Defaults: []map[string]any{}},
+	"management_network": {CollectionPath: "/api/v1/management/network", Defaults: []map[string]any{
+		{"id": "management-network", "interface_id": "eth0", "mode": "exclusive", "cidr": "192.168.88.254/24", "gateway": "", "dhcp_enabled": true, "preserve_management_port": true, "runtime_state": "desired_not_applied"},
+	}},
+	"interface_bond": {CollectionPath: "/api/v1/interface-bonds", Defaults: []map[string]any{}},
+	"object_group": {CollectionPath: "/api/v1/objects/ip-groups", Defaults: []map[string]any{
+		{"id": "obj-geoip-cn", "kind": "ip", "name": "GeoIP 中国大陆", "entries": []string{}, "source": map[string]any{"provider": "v2ray-rules-dat", "format": "geoip", "category": "CN", "file": "geoip.dat", "sha256": "6ba63d75f307d16a81ae09406ddcf2779fa75cb642d4aae59613370d62d33509"}, "source_entry_count": 5822},
+		{"id": "obj-geosite-cn", "kind": "domain", "name": "GeoSite 中国大陆", "entries": []string{}, "source": map[string]any{"provider": "v2ray-rules-dat", "format": "geosite", "category": "CN", "file": "geosite.dat", "sha256": "857227f9dcedbfda5c067ba740ca8a461a06a6ac12aeeb99dcbf82c0e1bdb125"}, "source_entry_count": 111514},
+	}},
+	"wan_link":           {CollectionPath: "/api/v1/gateway/wan-links", Defaults: []map[string]any{}},
+	"wan_group":          {CollectionPath: "/api/v1/gateway/wan-groups", Defaults: []map[string]any{}},
+	"route_policy":       {CollectionPath: "/api/v1/gateway/policies/routes", Defaults: []map[string]any{}},
+	"nat_static":         {CollectionPath: "/api/v1/gateway/nat/static", Defaults: []map[string]any{}},
+	"port_map":           {CollectionPath: "/api/v1/gateway/nat/port-maps", Defaults: []map[string]any{}},
+	"proxy_node":         {CollectionPath: "/api/v1/proxy/nodes", Defaults: []map[string]any{}},
+	"proxy_subscription": {CollectionPath: "/api/v1/proxy/subscriptions", Defaults: []map[string]any{}},
+	"proxy_group":        {CollectionPath: "/api/v1/proxy/groups", Defaults: []map[string]any{}},
+	"dns_policy":         {CollectionPath: "/api/v1/dns/policies", Defaults: []map[string]any{{"id": "default", "kind": "policy", "name": "Default DNS Policy", "enabled": true, "policy": map[string]any{"engine": "smartdns", "miss": map[string]any{"kind": "direct", "upstream_id": "dns-direct-default"}, "rules": []any{}}, "degraded": true}}},
+	"domain_ip_set":      {CollectionPath: "/api/v1/dns/domain-ip-sets", Defaults: []map[string]any{}},
+	"dns_upstream": {CollectionPath: "/api/v1/dns/upstreams", Defaults: []map[string]any{
+		{"id": "dns-direct-default", "name": "Default Direct Resolvers", "engine": "smartdns", "servers": []string{"1.1.1.1", "8.8.8.8"}, "cache_size": 32768, "ttl_min_seconds": 60, "ttl_max_seconds": 600, "prefetch": true, "degraded": true, "degraded_reason": "SmartDNS process manager not wired"},
+	}},
+	"dhcp_server":             {CollectionPath: "/api/v1/dhcp/servers", Defaults: []map[string]any{}},
+	"dhcp_lease":              {CollectionPath: "/api/v1/dhcp/leases", Defaults: []map[string]any{}},
+	"dhcp_static_binding":     {CollectionPath: "/api/v1/dhcp/static-bindings", Defaults: []map[string]any{}},
+	"security_acl":            {CollectionPath: "/api/v1/security/acls", Defaults: []map[string]any{{"id": "sec-acl-default-deny-wan", "kind": "acl", "name": "Default WAN Inbound Deny", "enabled": true, "match": map[string]any{"enabled": true, "schedule": "always", "src_ip": "any", "dst_ip": "wan", "protocol": "any", "direction": "wan_to_lan"}, "action": "deny", "degraded": true}}},
+	"security_ip_mac_binding": {CollectionPath: "/api/v1/security/ip-mac-bindings", Defaults: []map[string]any{}},
+	"security_threat_intel":   {CollectionPath: "/api/v1/security/threat-intel", Defaults: []map[string]any{}},
+	"security_attack_rule":    {CollectionPath: "/api/v1/security/attack-rules", Defaults: []map[string]any{}},
+	"traffic_control":         {CollectionPath: "/api/v1/flow-control/policies", Defaults: []map[string]any{{"id": "default", "rules": []map[string]any{{"id": "classify-default", "granularity": "rule", "actions": []map[string]any{{"kind": "classify", "traffic_class": "best-effort"}}}}, "capabilities": []controlapi.CapabilityState{{Name: "vpp_qos_push", Available: false, State: controlapi.CapabilityDegraded, Reason: "live VPP QoS adapter not wired"}}}}},
+}
+
+func defaultDatapathCapability() map[string]any {
+	return map[string]any{"state": "dataplane_locked", "vpp_native": "requires_runtime_proof", "rdma_dv": "unknown", "af_xdp_zero_copy": "unknown"}
+}
+
+func (server *Server) handleDesiredCollection(resourceType string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if resourceType == "interface" {
+				items, capabilities, err := server.interfaceRuntimeSnapshot(r.Context())
+				if err != nil {
+					writeError(w, r, http.StatusInternalServerError, "interface_snapshot_failed", err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]any{"items": items, "capabilities": capabilities, "request_id": requestID(r)})
+				return
+			}
+			items, err := server.desiredItems(r.Context(), resourceType)
+			if err != nil {
+				writeError(w, r, http.StatusInternalServerError, "desired_state_read_failed", err.Error())
+				return
+			}
+			if resourceType == "port_map" {
+				items = server.decoratePortMapRuntimeStates(r.Context(), items)
+			}
+			if resourceType == "nat_static" {
+				items = server.decorateNATStaticRuntimeStates(r.Context(), items)
+			}
+			if resourceType == "dhcp_server" {
+				items = server.decorateDHCPRuntimeStates(r.Context(), items)
+			}
+			if resourceType == "route_policy" {
+				items = server.decorateRoutePolicyRuntimeStates(r.Context(), items)
+			}
+			if resourceType == "wan_group" {
+				items = server.decorateWANGroupRuntimeStates(r.Context(), items)
+			}
+			if resourceType == "object_group" && server.profile.ID() == product.Orchestrator().ID() {
+				filtered := make([]map[string]any, 0, len(items))
+				for _, item := range items {
+					if objectGroupKind(item) == "ip" {
+						filtered = append(filtered, item)
+					}
+				}
+				items = filtered
+			}
+			if resourceType == "traffic_control" {
+				items = server.decorateTrafficControlRuntimeStates(r.Context(), items)
+			}
+			if resourceType == "dns_upstream" {
+				items = server.decorateDNSUpstreamRuntimeStates(r.Context(), server.decorateDNSRuntimeCapabilities(r.Context(), items))
+			}
+			if resourceType == "dns_policy" {
+				items = server.decorateDNSRuntimeCapabilities(r.Context(), items)
+			}
+			if resourceType == "wan_link" {
+				items = server.decorateWANLinkRuntimeStates(r.Context(), items)
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"items": items, "capabilities": server.degradedRuntimeCapabilities(r.Context()), "request_id": requestID(r)})
+		case http.MethodPost:
+			server.handleDesiredMutation(w, r, resourceType, "create", "")
+		default:
+			writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		}
+	}
+}
+
+func (server *Server) handleDesiredItem(resourceType string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, action := desiredPathID(resourceType, r.URL.Path)
+		if id == "" {
+			writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+			return
+		}
+		if action == "stats" && r.Method == http.MethodGet {
+			item, ok, capabilities, err := server.interfaceRuntimeItem(r.Context(), id)
+			if err != nil {
+				writeError(w, r, http.StatusInternalServerError, "interface_snapshot_failed", err.Error())
+				return
+			}
+			if !ok {
+				writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+				return
+			}
+			if resourceType == "object_group" && server.profile.ID() == product.Orchestrator().ID() && objectGroupKind(item) != "ip" {
+				writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"item": item, "capabilities": capabilities, "id": id, "request_id": requestID(r)})
+			return
+		}
+		if resourceType == "object_group" && action == "export" && r.Method == http.MethodGet {
+			server.handleObjectGroupExport(w, r, id)
+			return
+		}
+		if resourceType == "object_group" && action == "import" && r.Method == http.MethodPost {
+			server.handleObjectGroupImport(w, r, id)
+			return
+		}
+		if resourceType == "proxy_subscription" && action == "refresh" && r.Method == http.MethodPost {
+			server.handleProxySubscriptionRefresh(w, r, id)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			if resourceType == "interface" {
+				item, ok, capabilities, err := server.interfaceRuntimeItem(r.Context(), id)
+				if err != nil {
+					writeError(w, r, http.StatusInternalServerError, "interface_snapshot_failed", err.Error())
+					return
+				}
+				if !ok {
+					// Logical LAN/WAN assignments are desired-state resources
+					// with their own id; they are not physical runtime NICs.
+					// Read them back through the desired-state store so the
+					// item API is symmetric with POST /api/v1/interfaces.
+					item, ok, err = server.desiredItem(r.Context(), resourceType, id)
+					if err != nil {
+						writeError(w, r, http.StatusInternalServerError, "desired_state_read_failed", err.Error())
+						return
+					}
+				}
+				if !ok {
+					writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]any{"item": item, "capabilities": capabilities, "request_id": requestID(r)})
+				return
+			}
+			item, ok, err := server.desiredItem(r.Context(), resourceType, id)
+			if err != nil {
+				writeError(w, r, http.StatusInternalServerError, "desired_state_read_failed", err.Error())
+				return
+			}
+			if !ok {
+				writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+				return
+			}
+			if resourceType == "port_map" {
+				item = decoratePortMapItem(item)
+			}
+			if resourceType == "route_policy" {
+				item = server.decorateRoutePolicyRuntimeState(r.Context(), item)
+			}
+			if resourceType == "wan_group" {
+				item = server.decorateWANGroupRuntimeStates(r.Context(), []map[string]any{item})[0]
+			}
+			if resourceType == "port_map" {
+				item = server.decoratePortMapRuntimeStates(r.Context(), []map[string]any{item})[0]
+			}
+			if resourceType == "nat_static" {
+				item = server.decorateNATStaticRuntimeStates(r.Context(), []map[string]any{item})[0]
+			}
+			if resourceType == "dhcp_server" {
+				item = server.decorateDHCPRuntimeStates(r.Context(), []map[string]any{item})[0]
+			}
+			if resourceType == "traffic_control" {
+				item = server.decorateTrafficControlRuntimeState(r.Context(), item)
+			}
+			if resourceType == "dns_upstream" {
+				item = server.decorateDNSUpstreamRuntimeStates(r.Context(), server.decorateDNSRuntimeCapabilities(r.Context(), []map[string]any{item}))[0]
+			}
+			if resourceType == "dns_policy" {
+				item = server.decorateDNSRuntimeCapabilities(r.Context(), []map[string]any{item})[0]
+			}
+			if resourceType == "wan_link" {
+				item = server.decorateWANLinkRuntimeStates(r.Context(), []map[string]any{item})[0]
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"item": item, "capabilities": server.degradedRuntimeCapabilities(r.Context()), "request_id": requestID(r)})
+		case http.MethodPatch, http.MethodPost:
+			server.handleDesiredMutation(w, r, resourceType, actionOrDefault(action, "update"), id)
+		case http.MethodDelete:
+			server.handleDesiredDelete(w, r, resourceType, id)
+		default:
+			writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		}
+	}
+}
+
+func (server *Server) handleDesiredDelete(w http.ResponseWriter, r *http.Request, resourceType, id string) {
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", r.URL.Path, "delete", "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "denied", "readonly mutation denied", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, r.URL.Path, "delete") {
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	if resourceType == "interface" {
+		if canonical := server.canonicalInterfaceReference(r.Context(), id); isProductInterfaceID(canonical) {
+			id = canonical
+		}
+		if server.resolveInterfaceID(r.Context(), id) == server.managementInterfaceID(r.Context()) {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "denied", "management interface role is protected", r)
+			writeError(w, r, http.StatusUnprocessableEntity, "management_interface_protected", "management interface role cannot be deleted")
+			return
+		}
+		references, refErr := server.interfaceRoleReferences(r.Context(), id)
+		if refErr != nil {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "failure", refErr.Error(), r)
+			writeError(w, r, http.StatusInternalServerError, "reference_scan_failed", "interface references could not be scanned")
+			return
+		}
+		if len(references) > 0 {
+			message := fmt.Sprintf("interface %s is still referenced by %s %s; delete or move it first", id, references[0].Kind, references[0].ID)
+			server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "denied", message, r)
+			legacyRefs := make([]map[string]any, 0, len(references))
+			for _, reference := range references {
+				legacyRefs = append(legacyRefs, map[string]any{"resource_type": reference.Kind, "id": reference.ID, "role": reference.Role})
+			}
+			var conflict *configDependencyConflict
+			if guard, guardErr := server.configDependencyDeleteConflict(r.Context(), resourceType, id); guardErr == nil {
+				conflict = guard
+			}
+			writeLegacyDependencyConflict(w, r, resourceType, configgraph.NodeRef{Type: configgraph.KindInterface, ID: id}, legacyRefs, message, conflict)
+			return
+		}
+	}
+	if resourceType == "object_group" {
+		references, err := server.objectGroupReferences(r.Context(), id)
+		if err != nil {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "failure", err.Error(), r)
+			writeError(w, r, http.StatusInternalServerError, "reference_scan_failed", "object group references could not be scanned")
+			return
+		}
+		if len(references) > 0 {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "denied", "object group is referenced by enabled policies", r)
+			var conflict *configDependencyConflict
+			if guard, guardErr := server.configDependencyDeleteConflict(r.Context(), resourceType, id); guardErr == nil {
+				conflict = guard
+			}
+			writeLegacyDependencyConflict(w, r, resourceType, configgraph.NodeRef{Type: configgraph.KindObjectGroup, ID: id}, references, "object group is referenced by enabled policies", conflict)
+			return
+		}
+	}
+	// WS-K: every other resource type is protected by the dependency graph.
+	// proxy_node/proxy_group used to have a narrower scan in this handler; the
+	// graph also sees route policies and egress underlays, so it subsumes it.
+	if handled, guardErr := server.writeGraphDeleteGuard(w, r, resourceType, id); guardErr != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "failure", guardErr.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "reference_scan_failed", "dependency references could not be scanned")
+		return
+	} else if handled {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "denied", "object is still referenced", r)
+		return
+	}
+	if resourceType == "interface" {
+		// A document written before the migration is still keyed by the kernel
+		// name; remove every alias so the role cannot come back.
+		for _, alias := range server.interfaceDocumentAliases(r.Context(), id) {
+			_ = server.store.DeleteConfig(r.Context(), resourceType, alias)
+		}
+	}
+	if err := server.store.DeleteConfig(r.Context(), resourceType, id); err != nil {
+		if errors.Is(err, persistence.ErrNotFound) {
+			if resourceType == "proxy_egress" && id == server.proxyEgress.ID {
+				payload := map[string]any{"id": id, "deleted": true, "runtime_state": "desired_not_applied"}
+				raw, _ := json.Marshal(payload)
+				if saveErr := server.store.SaveConfig(r.Context(), persistence.ConfigDocument{ResourceType: resourceType, ResourceID: id, Payload: raw, PayloadHash: hashObject(payload), UpdatedAt: server.now().UTC()}); saveErr != nil {
+					server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "failure", saveErr.Error(), r)
+					writeError(w, r, http.StatusInternalServerError, "desired_state_delete_failed", "desired state could not be deleted")
+					return
+				}
+				server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "success", "", r)
+				server.bumpConfigGraphGeneration(r.Context(), "delete", resourceType, id, "")
+				writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id, "runtime_state": "desired_not_applied", "request_id": requestID(r)})
+				return
+			}
+			server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "failure", "resource not found", r)
+			writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+			return
+		}
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "desired_state_delete_failed", "desired state could not be deleted")
+		return
+	}
+	server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "success", "", r)
+	server.bumpConfigGraphGeneration(r.Context(), "delete", resourceType, id, "")
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id, "runtime_state": "desired_not_applied", "request_id": requestID(r)})
+}
+
+func (server *Server) objectGroupReferences(ctx context.Context, id string) ([]map[string]any, error) {
+	consumers := []string{"route_policy", "security_acl", "nat_static", "port_map", "dns_policy", "traffic_control"}
+	var references []map[string]any
+	for _, resourceType := range consumers {
+		items, err := server.desiredItems(ctx, resourceType)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range items {
+			if !desiredEnabled(item) || !containsReference(item, id) {
+				continue
+			}
+			references = append(references, map[string]any{"resource_type": resourceType, "id": stringField(item, "id"), "name": stringField(item, "name")})
+		}
+	}
+	return references, nil
+}
+
+func desiredEnabled(item map[string]any) bool {
+	if value, ok := item["enabled"].(bool); ok {
+		return value
+	}
+	return true
+}
+
+func containsReference(value any, id string) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if key == "id" || key == "name" {
+				continue
+			}
+			if containsReference(child, id) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if containsReference(child, id) {
+				return true
+			}
+		}
+	case []map[string]any:
+		for _, child := range typed {
+			if containsReference(child, id) {
+				return true
+			}
+		}
+	case []string:
+		for _, child := range typed {
+			if strings.TrimSpace(child) == id {
+				return true
+			}
+		}
+	case string:
+		for _, token := range strings.FieldsFunc(typed, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r' }) {
+			if strings.TrimSpace(token) == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (server *Server) handleObjectGroupExport(w http.ResponseWriter, r *http.Request, id string) {
+	item, ok, err := server.desiredItem(r.Context(), "object_group", id)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "object_group_read_failed", err.Error())
+		return
+	}
+	if !ok {
+		writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+		return
+	}
+	if source, hasSource := objectGroupSource(item); hasSource {
+		materialized, materializeErr := materializeObjectGroupItems([]map[string]any{item}, map[string]bool{id: true})
+		if materializeErr != nil {
+			writeError(w, r, http.StatusUnprocessableEntity, "geodata_source_unavailable", materializeErr.Error())
+			return
+		}
+		if len(materialized) == 1 {
+			item = materialized[0]
+		} else {
+			writeError(w, r, http.StatusUnprocessableEntity, "geodata_source_unavailable", fmt.Sprintf("object group %q source %s could not be materialized", id, source.File))
+			return
+		}
+	}
+	entries := objectGroupEntries(item)
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "kind": objectGroupKind(item), "entries": entries, "text": strings.Join(entries, "\n"), "request_id": requestID(r)})
+}
+
+func (server *Server) handleObjectGroupImport(w http.ResponseWriter, r *http.Request, id string) {
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", r.URL.Path, "import", "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, "import", "denied", "readonly mutation denied", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, r.URL.Path, "import") {
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	var req struct {
+		Text string `json:"text"`
+	}
+	importMode := "append"
+	var importedSource *geodata.Source
+	importKind := strings.ToLower(strings.TrimSpace(r.FormValue("kind")))
+	if importKind == "" {
+		importKind = "ip"
+	}
+	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
+		if err := r.ParseMultipartForm(64 << 20); err != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid_multipart", "uploaded object-group file could not be read")
+			return
+		}
+		importMode = strings.ToLower(strings.TrimSpace(r.FormValue("mode")))
+		if importMode == "" {
+			importMode = "append"
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			writeError(w, r, http.StatusBadRequest, "file_required", "an object-group import file is required")
+			return
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(file, 64<<20))
+		_ = file.Close()
+		if readErr != nil {
+			writeError(w, r, http.StatusBadRequest, "file_read_failed", "uploaded object-group file could not be read")
+			return
+		}
+		format := strings.ToLower(strings.TrimSpace(r.FormValue("format")))
+		if format == "" {
+			switch strings.ToLower(filepath.Ext(header.Filename)) {
+			case ".dat":
+				format = "geosite"
+			default:
+				format = "text"
+			}
+		}
+		category := strings.TrimSpace(r.FormValue("category"))
+		if format == "geoip" || format == "geosite" {
+			parsed, parseErr := func() (geodata.Data, error) {
+				if format == "geoip" {
+					return geodata.ParseGeoIP(raw, category)
+				}
+				return geodata.ParseGeoSite(raw, category)
+			}()
+			if parseErr != nil {
+				writeError(w, r, http.StatusUnprocessableEntity, "geodata_import_failed", parseErr.Error())
+				return
+			}
+			req.Text = strings.Join(parsed.Entries, "\n")
+			importedSource = &geodata.Source{Format: format, Category: parsed.Category, File: header.Filename, EntryCount: len(parsed.Entries)}
+		} else {
+			textData, parseErr := geodata.ParseText(raw, importKind)
+			if parseErr != nil {
+				writeError(w, r, http.StatusUnprocessableEntity, "text_import_failed", parseErr.Error())
+				return
+			}
+			req.Text = strings.Join(textData.Entries, "\n")
+		}
+	} else if err := decodeStrictJSON(r, &req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+	item, ok, err := server.desiredItem(r.Context(), "object_group", id)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "object_group_read_failed", err.Error())
+		return
+	}
+	if !ok {
+		writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+		return
+	}
+	// A source-backed built-in group is intentionally lazy in list responses.
+	// Once a user imports or appends manual entries, materialize the source once
+	// and remove the lazy source marker so the edited group is authoritative.
+	if _, hasSource := objectGroupSource(item); hasSource {
+		if importMode != "overwrite" && importMode != "replace" {
+			materialized, materializeErr := materializeObjectGroupItems([]map[string]any{item}, map[string]bool{id: true})
+			if materializeErr != nil {
+				writeError(w, r, http.StatusUnprocessableEntity, "geodata_source_unavailable", materializeErr.Error())
+				return
+			}
+			if len(materialized) == 1 {
+				item = materialized[0]
+			}
+		}
+		delete(item, "source")
+	}
+	originalEntries := objectGroupEntries(item)
+	baseEntries := originalEntries
+	if importMode == "overwrite" || importMode == "replace" {
+		baseEntries = nil
+	}
+	entries, invalidLines := importObjectGroupEntries(objectGroupKind(item), baseEntries, req.Text)
+	if len(entries) > 0 {
+		item["entries"] = entries
+		item["members"] = entries
+		item["source_entry_count"] = len(entries)
+		item["compiled_expansion"] = map[string]any{"kind": objectGroupKind(item), "entries": entries, "entry_count": len(entries)}
+		affected, _ := server.objectGroupReferences(r.Context(), id)
+		for _, consumer := range affected {
+			consumer["runtime_state"] = "dirty"
+			consumer["recompile_state"] = "pending"
+		}
+		item["affected_consumers"] = affected
+		item["runtime_state"] = "desired_not_applied"
+		if importedSource != nil {
+			item["import_source"] = importedSource
+		}
+		item["capabilities"] = server.degradedRuntimeCapabilities(r.Context())
+		raw, hash, err := persistence.MarshalPayload(item)
+		if err != nil {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, "import", "failure", err.Error(), r)
+			writeError(w, r, http.StatusBadRequest, "invalid_payload", "object group payload could not be encoded")
+			return
+		}
+		if err := server.store.SaveConfig(r.Context(), persistence.ConfigDocument{ResourceType: "object_group", ResourceID: id, Payload: raw, PayloadHash: hash, UpdatedAt: server.now().UTC()}); err != nil {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, "import", "failure", err.Error(), r)
+			writeError(w, r, http.StatusInternalServerError, "object_group_import_failed", "object group could not be saved")
+			return
+		}
+	}
+	server.recordAudit(session.Username, session.Role, r.URL.Path, "import", "success", "", r)
+	importedCount := len(entries)
+	if importMode != "overwrite" && importMode != "replace" && len(entries) >= len(originalEntries) {
+		importedCount = len(entries) - len(originalEntries)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "imported_count": importedCount, "entries": entries, "invalid_lines": invalidLines, "compiled_expansion": item["compiled_expansion"], "affected_consumers": item["affected_consumers"], "runtime_state": "desired_not_applied", "request_id": requestID(r)})
+}
+
+func objectGroupKind(item map[string]any) string {
+	return firstStringField(item, "group_type", "type", "kind")
+}
+
+func (server *Server) normalizeObjectGroupPayload(ctx context.Context, payload map[string]any) error {
+	kind := objectGroupKind(payload)
+	if kind != "ip" && kind != "domain" {
+		return fmt.Errorf("object_group kind must be ip or domain")
+	}
+	if server.profile.ID() == product.Orchestrator().ID() && kind != "ip" {
+		return fmt.Errorf("Orchestrator supports IP groups only")
+	}
+	name := stringField(payload, "name")
+	if name == "" {
+		return fmt.Errorf("object_group name is required")
+	}
+	if server.store != nil {
+		groups, err := server.desiredItems(ctx, "object_group")
+		if err != nil {
+			return err
+		}
+		id := stringField(payload, "id")
+		for _, group := range groups {
+			if stringField(group, "id") == id {
+				if objectGroupKind(group) != kind {
+					return fmt.Errorf("object_group id %q already belongs to kind %s", id, objectGroupKind(group))
+				}
+				continue
+			}
+			if objectGroupKind(group) == kind && strings.EqualFold(stringField(group, "name"), name) {
+				return fmt.Errorf("object_group name %q already exists for kind %s", name, kind)
+			}
+		}
+	}
+	entries, err := canonicalObjectGroupEntries(kind, objectGroupEntries(payload))
+	if err != nil {
+		return err
+	}
+	payload["kind"] = kind
+	payload["type"] = kind
+	payload["entries"] = entries
+	payload["members"] = entries
+	payload["compiled_expansion"] = map[string]any{"kind": kind, "entries": entries, "entry_count": len(entries)}
+	affected, _ := server.objectGroupReferences(ctx, stringField(payload, "id"))
+	for _, consumer := range affected {
+		consumer["runtime_state"] = "dirty"
+		consumer["recompile_state"] = "pending"
+	}
+	payload["affected_consumers"] = affected
+	return nil
+}
+
+func canonicalObjectGroupEntries(kind string, raw []string) ([]string, error) {
+	seen := map[string]struct{}{}
+	entries := make([]string, 0, len(raw))
+	for _, entry := range raw {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if err := validateObjectGroupEntry(kind, entry); err != nil {
+			return nil, fmt.Errorf("object_group entry %q invalid: %w", entry, err)
+		}
+		if _, ok := seen[entry]; ok {
+			continue
+		}
+		seen[entry] = struct{}{}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+func objectGroupEntries(item map[string]any) []string {
+	return append(stringSliceField(item, "entries"), stringSliceField(item, "members")...)
+}
+
+// objectGroupSource is deliberately metadata-only in the public object-group
+// response.  Large GeoSite categories can contain more than one hundred
+// thousand selectors; expanding them in every list response makes the UI
+// slow and needlessly increases the persistence/API surface.  Runtime
+// compilation calls materializeObjectGroupItems for only referenced groups.
+func objectGroupSource(item map[string]any) (geodata.Source, bool) {
+	raw, ok := item["source"].(map[string]any)
+	if !ok || len(raw) == 0 {
+		return geodata.Source{}, false
+	}
+	source := geodata.Source{
+		Format:   stringField(raw, "format"),
+		Category: stringField(raw, "category"),
+		File:     stringField(raw, "file"),
+		SHA256:   stringField(raw, "sha256"),
+	}
+	return source, source.Format != "" && source.Category != ""
+}
+
+func materializeObjectGroupItems(items []map[string]any, required map[string]bool) ([]map[string]any, error) {
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		clone := cloneObject(item)
+		id := stringField(clone, "id")
+		source, hasSource := objectGroupSource(clone)
+		if hasSource && (required == nil || required[id]) {
+			data, err := geodata.LoadSource(source)
+			if err != nil {
+				return nil, fmt.Errorf("object group %q: %w", id, err)
+			}
+			if objectGroupKind(clone) == "ip" && data.Format != geodata.FormatGeoIP {
+				return nil, fmt.Errorf("object group %q requires a GeoIP source", id)
+			}
+			if objectGroupKind(clone) == "domain" && data.Format != geodata.FormatGeoSite {
+				return nil, fmt.Errorf("object group %q requires a GeoSite source", id)
+			}
+			clone["entries"] = append([]string(nil), data.Entries...)
+			clone["members"] = append([]string(nil), data.Entries...)
+			clone["source_entry_count"] = len(data.Entries)
+			if sourceMap, ok := clone["source"].(map[string]any); ok {
+				sourceMap["sha256"] = data.SourceSHA256
+				sourceMap["entry_count"] = len(data.Entries)
+			}
+		}
+		result = append(result, clone)
+	}
+	return result, nil
+}
+
+func referencedObjectGroupIDs(groups, consumers []map[string]any) map[string]bool {
+	required := make(map[string]bool)
+	for _, group := range groups {
+		id := stringField(group, "id")
+		if id == "" || !containsReference(consumers, id) {
+			continue
+		}
+		required[id] = true
+	}
+	return required
+}
+
+func importObjectGroupEntries(kind string, existing []string, text string) ([]string, []map[string]any) {
+	seen := map[string]struct{}{}
+	entries := make([]string, 0, len(existing))
+	for _, entry := range existing {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if _, ok := seen[entry]; ok {
+			continue
+		}
+		seen[entry] = struct{}{}
+		entries = append(entries, entry)
+	}
+	var invalid []map[string]any
+	for index, line := range strings.Split(text, "\n") {
+		entry := strings.TrimSpace(line)
+		if entry == "" || strings.HasPrefix(entry, "#") {
+			continue
+		}
+		if err := validateObjectGroupEntry(kind, entry); err != nil {
+			invalid = append(invalid, map[string]any{"line": index + 1, "value": entry, "error": err.Error()})
+			continue
+		}
+		if _, ok := seen[entry]; ok {
+			continue
+		}
+		seen[entry] = struct{}{}
+		entries = append(entries, entry)
+	}
+	return entries, invalid
+}
+
+func validateObjectGroupEntry(kind, entry string) error {
+	if strings.ContainsAny(entry, " \t\r\n;|&$()<>\\\"") {
+		return fmt.Errorf("entry contains unsupported characters")
+	}
+	switch kind {
+	case "ip":
+		if _, err := netip.ParseAddr(entry); err == nil {
+			return nil
+		}
+		if _, err := netip.ParsePrefix(entry); err == nil {
+			return nil
+		}
+		parts := strings.Split(entry, "-")
+		if len(parts) == 2 {
+			if _, err := netip.ParseAddr(parts[0]); err == nil {
+				if _, err := netip.ParseAddr(parts[1]); err == nil {
+					return nil
+				}
+			}
+		}
+		return fmt.Errorf("entry must be an IP address, CIDR, or IP range")
+	case "domain":
+		if strings.ContainsAny(entry, "/:*?") || strings.HasPrefix(entry, "-") || strings.HasSuffix(entry, "-") || !strings.Contains(entry, ".") {
+			return fmt.Errorf("entry must be an exact or suffix domain")
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+func (server *Server) handleProxyEgressItem(w http.ResponseWriter, r *http.Request) {
+	id, _ := splitPathRemainder("/api/v1/proxy/egresses/", r.URL.Path)
+	if id == "" {
+		writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		items, err := server.proxyEgressResources(r.Context())
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "proxy_egress_read_failed", err.Error())
+			return
+		}
+		for _, item := range items {
+			if item.ID == id {
+				writeJSON(w, http.StatusOK, map[string]any{"item": item, "request_id": requestID(r)})
+				return
+			}
+		}
+		writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+	case http.MethodPatch:
+		server.handleDesiredMutation(w, r, "proxy_egress", "update", id)
+	case http.MethodDelete:
+		server.handleDesiredDelete(w, r, "proxy_egress", id)
+	default:
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+	}
+}
+
+func actionOrDefault(action, fallback string) string {
+	if strings.TrimSpace(action) == "" {
+		return fallback
+	}
+	return action
+}
+
+func desiredPathID(resourceType, path string) (string, string) {
+	def, ok := desiredResourceDefs[resourceType]
+	if !ok {
+		return "", ""
+	}
+	if resourceType == "traffic_control" && strings.HasPrefix(path, "/api/v1/gateway/traffic-control/") {
+		return splitPathRemainder("/api/v1/gateway/traffic-control/", path)
+	}
+	if resourceType == "object_group" && strings.HasPrefix(path, "/api/v1/objects/groups/") {
+		return splitPathRemainder("/api/v1/objects/groups/", path)
+	}
+	return splitPathRemainder(def.CollectionPath+"/", path)
+}
+
+func splitPathRemainder(prefix, path string) (string, string) {
+	rest := strings.Trim(strings.TrimPrefix(path, prefix), "/")
+	if rest == "" || strings.Contains(rest, "..") {
+		return "", ""
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+	return parts[0], parts[1]
+}
+
+func (server *Server) desiredItems(ctx context.Context, resourceType string) ([]map[string]any, error) {
+	def := desiredResourceDefs[resourceType]
+	items := map[string]map[string]any{}
+	for index, item := range def.Defaults {
+		clone := cloneObject(item)
+		applyFactoryLANInterface(resourceType, clone)
+		id := stringField(clone, "id")
+		if id == "" {
+			id = fmt.Sprintf("%s-%d", resourceType, index+1)
+			clone["id"] = id
+		}
+		items[id] = clone
+	}
+	if server.store != nil {
+		documents, err := server.store.Configs(ctx, resourceType)
+		if err != nil {
+			return nil, err
+		}
+		for _, document := range documents {
+			var item map[string]any
+			if err := json.Unmarshal(document.Payload, &item); err != nil {
+				return nil, err
+			}
+			if truthy(item["deleted"]) {
+				continue
+			}
+			if stringField(item, "id") == "" {
+				item["id"] = document.ResourceID
+			}
+			items[document.ResourceID] = item
+		}
+	}
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if resourceType == "object_group" && server.profile.ID().String() == "orchestrator" && objectGroupKind(item) != "ip" {
+			continue
+		}
+		result = append(result, item)
+	}
+	// Plan B: every resource that points at a port returns the product id, and an
+	// interface document written before the migration is served under it too.
+	result = server.normalizeDesiredPortReferences(ctx, resourceType, result)
+	sort.Slice(result, func(left, right int) bool {
+		return stringField(result[left], "id") < stringField(result[right], "id")
+	})
+	return result, nil
+}
+
+func applyFactoryLANInterface(resourceType string, item map[string]any) {
+	lanInterface := factoryLANInterface()
+	if lanInterface == "eth0" {
+		return
+	}
+	switch resourceType {
+	case "interface":
+		if stringField(item, "id") == "eth0" {
+			item["id"] = lanInterface
+		}
+		if stringField(item, "name") == "eth0" {
+			item["name"] = lanInterface
+		}
+	case "dhcp_server":
+		if stringField(item, "interface_id") == "eth0" {
+			item["interface_id"] = lanInterface
+		}
+	case "management_network":
+		if stringField(item, "interface_id") == "eth0" {
+			item["interface_id"] = lanInterface
+		}
+	}
+}
+
+func factoryLANInterface() string {
+	if value := strings.TrimSpace(os.Getenv("LY_ROUTE_MANAGEMENT_INTERFACE")); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(os.Getenv("LY_ROUTE_LAN_INTERFACE")); value != "" {
+		return value
+	}
+	return "eth0"
+}
+
+func (server *Server) desiredItem(ctx context.Context, resourceType, id string) (map[string]any, bool, error) {
+	items, err := server.desiredItems(ctx, resourceType)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, item := range items {
+		if stringField(item, "id") == id {
+			return item, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+func (server *Server) handleDesiredMutation(w http.ResponseWriter, r *http.Request, resourceType, action, explicitID string) {
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", r.URL.Path, action, "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "denied", "readonly mutation denied", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, r.URL.Path, action) {
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	var payload map[string]any
+	if err := decodeStrictJSON(r, &payload); err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", "request body must be valid JSON", r)
+		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+	// force acknowledges a rebuild of a referenced object (see
+	// config_dependency_guard.go). It is control metadata, never persisted on
+	// the resource document.
+	force := false
+	if value, present := payload["force"].(bool); present {
+		force = value
+		delete(payload, "force")
+	}
+	if queryForce := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("force"))); queryForce == "1" || queryForce == "true" {
+		force = true
+	}
+	hairpinProvided := false
+	if resourceType == "port_map" {
+		_, hairpinProvided = payload["hairpin"]
+	}
+	if resourceType == "proxy_node" {
+		if err := normalizeProxyNodeURIPayload(payload); err != nil {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_desired_resource", err.Error())
+			return
+		}
+	}
+	if resourceType == "proxy_egress" && r.Method == http.MethodPatch {
+		if _, ok := payload["runtime_profile"]; !ok {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", "proxy_egress runtime_profile is required", r)
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_desired_resource", "proxy_egress runtime_profile is required")
+			return
+		}
+	}
+	roleClearRequested := resourceType == "interface" && r.Method == http.MethodPatch && interfaceRoleClearRequested(payload)
+	// Capture the caller's own line-scoped values before the stored document is
+	// merged in. A role transition retires the previous line, and only fields
+	// supplied by this request may describe the new one.
+	requestedLineFields := map[string]any{}
+	if resourceType == "interface" {
+		requestedLineFields = interfaceRoleCallerLineFields(payload)
+	}
+	previousRole := ""
+	// previousItem is the stored document before this write. It lets the
+	// dependency guard tell an ordinary edit (name, MTU, address) from a
+	// rebuild (role, port binding, bond membership).
+	var previousItem map[string]any
+	if r.Method == http.MethodPatch && strings.TrimSpace(explicitID) != "" {
+		current, exists, err := server.desiredItem(r.Context(), resourceType, explicitID)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "desired_state_read_failed", err.Error())
+			return
+		}
+		if !exists && resourceType == "interface" {
+			// Interface documents are keyed by the kernel netdev name (lab30),
+			// while the API and the UI address a port by its product id (eth2).
+			// Looking up only the requested spelling made
+			// "PATCH /interfaces/eth2" miss the stored "lab30" document and
+			// recreate it from the partial role payload, silently dropping the
+			// LAN address and the logical name.
+			for _, alias := range server.interfaceDocumentAliases(r.Context(), explicitID) {
+				if existing, found, lookupErr := server.desiredItem(r.Context(), resourceType, alias); lookupErr == nil && found {
+					current, exists = existing, true
+					break
+				}
+			}
+		}
+		if !exists {
+			// A physical NIC with a telemetry row has no desired-state row
+			// until its first role configuration. The UI edits that row in
+			// place, so interface PATCH must be able to create the initial
+			// desired document. Other resources keep strict update semantics.
+			if resourceType != "interface" {
+				writeError(w, r, http.StatusNotFound, "not_found", "resource was not found")
+				return
+			}
+		} else {
+			previousRole, _ = interfaceDesiredRole(current)
+			previousItem = current
+			merged := cloneObject(current)
+			for key, value := range payload {
+				merged[key] = value
+			}
+			payload = merged
+		}
+	}
+	lineIdentityRetired := false
+	if resourceType == "interface" {
+		newRole, _ := interfaceDesiredRole(payload)
+		switch {
+		case roleClearRequested:
+			lineIdentityRetired = true
+			clearInterfaceRoleDerivedFields(payload, true)
+			deleteInterfaceLineScopedFields(payload)
+		case previousRole != "" && newRole != "" && !strings.EqualFold(previousRole, newRole):
+			// Moving a port between directions retires the old line, not just
+			// its address. Keeping display_name produced the field defect where
+			// /lan rendered a ghost row on the port's new role with an empty
+			// cidr. Delete every line-scoped field, then restore only what this
+			// PATCH explicitly supplied: otherwise an old `cidr` shadows a new
+			// `ip_cidr` in runtime compilation.
+			lineIdentityRetired = true
+			clearInterfaceRoleDerivedFields(payload, false)
+			deleteInterfaceLineScopedFields(payload)
+			for key, value := range requestedLineFields {
+				payload[key] = value
+			}
+		}
+	}
+	if resourceType == "port_map" && !hairpinProvided {
+		// PATCH omitting hairpin means false, not "inherit the previous
+		// mapping's hairpin flag".  This makes a 5353 -> 53 rewrite explicit
+		// and prevents an old hairpin attribute from silently carrying over.
+		payload["hairpin"] = false
+	}
+	id := nonEmpty(explicitID, stringField(payload, "id"))
+	if id == "" {
+		id = strings.ReplaceAll(newRequestID(), "-", "")
+	}
+	payload["id"] = id
+	// WS-K identity guard: a referenced object may always be re-labelled or
+	// re-addressed, but changing its identity (interface role/ownership, WAN
+	// port binding, bond membership) is a rebuild. Without force=true it is
+	// refused with the full reference list; with force the affected objects
+	// are returned as `cascade` so the UI can show the damage.
+	var identityCascade []configDependencyReference
+	if conflict, guardErr := server.configGraphIdentityConflict(r.Context(), resourceType, id, previousItem, payload); guardErr != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", guardErr.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "reference_scan_failed", "dependency references could not be scanned")
+		return
+	} else if conflict != nil {
+		if !force {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "denied", conflict.Message, r)
+			writeConfigDependencyConflict(w, r, *conflict)
+			return
+		}
+		identityCascade = conflict.Cascade
+		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "forced_rebuild", conflict.Message, r)
+	}
+	secrets := extractDesiredSecrets(resourceType, payload)
+	if err := validateDesiredPayload(resourceType, payload); err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
+		writeError(w, r, http.StatusUnprocessableEntity, "invalid_desired_resource", err.Error())
+		return
+	}
+	if resourceType == "interface" {
+		server.normalizeInterfaceDesiredPayload(r.Context(), payload, explicitID)
+		id = stringField(payload, "id")
+		if lineIdentityRetired {
+			if _, supplied := requestedLineFields["display_name"]; !supplied {
+				// normalizeInterfaceDesiredPayload derives a label from the port
+				// id for a fresh document. A retired line must not have one at
+				// all: /lan renders every labelled interface document as a line.
+				delete(payload, "display_name")
+			}
+		}
+	}
+	if resourceType == "wan_link" {
+		server.normalizeWANLinkDesiredPayload(r.Context(), payload, explicitID)
+		id = stringField(payload, "id")
+	}
+	// Every resource that names a port stores the product id, whichever
+	// spelling the caller used (ethN, kernel name, logical name, MAC, PCI).
+	server.normalizePortReferences(r.Context(), resourceType, payload)
+	if resourceType == "dhcp_server" {
+		// Store the canonical product id (ethN), never whatever spelling the
+		// caller used: a later LAN lookup must not depend on the UI's wording.
+		if reference := strings.TrimSpace(stringField(payload, "interface_id")); reference != "" {
+			payload["interface_id"] = server.canonicalInterfaceReference(r.Context(), reference)
+		}
+	}
+	var roleClearDeletes []persistence.ConfigKey
+	var roleClearCascaded []map[string]any
+	if resourceType == "interface" && roleClearRequested && previousRole != "" && !force {
+		var clearErr error
+		roleClearDeletes, roleClearCascaded, clearErr = server.prepareInterfaceRoleClear(r.Context(), id)
+		if clearErr != nil {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", clearErr.Error(), r)
+			writeError(w, r, http.StatusUnprocessableEntity, "interface_role_in_use", clearErr.Error())
+			return
+		}
+	}
+	if resourceType == "object_group" {
+		if err := server.normalizeObjectGroupPayload(r.Context(), payload); err != nil {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_desired_resource", err.Error())
+			return
+		}
+	}
+	if err := server.validateDesiredRuntimePayload(r.Context(), resourceType, action, payload, force); err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
+		code := "invalid_desired_resource"
+		var coded *desiredValidationError
+		if errors.As(err, &coded) && strings.TrimSpace(coded.Code) != "" {
+			code = coded.Code
+		}
+		writeError(w, r, http.StatusUnprocessableEntity, code, err.Error())
+		return
+	}
+	natRebuild := server.natRebuildImpact(r.Context(), resourceType, id, payload)
+	payload["runtime_state"] = "desired_not_applied"
+	payload["capabilities"] = server.degradedRuntimeCapabilities(r.Context())
+	raw, hash, err := persistence.MarshalPayload(payload)
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
+		writeError(w, r, http.StatusBadRequest, "invalid_payload", "resource payload could not be encoded")
+		return
+	}
+	document := persistence.ConfigDocument{ResourceType: resourceType, ResourceID: id, Payload: raw, PayloadHash: hash, UpdatedAt: server.now().UTC()}
+	deletes := make([]persistence.ConfigKey, 0)
+	if resourceType == "interface" {
+		deletes = append(deletes, server.staleInterfaceDocumentKeys(r.Context(), id)...)
+	}
+	deletes = append(deletes, roleClearDeletes...)
+	if err := server.store.SaveConfigsWithSecretsAndDelete(r.Context(), []persistence.ConfigWithSecrets{{Document: document, Secrets: secrets}}, deletes); err != nil {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", "desired state could not be saved", r)
+		writeError(w, r, http.StatusInternalServerError, "desired_state_save_failed", "desired state could not be saved")
+		return
+	}
+	server.recordAudit(session.Username, session.Role, r.URL.Path, action, "success", "", r)
+	server.bumpConfigGraphGeneration(r.Context(), action, resourceType, id, "")
+	if natRebuild != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/gateway/nat/port-maps", "nat_rebuild", "success", fmt.Sprintf("wan_link %s address changed; affected_port_maps=%v", id, natRebuild["affected_port_maps"]), r)
+	}
+	response := map[string]any{"item": payload, "runtime_state": "desired_not_applied", "request_id": requestID(r)}
+	if len(roleClearCascaded) > 0 {
+		response["cascade_deleted"] = roleClearCascaded
+	}
+	if len(identityCascade) > 0 {
+		response["cascade"] = identityCascade
+		response["forced_rebuild"] = true
+	}
+	if natRebuild != nil {
+		response["nat_rebuild"] = natRebuild
+	}
+	if resourceType == "object_group" {
+		response["affected_consumers"] = payload["affected_consumers"]
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (server *Server) handleManagementNetwork(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodPatch {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, r.URL.Path, strings.ToLower(r.Method)) {
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, server.managementNetworkState(r.Context(), true))
+	case http.MethodPost, http.MethodPatch:
+		var payload map[string]any
+		if err := decodeStrictJSON(r, &payload); err != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+			return
+		}
+		item, err := server.saveManagementNetwork(r.Context(), payload)
+		if err != nil {
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_management_network", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"item": item, "runtime_state": "desired_not_applied", "request_id": requestID(r)})
+	}
+}
+
+func (server *Server) managementNetworkStateStored(ctx context.Context, includeCurrent bool) map[string]any {
+	interfaceID := factoryLANInterface()
+	cidr := envOrDefault("LY_ROUTE_LAN_CIDR", "192.168.88.254/24")
+	gateway := strings.TrimSpace(os.Getenv("LY_ROUTE_MANAGEMENT_GATEWAY"))
+	if server.store != nil {
+		if documents, err := server.store.Configs(ctx, "management_network"); err == nil && len(documents) > 0 {
+			var payload map[string]any
+			if json.Unmarshal(documents[0].Payload, &payload) == nil {
+				if value := strings.TrimSpace(stringField(payload, "interface_id")); value != "" {
+					interfaceID = value
+				}
+				if value := strings.TrimSpace(nonEmpty(stringField(payload, "cidr"), stringField(payload, "ip_cidr"))); value != "" {
+					cidr = value
+				}
+				gateway = strings.TrimSpace(stringField(payload, "gateway"))
+				mode := normalizeManagementMode(stringField(payload, "mode"))
+				state := map[string]any{"id": "management-network", "interface_id": interfaceID, "mode": mode, "cidr": cidr, "gateway": gateway, "management_ip": strings.SplitN(cidr, "/", 2)[0], "dhcp_enabled": true, "preserve_management_port": true, "runtime_state": "desired_not_applied", "current": includeCurrent}
+				for _, key := range []string{"dhcp_pool_start", "dhcp_pool_end", "dns", "new_url", "rollback_guidance"} {
+					if value := strings.TrimSpace(stringField(payload, key)); value != "" {
+						state[key] = value
+					}
+				}
+				return state
+			}
+		}
+	}
+	return map[string]any{"id": "management-network", "interface_id": interfaceID, "mode": "exclusive", "cidr": cidr, "gateway": gateway, "management_ip": strings.SplitN(cidr, "/", 2)[0], "dhcp_enabled": true, "preserve_management_port": true, "runtime_state": "desired_not_applied", "current": includeCurrent}
+}
+
+func normalizeManagementMode(value string) string {
+	mode := strings.ToLower(strings.TrimSpace(value))
+	if mode == "shared_lan" {
+		return mode
+	}
+	return "exclusive"
+}
+
+func (server *Server) managementNetworkShared(ctx context.Context) bool {
+	return normalizeManagementMode(stringField(server.managementNetworkState(ctx, false), "mode")) == "shared_lan"
+}
+
+// managementRawInterfaceID is the value as persisted. It never consults the
+// identity service, so the identity builder can call it without recursing.
+func (server *Server) managementRawInterfaceID(ctx context.Context) string {
+	return strings.TrimSpace(stringField(server.managementNetworkStateStored(ctx, false), "interface_id"))
+}
+
+// managementInterfaceID is the kernel netdev the dataplane must use. Plan B
+// stores the product id (eth0) and resolves it here.
+func (server *Server) managementInterfaceID(ctx context.Context) string {
+	raw := server.managementRawInterfaceID(ctx)
+	if raw == "" {
+		return ""
+	}
+	if linux := server.interfaceLinuxName(ctx, raw); linux != "" {
+		return linux
+	}
+	return raw
+}
+
+// managementNetworkState is the API view: product id plus the kernel netdev as
+// an internal attribute, never a bare `ens192` in `interface_id`.
+func (server *Server) managementNetworkState(ctx context.Context, includeCurrent bool) map[string]any {
+	state := server.managementNetworkStateStored(ctx, includeCurrent)
+	raw := strings.TrimSpace(stringField(state, "interface_id"))
+	if raw == "" {
+		return state
+	}
+	canonical := server.canonicalInterfaceID(ctx, raw)
+	if !isProductInterfaceID(canonical) {
+		return state
+	}
+	state["interface_id"] = canonical
+	if linux := server.interfaceLinuxName(ctx, canonical); linux != "" {
+		state["system_name"] = linux
+	}
+	return state
+}
+
+func (server *Server) runtimeDataInterfaces(ctx context.Context) []string {
+	managementInterface := server.managementInterfaceID(ctx)
+	managementShared := server.managementNetworkShared(ctx)
+	dataInterfaces := []string{}
+	seen := map[string]bool{}
+	appendInterface := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || (!managementShared && name == managementInterface) || seen[name] || !vppInterfaceNameSafe(name) {
+			return
+		}
+		seen[name] = true
+		dataInterfaces = append(dataInterfaces, name)
+	}
+	for _, resourceType := range []string{"interface", "wan_link"} {
+		items, err := server.desiredItems(ctx, resourceType)
+		if err != nil {
+			continue
+		}
+		for _, item := range items {
+			if truthy(item["deleted"]) {
+				continue
+			}
+			role, _ := interfaceDesiredRole(item)
+			if !oneOf(role, []string{"lan", "wan", "internal", "external"}) {
+				continue
+			}
+			name := server.resolveInterfaceID(ctx, firstNonEmpty(stringField(item, "interface_id"), stringField(item, "id"), stringField(item, "name")))
+			appendInterface(name)
+		}
+	}
+	if server.orchestratorRepository != nil {
+		if topology, _, err := server.orchestratorRepository.Snapshot(ctx); err == nil {
+			view := topology.View()
+			for _, logical := range view.Interfaces {
+				if logical.Bond != nil {
+					for _, member := range logical.Bond.Members {
+						appendInterface(member)
+					}
+					continue
+				}
+				appendInterface(logical.Port)
+			}
+			for _, group := range view.Groups {
+				for _, port := range group.Ports {
+					appendInterface(port.Interface)
+				}
+			}
+		}
+	}
+	return dataInterfaces
+}
+
+// runtimeDataplaneInterfaces is the single interface set the capability probe,
+// the native path and the persisted port inventory all use. Role-tagged
+// interfaces alone are not enough: an address assignment always needs a proven
+// attachment, so a port that carries an address must be probed even when its
+// role metadata is missing or was rewritten. Keeping the two lists in sync is
+// what makes an online WAN gateway edit an address-only change instead of
+// dataplane_locked.
+func (server *Server) runtimeDataplaneInterfaces(ctx context.Context) []string {
+	interfaces := server.runtimeDataInterfaces(ctx)
+	assignments, err := server.runtimeAddressAssignments(ctx)
+	if err != nil {
+		return interfaces
+	}
+	managementInterface := server.managementInterfaceID(ctx)
+	managementShared := server.managementNetworkShared(ctx)
+	seen := make(map[string]bool, len(interfaces)+len(assignments))
+	for _, name := range interfaces {
+		seen[strings.TrimSpace(name)] = true
+	}
+	for _, assignment := range assignments {
+		name := strings.TrimSpace(assignment.LinuxInterface)
+		if name == "" || seen[name] || !vppInterfaceNameSafe(name) {
+			continue
+		}
+		if !managementShared && name == managementInterface {
+			continue
+		}
+		seen[name] = true
+		interfaces = append(interfaces, name)
+	}
+	return interfaces
+}
+
+func (server *Server) runtimeAddressAssignments(ctx context.Context) ([]vpp.AddressAssignment, error) {
+	assignments := []vpp.AddressAssignment{}
+	wanItems, err := server.desiredItems(ctx, "wan_link")
+	if err != nil {
+		return nil, err
+	}
+	dhcpWANs := map[string]map[string]any{}
+	removeStaticCIDRs := map[string][]string{}
+	// A port can only be one thing. When an enabled WAN line is bound to a port
+	// that still carries a LAN role/address, the line owns the port: emitting both
+	// assignments made the plan contain "lyroute-<port>" twice, and the
+	// reconciliation preflight rejected the whole apply with
+	// 'interface identity "lyroute-lab30" is duplicated'. The stored LAN
+	// configuration is kept (not deleted) and comes back when the line is removed.
+	wanBound := map[string]bool{}
+	for _, item := range wanItems {
+		if truthy(item["deleted"]) || !desiredEnabled(item) {
+			continue
+		}
+		if linuxInterface := server.resolveInterfaceID(ctx, firstNonEmpty(stringField(item, "interface_id"), stringField(item, "id"), stringField(item, "name"))); linuxInterface != "" {
+			wanBound[linuxInterface] = true
+		}
+	}
+	for _, item := range wanItems {
+		if truthy(item["deleted"]) {
+			continue
+		}
+		linuxInterface := server.resolveInterfaceID(ctx, firstNonEmpty(stringField(item, "interface_id"), stringField(item, "id"), stringField(item, "name")))
+		if linuxInterface == "" || (!server.managementNetworkShared(ctx) && linuxInterface == server.managementInterfaceID(ctx)) || !vppInterfaceNameSafe(linuxInterface) {
+			continue
+		}
+		if wanDesiredIPv4Mode(item) == "dhcp4" {
+			dhcpWANs[linuxInterface] = item
+			continue
+		}
+		if cidr := wanStaticCIDR(item); cidr != "" {
+			if parsedCIDR, ok := vppAddressCIDR(cidr); ok {
+				removeStaticCIDRs[linuxInterface] = appendUniqueString(removeStaticCIDRs[linuxInterface], parsedCIDR)
+			}
+		}
+	}
+	interfaceItems, err := server.desiredItems(ctx, "interface")
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range interfaceItems {
+		if truthy(item["deleted"]) {
+			continue
+		}
+		role, _ := interfaceDesiredRole(item)
+		if !oneOf(role, []string{"lan", "wan", "internal", "external"}) {
+			// A cleared role owns no VPP address. Never let legacy address
+			// fields on the document re-create the assignment.
+			continue
+		}
+		cidr := strings.TrimSpace(firstNonEmpty(stringField(item, "cidr"), stringField(item, "ip_cidr"), stringField(item, "ip")))
+		if cidr == "" || !strings.Contains(cidr, "/") || stringField(item, "kind") == "lan_bridge" || stringField(item, "type") == "lan_bridge" {
+			continue
+		}
+		parsedCIDR, ok := vppAddressCIDR(cidr)
+		if !ok {
+			continue
+		}
+		linuxInterface := server.resolveInterfaceID(ctx, firstNonEmpty(stringField(item, "interface_id"), stringField(item, "id"), stringField(item, "name")))
+		if linuxInterface == "" || (!server.managementNetworkShared(ctx) && linuxInterface == server.managementInterfaceID(ctx)) || !vppInterfaceNameSafe(linuxInterface) {
+			continue
+		}
+		if _, ok := dhcpWANs[linuxInterface]; ok {
+			removeStaticCIDRs[linuxInterface] = appendUniqueString(removeStaticCIDRs[linuxInterface], parsedCIDR)
+			continue
+		}
+		if wanBound[linuxInterface] {
+			// The WAN line owns this port; its assignment is emitted below.
+			continue
+		}
+		assignments = append(assignments, vpp.AddressAssignment{ID: nonEmpty(stringField(item, "id"), linuxInterface), LinuxInterface: linuxInterface, VPPInterface: vppInterfaceName(linuxInterface), CIDR: parsedCIDR, Role: role})
+	}
+	for _, item := range wanItems {
+		if truthy(item["deleted"]) || wanDesiredIPv4Mode(item) == "dhcp4" {
+			continue
+		}
+		cidr := wanStaticCIDR(item)
+		if cidr == "" {
+			continue
+		}
+		parsedCIDR, ok := vppAddressCIDR(cidr)
+		if !ok {
+			continue
+		}
+		linuxInterface := server.resolveInterfaceID(ctx, firstNonEmpty(stringField(item, "interface_id"), stringField(item, "id"), stringField(item, "name")))
+		if linuxInterface == "" || (!server.managementNetworkShared(ctx) && linuxInterface == server.managementInterfaceID(ctx)) || !vppInterfaceNameSafe(linuxInterface) {
+			continue
+		}
+		if _, ok := dhcpWANs[linuxInterface]; ok {
+			removeStaticCIDRs[linuxInterface] = appendUniqueString(removeStaticCIDRs[linuxInterface], parsedCIDR)
+			continue
+		}
+		assignments = append(assignments, vpp.AddressAssignment{ID: nonEmpty(stringField(item, "id"), linuxInterface), LinuxInterface: linuxInterface, VPPInterface: vppInterfaceName(linuxInterface), CIDR: parsedCIDR, Role: "wan"})
+	}
+	for linuxInterface, item := range dhcpWANs {
+		assignments = append(assignments, vpp.AddressAssignment{ID: nonEmpty(stringField(item, "id"), linuxInterface), LinuxInterface: linuxInterface, VPPInterface: vppInterfaceName(linuxInterface), Mode: "dhcp4", RemoveCIDRs: removeStaticCIDRs[linuxInterface], Role: "wan"})
+	}
+	if server.managementNetworkShared(ctx) {
+		management := server.managementNetworkState(ctx, false)
+		linuxInterface := server.resolveInterfaceID(ctx, stringField(management, "interface_id"))
+		cidr := strings.TrimSpace(stringField(management, "cidr"))
+		if linuxInterface != "" && cidr != "" {
+			if parsedCIDR, ok := vppAddressCIDR(cidr); ok {
+				alreadyAssigned := false
+				for _, assignment := range assignments {
+					if assignment.LinuxInterface == linuxInterface && assignment.CIDR == parsedCIDR {
+						alreadyAssigned = true
+						break
+					}
+				}
+				if !alreadyAssigned {
+					assignments = append(assignments, vpp.AddressAssignment{ID: "management-network", LinuxInterface: linuxInterface, VPPInterface: vppInterfaceName(linuxInterface), CIDR: parsedCIDR, Role: "lan"})
+				}
+			}
+		}
+	}
+	return assignments, nil
+}
+
+func (server *Server) proxyUnderlayWANIDs(ctx context.Context, egress proxy.Egress) ([]string, error) {
+	underlayID := strings.TrimSpace(egress.UnderlayWANID)
+	if underlayID == "" {
+		// Legacy in-memory callers may omit the field. A persisted/UI-created
+		// proxy egress is validated before it reaches runtime; leave selection to
+		// the single-WAN fallback below for those callers.
+		return nil, nil
+	}
+	if item, ok, err := server.desiredItem(ctx, "wan_link", underlayID); err != nil {
+		return nil, err
+	} else if ok {
+		if !desiredEnabled(item) {
+			return nil, fmt.Errorf("proxy egress %q underlay WAN %q is disabled", egress.ID, underlayID)
+		}
+		return []string{underlayID}, nil
+	}
+	if group, ok, err := server.desiredItem(ctx, "wan_group", underlayID); err != nil {
+		return nil, err
+	} else if ok {
+		if !desiredEnabled(group) {
+			return nil, fmt.Errorf("proxy egress %q underlay WAN group %q is disabled", egress.ID, underlayID)
+		}
+		members := wanGroupMemberIDs(group)
+		if len(members) == 0 {
+			return nil, fmt.Errorf("proxy egress %q underlay WAN group %q has no members", egress.ID, underlayID)
+		}
+		for _, memberID := range members {
+			item, exists, lookupErr := server.desiredItem(ctx, "wan_link", memberID)
+			if lookupErr != nil {
+				return nil, lookupErr
+			}
+			if !exists || !desiredEnabled(item) {
+				return nil, fmt.Errorf("proxy egress %q underlay WAN group %q member %q is unavailable", egress.ID, underlayID, memberID)
+			}
+		}
+		return members, nil
+	}
+	return nil, fmt.Errorf("proxy egress %q references unknown underlay WAN %q", egress.ID, underlayID)
+}
+
+func (server *Server) desiredInterfaceCIDRs(ctx context.Context) map[string]string {
+	items, err := server.desiredItems(ctx, "interface")
+	if err != nil {
+		return nil
+	}
+	cidrs := map[string]string{}
+	for _, item := range items {
+		if truthy(item["deleted"]) || stringField(item, "kind") == "lan_bridge" || stringField(item, "type") == "lan_bridge" {
+			continue
+		}
+		if role, _ := interfaceDesiredRole(item); !oneOf(role, []string{"lan", "wan", "internal", "external"}) {
+			continue
+		}
+		cidr := strings.TrimSpace(firstNonEmpty(stringField(item, "cidr"), stringField(item, "ip_cidr"), stringField(item, "address"), stringField(item, "ip")))
+		if cidr == "" || !strings.Contains(cidr, "/") {
+			continue
+		}
+		linuxInterface := server.resolveInterfaceID(ctx, firstNonEmpty(stringField(item, "interface_id"), stringField(item, "id"), stringField(item, "name")))
+		if linuxInterface != "" {
+			cidrs[linuxInterface] = cidr
+		}
+	}
+	return cidrs
+}
+
+func wanDesiredIPv4Mode(item map[string]any) string {
+	if ipv4, ok := item["ipv4"].(map[string]any); ok {
+		if mode := strings.ToLower(strings.TrimSpace(stringField(ipv4, "mode"))); mode != "" {
+			return mode
+		}
+	}
+	return strings.ToLower(nonEmpty(stringField(item, "wan_type"), stringField(item, "type")))
+}
+
+func appendUniqueString(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func wanStaticCIDR(item map[string]any) string {
+	wanType := strings.ToLower(nonEmpty(stringField(item, "wan_type"), stringField(item, "type")))
+	if strings.Contains(wanType, "dhcp") || wanType == "pppoe" || wanType == "proxy" {
+		return ""
+	}
+	if cidr := strings.TrimSpace(firstNonEmpty(stringField(item, "cidr"), stringField(item, "ip_cidr"), stringField(item, "address"))); strings.Contains(cidr, "/") {
+		return cidr
+	}
+	if ipv4, ok := item["ipv4"].(map[string]any); ok {
+		if cidr := strings.TrimSpace(nonEmpty(stringField(ipv4, "address"), stringField(ipv4, "cidr"))); strings.Contains(cidr, "/") {
+			return cidr
+		}
+	}
+	if ipv6, ok := item["ipv6"].(map[string]any); ok {
+		if cidr := strings.TrimSpace(nonEmpty(stringField(ipv6, "address"), stringField(ipv6, "cidr"))); strings.Contains(cidr, "/") {
+			return cidr
+		}
+	}
+	return ""
+}
+
+func vppInterfaceName(linuxInterface string) string {
+	linuxInterface = strings.TrimSpace(linuxInterface)
+	if linuxInterface == "" {
+		return ""
+	}
+	return "lyroute-" + linuxInterface
+}
+
+func vppAddressCIDR(value string) (string, bool) {
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
+	if err != nil {
+		return "", false
+	}
+	return prefix.String(), true
+}
+
+func vppInterfaceNameSafe(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '_' || char == '-' || char == '.' || char == ':' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (server *Server) saveManagementNetwork(ctx context.Context, payload map[string]any) (map[string]any, error) {
+	if confirmed, ok := payload["confirm_change"].(bool); !ok || !confirmed {
+		return nil, fmt.Errorf("management network changes require confirm_change=true")
+	}
+	item := server.managementNetworkState(ctx, false)
+	mode := normalizeManagementMode(stringField(item, "mode"))
+	if value := strings.TrimSpace(stringField(payload, "mode")); value != "" {
+		if value != "exclusive" && value != "shared_lan" {
+			return nil, fmt.Errorf("mode must be exclusive or shared_lan")
+		}
+		mode = value
+	}
+	item["mode"] = mode
+	if value := strings.TrimSpace(stringField(payload, "interface_id")); value != "" {
+		current := server.managementInterfaceID(ctx)
+		requested := server.canonicalInterfaceReference(ctx, value)
+		if requested == "" {
+			requested = value
+		}
+		if !vppInterfaceNameSafe(value) || current == "" || server.resolveInterfaceID(ctx, requested) != current {
+			return nil, fmt.Errorf("management interface is immutable and must remain %s", server.displayInterfaceName(ctx, current))
+		}
+		item["interface_id"] = server.canonicalInterfaceID(ctx, current)
+	}
+	if value := strings.TrimSpace(nonEmpty(stringField(payload, "cidr"), stringField(payload, "ip_cidr"))); value != "" {
+		item["cidr"] = value
+	}
+	if value := strings.TrimSpace(stringField(payload, "gateway")); value != "" {
+		item["gateway"] = value
+	}
+	if value := strings.TrimSpace(stringField(payload, "dhcp_pool_start")); value != "" {
+		item["dhcp_pool_start"] = value
+	}
+	if value := strings.TrimSpace(stringField(payload, "dhcp_pool_end")); value != "" {
+		item["dhcp_pool_end"] = value
+	}
+	if value := strings.TrimSpace(stringField(payload, "dns")); value != "" {
+		item["dns"] = value
+	}
+	prefix, err := netip.ParsePrefix(stringField(item, "cidr"))
+	if err != nil {
+		return nil, fmt.Errorf("cidr is invalid")
+	}
+	if gateway := stringField(item, "gateway"); gateway != "" {
+		address, err := netip.ParseAddr(gateway)
+		if err != nil || !prefix.Contains(address) {
+			return nil, fmt.Errorf("gateway must be inside management subnet")
+		}
+	}
+	if mode == "shared_lan" && stringField(item, "interface_id") == "" {
+		return nil, fmt.Errorf("shared_lan requires a LAN interface")
+	}
+	if mode == "exclusive" && server.orchestratorRepository != nil {
+		if topology, _, snapshotErr := server.orchestratorRepository.Snapshot(ctx); snapshotErr == nil {
+			view := topology.View()
+			for _, logical := range view.Interfaces {
+				if logical.Role == orchestrator.RoleLAN && logical.Port == stringField(item, "interface_id") {
+					return nil, fmt.Errorf("exclusive mode requires moving LAN away from the management interface first")
+				}
+			}
+		}
+	}
+	for _, key := range []string{"dhcp_pool_start", "dhcp_pool_end", "dns"} {
+		value := stringField(item, key)
+		if value == "" {
+			continue
+		}
+		address, err := netip.ParseAddr(value)
+		if err != nil || !prefix.Contains(address) {
+			return nil, fmt.Errorf("%s must be inside management subnet", key)
+		}
+	}
+	item["new_url"] = "https://" + strings.SplitN(stringField(item, "cidr"), "/", 2)[0] + "/"
+	item["rollback_guidance"] = "If access is lost, reconnect to the previous management subnet or restore the saved config backup from recovery mode."
+	raw, hash, err := persistence.MarshalPayload(item)
+	if err != nil {
+		return nil, err
+	}
+	if err := server.store.SaveConfig(ctx, persistence.ConfigDocument{ResourceType: "management_network", ResourceID: "management-network", Payload: raw, PayloadHash: hash, UpdatedAt: server.now().UTC()}); err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
+func validateDesiredPayload(resourceType string, payload map[string]any) error {
+	if want, ok := map[string]string{
+		"security_acl":            "acl",
+		"security_ip_mac_binding": "ip_mac_binding",
+		"security_threat_intel":   "threat_intel",
+		"security_attack_rule":    "attack_rule",
+	}[resourceType]; ok {
+		if got := stringField(payload, "kind"); got != "" && got != want {
+			return fmt.Errorf("%s kind must be %q", resourceType, want)
+		}
+		payload["kind"] = want
+		if err := validateSecurityDesiredPayload(resourceType, payload); err != nil {
+			return err
+		}
+	}
+	if resourceType == "interface" {
+		copyStringAlias(payload, "description", "description", "remark", "notes")
+		role, _ := interfaceDesiredRole(payload)
+		if role != "" {
+			if !oneOf(role, []string{"lan", "wan", "internal", "external"}) {
+				return fmt.Errorf("interface gateway_role must be one of lan, wan, internal, external")
+			}
+			payload["gateway_role"] = role
+			payload["mode_role"] = map[string]any{"gateway": role, "bridge": nil}
+			payload["candidate_scopes"] = []string{role}
+		}
+		if stringField(payload, "work_mode") == "" {
+			payload["work_mode"] = nonEmpty(stringField(payload, "active_path"), "native_auto")
+		}
+	}
+	if resourceType == "wan_link" {
+		copyStringAlias(payload, "description", "description", "remark", "notes")
+		normalizeWANLinkPayload(payload)
+	}
+	if resourceType == "wan_group" {
+		normalizeWANGroupPayload(payload)
+	}
+	if resourceType == "proxy_group" {
+		if err := normalizeProxyGroupPayload(payload); err != nil {
+			return err
+		}
+	}
+	if resourceType == "proxy_node" || resourceType == "proxy_subscription" {
+		if resourceType == "proxy_subscription" {
+			selection := strings.TrimSpace(stringField(payload, "selection"))
+			strategy := strings.TrimSpace(stringField(payload, "strategy"))
+			if selection == string(proxy.SelectionAdaptive) || strategy == proxy.AdaptiveSubscriptionStrategy {
+				topN := intField(payload, "top_n")
+				if topN == 0 {
+					topN = 2
+					payload["top_n"] = topN
+				}
+				if topN != 2 && topN != 3 {
+					return fmt.Errorf("proxy subscription top_n must be 2 or 3")
+				}
+				nodeRefs := stringSliceField(payload, "node_refs")
+				if len(nodeRefs) > 0 && len(nodeRefs) < 2 {
+					return fmt.Errorf("adaptive proxy subscription requires at least two candidate nodes")
+				}
+				if len(nodeRefs) > 0 && topN > len(nodeRefs) {
+					return fmt.Errorf("proxy subscription top_n cannot exceed candidate node count")
+				}
+			}
+		}
+		redactProxyDesiredPayload(payload)
+	}
+	return nil
+}
+
+// validatePortMapCandidate validates against the complete desired collection,
+// not only the item being edited. VPP identifies a static mapping by protocol
+// and internal endpoint, so a conflict must be rejected before it is persisted
+// and before an apply transaction can degrade an otherwise healthy gateway.
+func (server *Server) validatePortMapCandidate(ctx context.Context, payload map[string]any) error {
+	existing, err := server.desiredItems(ctx, "port_map")
+	if err != nil {
+		return err
+	}
+	candidateID := stringField(payload, "id")
+	candidates := make([]map[string]any, 0, len(existing)+1)
+	replaced := false
+	for _, item := range existing {
+		if stringField(item, "id") == candidateID {
+			candidates = append(candidates, cloneObject(payload))
+			replaced = true
+			continue
+		}
+		candidates = append(candidates, item)
+	}
+	if !replaced {
+		candidates = append(candidates, cloneObject(payload))
+	}
+	wanItems, err := server.natWANItems(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = nat.CompileConfigWithWANs(nil, candidates, wanItems)
+	return err
+}
+
+func (server *Server) validateDesiredRuntimePayload(ctx context.Context, resourceType, action string, payload map[string]any, force bool) error {
+	switch resourceType {
+	case "interface":
+		// A physical port write must name a port this device has. Logical
+		// assignments (a LAN/WAN/bridge document with its own id) are not port
+		// references and stay allowed.
+		if problem := server.interfaceWriteReferenceProblem(ctx, firstNonEmpty(stringField(payload, "interface_id"), stringField(payload, "id"))); problem != "" {
+			return fmt.Errorf("interface: %s", problem)
+		}
+		role, _ := interfaceDesiredRole(payload)
+		interfaceID := strings.TrimSpace(nonEmpty(stringField(payload, "interface_id"), stringField(payload, "id")))
+		// Compare kernel netdevs on both sides: the payload carries the product
+		// id (eth0) while managementInterfaceID resolves to the kernel name
+		// (enp1s0). Comparing them raw let a LAN line be "saved" onto the
+		// management port and return 200 even though nothing changed.
+		managementPort := strings.TrimSpace(server.resolveInterfaceID(ctx, server.managementInterfaceID(ctx)))
+		candidatePort := strings.TrimSpace(server.resolveInterfaceID(ctx, interfaceID))
+		if oneOf(role, []string{"lan", "wan"}) && candidatePort != "" && managementPort != "" && strings.EqualFold(candidatePort, managementPort) {
+			if !server.managementNetworkShared(ctx) || role == "wan" {
+				return fmt.Errorf("management interface cannot be configured as lan or wan")
+			}
+		}
+		if err := server.validateInterfaceLineRole(ctx, payload); err != nil {
+			return err
+		}
+		if err := server.validateInterfaceRoleReferences(ctx, payload); err != nil {
+			// force=true is the explicit rebuild acknowledgement handled by
+			// configGraphIdentityConflict; the persisted generation is the
+			// operator's choice at this point.
+			if !force {
+				return err
+			}
+		}
+		if err := server.validateDesiredResourceNameUnique(ctx, resourceType, payload); err != nil {
+			return err
+		}
+		return server.validateDesiredAddressPayload(ctx, resourceType, payload)
+	case "nat_static":
+		if err := server.validateDesiredResourceNameUnique(ctx, resourceType, payload); err != nil {
+			return err
+		}
+		if err := server.validateDesiredAddressPayload(ctx, resourceType, payload); err != nil {
+			return err
+		}
+		existing, err := server.desiredItems(ctx, "nat_static")
+		if err != nil {
+			return err
+		}
+		candidateID := stringField(payload, "id")
+		candidates := make([]map[string]any, 0, len(existing)+1)
+		replaced := false
+		for _, item := range existing {
+			if stringField(item, "id") == candidateID {
+				candidates = append(candidates, cloneObject(payload))
+				replaced = true
+				continue
+			}
+			candidates = append(candidates, item)
+		}
+		if !replaced {
+			candidates = append(candidates, cloneObject(payload))
+		}
+		wanItems, err := server.natWANItems(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = nat.CompileConfigWithWANs(candidates, nil, wanItems)
+		return err
+	case "port_map":
+		if err := server.validateDesiredResourceNameUnique(ctx, resourceType, payload); err != nil {
+			return err
+		}
+		if err := server.validateDesiredAddressPayload(ctx, resourceType, payload); err != nil {
+			return err
+		}
+		return server.validatePortMapCandidate(ctx, payload)
+	case "route_policy":
+		if err := server.validateDesiredResourceNameUnique(ctx, resourceType, payload); err != nil {
+			return err
+		}
+		// The VPP pre-NAT classifier keeps one ingress interface and one
+		// lan-prefix per appliance. Reject a desired set whose policies resolve
+		// to different LANs before it is persisted: otherwise the second policy
+		// silently moves the classifier and the first policy stops matching.
+		existing, err := server.desiredItems(ctx, "route_policy")
+		if err != nil {
+			return err
+		}
+		candidateID := stringField(payload, "id")
+		candidates := make([]map[string]any, 0, len(existing)+1)
+		replaced := false
+		for _, item := range existing {
+			if stringField(item, "id") == candidateID {
+				candidates = append(candidates, cloneObject(payload))
+				replaced = true
+				continue
+			}
+			candidates = append(candidates, item)
+		}
+		if !replaced {
+			candidates = append(candidates, cloneObject(payload))
+		}
+		domainIPSetItems, err := server.desiredItems(ctx, "domain_ip_set")
+		if err != nil {
+			return err
+		}
+		compiled, err := server.compileTrafficPolicySelection(ctx, candidates, nil, domainIPSetItems)
+		if err != nil {
+			return err
+		}
+		assignments, err := server.runtimeAddressAssignments(ctx)
+		if err != nil {
+			return err
+		}
+		if err := vpp.ValidateRoutePolicyLANBindings(compiled.RoutePolicies, assignments); err != nil {
+			return err
+		}
+		// A 1:1 static NAT mapping rewrites the source of its inside host to
+		// the external VIP before the steered packet reaches the proxy, so the
+		// traffic silently leaves the WAN instead of the proxy. The product
+		// decision is to reject that save instead of committing a policy the
+		// dataplane cannot honour.
+		staticMappings, err := server.staticNATMappings(ctx)
+		if err != nil {
+			return err
+		}
+		proxyEgressIDs, err := server.proxyEgressIDsForPolicyValidation(ctx)
+		if err != nil {
+			return err
+		}
+		return vpp.ValidateRoutePolicyStaticNAT(compiled.RoutePolicies, staticMappings, proxyEgressIDs)
+	case "traffic_control":
+		intent, err := flowIntentFromDesiredPayload(payload)
+		if err != nil {
+			return err
+		}
+		compiled, err := flow.CompileIntent(intent)
+		if err != nil {
+			return err
+		}
+		// Fail closed when the running VPP build cannot enforce an action this
+		// policy actually compiles into. The check is per facility: a build
+		// without the rate plugin can still block traffic through ACLs, and a
+		// build without core QoS can still police a whole attachment.
+		capability, probeErr := server.qosCapability(ctx)
+		if probeErr != nil {
+			// A transient vppctl failure must not reject a valid save. The
+			// capability stays unknown and runtime/status reports that.
+			return nil
+		}
+		if missing := vpp.MissingQoSCapabilities(capability, compiled.VPPGroups); len(missing) > 0 {
+			return &desiredValidationError{
+				Code: "qos_unsupported",
+				Message: "traffic-control policy cannot be enforced by the running VPP build: missing " +
+					strings.Join(missing, ", ") +
+					". Install/enable the missing dataplane component or change the action to one this build supports. " +
+					capability.Summary(),
+			}
+		}
+		// Shape is interface-level and egress-only. Prove the requested LAN/WAN
+		// role exists; a policy that saved without it would fail every later
+		// plan generation.
+		if compiledUsesShape(compiled) {
+			assignments, assignErr := server.runtimeAddressAssignments(ctx)
+			if assignErr != nil {
+				return assignErr
+			}
+			if shapeErr := vpp.ValidateFlowShapingInterfaces(compiled, assignments); shapeErr != nil {
+				return &desiredValidationError{Code: "shape_interface_unavailable", Message: shapeErr.Error()}
+			}
+		}
+		return nil
+	case "dhcp_server":
+		interfaceID := strings.TrimSpace(stringField(payload, "interface_id"))
+		if problem := server.interfaceReferenceProblem(ctx, interfaceID); problem != "" {
+			return fmt.Errorf("DHCP service: %s", problem)
+		}
+		if server.dhcpTargetIsExplicitWAN(ctx, interfaceID) {
+			return fmt.Errorf("DHCP service: interface %q is configured as a WAN link; bind the DHCP server to a LAN port with an address (move the port role to lan first)", interfaceID)
+		}
+		subnet, err := netip.ParsePrefix(strings.TrimSpace(stringField(payload, "subnet")))
+		if err != nil {
+			return fmt.Errorf("DHCP subnet must be a valid IPv4 prefix")
+		}
+		for _, pool := range stringSliceField(payload, "pools") {
+			parts := strings.SplitN(strings.TrimSpace(pool), "-", 2)
+			if len(parts) != 2 {
+				return fmt.Errorf("DHCP pool %q must be a start-end range", pool)
+			}
+			start, startErr := netip.ParseAddr(strings.TrimSpace(parts[0]))
+			end, endErr := netip.ParseAddr(strings.TrimSpace(parts[1]))
+			if startErr != nil || endErr != nil || !subnet.Contains(start) || !subnet.Contains(end) {
+				return fmt.Errorf("DHCP pool %q is outside subnet %s", pool, subnet)
+			}
+			if end.Less(start) {
+				return fmt.Errorf("DHCP pool %q ends before it starts", pool)
+			}
+		}
+		return nil
+	case "security_acl":
+		groups, err := server.desiredItems(ctx, "object_group")
+		if err != nil {
+			return err
+		}
+		_, err = trafficpolicy.CompileConfig(nil, []map[string]any{payload}, groups)
+		return err
+	case "proxy_egress":
+		if err := server.validateDesiredResourceNameUnique(ctx, resourceType, payload); err != nil {
+			return err
+		}
+		if stringField(payload, "underlay_wan_id") == "" && stringField(payload, "underlay_wan") == "" {
+			return fmt.Errorf("proxy_egress requires underlay_wan_id")
+		}
+		if stringField(payload, "runtime_profile") == "" {
+			return fmt.Errorf("proxy_egress requires runtime_profile")
+		}
+		if value := stringField(payload, "capture_path"); value != "" && value != string(proxy.VPPService) {
+			return fmt.Errorf("proxy_egress capture_path must be %q", proxy.VPPService)
+		}
+		if value := stringField(payload, "engine"); value != "" && value != string(proxy.Xray) {
+			return fmt.Errorf("proxy_egress engine must be %q", proxy.Xray)
+		}
+		if value := stringField(payload, "handoff"); value != "" && value != string(proxy.VPPToService) {
+			return fmt.Errorf("proxy_egress handoff must be %q", proxy.VPPToService)
+		}
+		if lowCopyRequested(payload) {
+			return fmt.Errorf("poc_failed: low-copy proxy handoff requires Task 16 PASS")
+		}
+		selected := 0
+		for _, key := range []string{"node_id", "subscription_id", "group_id"} {
+			if strings.TrimSpace(stringField(payload, key)) != "" {
+				selected++
+			}
+		}
+		if selected > 1 {
+			return fmt.Errorf("proxy_egress node_id, subscription_id and group_id are mutually exclusive")
+		}
+		if err := validateProxySNATAddressList(stringSliceField(payload, "snat_addresses")); err != nil {
+			return fmt.Errorf("proxy_egress %w", err)
+		}
+		if err := server.validateProxyGroupReference(ctx, stringField(payload, "group_id")); err != nil {
+			return err
+		}
+		return server.validateProxyEgressDefaultSNAT(ctx, payload)
+	case "proxy_group":
+		if err := server.validateDesiredResourceNameUnique(ctx, resourceType, payload); err != nil {
+			return err
+		}
+		return server.validateProxyGroupMembers(ctx, payload)
+	case "proxy_node":
+		return server.validateDesiredResourceNameUnique(ctx, resourceType, payload)
+	case "wan_group":
+		if err := server.validateDesiredResourceNameUnique(ctx, resourceType, payload); err != nil {
+			return err
+		}
+		return server.validateWANGroupPayload(ctx, payload)
+	case "wan_link":
+		if err := server.validateDesiredResourceNameUnique(ctx, resourceType, payload); err != nil {
+			return err
+		}
+		if err := server.validateDesiredAddressPayload(ctx, resourceType, payload); err != nil {
+			return err
+		}
+		return server.validateWANLinkPayload(ctx, action, payload)
+	default:
+		return nil
+	}
+}
+
+func (server *Server) validateWANLinkPayload(ctx context.Context, action string, payload map[string]any) error {
+	requestedInterface := strings.TrimSpace(firstNonEmpty(stringField(payload, "interface_id"), stringField(payload, "system_name")))
+	interfaceID := server.resolveInterfaceID(ctx, firstNonEmpty(stringField(payload, "interface_id"), stringField(payload, "system_name"), stringField(payload, "id"), stringField(payload, "name")))
+	if interfaceID == "" {
+		return nil
+	}
+	// A line bound to a port the device does not have is accepted today and
+	// persisted as an unassignable line; the next apply then fails closed with
+	// dataplane_locked/runtime_capability_proof and the whole dataplane stops
+	// converging. Operators see that as "the NIC binding cannot be saved".
+	// The persisted port inventory is only trusted while it still describes this
+	// host (see operatorInterfaceInventory).
+	if requestedInterface != "" {
+		if inventory, authoritative := server.operatorInterfaceInventory(ctx); authoritative {
+			if !inventoryHasInterface(inventory, interfaceID) && !server.livePhysicalDataPort(interfaceID) {
+				return fmt.Errorf("interface %q is not present in this device's port inventory", requestedInterface)
+			}
+			if strings.EqualFold(strings.TrimSpace(inventory.Management.LinuxInterface), interfaceID) {
+				return fmt.Errorf("management interface %s cannot be assigned to a WAN link", server.displayInterfaceName(ctx, interfaceID))
+			}
+		}
+	}
+	if err := validateWANLinkConfigured(payload); err != nil {
+		return err
+	}
+	families := wanConfiguredFamilies(payload)
+	if len(families) == 0 {
+		return nil
+	}
+	items, err := server.desiredItems(ctx, "wan_link")
+	if err != nil {
+		return err
+	}
+	payloadID := stringField(payload, "id")
+	for _, item := range items {
+		if truthy(item["deleted"]) {
+			continue
+		}
+		itemID := stringField(item, "id")
+		if action != "create" && itemID != "" && itemID == payloadID {
+			continue
+		}
+		itemInterface := server.resolveInterfaceID(ctx, firstNonEmpty(stringField(item, "interface_id"), stringField(item, "system_name"), stringField(item, "id"), stringField(item, "name")))
+		if itemInterface != interfaceID {
+			continue
+		}
+		itemFamilies := wanConfiguredFamilies(item)
+		for family := range families {
+			if itemFamilies[family] {
+				return fmt.Errorf("interface %s already has %s configuration", server.displayInterfaceName(ctx, interfaceID), strings.ToUpper(family))
+			}
+		}
+	}
+	return nil
+}
+
+func validateWANLinkConfigured(item map[string]any) error {
+	wanType := strings.ToLower(strings.TrimSpace(nonEmpty(stringField(item, "wan_type"), stringField(item, "type"))))
+	if ipv4, ok := item["ipv4"].(map[string]any); ok {
+		mode := strings.ToLower(strings.TrimSpace(stringField(ipv4, "mode")))
+		if mode != "" && mode != "disabled" && mode != "none" && wanType == "" {
+			wanType = mode
+		}
+	}
+	if ipv6, ok := item["ipv6"].(map[string]any); ok {
+		mode := strings.ToLower(strings.TrimSpace(stringField(ipv6, "mode")))
+		if mode != "" && mode != "disabled" && mode != "none" && wanType == "" {
+			wanType = mode
+		}
+	}
+	if wanType == "" {
+		return fmt.Errorf("WAN link requires a configured address mode")
+	}
+	switch wanType {
+	case "dhcp", "dhcp4", "dhcp6":
+		return nil
+	case "pppoe":
+		return nil
+	case "static", "static4":
+		cidr := firstNonEmpty(stringField(item, "cidr"), stringField(item, "ip_cidr"), stringField(item, "address"))
+		gateway := firstNonEmpty(stringField(item, "gateway"), stringField(item, "next_hop"))
+		hasAddressField := hasAnyKey(item, "cidr", "ip_cidr", "address")
+		hasGatewayField := hasAnyKey(item, "gateway", "next_hop")
+		staticMode := false
+		if ipv4, ok := item["ipv4"].(map[string]any); ok {
+			staticMode = strings.ToLower(strings.TrimSpace(stringField(ipv4, "mode"))) == "static"
+			cidr = firstNonEmpty(cidr, stringField(ipv4, "address"), stringField(ipv4, "cidr"))
+			gateway = firstNonEmpty(gateway, stringField(ipv4, "gateway"))
+			hasAddressField = hasAddressField || hasAnyKey(ipv4, "address", "cidr")
+			hasGatewayField = hasGatewayField || hasAnyKey(ipv4, "gateway")
+		}
+		if staticMode && (cidr == "" || gateway == "") {
+			return fmt.Errorf("static IPv4 WAN requires address and gateway")
+		}
+		return nil
+	case "static6":
+		cidr := firstNonEmpty(stringField(item, "cidr"), stringField(item, "ip_cidr"), stringField(item, "address"))
+		gateway := firstNonEmpty(stringField(item, "gateway"), stringField(item, "next_hop"))
+		hasAddressField := hasAnyKey(item, "cidr", "ip_cidr", "address")
+		hasGatewayField := hasAnyKey(item, "gateway", "next_hop")
+		staticMode := false
+		if ipv6, ok := item["ipv6"].(map[string]any); ok {
+			staticMode = strings.ToLower(strings.TrimSpace(stringField(ipv6, "mode"))) == "static"
+			cidr = firstNonEmpty(cidr, stringField(ipv6, "address"), stringField(ipv6, "cidr"))
+			gateway = firstNonEmpty(gateway, stringField(ipv6, "gateway"))
+			hasAddressField = hasAddressField || hasAnyKey(ipv6, "address", "cidr")
+			hasGatewayField = hasGatewayField || hasAnyKey(ipv6, "gateway")
+		}
+		if staticMode && (cidr == "" || gateway == "") {
+			return fmt.Errorf("static IPv6 WAN requires address and gateway")
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+func hasAnyKey(item map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if _, ok := item[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func wanConfiguredFamilies(item map[string]any) map[string]bool {
+	families := map[string]bool{}
+	if family := wanCIDRFamily(firstNonEmpty(stringField(item, "cidr"), stringField(item, "ip_cidr"), stringField(item, "address"))); family != "" {
+		families[family] = true
+	}
+	wanType := strings.ToLower(strings.TrimSpace(nonEmpty(stringField(item, "wan_type"), stringField(item, "type"))))
+	switch wanType {
+	case "static", "static4", "dhcp", "dhcp4", "pppoe":
+		families["ipv4"] = true
+	case "static6", "dhcp6":
+		families["ipv6"] = true
+	}
+	if ipv4, ok := item["ipv4"].(map[string]any); ok {
+		mode := strings.ToLower(strings.TrimSpace(stringField(ipv4, "mode")))
+		if mode != "" && mode != "disabled" && mode != "none" {
+			families["ipv4"] = true
+		}
+		if family := wanCIDRFamily(firstNonEmpty(stringField(ipv4, "address"), stringField(ipv4, "cidr"))); family != "" {
+			families[family] = true
+		}
+	}
+	if ipv6, ok := item["ipv6"].(map[string]any); ok {
+		mode := strings.ToLower(strings.TrimSpace(stringField(ipv6, "mode")))
+		if mode != "" && mode != "disabled" && mode != "none" {
+			families["ipv6"] = true
+		}
+		if family := wanCIDRFamily(firstNonEmpty(stringField(ipv6, "address"), stringField(ipv6, "cidr"))); family != "" {
+			families[family] = true
+		}
+	}
+	return families
+}
+
+func wanCIDRFamily(value string) string {
+	if value == "" {
+		return ""
+	}
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
+	if err == nil {
+		if prefix.Addr().Is4() {
+			return "ipv4"
+		}
+		return "ipv6"
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(value))
+	if err != nil {
+		return ""
+	}
+	if addr.Is4() {
+		return "ipv4"
+	}
+	return "ipv6"
+}
+
+func decoratePortMapItems(items []map[string]any) []map[string]any {
+	decorated := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		decorated = append(decorated, decoratePortMapItem(item))
+	}
+	return decorated
+}
+
+func decoratePortMapItem(item map[string]any) map[string]any {
+	decorated := cloneObject(item)
+	if _, ok := decorated["enabled"]; !ok {
+		decorated["enabled"] = true
+	}
+	if _, ok := decorated["last_hit_at"]; !ok {
+		decorated["last_hit_at"] = nil
+	}
+	if _, ok := decorated["session_count"]; !ok {
+		decorated["session_count"] = nil
+	}
+	if _, ok := decorated["dataplane_observed"]; !ok {
+		decorated["dataplane_observed"] = false
+	}
+	if _, ok := decorated["runtime_state"]; !ok {
+		decorated["runtime_state"] = "desired_not_applied"
+	}
+	return decorated
+}
+
+func decorateTrafficControlItems(items []map[string]any) []map[string]any {
+	decorated := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		decorated = append(decorated, decorateTrafficControlItem(item))
+	}
+	return decorated
+}
+
+func decorateTrafficControlItem(item map[string]any) map[string]any {
+	decorated := cloneObject(item)
+	if _, ok := decorated["hit_count"]; !ok {
+		decorated["hit_count"] = nil
+	}
+	if _, ok := decorated["hit_count_state"]; !ok {
+		decorated["hit_count_state"] = "unavailable"
+	}
+	if _, ok := decorated["hit_count_reason"]; !ok {
+		decorated["hit_count_reason"] = "VPP policy hit counter readback is not configured"
+	}
+	return decorated
+}
+
+func normalizeWANLinkPayload(payload map[string]any) {
+	wanType := strings.ToLower(nonEmpty(stringField(payload, "wan_type"), stringField(payload, "type")))
+	if wanType == "" {
+		wanType = "static"
+	}
+	payload["wan_type"] = wanType
+	payload["schema_version"] = 1
+	if _, ok := payload["ipv4"]; !ok {
+		payload["ipv4"] = map[string]any{"mode": wanIPv4Mode(wanType)}
+	}
+	if _, ok := payload["ipv6"]; !ok {
+		payload["ipv6"] = map[string]any{"mode": wanIPv6Mode(wanType), "ra": wanType == "dhcp", "dhcpv6": wanType == "dhcp", "prefix_delegation": wanType == "dhcp" || wanType == "pppoe"}
+	}
+	if _, ok := payload["passive_state"]; !ok {
+		payload["passive_state"] = map[string]any{"removal_triggers": []string{"link_down", "pppoe_session_down", "dhcp_lease_expired"}, "auto_rejoin": true, "active_health_checks": false}
+	}
+	if wanType == "pppoe" {
+		if secret := firstStringField(payload, "password", "pppoe_password"); secret != "" {
+			payload["credential_ref"] = "local-secret:pppoe:" + stringField(payload, "id")
+			payload["pppoe_password_redacted"] = "redacted"
+			delete(payload, "password")
+			delete(payload, "pppoe_password")
+		}
+	}
+}
+
+func normalizeWANGroupPayload(payload map[string]any) {
+	payload["schema_version"] = 1
+	if _, ok := payload["load_balance"]; !ok {
+		payload["load_balance"] = map[string]any{"mode": "per_connection_weighted"}
+	}
+	if _, ok := payload["passive_state"]; !ok {
+		payload["passive_state"] = map[string]any{"removal_triggers": []string{"link_down", "pppoe_session_down", "dhcp_lease_expired"}, "auto_rejoin": true, "active_health_checks": false}
+	}
+}
+
+func redactProxyDesiredPayload(payload map[string]any) {
+	for _, key := range []string{"secret", "token", "password", "url", "subscription_url", "uri"} {
+		value := stringField(payload, key)
+		if value == "" {
+			continue
+		}
+		// A subscription list is unusable when every row shows "redacted".
+		// The host (never the path or token) is enough to identify the source.
+		if key == "url" || key == "subscription_url" {
+			if parsed, err := url.Parse(value); err == nil && parsed.Host != "" {
+				payload["url_host"] = parsed.Host
+			}
+		}
+		payload[key+"_redacted"] = "redacted"
+		delete(payload, key)
+	}
+}
+
+func normalizeProxyNodeURIPayload(payload map[string]any) error {
+	raw := strings.TrimSpace(stringField(payload, "uri"))
+	if raw == "" {
+		address := strings.TrimSpace(stringField(payload, "address"))
+		if strings.Contains(address, "://") {
+			raw = address
+		}
+	}
+	if raw == "" {
+		return nil
+	}
+	node, err := proxy.ParseNodeURI(raw)
+	if err != nil {
+		return fmt.Errorf("proxy node URI: %w", err)
+	}
+	if stringField(payload, "id") == "" {
+		payload["id"] = node.ID
+	}
+	if stringField(payload, "name") == "" {
+		payload["name"] = node.Name
+	}
+	payload["protocol"] = node.Protocol
+	payload["address"] = node.Address
+	payload["port"] = node.Port
+	payload["secret"] = node.Secret
+	payload["settings"] = node.Settings
+	payload["uri"] = raw
+	return nil
+}
+
+func extractDesiredSecrets(resourceType string, payload map[string]any) map[string]string {
+	secrets := map[string]string{}
+	switch resourceType {
+	case "proxy_node":
+		if value := firstNonEmpty(stringField(payload, "secret"), stringField(payload, "token"), stringField(payload, "password")); value != "" {
+			secrets["secret"] = value
+			payload["credential_ref"] = "local-secret:proxy_node:" + stringField(payload, "id") + ":secret"
+		}
+	case "proxy_subscription":
+		if value := firstNonEmpty(stringField(payload, "url"), stringField(payload, "subscription_url")); value != "" {
+			secrets["url"] = value
+			payload["credential_ref"] = "local-secret:proxy_subscription:" + stringField(payload, "id") + ":url"
+		}
+	case "wan_link":
+		if value := firstNonEmpty(stringField(payload, "pppoe_password"), stringField(payload, "password")); value != "" {
+			secrets["pppoe_password"] = value
+		}
+	}
+	return secrets
+}
+
+func lowCopyRequested(payload map[string]any) bool {
+	for _, key := range []string{"low_copy", "low_copy_enabled", "vpp_low_copy", "transparent_handoff"} {
+		if truthy(payload[key]) {
+			return true
+		}
+	}
+	for _, key := range []string{"handoff", "datapath", "main_path"} {
+		if strings.Contains(strings.ReplaceAll(strings.ToLower(stringField(payload, key)), "-", "_"), "low_copy") {
+			return true
+		}
+	}
+	return false
+}
+
+func wanIPv4Mode(wanType string) string {
+	switch wanType {
+	case "dhcp", "dhcp4":
+		return "dhcp4"
+	case "pppoe":
+		return "pppoe"
+	case "proxy":
+		return "underlay"
+	default:
+		return "static"
+	}
+}
+
+func wanIPv6Mode(wanType string) string {
+	switch wanType {
+	case "dhcp", "dhcp4", "dhcp6":
+		return "dhcpv6_pd"
+	case "pppoe":
+		return "pppoe_dhcpv6_pd"
+	case "proxy":
+		return "underlay"
+	default:
+		return "static_or_slaac"
+	}
+}
+
+func (server *Server) validateWANGroupPayload(ctx context.Context, payload map[string]any) error {
+	members := wanGroupMemberIDs(payload)
+	if len(members) < 2 {
+		return fmt.Errorf("wan_group requires at least two real WAN members")
+	}
+	for _, member := range members {
+		kind, err := server.wanMemberKind(ctx, member)
+		if err != nil {
+			return err
+		}
+		if kind != "real" {
+			return fmt.Errorf("wan_group does not support proxy egress member %q", member)
+		}
+	}
+	return nil
+}
+
+func wanGroupMemberIDs(payload map[string]any) []string {
+	ids := stringSliceField(payload, "members")
+	if len(ids) > 0 {
+		return ids
+	}
+	ids = stringSliceField(payload, "wan_members")
+	if len(ids) > 0 {
+		return ids
+	}
+	for _, item := range anySliceField(payload, "member_weights", "wan_members") {
+		if object, ok := item.(map[string]any); ok {
+			if id := firstStringField(object, "id", "wan_id", "member_id", "egress_id"); id != "" {
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
+}
+
+func (server *Server) wanMemberKind(ctx context.Context, id string) (string, error) {
+	if item, ok, err := server.desiredItem(ctx, "wan_link", id); err != nil {
+		return "", err
+	} else if ok {
+		if strings.EqualFold(stringField(item, "wan_type"), "proxy") || strings.EqualFold(stringField(item, "type"), "proxy") {
+			return "proxy", nil
+		}
+		return "real", nil
+	}
+	if _, ok, err := server.desiredItem(ctx, "proxy_egress", id); err != nil {
+		return "", err
+	} else if ok {
+		return "proxy", nil
+	}
+	return "real", nil
+}
+
+func anySliceField(item map[string]any, keys ...string) []any {
+	for _, key := range keys {
+		if values, ok := item[key].([]any); ok {
+			return values
+		}
+	}
+	return nil
+}
+
+func compiledUsesShape(compiled flow.CompiledIntent) bool {
+	for _, group := range compiled.VPPGroups {
+		if strings.TrimSpace(group.Kind) == "vpp.shape" {
+			return true
+		}
+	}
+	return false
+}
+
+func flowIntentFromDesiredPayload(payload map[string]any) (flow.Intent, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return flow.Intent{}, err
+	}
+	var intent flow.Intent
+	if err := json.Unmarshal(raw, &intent); err != nil {
+		return flow.Intent{}, err
+	}
+	if intent.ID == "" {
+		intent.ID = stringField(payload, "id")
+	}
+	return intent, nil
+}
+
+func oneOf(value string, allowed []string) bool {
+	for _, item := range allowed {
+		if value == item {
+			return true
+		}
+	}
+	return false
+}
+
+func truthy(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "true") || strings.EqualFold(strings.TrimSpace(typed), "enabled")
+	default:
+		return false
+	}
+}
+
+func cloneObject(item map[string]any) map[string]any {
+	raw, _ := json.Marshal(item)
+	var clone map[string]any
+	_ = json.Unmarshal(raw, &clone)
+	return clone
+}
+
+func readSystemSummary() (map[string]any, controlapi.CapabilityState) {
+	summary := map[string]any{}
+	reasons := []string{}
+	if cpu, err := parseProcStat(); err == nil {
+		summary["cpu_busy_percent"] = cpu
+	} else {
+		reasons = append(reasons, err.Error())
+	}
+	if memory, err := parseProcMeminfo(); err == nil {
+		for key, value := range memory {
+			summary[key] = value
+		}
+	} else {
+		reasons = append(reasons, err.Error())
+	}
+	if load, err := parseProcLoadavg(); err == nil {
+		summary["load_average"] = load
+	} else {
+		reasons = append(reasons, err.Error())
+	}
+	if len(reasons) > 0 {
+		return summary, controlapi.CapabilityState{Name: "system_summary", Available: false, State: controlapi.CapabilityDegraded, Reason: strings.Join(reasons, "; ")}
+	}
+	return summary, controlapi.CapabilityState{Name: "system_summary", Available: true, State: controlapi.CapabilityAvailable}
+}
+
+func parseProcStat() (float64, error) {
+	content, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, fmt.Errorf("/proc/stat unavailable: %w", err)
+	}
+	lines := strings.Split(string(content), "\n")
+	if len(lines) == 0 || !strings.HasPrefix(lines[0], "cpu ") {
+		return 0, fmt.Errorf("/proc/stat missing aggregate cpu row")
+	}
+	fields := strings.Fields(lines[0])
+	if len(fields) < 8 {
+		return 0, fmt.Errorf("/proc/stat aggregate cpu row is incomplete")
+	}
+	values := make([]uint64, 0, len(fields)-1)
+	var total uint64
+	for _, field := range fields[1:] {
+		value, err := strconv.ParseUint(field, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("/proc/stat has invalid cpu counter %q", field)
+		}
+		values = append(values, value)
+		total += value
+	}
+	if total == 0 {
+		return 0, fmt.Errorf("/proc/stat aggregate cpu total is zero")
+	}
+	idle := values[3]
+	if len(values) > 4 {
+		idle += values[4]
+	}
+	return round2(float64(total-idle) * 100 / float64(total)), nil
+}
+
+func parseProcMeminfo() (map[string]any, error) {
+	content, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return nil, fmt.Errorf("/proc/meminfo unavailable: %w", err)
+	}
+	values := map[string]uint64{}
+	for _, line := range strings.Split(string(content), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		value, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		values[strings.TrimSuffix(fields[0], ":")] = value * 1024
+	}
+	total := values["MemTotal"]
+	available := values["MemAvailable"]
+	if total == 0 || available == 0 {
+		return nil, fmt.Errorf("/proc/meminfo missing MemTotal or MemAvailable")
+	}
+	used := total - available
+	return map[string]any{"memory_total_bytes": total, "memory_available_bytes": available, "memory_used_bytes": used, "memory_used_percent": round2(float64(used) * 100 / float64(total))}, nil
+}
+
+func parseProcLoadavg() (map[string]float64, error) {
+	content, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return nil, fmt.Errorf("/proc/loadavg unavailable: %w", err)
+	}
+	fields := strings.Fields(string(content))
+	if len(fields) < 3 {
+		return nil, fmt.Errorf("/proc/loadavg is incomplete")
+	}
+	keys := []string{"1m", "5m", "15m"}
+	load := map[string]float64{}
+	for index, key := range keys {
+		value, err := strconv.ParseFloat(fields[index], 64)
+		if err != nil {
+			return nil, fmt.Errorf("/proc/loadavg has invalid value %q", fields[index])
+		}
+		load[key] = value
+	}
+	return load, nil
+}
+
+func clampIntQuery(raw string, fallback, minValue, maxValue int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		value = fallback
+	}
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func round2(value float64) float64 {
+	return float64(int(value*100+0.5)) / 100
+}
+
+func stringField(item map[string]any, key string) string {
+	value, _ := item[key].(string)
+	return strings.TrimSpace(value)
+}
+
+func intField(item map[string]any, key string) int {
+	switch value := item[key].(type) {
+	case int:
+		return value
+	case float64:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
+func firstIntField(item map[string]any, keys ...string) int {
+	for _, key := range keys {
+		if value := intField(item, key); value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func (server *Server) degradedRuntimeCapabilities(ctx context.Context) []controlapi.CapabilityState {
+	type capabilityService struct {
+		service           serviceRuntime.ServiceName
+		name              string
+		unavailableReason string
+	}
+	entries := []capabilityService{
+		{serviceRuntime.VPP, "vpp_runtime_apply", "VPP apply runtime is not configured"},
+		{serviceRuntime.SmartDNS, "smartdns_runtime_apply", "SmartDNS service runtime is not configured"},
+		{serviceRuntime.Dnsmasq, "dnsmasq_runtime_apply", "Dnsmasq service runtime is not configured"},
+		{serviceRuntime.Xray, "xray_runtime_apply", "xray service runtime is not configured"},
+	}
+	results := make([]controlapi.CapabilityState, 0, len(entries))
+	if !server.serviceRuntimeConfigured() {
+		for _, entry := range entries {
+			results = append(results, controlapi.CapabilityState{Name: entry.name, Available: false, State: controlapi.CapabilityDegraded, Reason: entry.unavailableReason})
+		}
+		return results
+	}
+	services := make([]serviceRuntime.ServiceName, 0, len(entries))
+	for _, entry := range entries {
+		services = append(services, entry.service)
+	}
+	health, err := server.services.HealthCheck(ctx, services...)
+	byService := make(map[serviceRuntime.ServiceName]serviceRuntime.Health, len(health))
+	for _, item := range health {
+		byService[item.Service] = item
+	}
+	for _, entry := range entries {
+		if err != nil {
+			results = append(results, controlapi.CapabilityState{Name: entry.name, Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()})
+			continue
+		}
+		item, ok := byService[entry.service]
+		if !ok || !item.Available {
+			reason := serviceUnitReason(entry.service)
+			if item.Reason != "" {
+				reason = item.Reason
+			}
+			results = append(results, controlapi.CapabilityState{Name: entry.name, Available: false, State: controlapi.CapabilityDegraded, Reason: reason})
+			continue
+		}
+		results = append(results, controlapi.CapabilityState{Name: entry.name, Available: true, State: controlapi.CapabilityAvailable})
+	}
+	return results
+}
+
+func nonEmpty(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func envOrDefault(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func loadDNSSyncToken() string {
+	if token := strings.TrimSpace(os.Getenv("LY_ROUTE_DNS_SYNC_TOKEN")); token != "" {
+		return token
+	}
+	path := envOrDefault("LY_ROUTE_DNS_SYNC_TOKEN_FILE", "/etc/ly-route/dns-sync.token")
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(payload))
+}
+
+func envBoolOrDefault(key string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+func (server *Server) handleRuntimePreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	plan, err := server.buildRuntimePlan(ctx, requestID(r))
+	if err != nil {
+		writeError(w, r, http.StatusUnprocessableEntity, "runtime_preview_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "preview", "runtime_state": runtimeState(plan.Components), "plan": plan, "request_id": requestID(r)})
+}
+
+func (server *Server) handleRuntimeApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	session, ok := server.sessionFromRequest(r)
+	if !ok && server.validDNSSyncRequest(r) {
+		session = Session{Username: "dns-sync", Role: "admin"}
+		ok = true
+	}
+	if !ok {
+		server.recordAudit("anonymous", "system", "/api/v1/runtime/apply", "apply", "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "denied", "readonly mutation denied", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, "/api/v1/runtime/apply", "apply") {
+		return
+	}
+	// Refuse before taking the apply gate: a thermally blocked apply must not
+	// leave a transaction, a pending generation or an in-progress marker behind.
+	if server.rejectDestructiveThermal(w, r, session, "/api/v1/runtime/apply", "apply") {
+		return
+	}
+	transactionID := "runtime-" + newRequestID()
+	lease, acquired := server.beginApply("runtime-apply", transactionID, 0)
+	if !acquired {
+		// A second click must not queue for minutes behind the first apply.
+		// Return the transaction that actually owns the gate; a fresh,
+		// never-executed ID would make the client poll a transaction that can
+		// never commit. Clients can poll runtime/status for the real receipt.
+		inFlight := server.applyState()
+		response := map[string]any{
+			"status": "apply_in_progress", "runtime_state": "degraded",
+			"reason":              "another runtime apply is in progress",
+			"in_flight_apply":     inFlight,
+			"retry_after_seconds": 2,
+			"request_id":          requestID(r),
+		}
+		// Only report a transaction ID when the holder is itself an apply. A
+		// periodic proxy reconcile has no transaction to poll; returning a
+		// fresh ID for it would recreate the phantom-transaction deadlock.
+		if inFlight.TransactionID != "" {
+			response["transaction_id"] = inFlight.TransactionID
+		}
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "denied", "another runtime apply is in progress", r)
+		writeJSON(w, http.StatusAccepted, response)
+		return
+	}
+	defer lease.release()
+	if server.profile.ID() == product.Orchestrator().ID() {
+		server.BeginOperation("runtime-apply", "orchestrator runtime")
+		defer server.EndOperation()
+	}
+	// A gateway apply owns daemon and VPP transitions that can outlive a reverse
+	// proxy's request timeout. Keep the transaction bounded, but do not cancel a
+	// valid commit just because the browser or nginx closed its HTTP request.
+	applyCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), server.applyTimeoutOrDefault())
+	defer cancel()
+	// Run the apply body behind a hard wall-clock bound.  Cancellation alone
+	// cannot prove that a wedged child returned, so the request goroutine also
+	// stops waiting after the grace period and releases the gate.
+	buffered := newBufferedHTTPResponse()
+	completed := runBoundedWork(applyCtx, server.applyGraceOrDefault(), func() {
+		server.executeRuntimeApply(buffered, r, session, applyCtx, transactionID, lease)
+	})
+	if !completed {
+		cancel()
+		lease.expired.Store(true)
+		reason := applyTimeoutReason("runtime apply", server.applyTimeoutOrDefault())
+		result := degradedRuntimeResult(transactionID, reason, server.now().UTC())
+		result.Status = "apply_failed"
+		server.publishFailedRuntimeResult(nil, result)
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", reason, r)
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "apply_failed", "runtime_state": "degraded", "reason": reason, "transaction_id": transactionID, "request_id": requestID(r)})
+		return
+	}
+	buffered.flushTo(w)
+}
+
+// executeRuntimeApply is the bounded body of /api/v1/runtime/apply. It never
+// acquires the apply gate itself: the handler owns the lease and guarantees it
+// is released even if this function never returns.
+func (server *Server) executeRuntimeApply(w http.ResponseWriter, r *http.Request, session Session, applyCtx context.Context, transactionID string, lease *applyLease) {
+	if server.applyWorkOverride != nil {
+		server.applyWorkOverride(applyCtx, "runtime-apply", w)
+		return
+	}
+	// Record any bounded dataplane self-heal performed during this transaction
+	// so the committed snapshot and the API response can report it.
+	applyCtx, _ = selfheal.WithRecorder(applyCtx)
+	if server.profile.ID() == product.Orchestrator().ID() {
+		// Force a live capability observation before committing. A probe
+		// failure is reported by the plan as a degradation and never aborts the
+		// apply: the previous generation keeps forwarding until a real
+		// eligibility failure.
+		_ = server.refreshDataplaneCapability(applyCtx)
+		if err := server.applyPersistedOrchestratorState(applyCtx, transactionID); err != nil {
+			cause := "orchestrator apply: " + err.Error()
+			result := degradedRuntimeResult(transactionID, cause, server.now().UTC())
+			result.Status = "apply_failed"
+			server.publishRuntimeResult(lease, result)
+			server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", cause, r)
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": cause, "transaction_id": transactionID, "request_id": requestID(r)})
+			return
+		}
+		components, _ := server.orchestratorTransparentRuntimeComponents(applyCtx)
+		state := runtimeState(components)
+		status := "committed"
+		code := http.StatusOK
+		if state != "running" {
+			status = "degraded"
+			code = http.StatusAccepted
+		}
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "success", "", r)
+		writeJSON(w, code, map[string]any{"status": status, "runtime_state": state, "transaction_id": transactionID, "components": components, "request_id": requestID(r)})
+		return
+	}
+	// The plan is only authoritative for the desired state it was compiled
+	// from. Hash the current desired documents before planning and refuse the
+	// fast path whenever the last committed generation belongs to a different
+	// source. This is what stops an old operations.json/transaction from being
+	// replayed after the operator edits a LAN/WAN address.
+	sourceHash, sourceHashErr := server.runtimeDesiredSourceHash(applyCtx)
+	if sourceHashErr != nil {
+		cause := "desired source hash: " + sourceHashErr.Error()
+		result := degradedRuntimeResult(transactionID, cause, server.now().UTC())
+		result.Status = "compile_failed"
+		if recordErr := server.recordRuntimeApply(applyCtx, result, session, r); recordErr != nil {
+			result.Reason += ": audit persistence: " + recordErr.Error()
+		}
+		server.publishFailedRuntimeResult(lease, result)
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", cause, r)
+		writeJSON(w, http.StatusAccepted, server.applyFailureResponse(result, cause, nil))
+		return
+	}
+	generation, generationErr := server.beginRuntimeApplyGeneration(sourceHash, transactionID)
+	if generationErr != nil {
+		cause := "apply state: begin desired generation: " + generationErr.Error()
+		result := degradedRuntimeResult(transactionID, cause, server.now().UTC())
+		result.Status = "apply_failed"
+		if recordErr := server.recordRuntimeApply(applyCtx, result, session, r); recordErr != nil {
+			result.Reason += ": audit persistence: " + recordErr.Error()
+		}
+		server.publishFailedRuntimeResult(lease, result)
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", cause, r)
+		response := server.applyFailureResponse(result, cause, nil)
+		response["request_id"] = requestID(r)
+		writeJSON(w, http.StatusAccepted, response)
+		return
+	}
+	applyStateSettled := false
+	defer func() {
+		if generation == nil || applyStateSettled {
+			return
+		}
+		// Every early return after Begin must leave an auditable failure
+		// instead of a pending desired generation that looks applied.
+		server.failRuntimeApplyState(transactionID, "apply did not commit", applystate.ReceiptStatusFailed)
+	}()
+	noopAllowed := true
+	if generation != nil {
+		noopAllowed = generation.Unchanged
+	}
+	if noopAllowed {
+		if noop, ok := server.tryNoopRuntimeApply(applyCtx, sourceHash); ok {
+			now := server.now().UTC()
+			noop.SourceHash = sourceHash
+			noop.Noop = true
+			noop.Reason = "desired generation is unchanged and live; no-op committed"
+			// The live VPP/artifact check above is a fresh readback for this
+			// generation. Refresh the liveness timestamps so the next status poll
+			// does not degrade an old (but still live) receipt as stale.
+			noop.AppliedAt = now
+			noop.Receipt.AppliedAt = now
+			noop.Readback.Timestamp = now
+			noop.Readback.Fresh = true
+			noop.ReconciliationReceipt = apply.ReconciliationReceipt{TransactionID: noop.TransactionID, Capability: "runtime.reconciliation", Status: apply.ReceiptApplied, Cause: noop.Reason, Timestamp: now}
+			server.publishRuntimeResult(lease, *noop)
+			server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "success", noop.Reason, r)
+			response := map[string]any{
+				"status":           noop.Status,
+				"runtime_state":    noop.RuntimeState,
+				"reason":           noop.Reason,
+				"transaction_id":   noop.TransactionID,
+				"snapshot_hash":    noop.SnapshotHash,
+				"source_hash":      sourceHash,
+				"noop":             true,
+				"outcome":          "unchanged",
+				"unchanged":        true,
+				"components":       noop.Components,
+				"applied_services": noop.Applied,
+				"request_id":       requestID(r),
+			}
+			if generation != nil {
+				// A no-op must not inherit the previous generation's partial
+				// flag: this transaction re-read the live components above, so
+				// the reported degradation is whatever is true now.
+				unchangedReasons := runtimeConcreteDegradedReasons(noop.Components, nil, noop.CapabilityFailures)
+				unchangedState, unchangedErr := server.applyGenerationState.MarkUnchangedEvaluated(transactionID, len(unchangedReasons) > 0, unchangedReasons)
+				if unchangedErr != nil {
+					cause := "apply state: record unchanged generation: " + unchangedErr.Error()
+					state := server.failRuntimeApplyState(transactionID, cause, applystate.ReceiptStatusFailed)
+					applyStateSettled = true
+					mergeApplyStateFields(response, state)
+					response["status"] = "apply_failed"
+					response["runtime_state"] = "degraded"
+					response["reason"] = cause
+					writeJSON(w, http.StatusAccepted, response)
+					return
+				}
+				applyStateSettled = true
+				mergeApplyStateFields(response, unchangedState)
+				response["outcome"] = "unchanged"
+				response["unchanged"] = true
+			}
+			writeJSON(w, http.StatusOK, response)
+			return
+		}
+	}
+	// A live attachment in a mode the rule library forbids (historically an
+	// igc AF_XDP residue) is repaired before planning. This is the only apply
+	// path that is allowed to change a mode that already exists: it is a safety
+	// migration to AF_PACKET, not an automatic performance upgrade. It runs
+	// before the capability observation so the stale record cannot be observed
+	// and reselected. A failed migration is recorded as needs_repair and is not
+	// replayed in the same boot.
+	server.migrateForbiddenTakeoverModes(applyCtx)
+	// Force a live capability observation before planning. A probe failure is
+	// reported by the plan as a degradation and never aborts the apply: the
+	// previous generation keeps forwarding until a real eligibility failure.
+	_ = server.refreshDataplaneCapability(applyCtx)
+	plan, err := server.buildRuntimePlan(applyCtx, transactionID)
+	if err != nil {
+		result := degradedRuntimeResult(transactionID, err.Error(), server.now().UTC())
+		result.Status = "compile_failed"
+		if recordErr := server.recordRuntimeApply(applyCtx, result, session, r); recordErr != nil {
+			result.Reason += ": audit persistence: " + recordErr.Error()
+		}
+		response := server.applyFailureResponse(result, result.Reason, nil)
+		response["reason"] = "apply rejected during planning; the previous committed generation is still in force: " + firstLine(result.Reason, 400)
+		response["request_id"] = requestID(r)
+		writeJSON(w, http.StatusAccepted, response)
+		return
+	}
+	// Host-originated service traffic (DNS upstreams) has to enter the dataplane:
+	// the kernel default route points at the management gateway, so an upstream on
+	// a WAN segment is otherwise unreachable. Best effort, never fails the apply.
+	// The routed probe tap must exist before the DNS host routes can point at it;
+	// it is created here, idempotently, so a VPP restart cannot lose it.
+	if probeErr := ensureProbeTap(applyCtx); probeErr != nil {
+		log.Printf("probe tap: %v", probeErr)
+	}
+	for _, warning := range server.ensureServiceHostRoutes(applyCtx, vpp.PlanRequiresNAT(plan.GatewayPlan)) {
+		log.Printf("service host route: %s", warning)
+	}
+	var rejectedApplyServices map[serviceRuntime.ServiceName]struct{}
+	// Try a native candidate before settling for the AF_PACKET compatibility
+	// fallback. The probe cannot discover DPDK without binding the device, so a
+	// plan that already selected AF (Degraded) still needs one native attempt.
+	// Crash-guarded or non-destructively owned ports make bootstrap a no-op.
+	nativeProbeNeeded := plan.DataplaneState == "dataplane_locked" ||
+		plan.DataplaneState == "dataplane_degraded" ||
+		plan.DataplaneState == "af_fallback_required" ||
+		plan.SelectedNativePath.Degraded ||
+		// A physical port that the backend plan wants on a higher mode is a
+		// reason to run the ownership preflight; there is no operator switch.
+		server.autoTakeoverPending(applyCtx)
+	if nativeProbeNeeded && len(plan.GatewayPlan.NativePath.Assignments) > 0 {
+		// A dataplane bootstrap restarts VPP. SmartDNS is PartOf=vpp.service, so
+		// an aborted apply (for example the 409 AF-consent gate) can leave a
+		// previously-running daemon stopped. Record the healthy baseline before
+		// touching VPP and restore it even when this apply is rejected.
+		rejectedApplyServices = server.captureRunningServices(applyCtx)
+		// A fresh, API-configured appliance has no installer NIC mapping, so the
+		// boot ownership preflight had nothing to bind. Before declaring the
+		// dataplane locked, run the same preflight now, restart VPP, and re-probe
+		// once. This is the first-takeover path; repeated applies see the NICs
+		// already owned by VPP or crash-guarded and skip it.
+		attempted := server.bootstrapDataplaneOwnership(applyCtx)
+		recoverOwned := false
+		if plan.DataplaneState == "dataplane_locked" || plan.DataplaneState == "dataplane_degraded" {
+			// A product-owned port without a usable capability must be waited
+			// for (bounded), not rejected in the first two seconds.
+			recoverOwned = server.dataplaneRecoveryExpected(applyCtx)
+		}
+		if attempted || recoverOwned {
+			// The first takeover binds the data NICs and restarts VPP, or a
+			// candidate crashed VPP and the fallback is being established. An
+			// immediate probe races that restart and reports "locked" even
+			// though the ports are correctly attached, so wait (bounded) for a
+			// usable observation before rejecting the operator's first apply.
+			deadline := time.Now().Add(dataplaneReadyWait)
+			// bootstrapDataplaneOwnership already restarted VPP when it bound a
+			// candidate. Never restart again on every interval while the probe
+			// is still catching up: that loop produced the 40+ restart storm.
+			restartedDuringWait := attempted
+			for {
+				if server.capabilityProber != nil {
+					server.capabilityProber.Invalidate()
+				}
+				_ = server.refreshDataplaneCapability(applyCtx)
+				if retried, retryErr := server.buildRuntimePlan(applyCtx, transactionID); retryErr == nil {
+					plan = retried
+				}
+				log.Printf("dataplane apply wait: state=%s assignments=%d attachments=%d degraded=%v source=%s",
+					plan.DataplaneState, len(plan.GatewayPlan.NativePath.Assignments),
+					len(plan.SelectedNativePath.Attachments), plan.SelectedNativePath.Degraded, plan.CapabilitySource)
+				if runtimePlanDataplaneSettled(plan) {
+					break
+				}
+				if !time.Now().Before(deadline) || applyCtx.Err() != nil {
+					break
+				}
+				if !server.vppReachable(applyCtx) && !restartedDuringWait {
+					// Repair, do not hammer vppctl: at most one restart in this
+					// wait window, then keep polling for the probe to settle.
+					restartedDuringWait = true
+					_ = server.restartVPPAndWait(applyCtx)
+				}
+				select {
+				case <-applyCtx.Done():
+				case <-time.After(dataplaneReadyInterval):
+				}
+			}
+		}
+		// Restore daemons stopped by the VPP restart before any early return.
+		// Repeating this after a successful plan is harmless and keeps a
+		// subsequent apply from needing a manual service start.
+		server.restoreRunningServices(applyCtx, rejectedApplyServices)
+	}
+	if plan.DataplaneState == "af_fallback_required" && len(plan.AFRequiredInterfaces) > 0 {
+		reason := plan.AFRequiredMessage
+		if strings.TrimSpace(reason) == "" {
+			reason = vpp.AFPacketDegradedReason
+		}
+		result := degradedRuntimeResult(transactionID, reason, server.now().UTC())
+		result.Status = "af_fallback_required"
+		result.RuntimeState = "degraded"
+		result.GatewayPlan = &plan.GatewayPlan
+		result.Components = plan.Components
+		if recordErr := server.recordRuntimeApply(applyCtx, result, session, r); recordErr != nil {
+			result.Reason += ": audit persistence: " + recordErr.Error()
+		}
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "denied", reason, r)
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"status":        "af_fallback_required",
+			"runtime_state": "degraded",
+			"reason":        reason,
+			"error": map[string]any{
+				"code":    "af_fallback_required",
+				"message": reason,
+				"ports":   plan.AFRequiredInterfaces,
+			},
+			"af_fallback_required": map[string]any{
+				"ports":   plan.AFRequiredInterfaces,
+				"message": reason,
+			},
+			"dataplane_degradations": plan.DataplaneDegradations,
+			"transaction_id":         transactionID,
+			"request_id":             requestID(r),
+		})
+		return
+	}
+	// An apply must not race a restarting dataplane. When a dataplane has
+	// already committed, wait for VPP to answer before running the transaction;
+	// the interfaces node reattaches ports that a restart dropped, so waiting
+	// for the ports here would deadlock the recovery apply. A true first boot
+	// has no committed dataplane and runs without this barrier.
+	if plan.DataplaneState == "native_ready" && len(plan.GatewayPlan.NativePath.Assignments) > 0 && server.dataplaneTakeoverExpected(applyCtx) {
+		readiness := server.waitForVPPResponsive(applyCtx, dataplaneReadyWait, dataplaneReadyInterval)
+		if !readiness.VPPResponding {
+			reason := strings.TrimSpace(readiness.Reason)
+			if reason == "" {
+				reason = "VPP is restarting or not answering; the previous generation is preserved"
+			}
+			result := degradedRuntimeResult(transactionID, reason, server.now().UTC())
+			result.Status = "dataplane_degraded"
+			result.GatewayPlan = &plan.GatewayPlan
+			result.Components = plan.Components
+			if recordErr := server.recordRuntimeApply(applyCtx, result, session, r); recordErr != nil {
+				result.Reason += ": audit persistence: " + recordErr.Error()
+			}
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": result.Reason, "transaction_id": transactionID, "components": result.Components, "dataplane_readiness": readiness, "request_id": requestID(r)})
+			return
+		}
+	}
+	if (plan.DataplaneState == "dataplane_locked" || plan.DataplaneState == "dataplane_degraded") && len(plan.GatewayPlan.NativePath.Assignments) > 0 {
+		// An address-only edit on an already bound port must not surface as a
+		// bare dataplane_locked (a 202 that looks accepted). Name the ports that
+		// lost their attachment proof and return a retryable 4xx: the operator
+		// can re-apply or restart VPP, and the previous generation keeps
+		// forwarding in the meantime.
+		if ports := unprovenAddressAssignmentPorts(plan); len(ports) > 0 {
+			reason := "WAN/LAN 地址变更需要重新建立数据面附件：端口 " + strings.Join(ports, ", ") + " 当前没有可用的 attachment proof。请重新 apply（或执行 systemctl restart vpp 后重试）；上一代已提交配置仍在生效，LAN 未受影响。"
+			result := degradedRuntimeResult(transactionID, reason, server.now().UTC())
+			result.Status = "dataplane_reattach_required"
+			result.GatewayPlan = &plan.GatewayPlan
+			result.Components = plan.Components
+			if recordErr := server.recordRuntimeApply(applyCtx, result, session, r); recordErr != nil {
+				result.Reason += ": audit persistence: " + recordErr.Error()
+			}
+			server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "denied", reason, r)
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"status":        "dataplane_reattach_required",
+				"runtime_state": result.RuntimeState,
+				"reason":        reason,
+				"error": map[string]any{
+					"code":        "dataplane_reattach_required",
+					"message":     reason,
+					"ports":       ports,
+					"recoverable": true,
+				},
+				"dataplane_prerequisites": plan.DataplaneProof,
+				"dataplane_degradations":  plan.DataplaneDegradations,
+				"capability_source":       plan.CapabilitySource,
+				"transaction_id":          transactionID,
+				"request_id":              requestID(r),
+			})
+			return
+		}
+		reason := dataplaneLockReason(plan)
+		result := degradedRuntimeResult(transactionID, reason, server.now().UTC())
+		result.Status = plan.DataplaneState
+		result.GatewayPlan = &plan.GatewayPlan
+		result.Components = plan.Components
+		if recordErr := server.recordRuntimeApply(applyCtx, result, session, r); recordErr != nil {
+			result.Reason += ": audit persistence: " + recordErr.Error()
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": result.Reason, "transaction_id": transactionID, "components": result.Components, "dataplane_prerequisites": plan.DataplaneProof, "dataplane_degradations": plan.DataplaneDegradations, "capability_source": plan.CapabilitySource, "request_id": requestID(r)})
+		return
+	}
+	if !server.serviceRuntimeConfigured() {
+		result := degradedRuntimeResult(transactionID, "service runtime controller is not configured", server.now().UTC())
+		result.Status = "unavailable"
+		result.RuntimeState = "unavailable"
+		server.publishRuntimeResult(lease, result)
+		result.Components = server.applyRuntimeEvidence(plan.Components)
+		if err := server.recordRuntimeApply(applyCtx, result, session, r); err != nil {
+			result.Reason += ": audit persistence: " + err.Error()
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": result.Reason, "transaction_id": transactionID, "components": result.Components, "request_id": requestID(r)})
+		return
+	}
+	// Never issue a transaction's batch of VPP operations against a dead VPP.
+	// A crashed candidate may have left the service down; restart once (bounded)
+	// and fail fast with an actionable reason instead of a long rollback chain.
+	if (len(plan.VppOperations) > 0 || len(plan.GatewayPlan.NativePath.Assignments) > 0) && !server.vppReachable(applyCtx) && server.vppServiceManageable(applyCtx) {
+		log.Printf("runtime apply: VPP is not reachable before the transaction; restarting the dataplane")
+		_ = server.restartVPPAndWait(applyCtx)
+		if !server.vppReachable(applyCtx) {
+			reason := "VPP is not reachable after the dataplane candidate started; check vpp.service and the native crash guard before retrying"
+			result := degradedRuntimeResult(transactionID, reason, server.now().UTC())
+			result.Status = "dataplane_degraded"
+			server.publishRuntimeResult(lease, result)
+			server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", reason, r)
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": reason, "transaction_id": transactionID, "request_id": requestID(r)})
+			return
+		}
+	}
+	serviceArtifacts := runtimeServiceArtifacts(plan.RuntimeArtifacts, server.gatewayTransaction != nil)
+	evidenceRequest := RuntimeEvidenceRequest{TransactionID: transactionID, Capability: "/api/v1/runtime/apply", Artifacts: serviceArtifacts}
+	var appliedArtifacts []serviceRuntime.RenderedArtifact
+	var capabilityFailures []apply.CapabilityFailureEvidence
+	var hooks *apply.ApplyHooks
+	executor := apply.Executor{
+		Store:   server.store,
+		Now:     server.now,
+		Gateway: server.gatewayTransaction,
+		Receipt: func(ctx context.Context, _ apply.Plan) (apply.ApplyReceipt, error) {
+			return server.runtimeReceipt(ctx, evidenceRequest)
+		},
+		Readback: func(ctx context.Context, _ apply.Plan) (apply.Readback, error) {
+			return server.runtimeReadback(ctx, evidenceRequest)
+		},
+		CapabilityFailures: func() []apply.CapabilityFailureEvidence { return capabilityFailures },
+	}
+	applyIdentity := serviceRuntime.ApplyIdentity{TransactionID: transactionID, DesiredHash: sourceHash}
+	if generation != nil {
+		applyIdentity.DesiredGeneration = generation.State.DesiredGeneration
+	}
+	if gatewaySupportsApplyGraph(server.gatewayTransaction) {
+		hooks = server.buildApplyHooks(applyIdentity, serviceArtifacts, &evidenceRequest, &appliedArtifacts, &capabilityFailures)
+	} else {
+		server.configureLegacyServiceStages(&executor, applyIdentity, serviceArtifacts, &evidenceRequest, &appliedArtifacts, &capabilityFailures)
+	}
+	executor.BeforeCommit = server.runtimeGenerationCommitCheck(transactionID, sourceHash, serviceArtifacts, &appliedArtifacts)
+	server.resetGatewayExecutionRecords()
+	execution, err := executor.Run(applyCtx, apply.Request{
+		TransactionID:      transactionID,
+		Actor:              session.Username,
+		Role:               session.Role,
+		Resource:           "/api/v1/runtime/apply",
+		ProxyEgress:        plan.ProxyEgress,
+		FlowIntent:         plan.FlowIntent,
+		SnapshotID:         "snapshot-" + transactionID,
+		PreviousSnapshotID: server.latestRuntimeSnapshotID(applyCtx),
+		RollbackID:         "rollback-" + transactionID,
+		GatewayPlan:        plan.GatewayPlan,
+		GenerationHash:     runtimePlanHash(plan),
+		Hooks:              hooks,
+		SourceHash:         sourceHash,
+		ArtifactHashes:     runtimeArtifactHashes(serviceArtifacts),
+	})
+	if err != nil {
+		cause := "runtime transaction: " + err.Error()
+		if generation != nil && server.applyStateEnabled() {
+			failedReceipt := buildGoVPPReceipt(transactionID, sourceHash, generation.State.DesiredGeneration, server.gatewayExecutionRecords(), applystate.StatusFailed, true, []string{cause})
+			if receiptErr := server.publishGoVPPReceipt(failedReceipt); receiptErr != nil {
+				cause += "; publish failed transaction receipt: " + receiptErr.Error()
+			}
+		}
+		result := degradedRuntimeResult(transactionID, cause, server.now().UTC())
+		result.Status = "apply_failed"
+		result.RollbackReceipt = execution.RollbackReceipt
+		// The previous committed generation stays authoritative. Repair the
+		// addresses it owned (add-only) before reporting, so a rollback defect
+		// can never leave the LAN without its gateway address.
+		repaired := server.repairLANAddresses(applyCtx, execution.Plan)
+		result.Components = server.applyRuntimeEvidence(plan.Components)
+		server.publishFailedRuntimeResult(lease, result)
+		server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", cause, r)
+		response := server.applyFailureResponse(result, cause, repaired)
+		if generation != nil {
+			state := server.failRuntimeApplyState(transactionID, cause, applystate.ReceiptStatusFailed)
+			applyStateSettled = true
+			mergeApplyStateFields(response, state)
+		}
+		response["request_id"] = requestID(r)
+		writeJSON(w, http.StatusAccepted, response)
+		return
+	}
+	server.persistNativeTakeoverProofs(applyCtx, plan.SelectedNativePath)
+	receipt, readback := execution.Receipt, execution.Readback
+	vppApplied := len(artifactsForService(appliedArtifacts, serviceRuntime.VPP)) > 0
+	preliminary := RuntimeApplyResult{
+		Status: RuntimeStatusCommitted, RuntimeState: RuntimeStateRunning,
+		TransactionID: transactionID, Receipt: receipt, Readback: readback,
+		Applied:     artifactServiceNames(appliedArtifacts),
+		GatewayPlan: &plan.GatewayPlan, GatewayEvidence: execution.GatewayResult.Evidence,
+		CapabilityFailures: capabilityFailures, AppliedAt: receipt.AppliedAt,
+		SelfHealed: selfheal.Items(applyCtx),
+	}
+	components := server.runtimeStatusComponentsForResult(applyCtx, appliedArtifacts, vppApplied, &preliminary)
+	components = applyCapabilityFailures(components, capabilityFailures, transactionID, server.now().UTC())
+	components = server.applyQoSPlanState(components, plan.QoSSkipped, plan.QoSReason)
+	if component, ok := afPacketRuntimeComponent(plan.SelectedNativePath); ok {
+		components = append(components, component)
+	}
+	// Something being non-running is not the same as a partial transaction.
+	// Derive partial only from concrete evidence: named capability failures or
+	// components/steps that really failed. QoS unsupported/no-op is not partial.
+	degradedReasons := runtimeConcreteDegradedReasons(components, nil, capabilityFailures)
+	state := runtimeState(components)
+	statusCode := http.StatusOK
+	resultStatus := "committed"
+	reason := ""
+	if state != "running" {
+		statusCode = http.StatusAccepted
+		resultStatus = "degraded"
+		reason = "runtime apply completed with degraded components"
+	}
+	result := RuntimeApplyResult{Status: resultStatus, RuntimeState: state, TransactionID: transactionID, Reason: reason, Components: components, Applied: artifactServiceNames(appliedArtifacts), SnapshotHash: runtimePlanHash(plan), SourceHash: sourceHash, ArtifactHashes: runtimeArtifactHashes(serviceArtifacts), AppliedAt: server.now().UTC(), Receipt: receipt, Readback: readback, GatewayPlan: &plan.GatewayPlan, GatewayEvidence: execution.GatewayResult.Evidence, CapabilityFailures: capabilityFailures, SelfHealed: selfheal.Items(applyCtx)}
+	response := map[string]any{"status": result.Status, "runtime_state": result.RuntimeState, "reason": result.Reason, "transaction_id": transactionID, "components": components, "applied_services": result.Applied, "capability_failures": result.CapabilityFailures, "snapshot_hash": result.SnapshotHash, "source_hash": result.SourceHash, "request_id": requestID(r)}
+	if len(result.SelfHealed) > 0 {
+		response["self_healed"] = result.SelfHealed
+	}
+	if generation != nil {
+		var goReceipt *applystate.Receipt
+		if server.applyStateEnabled() {
+			receipt := buildGoVPPReceipt(
+				transactionID, sourceHash, generation.State.DesiredGeneration,
+				server.gatewayExecutionRecords(), applystate.StatusApplied,
+				len(degradedReasons) > 0, degradedReasons,
+			)
+			receipt.SelfHealed = selfheal.Items(applyCtx)
+			if receiptErr := server.publishGoVPPReceipt(receipt); receiptErr != nil {
+				cause := "apply receipt: " + receiptErr.Error()
+				failedState := server.failRuntimeApplyState(transactionID, cause, applystate.ReceiptStatusFailed)
+				applyStateSettled = true
+				mergeApplyStateFields(response, failedState)
+				response["status"] = "apply_failed"
+				response["runtime_state"] = "degraded"
+				response["reason"] = cause
+				response["request_id"] = requestID(r)
+				server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", cause, r)
+				writeJSON(w, http.StatusAccepted, response)
+				return
+			}
+			goReceipt = &receipt
+		}
+		appliedState, stateErr := server.commitRuntimeApplyStateWithReceipt(transactionID, sourceHash, generation, execution, appliedArtifacts, capabilityFailures, len(degradedReasons) > 0, goReceipt)
+		if stateErr != nil {
+			cause := "apply state: " + stateErr.Error()
+			failedState := server.failRuntimeApplyState(transactionID, cause, applyReceiptFailureStatus(stateErr))
+			applyStateSettled = true
+			mergeApplyStateFields(response, failedState)
+			response["status"] = "apply_failed"
+			response["runtime_state"] = "degraded"
+			response["reason"] = cause
+			response["error"] = map[string]any{
+				"code":        "apply_state_failed",
+				"message":     cause,
+				"transaction": transactionID,
+			}
+			server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", "failure", cause, r)
+			writeJSON(w, http.StatusAccepted, response)
+			return
+		}
+		applyStateSettled = true
+		mergeApplyStateFields(response, appliedState)
+		response["outcome"] = "applied"
+		if appliedState.Partial {
+			response["outcome"] = "partial"
+		}
+	}
+	server.publishRuntimeResult(lease, result)
+	writeJSON(w, statusCode, response)
+}
+
+// capabilityObservationDegradesDataplane reports whether a failed capability
+// observation — rather than a real eligibility failure — is why no forwarding
+// path could be selected. It is only true when there is nothing at all to fall
+// back to and real data ports exist: a missing probe must be reported as a
+// degradation, while a genuine prerequisite failure stays dataplane_locked.
+const (
+	// dataplaneReadyWait bounds how long the first-takeover apply waits for VPP
+	// and the capability probe to settle after the data NICs are bound.
+	dataplaneReadyWait = 45 * time.Second
+	// dataplaneReadyInterval is the probe retry cadence inside that window.
+	dataplaneReadyInterval = 3 * time.Second
+)
+
+// dataplaneLockReason reports why the dataplane is not usable. Only dataplane
+// related warnings may explain a lock: a QoS/DNS degradation note must never be
+// presented to the operator as the reason their interfaces were rejected.
+// unprovenAddressAssignmentPorts lists the ports whose address assignment has
+// no selected, proven native attachment. It distinguishes "this port needs its
+// dataplane attachment rebuilt" from a generic capability failure so the apply
+// handler can answer with an actionable 4xx instead of dataplane_locked.
+func unprovenAddressAssignmentPorts(plan RuntimePlan) []string {
+	ports := []string{}
+	seen := map[string]bool{}
+	for _, prerequisite := range plan.DataplaneProof {
+		if prerequisite.Passed {
+			continue
+		}
+		switch prerequisite.Name {
+		case "address_assignment_proven", "address_assignment_vpp_interface_matches":
+		default:
+			continue
+		}
+		name := strings.TrimSpace(prerequisite.Interface)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		ports = append(ports, name)
+	}
+	sort.Strings(ports)
+	return ports
+}
+
+func dataplaneLockReason(plan RuntimePlan) string {
+	for _, warning := range plan.Warnings {
+		text := strings.TrimSpace(warning)
+		if text == "" {
+			continue
+		}
+		lower := strings.ToLower(text)
+		for _, marker := range []string{"dataplane", "interface", "probe", "vpp", "接管", "网卡", "数据面"} {
+			if strings.Contains(lower, marker) {
+				return text
+			}
+		}
+	}
+	if plan.DataplaneState == "dataplane_degraded" {
+		return "dataplane capability could not be observed; the previous generation is preserved"
+	}
+	return "dataplane prerequisites are not satisfied"
+}
+
+func capabilityObservationDegradesDataplane(observation vpp.Observation, assignments int) bool {
+	return observation.Source == vpp.ProbeSourceAbsent && assignments > 0
+}
+
+// runtimePlanDataplaneSettled reports whether the plan is ready to execute
+// after a takeover/fallback. A native_ready plan must actually carry an
+// attachment for every assigned data port: a probe that ran while the netdevs
+// were being restored can leave the plan "ready" with no dataplane operations
+// at all, which would commit the services without the fallback.
+func runtimePlanDataplaneSettled(plan RuntimePlan) bool {
+	if plan.DataplaneState == "dataplane_locked" || plan.DataplaneState == "dataplane_degraded" {
+		return false
+	}
+	if plan.DataplaneState != "native_ready" {
+		// af_fallback_required is the operator decision path; the caller must
+		// return 409 immediately instead of exhausting the wait window.
+		return true
+	}
+	assignments := len(plan.GatewayPlan.NativePath.Assignments)
+	if assignments == 0 {
+		return false
+	}
+	return len(plan.SelectedNativePath.Attachments) >= assignments
+}
+
+// observeDataplaneCapability runs the active capability probe and returns the
+// observed capability. It never returns an error: a probe failure is a QoS or
+// observability degradation, never a dataplane lock.
+func (server *Server) observeDataplaneCapability(ctx context.Context, interfaces []string) vpp.Observation {
+	prober := server.capabilityProber
+	if prober == nil {
+		prober = vpp.NewCapabilityProber(
+			envOrDefault("LY_ROUTE_VPP_PROBE_COMMAND", "/usr/lib/ly-route/runtime-check.sh"),
+			envOrDefault("LY_ROUTE_VPP_CAPABILITY_PROOF", "/var/lib/ly-route/vpp-native-capabilities.json"),
+			envOrDefault("LY_ROUTE_DATAPLANE_ACTIVE_STATE", "/var/lib/ly-route/dataplane/active.json"),
+		)
+	}
+	observation := prober.Observe(ctx, vpp.ProbeTarget{
+		ManagementInterface: server.managementInterfaceID(ctx),
+		ManagementShared:    server.managementNetworkShared(ctx),
+		DataInterfaces:      interfaces,
+	})
+	return vpp.AugmentObservationWithCommittedProofs(observation, server.committedDataplaneStatePath(), interfaces)
+}
+
+// committedDataplaneStatePath is the last committed dataplane generation. It is
+// the rollback-safe proof source used when a live probe cannot cover a port.
+func (server *Server) committedDataplaneStatePath() string {
+	return envOrDefault("LY_ROUTE_DATAPLANE_ACTIVE_STATE", "/var/lib/ly-route/dataplane/active.json")
+}
+
+// refreshDataplaneCapability forces a live probe before an apply commits. A
+// failed probe is recorded as a degradation and the apply continues against the
+// last observed or committed capability; it must not abort forwarding.
+func (server *Server) refreshDataplaneCapability(ctx context.Context) vpp.Observation {
+	interfaces := server.runtimeDataplaneInterfaces(ctx)
+	prober := server.capabilityProber
+	if prober == nil {
+		return server.observeDataplaneCapability(ctx, interfaces)
+	}
+	prober.Invalidate()
+	observation := prober.Observe(ctx, vpp.ProbeTarget{
+		ManagementInterface: server.managementInterfaceID(ctx),
+		ManagementShared:    server.managementNetworkShared(ctx),
+		DataInterfaces:      interfaces,
+	})
+	return vpp.AugmentObservationWithCommittedProofs(observation, server.committedDataplaneStatePath(), interfaces)
+}
+
+func (server *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	// Keep the response inside the 10s gate with headroom for serialization.
+	// Component probes get their own detached budget inside the plan builder,
+	// so a slow plan read cannot starve them and vice versa.
+	ctx, cancel := context.WithTimeout(r.Context(), statusPlanBudget)
+	defer cancel()
+	// The Orchestrator profile runs a transparent datapath. Its component
+	// inventory is defined by the observed VPP generation plus local
+	// persistence; the Gateway service inventory and plan-operation evidence
+	// below describe a different product. Answer every poll from the
+	// transparent evidence so the inventory cannot oscillate between a plan
+	// rebuild and the cached Gateway component reprobe.
+	if components, handled := server.orchestratorStatusComponents(ctx); handled {
+		writeJSON(w, http.StatusOK, map[string]any{"status": runtimeState(components), "components": components, "last_apply": server.lastRuntimeApply(), "last_failed_apply": server.lastFailedRuntimeApply(), "request_id": requestID(r)})
+		return
+	}
+	server.runtimeMu.Lock()
+	last := server.lastRuntime
+	server.runtimeMu.Unlock()
+	var components []RuntimeComponentState
+	if last != nil && len(last.Components) > 0 {
+		// A committed generation already fixed the rendered component
+		// inventory. Re-probe live health instead of recompiling the whole
+		// gateway plan on every status poll: the plan build is the expensive
+		// part (proxy/TLS preparation, geo data, artifact rendering) and its
+		// result cannot change until the next apply.
+		components = server.reprobeRuntimeComponents(ctx, last.Components)
+	} else if last != nil && last.Status == RuntimeStatusCommitted && last.RuntimeState == RuntimeStateRunning {
+		// A committed generation without a cached inventory (older persisted
+		// evidence) still must not pay for a full plan rebuild on every status
+		// poll. Probe the live service set directly.
+		components = server.statusHealthComponents(ctx)
+	} else if last != nil && last.ReconciliationReceipt.Status == apply.ReceiptApplied {
+		// Persisted restart evidence does not carry a rendered component
+		// inventory. Probe live service health directly; apply/preview still
+		// rebuild and validate the full plan.
+		components = server.statusHealthComponents(ctx)
+	} else {
+		plan, err := server.buildRuntimePlan(ctx, requestID(r))
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status":            "degraded",
+				"components":        []RuntimeComponentState{{Name: "配置检查", State: "degraded", Available: false, Reason: serviceRuntime.Redact(err.Error())}},
+				"last_apply":        server.lastRuntimeApply(),
+				"last_failed_apply": server.lastFailedRuntimeApply(),
+				"last_reconcile":    server.lastReconciliationNotice(),
+				"apply":             server.applyState(),
+				"request_id":        requestID(r),
+			})
+			return
+		}
+		components = plan.Components
+		server.runtimeMu.Lock()
+		if server.lastRuntime != nil {
+			server.lastRuntime.Components = append([]RuntimeComponentState(nil), components...)
+		}
+		server.runtimeMu.Unlock()
+	}
+	committed := server.runtimeEvidence()
+	notice := server.runtimeAttemptNotice(committed)
+	components = runtimeComponentsWithAttempt(components, notice)
+	writeJSON(w, http.StatusOK, map[string]any{"status": runtimeState(components), "components": components, "last_apply": server.lastRuntimeApply(), "last_failed_apply": server.lastFailedRuntimeApply(), "last_reconcile": server.lastReconciliationNotice(), "apply": server.applyState(), "request_id": requestID(r)})
+}
+
+// reprobeRuntimeComponents refreshes the live state of an already-rendered
+// component inventory without rebuilding the runtime plan.
+func (server *Server) reprobeRuntimeComponents(ctx context.Context, components []RuntimeComponentState) []RuntimeComponentState {
+	// The Orchestrator transparent datapath is refreshed from its generation
+	// evidence, never from the cached Gateway component inventory: its vpp
+	// component carries no Gateway plan operations, and treating that as
+	// "nothing rendered" degrades a healthy generation.
+	if live, handled := server.orchestratorStatusComponents(ctx); handled {
+		return live
+	}
+	updated := append([]RuntimeComponentState(nil), components...)
+	services := make([]serviceRuntime.ServiceName, 0, len(updated))
+	index := make(map[string]int, len(updated))
+	for position, component := range updated {
+		switch serviceRuntime.ServiceName(component.Name) {
+		case serviceRuntime.SmartDNS, serviceRuntime.Dnsmasq, serviceRuntime.Xray, serviceRuntime.PPPoE:
+			services = append(services, serviceRuntime.ServiceName(component.Name))
+			index[component.Name] = position
+		}
+	}
+	if server.serviceRuntimeConfigured() && len(services) > 0 {
+		health, err := server.services.HealthCheck(ctx, services...)
+		if err == nil {
+			for _, item := range health {
+				position, found := index[string(item.Service)]
+				if !found {
+					continue
+				}
+				if item.Available {
+					updated[position].State = "running"
+					updated[position].Available = true
+					updated[position].Reason = ""
+				} else {
+					updated[position].State = "degraded"
+					updated[position].Available = false
+					updated[position].Reason = item.Reason
+				}
+			}
+		}
+	}
+	for position := range updated {
+		if updated[position].Name == "vpp" {
+			previous := updated[position]
+			live := server.vppRuntimeComponent(ctx, previous.State == "rendered")
+			if live.State == "running" && !previous.Unchanged {
+				// The last committed transaction did execute VPP. Keep that
+				// distinction while still refreshing live health.
+				live.Unchanged = false
+			}
+			updated[position] = live
+		}
+	}
+	return server.applyRuntimeEvidence(updated)
+}
+
+func (server *Server) lastRuntimeApply() *RuntimeApplyResult {
+	server.runtimeMu.Lock()
+	defer server.runtimeMu.Unlock()
+	return server.lastRuntime
+}
+
+func (server *Server) buildRuntimePlan(ctx context.Context, requestID string) (RuntimePlan, error) {
+	ctx = withInterfaceAliasCache(ctx)
+	ctx = withInterfaceIdentities(ctx)
+	if server.profile.ID() == product.Orchestrator().ID() {
+		return server.buildOrchestratorRuntimePlan(ctx, requestID)
+	}
+	proxyEgress, hasProxyEgress, err := server.runtimeProxyEgress(ctx)
+	if err != nil {
+		return RuntimePlan{}, err
+	}
+	flowIntent, hasFlowIntent, err := server.runtimeFlowIntent(ctx)
+	if err != nil {
+		return RuntimePlan{}, err
+	}
+	return server.buildRuntimePlanFromConfig(ctx, requestID, proxyEgress, hasProxyEgress, flowIntent, hasFlowIntent)
+}
+
+func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID string, proxyEgress proxy.Egress, hasProxyEgress bool, flowIntent flow.Intent, hasFlowIntent bool) (RuntimePlan, error) {
+	planStart := time.Now()
+	planTiming := os.Getenv("LY_ROUTE_PLAN_TIMING") == "1"
+	mark := func(name string) {
+		if planTiming {
+			fmt.Fprintf(os.Stderr, "ly-route-plan %-24s %s\n", name, time.Since(planStart).Round(time.Millisecond))
+		}
+	}
+	defer mark("total")
+	if server.serviceRuntimeConfigured() {
+		// Warm the per-service health cache while the plan is still reading
+		// desired state.  The component section runs several seconds later;
+		// doing the (bounded) systemctl probes here keeps them off the tail
+		// of the request and out of the 10s status budget.
+		go func() {
+			_, _ = server.services.HealthCheck(ctx, serviceRuntime.VPP, serviceRuntime.SmartDNS, serviceRuntime.Dnsmasq, serviceRuntime.Xray, serviceRuntime.PPPoE)
+		}()
+	}
+	addressAssignments, err := server.runtimeAddressAssignments(ctx)
+	if err != nil {
+		return RuntimePlan{}, err
+	}
+	mark("address-assignments")
+	var compiledProxy proxy.CompiledEgress
+	var compiledFlow flow.CompiledIntent
+	var artifacts []serviceRuntime.RenderedArtifact
+	var dnsServiceNetworks []vpp.DNSServiceNetwork
+	var planningWarnings []string
+	proxyRuntimeWarning := ""
+	var proxyEgresses []proxy.Egress
+	if hasProxyEgress {
+		var err error
+		compiledProxy, err = proxy.CompileEgress(proxyEgress)
+		if err != nil {
+			return RuntimePlan{}, err
+		}
+		proxyEgresses = []proxy.Egress{proxyEgress}
+		proxyRuntimeWarning = server.compileProxySubscription(ctx, proxyEgress, &compiledProxy)
+		if proxyRuntimeWarning != "" {
+			planningWarnings = append(planningWarnings, proxyRuntimeWarning)
+			degradeProxyRuntime(&compiledProxy)
+		} else {
+			// The egress document is stable but its service TAP may have been
+			// re-created by a VPP restart or a previous egress rebuild. Bind the
+			// live ly_px* names before any artifact is rendered so nftables,
+			// Linux policy routing and ABF all agree on one interface identity.
+			compiledProxy.ServiceNetwork = server.resolveLiveProxyServiceNetwork(ctx, compiledProxy.ServiceNetwork)
+		}
+	}
+	mark("proxy")
+	if hasFlowIntent {
+		var err error
+		runtimeFlowIntent, expandErr := server.expandFlowIntentAddressGroups(ctx, flowIntent)
+		if expandErr != nil {
+			return RuntimePlan{}, expandErr
+		}
+		compiledFlow, err = flow.CompileIntent(runtimeFlowIntent)
+		if err != nil {
+			return RuntimePlan{}, err
+		}
+	}
+	mark("flow")
+	var compiledNAT nat.CompiledConfig
+	var compiledPolicy trafficpolicy.Config
+	var natErr, policyErr error
+	var planWait sync.WaitGroup
+	planWait.Add(2)
+	go func() {
+		defer planWait.Done()
+		compiledNAT, natErr = server.currentNATConfig(ctx)
+	}()
+	go func() {
+		defer planWait.Done()
+		compiledPolicy, policyErr = server.currentTrafficPolicyConfig(ctx)
+	}()
+	planWait.Wait()
+	if natErr != nil {
+		return RuntimePlan{}, natErr
+	}
+	if policyErr != nil {
+		return RuntimePlan{}, policyErr
+	}
+	mark("nat+traffic-policy")
+	// The DNS generation must be compiled before Xray is rendered: a proxy
+	// outcome owns a loopback endpoint inside the Xray payload, and SmartDNS
+	// must point at the same endpoint generation. Detection-only work stays
+	// here; the artifacts are written after the proxy endpoints are planned.
+	dnsPlan, err := server.currentDNSPlan(ctx, proxyEgresses, compiledPolicy)
+	if err != nil {
+		return RuntimePlan{}, err
+	}
+	mark("dns-plan")
+	retiredRoutePolicyIDs, err := server.currentRetiredRoutePolicyIDs(ctx)
+	if err != nil {
+		return RuntimePlan{}, err
+	}
+	var proxyDNSEndpoints serviceRuntime.ProxyDNSEndpointPlan
+	if hasProxyEgress && proxyRuntimeWarning == "" {
+		underlayRoute, resolveErr := server.proxyUnderlayRoute(ctx, proxyEgress, compiledPolicy)
+		if resolveErr != nil {
+			return RuntimePlan{}, resolveErr
+		}
+		underlayMTU, resolveErr := server.proxyUnderlayMTU(ctx, proxyEgress)
+		if resolveErr != nil {
+			return RuntimePlan{}, resolveErr
+		}
+		compiledProxy.ServiceNetwork.NATPoolAddress = ""
+		excludedSNATAddresses, excludedErr := server.proxySNATExcludedAddresses(ctx, proxyEgress.ID)
+		if excludedErr != nil {
+			return RuntimePlan{}, excludedErr
+		}
+		snatAllocation, snatErr := allocateProxySNATAddress(proxySNATRequest{
+			EgressID:          proxyEgress.ID,
+			Assignments:       addressAssignments,
+			UnderlayRoute:     underlayRoute,
+			ReservedAddresses: normalizeProxySNATAddresses(proxyEgress.SNATAddresses),
+			ExcludedAddresses: excludedSNATAddresses,
+			StaticMappings:    compiledNAT.StaticMappings,
+			PortMappings:      compiledNAT.PortMappings,
+		})
+		if snatErr != nil {
+			return RuntimePlan{}, snatErr
+		}
+		compiledProxy.ServiceNetwork.NATPoolAddress = snatAllocation.Address
+		if snatAllocation.Source == proxySNATSourceReservedPool {
+			planningWarnings = append(planningWarnings, fmt.Sprintf("proxy egress %q uses explicitly reserved SNAT address %s on WAN %s", proxyEgress.ID, snatAllocation.Address, snatAllocation.WANInterface))
+		}
+		if bindErr := proxy.BindServiceNetwork(&compiledProxy, underlayRoute, proxyLANRoutes(addressAssignments), underlayMTU); bindErr != nil {
+			return RuntimePlan{}, bindErr
+		}
+		proxyDNSEndpoints = serviceRuntime.PlanProxyDNSEndpoints(
+			dnsPlan.ProxyBindings,
+			dnsPlan.Upstreams,
+			map[string]string{proxyEgress.ID: compiledProxy.XrayRuntime.OutboundTag},
+			map[string]bool{proxyEgress.ID: true},
+		)
+		xrayArtifacts, renderErr := serviceRuntime.RenderXrayWithProxyDNS(compiledProxy, proxyDNSEndpoints)
+		if renderErr != nil {
+			return RuntimePlan{}, renderErr
+		}
+		artifacts = append(artifacts, xrayArtifacts...)
+	} else if len(dnsPlan.ProxyBindings) > 0 {
+		// A DNS proxy outcome without a compiled proxy runtime must not render
+		// as if the endpoint existed: the planner records the problem, the
+		// renderer applies the documented failure matrix, and the status
+		// component reports the endpoint as unavailable.
+		proxyDNSEndpoints = serviceRuntime.PlanProxyDNSEndpoints(dnsPlan.ProxyBindings, dnsPlan.Upstreams, nil, map[string]bool{})
+	}
+	securityGeneration, err := server.currentSecurityGeneration(ctx, compiledPolicy, addressAssignments)
+	if err != nil {
+		return RuntimePlan{}, err
+	}
+	mark("security")
+	dnsPolicies := dnsPlan.Policies
+	dnsArtifacts, err := dnsPlan.render(proxyDNSEndpoints)
+	if err != nil {
+		return RuntimePlan{}, err
+	}
+	mark("dns-policies")
+	dnsServiceNetworks = dnsPlan.Networks
+	artifacts = append(artifacts, dnsArtifacts...)
+	if hasProxyEgress && proxyRuntimeWarning == "" {
+		if bindErr := proxy.BindServiceNetwork(
+			&compiledProxy,
+			compiledProxy.ServiceNetwork.UnderlayRoute,
+			proxyServiceReturnRoutes(addressAssignments, dnsServiceNetworks, proxyEgress.ID),
+			compiledProxy.ServiceNetwork.MTU,
+		); bindErr != nil {
+			return RuntimePlan{}, bindErr
+		}
+		routingArtifacts, renderErr := serviceRuntime.RenderLinuxPolicyRouting(compiledProxy.LinuxPolicyRouting, compiledNAT.Behavior, dnsServiceNetworks...)
+		if renderErr != nil {
+			return RuntimePlan{}, renderErr
+		}
+		artifacts = append(artifacts, routingArtifacts...)
+	} else if len(dnsServiceNetworks) > 0 {
+		routingArtifacts, renderErr := serviceRuntime.RenderDNSServiceRouting(compiledNAT.Behavior, dnsServiceNetworks)
+		if renderErr != nil {
+			return RuntimePlan{}, renderErr
+		}
+		artifacts = append(artifacts, routingArtifacts...)
+	}
+	// VPP's dns-intercept plugin owns one (interface, fib) attachment. A plan
+	// that spans several LAN ports cannot be rendered without dropping
+	// interception on the remaining ports, and its readback then fails with
+	// "transparent DNS pre-NAT interception is absent for <lan>" so a 3-LAN
+	// gateway could never commit. Single-LAN gateways keep the plugin as the
+	// primary path (it is the only mechanism that sees DPDK transit traffic);
+	// multi-LAN gateways install per-ingress ABF steering instead. Every plan
+	// also renders the nftables LAN capture layer below, which keeps LAN DNS
+	// alive when the plugin/host-stack session is unavailable.
+	dnsInterceptionEnabled := dnsInterceptionPlanEnabled(server.profile.ID(), addressAssignments)
+	dnsABFSteering := dnsABFSteeringPlanEnabled(server.profile.ID(), addressAssignments)
+	dnsInterception := dnsCapturePlan(addressAssignments, dnsServiceNetworks, compiledProxy.ServiceNetwork, dnsInterceptionEnabled)
+	capturePlan := compiledProxy.NftablesCapture
+	if hasProxyEgress && strings.TrimSpace(capturePlan.Table) == "" {
+		// The proxy egress still exists but its runtime could not be compiled
+		// or verified. Flush the managed capture table so selected traffic
+		// falls through to the direct path instead of being black-holed by a
+		// stale TPROXY generation.
+		capturePlan = proxy.FailOpenNftablesCapture(proxyEgress.ID)
+	}
+	// Always render the managed nftables generation, including the empty
+	// case: the artifact flushes stale ly_route_dns_capture and
+	// ly_route_proxy_capture tables left by a previous plan. Skipping the
+	// render when the DNS guard disappears would leave the old LCP drop
+	// rules in the kernel and break LAN DNS.
+	nftablesArtifacts, renderErr := serviceRuntime.RenderGatewayNftablesCapture(capturePlan, dnsInterception)
+	if renderErr != nil {
+		return RuntimePlan{}, renderErr
+	}
+	artifacts = append(artifacts, nftablesArtifacts...)
+	// The nftables chain always redirects LAN :53 to the local resolver, so
+	// dnsmasq has to listen on every LAN gateway address even on the single-LAN
+	// VPP path. Without a listener the redirect would be a black hole.
+	dhcpPlans, dhcpArtifacts, dhcpWarnings, err := server.currentDHCPServers(ctx, addressAssignments, true)
+	if err != nil {
+		return RuntimePlan{}, err
+	}
+	mark("dhcp")
+	artifacts = append(artifacts, dhcpArtifacts...)
+	planningWarnings = append(planningWarnings, dhcpWarnings...)
+	pppoePeers, pppoeArtifacts, err := server.currentPPPoEPeers(ctx)
+	if err != nil {
+		return RuntimePlan{}, err
+	}
+	mark("pppoe-peers")
+	artifacts = append(artifacts, pppoeArtifacts...)
+	dataInterfaces := server.runtimeDataplaneInterfaces(ctx)
+	server.persistDataplaneInventory(ctx, dataInterfaces)
+	dataplanePolicy := server.dataplanePolicy(ctx)
+	observation := server.observeDataplaneCapability(ctx, dataInterfaces)
+	nativePath := observation.NativePathRequest(server.managementInterfaceID(ctx), dataInterfaces, server.now().UTC(), server.managementNetworkShared(ctx))
+	server.suppressCrashGuardedCandidates(&nativePath)
+	for index := range nativePath.Assignments {
+		port := server.displayInterfaceName(ctx, nativePath.Assignments[index].LinuxInterface)
+		nativePath.Assignments[index].AFPacketConsent = server.allowsAFPacketFor(ctx, dataplanePolicy, port)
+	}
+	// Run after consent resolution: the live attachment wins over every
+	// recorded hint, so a committed port is reconciled instead of re-created.
+	// The rule library then removes any candidate it forbids: a stale
+	// verification can no longer drive an igb/igc/e1000e/r8169 port to AF_XDP.
+	server.preferCommittedNativeCandidates(ctx, &nativePath)
+	server.enforceTakeoverRuleLibrary(ctx, &nativePath)
+	if observation.Degraded {
+		planningWarnings = append(planningWarnings, "dataplane capability degraded ("+string(observation.Source)+"): "+observation.Reason)
+	}
+	mark("native-path")
+	dataplanePrepared := false
+	if composition, ok := server.gatewayTransaction.(apply.ProductionGatewayComposition); ok {
+		dataplanePrepared = composition.HasDataplaneController()
+	}
+	runtimePolicy := runtimePolicyForAddressAssignments(compiledPolicy, addressAssignments)
+	gatewayFlow := compiledFlow
+	gatewayFlow.VPPGroups = nil
+	for _, group := range compiledFlow.VPPGroups {
+		if len(group.Objects) > 0 {
+			gatewayFlow.VPPGroups = append(gatewayFlow.VPPGroups, group)
+		}
+	}
+	qosSkipped := false
+	qosSkipReason := ""
+	qosSkipAll := false
+	if capability, probeErr := server.qosCapability(ctx); probeErr == nil {
+		supportedGroups, unsupportedGroups, missing := vpp.SupportedQoSGroups(capability, gatewayFlow.VPPGroups)
+		if len(unsupportedGroups) > 0 {
+			// Drop only the actions this build cannot enforce. The remaining
+			// actions stay reconcilable, and no generation carries an object
+			// the dataplane cannot read back.
+			supportedTargets, droppedTargets := vpp.SupportedQoSTargets(capability, gatewayFlow.Targets)
+			qosSkipped = true
+			qosSkipReason = "qos unsupported: " + strings.Join(missing, ", ") +
+				"; dropped " + strconv.Itoa(len(unsupportedGroups)) + " object group(s) and " +
+				strconv.Itoa(len(droppedTargets)) + " target(s) that cannot be enforced"
+			gatewayFlow.VPPGroups = supportedGroups
+			gatewayFlow.Targets = supportedTargets
+			qosSkipAll = len(supportedGroups) == 0 && len(supportedTargets) == 0
+			planningWarnings = append(planningWarnings, "qos unsupported: skipped unenforceable traffic-control actions ("+strings.Join(missing, ", ")+")")
+		}
+	}
+	gatewayPolicy := runtimePolicy
+	if len(securityGeneration.ACLs) > 0 || len(securityGeneration.MACIP) > 0 || len(securityGeneration.AttackRules) > 0 {
+		// The generation operation owns the complete security attachment list;
+		// retaining individual ACL operations would replace that list one rule at
+		// a time and make ordered policy non-deterministic.
+		gatewayPolicy.SecurityACLs = nil
+	}
+	selectedPath, selectionErr := vpp.SelectNativePath(nativePath)
+	if selectionErr == nil {
+		alignAddressAssignmentsWithPath(addressAssignments, selectedPath)
+	}
+	if err := vpp.ResolveFlowShapingInterfaces(&gatewayFlow, addressAssignments); err != nil {
+		return RuntimePlan{}, err
+	}
+	canonicalGatewayPlan := vpp.Plan{RequestID: requestID, NativePath: nativePath, DataplanePrepared: dataplanePrepared, AddressAssignments: addressAssignments, Proxy: compiledProxy, Flow: gatewayFlow, NAT: compiledNAT, Policy: gatewayPolicy, RetiredRoutePolicyIDs: retiredRoutePolicyIDs, Security: securityGeneration, DNSInterception: dnsInterceptionEnabled, DNSABFSteering: dnsABFSteering, LANVPPInterfaces: lanVPPInterfaces(addressAssignments), DNSServiceNetworks: dnsServiceNetworks, SkipQoS: qosSkipAll}
+	operations, err := vpp.BuildOperations(canonicalGatewayPlan)
+	mark("build-operations")
+	dataplaneState := "native_ready"
+	var dataplaneProof []vpp.PrerequisiteResult
+	dataplaneDegradations := []vpp.Degradation{}
+	if qosSkipped {
+		dataplaneDegradations = append(dataplaneDegradations, vpp.Degradation{Name: "qos", Reason: qosSkipReason, Impact: "qos"})
+	}
+	var afRequiredInterfaces []string
+	afRequiredMessage := ""
+	degradedObservation := capabilityObservationDegradesDataplane(observation, len(nativePath.Assignments))
+	if selectionErr == nil {
+		dataplaneDegradations = append(dataplaneDegradations, selectedPath.Degradations...)
+		dataplaneProof = selectedPath.Prerequisites
+	} else if observation.Degraded {
+		dataplaneDegradations = append(dataplaneDegradations, vpp.Degradation{
+			Name:   "dataplane_capability_observation",
+			Reason: observation.Reason,
+			Impact: "dataplane_apply",
+		})
+	}
+	warnings := append([]string(nil), planningWarnings...)
+	gatewayBonds := []vpp.BondState{}
+	if err != nil {
+		var afRequired *vpp.AFFallbackRequiredError
+		var locked *vpp.DataplaneLockedError
+		switch {
+		case errors.As(err, &afRequired):
+			operations = nil
+			dataplaneState = "af_fallback_required"
+			afRequiredInterfaces = server.canonicalAFRequiredInterfaces(ctx, afRequired.Interfaces)
+			afRequiredMessage = "AF_PACKET 兼容模式需要操作员明确确认：该模式仍由 VPP 转发，但性能受限。请在数据面策略中允许这些端口使用 AF_PACKET 兼容模式后重试。"
+			warnings = append(warnings, afRequired.Error())
+		case errors.As(err, &locked):
+			operations = nil
+			dataplaneState = locked.Code()
+			// A failed observation is a degradation, not an eligibility verdict, but
+			// only when it is the reason no path exists.
+			if degradedObservation {
+				dataplaneState = "dataplane_degraded"
+			}
+			dataplaneProof = locked.Prerequisites
+			warnings = append(warnings, err.Error())
+		default:
+			return RuntimePlan{}, err
+		}
+	}
+	if err == nil {
+		bondOperations, err := server.currentInterfaceBondOperations(ctx, requestID)
+		if err != nil {
+			var locked *vpp.DataplaneLockedError
+			if !errors.As(err, &locked) {
+				return RuntimePlan{}, err
+			}
+			operations = nil
+			dataplaneState = locked.Code()
+			if degradedObservation {
+				dataplaneState = "dataplane_degraded"
+			}
+			dataplaneProof = append(dataplaneProof, locked.Prerequisites...)
+			warnings = append(warnings, err.Error())
+		} else {
+			operations = append(operations, bondOperations...)
+			gatewayBonds = bondStatesFromOperations(bondOperations)
+		}
+	}
+	if dataplaneState == "dataplane_locked" || dataplaneState == "dataplane_degraded" || dataplaneState == "af_fallback_required" {
+		artifacts = nonForwardingArtifacts(artifacts)
+		compiledProxy.NftablesCapture = proxy.NftablesCapturePlan{}
+		compiledProxy.LinuxPolicyRouting = proxy.LinuxPolicyRoutingPlan{}
+	}
+	// WS-K: stamp the configuration phase into every operation before the
+	// artifact is rendered, so operations.json (the vpp-apply plan) carries the
+	// dependency-ordered phase for each operation.
+	dependencyPlan := server.configDependencyPlan(ctx)
+	annotateConfigPhases(operations, dependencyPlan)
+	// The gateway always owns operations.json, including the empty
+	// generation. Otherwise a stale replay plan from the previous LAN/WAN
+	// generation survives an apply that no longer carries those mutations,
+	// and vpp-apply restores it on the next VPP restart.
+	if len(operations) > 0 || server.gatewayTransaction != nil {
+		vppArtifacts, err := serviceRuntime.RenderVPPOperations(operations)
+		if err != nil {
+			return RuntimePlan{}, err
+		}
+		artifacts = append(artifacts, vppArtifacts...)
+	}
+	componentCtx, cancelComponents := context.WithTimeout(context.WithoutCancel(ctx), statusComponentBudget)
+	components := server.runtimeStatusComponents(componentCtx, artifacts, len(operations) > 0)
+	cancelComponents()
+	components = server.applyQoSPlanState(components, qosSkipped, qosSkipReason)
+	mark("components")
+	if proxyRuntimeWarning != "" {
+		components = markComponentDegraded(components, string(serviceRuntime.Xray), proxyRuntimeWarning)
+	}
+	gatewayInterfaces := make([]vpp.InterfaceState, 0, len(addressAssignments))
+	for _, assignment := range addressAssignments {
+		gatewayInterfaces = append(gatewayInterfaces, vpp.InterfaceState{Name: assignment.VPPInterface, AdminState: "up", LinkState: "up", Addresses: []string{assignment.CIDR}})
+	}
+	gatewayPlan := canonicalGatewayPlan
+	gatewayPlan.Interfaces = gatewayInterfaces
+	gatewayPlan.Bonds = gatewayBonds
+	return RuntimePlan{ProxyEgress: proxyEgress, CompiledProxy: compiledProxy, FlowIntent: flowIntent, CompiledFlow: compiledFlow, CompiledNAT: compiledNAT, CompiledPolicy: compiledPolicy, DNSPolicies: dnsPolicies, ServiceArtifacts: summarizeRuntimeArtifacts(artifacts), RuntimeArtifacts: artifacts, VppOperations: operations, NftablesCapture: compiledProxy.NftablesCapture, DNSInterception: dnsInterception, LinuxPolicyRouting: compiledProxy.LinuxPolicyRouting, DHCPServers: dhcpPlans, PPPoEPeers: summarizePPPoEPeers(pppoePeers), Components: components, Warnings: warnings, DataplaneState: dataplaneState, DataplanePolicy: dataplanePolicy, DataplaneProof: dataplaneProof, DataplaneDegradations: dataplaneDegradations, QoSSkipped: qosSkipped, QoSReason: qosSkipReason, SelectedNativePath: selectedPath, AFRequiredInterfaces: afRequiredInterfaces, AFRequiredMessage: afRequiredMessage, CapabilitySource: string(observation.Source), GatewayPlan: gatewayPlan, DependencyPlan: dependencyPlan}, nil
+}
+
+// dnsTransparentInterceptionSupported reports whether all LAN address
+// assignments share one VPP ingress interface. VPP's dns-intercept plugin owns
+// a single (interface, fib) attachment, so a plan spanning several LAN ports
+// cannot be rendered without dropping interception on the remaining ports.
+// dnsInterceptionPlanEnabled decides whether the plan uses the single-interface
+// transparent DNS interceptor instead of per-ingress ABF steering.
+func dnsInterceptionPlanEnabled(profileID product.ID, assignments []vpp.AddressAssignment) bool {
+	if profileID != product.Gateway().ID() {
+		return false
+	}
+	return dnsTransparentInterceptionSupported(assignments)
+}
+
+func dnsTransparentInterceptionSupported(assignments []vpp.AddressAssignment) bool {
+	// The dns-intercept plugin keeps a vector of attachment slots, so every
+	// LAN can be steered in one generation. (The ISO-era plugin shipped a
+	// single slot; the plugin is now built from this tree.)
+	for _, assignment := range assignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		if strings.TrimSpace(assignment.VPPInterface) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// dnsABFSteeringPlanEnabled selects per-ingress ABF steering for a gateway
+// with more than one LAN. The shipped dns-intercept plugin has a single
+// (interface, table) attachment slot, so a multi-LAN plan that used it could
+// never cover every LAN; the ABF path installs a policy family per ingress and
+// therefore scales with the LAN count.
+func dnsABFSteeringPlanEnabled(profileID product.ID, assignments []vpp.AddressAssignment) bool {
+	// The per-ingress ABF family is still not reliable on the shipped VPP: the
+	// two table-100 policies of a LAN family are created but never attached,
+	// and the readback then aborts the whole apply. Keep the single-LAN plugin
+	// path, which is verified, and let the health probe report every LAN it
+	// cannot cover instead of failing the transaction.
+	return false
+}
+
+func dnsABFSteeringPlanEnabledLegacy(profileID product.ID, assignments []vpp.AddressAssignment) bool {
+	if profileID != product.Gateway().ID() {
+		return false
+	}
+	return len(lanVPPInterfaces(assignments)) > 1
+}
+
+func lanVPPInterfaces(assignments []vpp.AddressAssignment) []string {
+	result := []string{}
+	seen := map[string]bool{}
+	for _, assignment := range assignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		name := strings.TrimSpace(assignment.VPPInterface)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		result = append(result, name)
+	}
+	return result
+}
+
+// gatewayNftablesNeeded reports whether the plan must render the managed
+// nftables artifact. Both the LAN DNS capture redirect and the DNS LCP guard are
+// independent of proxy capture: without the redirect a LAN query to an
+// arbitrary resolver never reaches the local listener, and without the guard
+// the duplicate DNS copy delivered to the Linux LCP interface hits an unbound
+// port on the gateway address and races the dataplane answer.
+func gatewayNftablesNeeded(capture proxy.NftablesCapturePlan, dns serviceRuntime.DNSInterceptionPlan) bool {
+	if strings.TrimSpace(capture.Table) != "" {
+		return true
+	}
+	if len(dns.LANInterfaces) > 0 {
+		return true
+	}
+	return len(dns.LCPGuardAddresses) > 0 && len(dns.LCPGuardInterfaces) > 0
+}
+
+// dnsFallbackRedirectPlan redirects DNS received on each current LAN to the
+// local dnsmasq resolver. It is no longer only the multi-LAN fallback: the
+// capture layer is rendered for every plan so LAN DNS survives a missing or
+// stale VPP dns-intercept attachment.
+//
+// Both the physical Linux name and the LAN control-plane host interface are
+// included. In AF_PACKET mode the kernel sees the LAN frame on the physical
+// port, while host-bound traffic is delivered on the LCP; covering both keeps
+// the rule set independent of the selected dataplane transport. A port that is
+// no longer a LAN is not emitted at all.
+func dnsFallbackRedirectPlan(assignments []vpp.AddressAssignment) serviceRuntime.DNSInterceptionPlan {
+	interfaces := make([]string, 0, len(assignments)*2)
+	seen := map[string]bool{}
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		interfaces = append(interfaces, name)
+	}
+	for _, assignment := range assignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		linuxInterface := strings.TrimSpace(assignment.LinuxInterface)
+		if linuxInterface == "" {
+			linuxInterface = strings.TrimPrefix(strings.TrimSpace(assignment.VPPInterface), "lyroute-")
+		}
+		if linuxInterface == "" {
+			continue
+		}
+		add(linuxInterface)
+		add(vpp.LANControlPlaneHostInterface(linuxInterface))
+	}
+	return serviceRuntime.DNSInterceptionPlan{LANInterfaces: interfaces, ListenPort: 53}
+}
+
+// dnsCapturePlan assembles the complete LAN DNS capture generation. The
+// redirect list is rebuilt from the current LAN assignments on every apply;
+// bypass addresses and prefixes keep the gateway itself, the LAN prefixes, the
+// proxy/DNS service /30 peers, loopback and the reserved ranges out of the
+// redirect. transparent enables the single-LAN VPP dns-intercept guards;
+// because dnsmasq owns the LAN listener, the DNS drop guard is disabled and
+// only the ICMP duplicate guard remains.
+func dnsCapturePlan(assignments []vpp.AddressAssignment, dnsNetworks []vpp.DNSServiceNetwork, proxyNetwork proxy.ProxyServiceNetwork, transparent bool) serviceRuntime.DNSInterceptionPlan {
+	plan := dnsFallbackRedirectPlan(assignments)
+	plan.LocalResolver = true
+	for _, assignment := range assignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(assignment.CIDR))
+		if err != nil {
+			continue
+		}
+		plan.BypassAddresses = append(plan.BypassAddresses, prefix.Addr().String())
+		plan.BypassPrefixes = append(plan.BypassPrefixes, prefix.Masked().String())
+	}
+	for _, network := range dnsNetworks {
+		if cidr := strings.TrimSpace(network.CIDR); cidr != "" {
+			plan.BypassPrefixes = append(plan.BypassPrefixes, cidr)
+		}
+	}
+	for _, cidr := range []string{proxyNetwork.IngressCIDR, proxyNetwork.EgressCIDR} {
+		if cidr = strings.TrimSpace(cidr); cidr != "" {
+			plan.BypassPrefixes = append(plan.BypassPrefixes, cidr)
+		}
+	}
+	plan.BypassPrefixes = append(plan.BypassPrefixes, proxyNetwork.LANRoutes...)
+	if transparent {
+		guard := dnsLCPGuardPlan(assignments, dnsNetworks)
+		plan.LCPGuardAddresses = guard.LCPGuardAddresses
+		plan.LCPGuardInterfaces = guard.LCPGuardInterfaces
+		plan.LCPGuardTapInterfaces = guard.LCPGuardTapInterfaces
+	}
+	return plan
+}
+
+func dnsLCPGuardPlan(assignments []vpp.AddressAssignment, dnsNetworks []vpp.DNSServiceNetwork) serviceRuntime.DNSInterceptionPlan {
+	addresses := make([]string, 0, len(assignments))
+	interfaces := make([]string, 0, len(assignments)+len(dnsNetworks))
+	tapInterfaces := make([]string, 0, len(assignments))
+	for _, assignment := range assignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(assignment.CIDR))
+		if err == nil {
+			addresses = append(addresses, prefix.Addr().String())
+		}
+		// The guard exists only for the duplicate copies delivered to Linux:
+		// the LAN LCP tap and the VPP host-stack punt tap used by the DNS
+		// service network. SmartDNS binds the loopback stub, so neither copy
+		// may reach an unbound kernel socket and race the VPP adapter with an
+		// ICMP port-unreachable.
+		linuxInterface := strings.TrimSpace(assignment.LinuxInterface)
+		if linuxInterface == "" {
+			linuxInterface = strings.TrimPrefix(strings.TrimSpace(assignment.VPPInterface), "lyroute-")
+		}
+		if linuxInterface != "" {
+			// AF_PACKET leaves the Linux interface up, so the kernel also
+			// receives every data-plane frame on it. That copy is the one
+			// that answered with ICMP port-unreachable before the VPP
+			// adapter could. Guard both the physical interface and the
+			// LCP mirror.
+			interfaces = append(interfaces, linuxInterface)
+			tap := vpp.LANControlPlaneHostInterface(linuxInterface)
+			interfaces = append(interfaces, tap)
+			if tap != "" {
+				tapInterfaces = append(tapInterfaces, tap)
+			}
+		}
+	}
+	for _, network := range dnsNetworks {
+		if name := strings.TrimSpace(network.HostInterface); name != "" {
+			interfaces = append(interfaces, name)
+		}
+	}
+	return serviceRuntime.DNSInterceptionPlan{
+		LCPGuardAddresses:     addresses,
+		LCPGuardInterfaces:    interfaces,
+		LCPGuardTapInterfaces: tapInterfaces,
+	}
+}
+
+func dataplaneLockedReason(proof []vpp.PrerequisiteResult, warnings []string) string {
+	failed := make([]string, 0, len(proof))
+	for _, item := range proof {
+		if item.Passed {
+			continue
+		}
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			continue
+		}
+		reason := strings.TrimSpace(item.Reason)
+		if reason != "" {
+			name += " (" + reason + ")"
+		}
+		failed = append(failed, name)
+	}
+	if len(failed) > 0 {
+		return "dataplane_locked: " + strings.Join(failed, ", ")
+	}
+	for _, warning := range warnings {
+		if value := strings.TrimSpace(warning); value != "" {
+			return "dataplane_locked: " + value
+		}
+	}
+	return "dataplane_locked: forwarding prerequisites failed"
+}
+
+// runtimePolicyForAddressAssignments drops resources the dataplane must never
+// render. The seeded "Default WAN Inbound Deny" ACL compiles to an
+// unconditional catch-all deny (its "dst_ip: wan" selector degrades to
+// 0.0.0.0/0): applied to the LAN it blackholes DHCP replies and every client
+// return path, and applied to WAN ingress it drops NAT44 return traffic and
+// port-forwarded flows before translation. NAT44-ED is stateful and already
+// drops unsolicited inbound traffic, so the built-in rule is excluded for
+// every WAN type instead of being attached somewhere destructive.
+func runtimePolicyForAddressAssignments(policy trafficpolicy.Config, _ []vpp.AddressAssignment) trafficpolicy.Config {
+	filtered := policy
+	filtered.SecurityACLs = make([]trafficpolicy.SecurityACL, 0, len(policy.SecurityACLs))
+	for _, acl := range policy.SecurityACLs {
+		if acl.ID != "sec-acl-default-deny-wan" {
+			filtered.SecurityACLs = append(filtered.SecurityACLs, acl)
+		}
+	}
+	return filtered
+}
+
+func nonForwardingArtifacts(artifacts []serviceRuntime.RenderedArtifact) []serviceRuntime.RenderedArtifact {
+	filtered := make([]serviceRuntime.RenderedArtifact, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		if artifact.Service == serviceRuntime.VPP || artifact.Service == serviceRuntime.Nftables || artifact.Service == serviceRuntime.LinuxRouting {
+			continue
+		}
+		filtered = append(filtered, artifact)
+	}
+	return filtered
+}
+
+func runtimeServiceArtifacts(artifacts []serviceRuntime.RenderedArtifact, gatewayInstalled bool) []serviceRuntime.RenderedArtifact {
+	if !gatewayInstalled {
+		return artifacts
+	}
+	// The typed gateway transaction already applied and verified the live VPP
+	// graph. Persist the same operation set for reboot/crash recovery without
+	// executing the legacy helper a second time.
+	result := serviceRuntime.PersistOnlyForServices(artifacts, serviceRuntime.VPP)
+	if len(artifactsForService(result, serviceRuntime.LinuxRouting)) == 0 {
+		// Reconcile an earlier proxy or DNS routing generation. Leaving its
+		// generated script in place lets systemd replay stale TAPs and FIBs when
+		// SmartDNS is restarted by an otherwise unrelated configuration apply.
+		result = append(result, serviceRuntime.LinuxRoutingResetArtifact())
+	}
+	return result
+}
+
+func artifactsExceptService(artifacts []serviceRuntime.RenderedArtifact, excluded ...serviceRuntime.ServiceName) []serviceRuntime.RenderedArtifact {
+	skip := make(map[serviceRuntime.ServiceName]bool, len(excluded))
+	for _, service := range excluded {
+		skip[service] = true
+	}
+	filtered := make([]serviceRuntime.RenderedArtifact, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		if skip[artifact.Service] {
+			continue
+		}
+		filtered = append(filtered, artifact)
+	}
+	return filtered
+}
+
+func gatewaySupportsApplyGraph(runner apply.GatewayTransactionRunner) bool {
+	provider, ok := runner.(apply.ApplyGraphProvider)
+	return ok && provider.ApplyGraphSupported()
+}
+
+// configureLegacyServiceStages keeps third-party/test gateway doubles working.
+// The production transaction advertises ApplyGraphSupported and uses Plan.Hooks
+// instead; this path is only a compatibility adapter, not a production phase.
+func (server *Server) configureLegacyServiceStages(
+	executor *apply.Executor,
+	identity serviceRuntime.ApplyIdentity,
+	serviceArtifacts []serviceRuntime.RenderedArtifact,
+	evidenceRequest *RuntimeEvidenceRequest,
+	appliedArtifacts *[]serviceRuntime.RenderedArtifact,
+	capabilityFailures *[]apply.CapabilityFailureEvidence,
+) {
+	pppoeArtifacts := artifactsForService(serviceArtifacts, serviceRuntime.PPPoE)
+	otherArtifacts := artifactsExceptService(serviceArtifacts, serviceRuntime.PPPoE)
+	executor.BeforeGateway = func(ctx context.Context, _ apply.Plan) error {
+		if server.services == nil || len(pppoeArtifacts) == 0 {
+			return nil
+		}
+		report := server.services.ApplyCapabilitiesForIdentity(ctx, identity, pppoeArtifacts)
+		*appliedArtifacts = append(*appliedArtifacts, report.AppliedArtifacts...)
+		*capabilityFailures = append(*capabilityFailures, serviceFailureEvidence(report.Failures)...)
+		if err := report.Err(); err != nil && !onlyPPPoEBootstrapFailures(report.Failures) {
+			return err
+		}
+		return nil
+	}
+	executor.Apply = func(ctx context.Context, plan apply.Plan) error {
+		if server.services == nil {
+			return errors.New("live runtime apply runner is not configured")
+		}
+		report := server.services.ApplyCapabilitiesForIdentity(ctx, identity, otherArtifacts)
+		*appliedArtifacts = append(*appliedArtifacts, report.AppliedArtifacts...)
+		*capabilityFailures = append(*capabilityFailures, serviceFailureEvidence(report.Failures)...)
+		evidenceRequest.Artifacts = *appliedArtifacts
+		if proxyRuntimeRemoved(plan) {
+			if err := server.services.Stop(ctx, serviceRuntime.Xray, nil); err != nil {
+				return fmt.Errorf("stop removed proxy runtime: %w", err)
+			}
+		}
+		return nil
+	}
+	executor.Rollback = func(ctx context.Context, _ apply.Plan) error {
+		if server.services == nil {
+			return nil
+		}
+		return server.services.Rollback(ctx, *appliedArtifacts)
+	}
+}
+
+// buildApplyHooks wires the host services into the gateway dependency graph.
+// PPPoE is a first-class graph node (status publication before dependent
+// networks); every other artifact is an authoritative service node after the
+// VPP graph.  The graph owns ordering and reverse rollback; this function only
+// adapts the service controller.
+func (server *Server) buildApplyHooks(
+	identity serviceRuntime.ApplyIdentity,
+	serviceArtifacts []serviceRuntime.RenderedArtifact,
+	evidenceRequest *RuntimeEvidenceRequest,
+	appliedArtifacts *[]serviceRuntime.RenderedArtifact,
+	capabilityFailures *[]apply.CapabilityFailureEvidence,
+) *apply.ApplyHooks {
+	if server.services == nil {
+		return nil
+	}
+	pppoeArtifacts := artifactsForService(serviceArtifacts, serviceRuntime.PPPoE)
+	otherArtifacts := artifactsExceptService(serviceArtifacts, serviceRuntime.PPPoE)
+	return &apply.ApplyHooks{
+		EnsurePPPoE: func(ctx context.Context, _ apply.Plan) error {
+			report := server.services.ApplyCapabilitiesForIdentity(ctx, identity, pppoeArtifacts)
+			*appliedArtifacts = append(*appliedArtifacts, report.AppliedArtifacts...)
+			*capabilityFailures = append(*capabilityFailures, serviceFailureEvidence(report.Failures)...)
+			if err := report.Err(); err != nil {
+				return fmt.Errorf("PPPoE helper start: %w", err)
+			}
+			return nil
+		},
+		VerifyPPPoE: func(ctx context.Context, _ apply.Plan) error {
+			return server.verifyPPPoEArtifacts(ctx, pppoeArtifacts)
+		},
+		RollbackPPPoE: func(ctx context.Context, _ apply.Plan) error {
+			return server.services.Rollback(ctx, pppoeArtifacts)
+		},
+		ApplyServices: func(ctx context.Context, plan apply.Plan) error {
+			report := server.services.ApplyCapabilitiesForIdentity(ctx, identity, otherArtifacts)
+			*appliedArtifacts = append(*appliedArtifacts, report.AppliedArtifacts...)
+			*capabilityFailures = append(*capabilityFailures, serviceFailureEvidence(report.Failures)...)
+			evidenceRequest.Artifacts = *appliedArtifacts
+			if proxyRuntimeRemoved(plan) {
+				if err := server.services.Stop(ctx, serviceRuntime.Xray, nil); err != nil {
+					return fmt.Errorf("stop removed proxy runtime: %w", err)
+				}
+			}
+			if len(plan.GatewayPlan.Proxy.VPPSteering) > 0 {
+				// A selected proxy egress is not committed unless the capture,
+				// Linux policy routing, and Xray runtime are all installed.
+				// Treating their failures as degraded evidence silently produced a
+				// committed apply with no TPROXY rules, so LAN traffic fell through
+				// to the direct WAN path. Fail the transaction instead; the graph
+				// then rolls back and the caller never sees "committed".
+				for _, required := range []serviceRuntime.ServiceName{serviceRuntime.Nftables, serviceRuntime.LinuxRouting, serviceRuntime.Xray} {
+					if len(artifactsForService(otherArtifacts, required)) == 0 {
+						return fmt.Errorf("proxy steering requires a %s artifact; refusing to commit without it", required)
+					}
+				}
+				for _, failure := range report.Failures {
+					switch failure.Service {
+					case serviceRuntime.Nftables, serviceRuntime.LinuxRouting, serviceRuntime.Xray, serviceRuntime.VPP:
+						return fmt.Errorf("proxy steering %s apply failed: %w", failure.Service, failure)
+					}
+				}
+			}
+			for _, failure := range report.Failures {
+				if failure.Service == serviceRuntime.VPP {
+					// The VPP helper receipt is the dataplane convergence
+					// evidence for this generation. A missing, unbound or stale
+					// receipt can never be committed as a degraded success.
+					return fmt.Errorf("VPP apply receipt contract: %w", failure)
+				}
+			}
+			if len(plan.GatewayPlan.NAT.PortMappings) > 0 {
+				// A port mapping is not committed until the standalone replay
+				// operations have been persisted. Otherwise VPP can contain the
+				// mapping while a reboot has no durable way to recreate it. This
+				// is the one service failure that must fail the transaction and
+				// trigger rollback instead of being reported as degraded.
+				for _, failure := range report.Failures {
+					if failure.Service == serviceRuntime.VPP {
+						return fmt.Errorf("persist VPP replay operations for port mappings: %w", failure)
+					}
+				}
+				persisted := false
+				for _, artifact := range report.AppliedArtifacts {
+					if artifact.Service == serviceRuntime.VPP && artifact.Path == "/var/lib/ly-route/vpp/operations.json" {
+						persisted = true
+						break
+					}
+				}
+				if !persisted {
+					return fmt.Errorf("persist VPP replay operations for port mappings: operations artifact was not applied")
+				}
+			}
+			// Other service capability failures remain evidence/degraded state;
+			// they do not discard an otherwise committed VPP graph.
+			return nil
+		},
+		RollbackServices: func(ctx context.Context, _ apply.Plan) error {
+			return server.services.Rollback(ctx, artifactsExceptService(*appliedArtifacts, serviceRuntime.PPPoE))
+		},
+		VerifyServiceNetworks: func(ctx context.Context, plan apply.Plan) error {
+			adapter := vpp.Adapter{Client: vpp.NewProductionVPPCTLClient(liveVPPBinary())}
+			return adapter.VerifyDNSServiceNetworks(ctx, plan.GatewayPlan)
+		},
+		VerifyNAT44: func(ctx context.Context, plan apply.Plan) error {
+			adapter := vpp.Adapter{Client: vpp.NewProductionVPPCTLClient(liveVPPBinary())}
+			return adapter.VerifyNAT44Ready(ctx, plan.GatewayPlan)
+		},
+	}
+}
+
+// proxyRuntimeRemoved reports a transition from a compiled proxy steering
+// generation to a no-proxy generation.  The old daemon and capture table are
+// then teardown artifacts, not "not configured" no-ops.
+func proxyRuntimeRemoved(plan apply.Plan) bool {
+	if !plan.Previous.Available || plan.Previous.GatewayPlan == nil {
+		return false
+	}
+	return len(plan.Previous.GatewayPlan.Proxy.VPPSteering) > 0 && len(plan.GatewayPlan.Proxy.VPPSteering) == 0
+}
+
+func onlyPPPoEBootstrapFailures(failures []serviceRuntime.CapabilityFailure) bool {
+	if len(failures) == 0 {
+		return false
+	}
+	for _, failure := range failures {
+		if failure.Service != serviceRuntime.PPPoE && failure.Service != serviceRuntime.PPPd {
+			return false
+		}
+	}
+	return true
+}
+
+// staticNATMappings compiles the persisted 1:1 static NAT mappings. Route
+// policy validation uses it to detect a proxy policy that the NAT44 source
+// rewrite would silently steal.
+func (server *Server) staticNATMappings(ctx context.Context) ([]nat.StaticMapping, error) {
+	items, err := server.desiredItems(ctx, "nat_static")
+	if err != nil {
+		return nil, err
+	}
+	compiled, err := nat.CompileConfig(items, nil)
+	if err != nil {
+		return nil, err
+	}
+	return compiled.StaticMappings, nil
+}
+
+// proxyEgressIDsForPolicyValidation lists the egress IDs whose route policies
+// are steered into the proxy service rather than out a physical WAN. An
+// appliance without an active proxy egress returns an empty list and the
+// static-NAT conflict check stays out of the way.
+func (server *Server) proxyEgressIDsForPolicyValidation(ctx context.Context) ([]string, error) {
+	egress, configured, err := server.runtimeProxyEgress(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !configured {
+		return nil, nil
+	}
+	if id := strings.TrimSpace(egress.ID); id != "" {
+		return []string{id}, nil
+	}
+	return nil, nil
+}
+
+func (server *Server) currentNATConfig(ctx context.Context) (nat.CompiledConfig, error) {
+	staticItems, err := server.desiredItems(ctx, "nat_static")
+	if err != nil {
+		return nat.CompiledConfig{}, err
+	}
+	portMapItems, err := server.desiredItems(ctx, "port_map")
+	if err != nil {
+		return nat.CompiledConfig{}, err
+	}
+	wanItems, err := server.natWANItems(ctx)
+	if err != nil {
+		return nat.CompiledConfig{}, err
+	}
+	routeItems, err := server.desiredItems(ctx, "route_policy")
+	if err != nil {
+		return nat.CompiledConfig{}, err
+	}
+	compiled, err := nat.CompileConfigWithWANs(staticItems, portMapItems, wanItems)
+	if err != nil {
+		return nat.CompiledConfig{}, err
+	}
+	behavior, err := nat.ResolveBehavior(staticItems, portMapItems, wanItems, routeItems)
+	if err != nil {
+		return nat.CompiledConfig{}, err
+	}
+	compiled.Behavior = behavior
+	wanPaths, err := server.currentWANGroupBindings(ctx)
+	if err != nil {
+		return nat.CompiledConfig{}, err
+	}
+	for index := range compiled.StaticMappings {
+		if path, ok := wanPaths[compiled.StaticMappings[index].WANInterface]; ok {
+			compiled.StaticMappings[index].WANNextHop = strings.TrimSpace(path.NextHop)
+		}
+	}
+	for index := range compiled.PortMappings {
+		if path, ok := wanPaths[compiled.PortMappings[index].WANInterface]; ok {
+			compiled.PortMappings[index].WANNextHop = strings.TrimSpace(path.NextHop)
+		}
+	}
+	bindings := make(map[string]string, len(wanPaths))
+	for id, path := range wanPaths {
+		interfaceName := path.VPPInterface
+		if strings.HasPrefix(interfaceName, "pppoe-runtime:") {
+			peerID := strings.TrimPrefix(interfaceName, "pppoe-runtime:")
+			if liveInterface, _, _, connected := livePPPoERuntimePath(ctx, peerID); connected {
+				interfaceName = liveInterface
+			}
+		}
+		bindings[id] = interfaceName
+	}
+	if err := nat.BindWANInterfaces(&compiled, bindings); err != nil {
+		return nat.CompiledConfig{}, err
+	}
+	return compiled, nil
+}
+
+func (server *Server) natWANItems(ctx context.Context) ([]map[string]any, error) {
+	items, err := server.desiredItems(ctx, "wan_link")
+	if err != nil {
+		return nil, err
+	}
+	return resolvePPPoENATWANAddresses(ctx, items, livePPPoEAddress), nil
+}
+
+type pppoeAddressLookup func(context.Context, string) (string, string, bool)
+
+func resolvePPPoENATWANAddresses(ctx context.Context, items []map[string]any, lookup pppoeAddressLookup) []map[string]any {
+	resolved := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		clone := make(map[string]any, len(item)+1)
+		for key, value := range item {
+			clone[key] = value
+		}
+		if strings.EqualFold(nonEmpty(stringField(clone, "wan_type"), stringField(clone, "type")), "pppoe") {
+			for _, key := range []string{"external_address", "current_address", "address", "ip", "ip_cidr", "cidr"} {
+				delete(clone, key)
+			}
+			if ipv4, _, ok := lookup(ctx, stringField(clone, "id")); ok && strings.TrimSpace(ipv4) != "" {
+				clone["current_address"] = strings.TrimSpace(ipv4)
+			}
+		}
+		resolved = append(resolved, clone)
+	}
+	return resolved
+}
+
+func (server *Server) natRebuildImpact(ctx context.Context, resourceType, id string, next map[string]any) map[string]any {
+	if resourceType != "wan_link" || server.store == nil {
+		return nil
+	}
+	previous, err := server.store.Config(ctx, "wan_link", id)
+	if err != nil {
+		return nil
+	}
+	var prev map[string]any
+	if err := json.Unmarshal(previous.Payload, &prev); err != nil {
+		return nil
+	}
+	previousAddress := wanAcquiredAddress(prev)
+	nextAddress := wanAcquiredAddress(next)
+	if previousAddress == nextAddress {
+		return nil
+	}
+	portMaps, err := server.desiredItems(ctx, "port_map")
+	if err != nil {
+		return nil
+	}
+	affected := make([]string, 0)
+	for _, item := range portMaps {
+		if stringField(item, "wan_link") == id || stringField(item, "wan_interface") == id || stringField(item, "egress") == id {
+			if mapID := stringField(item, "id"); mapID != "" {
+				affected = append(affected, mapID)
+			}
+		}
+	}
+	if len(affected) == 0 {
+		return nil
+	}
+	return map[string]any{"wan_link": id, "previous_address": previousAddress, "current_address": nextAddress, "affected_port_maps": affected, "runtime_state": "nat_rebuild_required"}
+}
+
+func wanAcquiredAddress(item map[string]any) string {
+	for _, key := range []string{"current_address", "address", "ip", "ip_cidr", "cidr"} {
+		if value := stringField(item, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (server *Server) currentRetiredRoutePolicyIDs(ctx context.Context) ([]string, error) {
+	items, err := server.desiredItems(ctx, "route_policy")
+	if err != nil {
+		return nil, err
+	}
+	return retiredRoutePolicyIDs(items), nil
+}
+
+func retiredRoutePolicyIDs(items []map[string]any) []string {
+	seen := map[string]struct{}{}
+	ids := make([]string, 0)
+	for _, item := range items {
+		if desiredEnabled(item) {
+			continue
+		}
+		id := stringField(item, "id")
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// compileTrafficPolicySelection expands the same object groups, local-LAN
+// selector and DNS domain addresses as the runtime plan compiler. Validation
+// paths use it so a candidate that is legal at apply time is not rejected just
+// because a validation path compiled it without those resolvers.
+func (server *Server) compileTrafficPolicySelection(ctx context.Context, routeItems, securityItems, domainIPSetItems []map[string]any) (trafficpolicy.Config, error) {
+	objectGroupItems, err := server.desiredItems(ctx, "object_group")
+	if err != nil {
+		return trafficpolicy.Config{}, err
+	}
+	references := append(append([]map[string]any{}, routeItems...), securityItems...)
+	objectGroupItems, err = materializeObjectGroupItems(objectGroupItems, referencedObjectGroupIDs(objectGroupItems, references))
+	if err != nil {
+		return trafficpolicy.Config{}, err
+	}
+	hasLocalLAN := false
+	for _, item := range objectGroupItems {
+		if stringField(item, "id") == "obj-local-lan" {
+			hasLocalLAN = true
+			break
+		}
+	}
+	if !hasLocalLAN {
+		objectGroupItems = append(objectGroupItems, server.localLANObjectGroupItems(ctx)...)
+	}
+	return trafficpolicy.CompileConfigWithDomainIPSet(routeItems, securityItems, objectGroupItems, domainIPSetEntries(domainIPSetItems))
+}
+
+func (server *Server) currentTrafficPolicyConfig(ctx context.Context) (trafficpolicy.Config, error) {
+	routeItems, err := server.desiredItems(ctx, "route_policy")
+	if err != nil {
+		return trafficpolicy.Config{}, err
+	}
+	securityItems, err := server.desiredItems(ctx, "security_acl")
+	if err != nil {
+		return trafficpolicy.Config{}, err
+	}
+	domainIPSetItems, err := server.desiredItems(ctx, "domain_ip_set")
+	if err != nil {
+		return trafficpolicy.Config{}, err
+	}
+	generatedDNSRoutes, err := server.dnsFixedWANRouteItems(ctx, domainIPSetItems)
+	if err != nil {
+		return trafficpolicy.Config{}, err
+	}
+	routeItems = append(routeItems, generatedDNSRoutes...)
+	compiled, err := server.compileTrafficPolicySelection(ctx, routeItems, securityItems, domainIPSetItems)
+	if err != nil {
+		return trafficpolicy.Config{}, err
+	}
+	wanGroupItems, err := server.desiredItems(ctx, "wan_group")
+	if err != nil {
+		return trafficpolicy.Config{}, err
+	}
+	wanBindings, err := server.currentWANGroupBindings(ctx)
+	if err != nil {
+		return trafficpolicy.Config{}, err
+	}
+	compiled.WANGroups, err = trafficpolicy.CompileWANGroupsWithBindings(wanGroupItems, wanBindings)
+	if err != nil {
+		return trafficpolicy.Config{}, err
+	}
+	if err := trafficpolicy.BindRoutePolicyPaths(compiled.RoutePolicies, wanBindings, compiled.WANGroups); err != nil {
+		return trafficpolicy.Config{}, err
+	}
+	return compiled, nil
+}
+
+// localLANObjectGroupItems keeps the retired `obj-local-lan` selector usable in
+// persisted route and security policies. Its value is runtime-derived, so it is
+// injected only into the compiler input and never exposed as desired state.
+func (server *Server) localLANObjectGroupItems(ctx context.Context) []map[string]any {
+	assignments, err := server.runtimeAddressAssignments(ctx)
+	if err != nil {
+		return nil
+	}
+	entries := make([]string, 0, len(assignments))
+	for _, assignment := range assignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		cidr := strings.TrimSpace(assignment.CIDR)
+		if cidr == "" {
+			continue
+		}
+		if prefix, prefixErr := netip.ParsePrefix(cidr); prefixErr == nil {
+			cidr = prefix.Masked().String()
+		}
+		entries = append(entries, cidr)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	return []map[string]any{{"id": "obj-local-lan", "kind": "ip", "entries": entries}}
+}
+
+// dnsFixedWANRouteItems turns observed SmartDNS answers into short-lived,
+// highest-priority VPP route policies. The observer is identified explicitly
+// by dns_rule_id; ordinary domain IP sets can never acquire DNS precedence.
+func (server *Server) dnsFixedWANRouteItems(ctx context.Context, items []map[string]any) ([]map[string]any, error) {
+	policy, err := server.activeDNSPolicyResource(ctx)
+	if err != nil {
+		return nil, err
+	}
+	observed := map[string][]string{}
+	now := server.now().UTC()
+	for _, item := range items {
+		ruleID := stringField(item, "dns_rule_id")
+		if ruleID == "" || !desiredEnabled(item) {
+			continue
+		}
+		if expiresAt := stringField(item, "expires_at"); expiresAt != "" {
+			deadline, parseErr := time.Parse(time.RFC3339, expiresAt)
+			if parseErr != nil || !deadline.After(now) {
+				continue
+			}
+		}
+		ips := stringSliceField(item, "ips")
+		if len(ips) == 0 {
+			ips = stringSliceField(item, "addresses")
+		}
+		for _, ip := range ips {
+			address, parseErr := netip.ParseAddr(strings.TrimSpace(ip))
+			if parseErr != nil {
+				continue
+			}
+			prefix := address.String() + "/128"
+			if address.Is4() {
+				prefix = address.String() + "/32"
+			}
+			if !containsString(observed[ruleID], prefix) {
+				observed[ruleID] = append(observed[ruleID], prefix)
+			}
+		}
+	}
+	routes := make([]map[string]any, 0)
+	for order, rule := range policy.Policy.Rules {
+		if rule.Outcome.Kind != dns.OutcomeDirect || strings.TrimSpace(rule.Outcome.WANEgressID) == "" {
+			continue
+		}
+		ips := observed[rule.ID]
+		if len(ips) == 0 {
+			continue
+		}
+		sources := append([]string(nil), rule.SourcePrefixes...)
+		if len(sources) == 0 {
+			sources = []string{"any"}
+		}
+		routes = append(routes, map[string]any{
+			"id":      "dns-override-" + rule.ID,
+			"enabled": true,
+			// The VPP pre-NAT plugin accepts an unsigned priority. Keep DNS
+			// overrides ahead of regular router policies without relying on the
+			// ABF-only negative logical priority range.
+			"priority": order,
+			"action":   "route",
+			"egress":   rule.Outcome.WANEgressID,
+			"match": map[string]any{
+				"src_ip":   strings.Join(sources, ","),
+				"dst_ip":   strings.Join(ips, ","),
+				"protocol": "any",
+				"src_port": "any",
+				"dst_port": "any",
+			},
+		})
+	}
+	return routes, nil
+}
+
+func containsString(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+func (server *Server) currentWANGroupBindings(ctx context.Context) (map[string]trafficpolicy.WANPath, error) {
+	bindings := map[string]trafficpolicy.WANPath{}
+	wanItems, err := server.desiredItems(ctx, "wan_link")
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range wanItems {
+		if !desiredEnabled(item) {
+			continue
+		}
+		id := firstStringField(item, "id", "name")
+		linuxInterface := server.resolveInterfaceID(ctx, firstStringField(item, "interface_id", "linux_interface", "id", "name"))
+		if id == "" || linuxInterface == "" || !vppInterfaceNameSafe(linuxInterface) {
+			continue
+		}
+		vppInterface := vppInterfaceName(linuxInterface)
+		nextHop := wanNextHop(item)
+		peerID := firstStringField(item, "pppoe_peer_id", "pppoe_id", "id")
+		isPPPoE := strings.EqualFold(nonEmpty(stringField(item, "wan_type"), stringField(item, "type")), "pppoe")
+		if isPPPoE {
+			vppInterface = "pppoe-runtime:" + peerID
+		}
+		if _, sessionNextHop, runtimeToken, connected := livePPPoERuntimePath(ctx, peerID); isPPPoE && connected {
+			if sessionNextHop != "" {
+				nextHop = sessionNextHop
+			}
+			bindings[id] = trafficpolicy.WANPath{VPPInterface: vppInterface, NextHop: nextHop, RuntimeToken: runtimeToken}
+			continue
+		}
+		bindings[id] = trafficpolicy.WANPath{VPPInterface: vppInterface, NextHop: nextHop}
+	}
+	interfaceItems, err := server.desiredItems(ctx, "interface")
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range interfaceItems {
+		if !desiredEnabled(item) || !strings.EqualFold(stringField(item, "gateway_role"), "wan") {
+			continue
+		}
+		id := firstStringField(item, "id", "name", "interface_id")
+		linuxInterface := server.resolveInterfaceID(ctx, firstStringField(item, "interface_id", "linux_interface", "id", "name"))
+		if id == "" || linuxInterface == "" || !vppInterfaceNameSafe(linuxInterface) {
+			continue
+		}
+		if _, exists := bindings[id]; !exists {
+			bindings[id] = trafficpolicy.WANPath{VPPInterface: vppInterfaceName(linuxInterface), NextHop: wanNextHop(item)}
+		}
+	}
+	proxyEgress, hasProxyEgress, err := server.runtimeProxyEgress(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if hasProxyEgress && strings.TrimSpace(proxyEgress.ID) != "" {
+		network := proxy.ServiceNetworkForEgressID(proxyEgress.ID)
+		bindings[proxyEgress.ID] = trafficpolicy.WANPath{
+			VPPInterface: network.IngressVPPInterface,
+			NextHop:      network.IngressHostAddress,
+		}
+	}
+	return bindings, nil
+}
+
+func (server *Server) proxyUnderlayRoute(ctx context.Context, egress proxy.Egress, policy trafficpolicy.Config) (string, error) {
+	underlayID := strings.TrimSpace(egress.UnderlayWANID)
+	if underlayID == "" {
+		bindings, err := server.currentWANGroupBindings(ctx)
+		if err != nil {
+			return "", err
+		}
+		candidates := make([]trafficpolicy.WANPath, 0, len(bindings))
+		for id, path := range bindings {
+			if id == egress.ID || strings.TrimSpace(path.VPPInterface) == "" {
+				continue
+			}
+			candidates = append(candidates, path)
+		}
+		if len(candidates) == 0 {
+			// Legacy in-memory callers predate the explicit underlay field. The
+			// persisted API rejects an unbound proxy egress, so reaching this
+			// branch means there is no operator-supplied underlay to validate.
+			return "local", nil
+		}
+		// Legacy in-memory callers predate the explicit underlay field. Keep
+		// those callers deterministic without weakening the persisted API
+		// validation above: the first sorted path is only a test/runtime
+		// compatibility fallback, never a UI-created configuration.
+		sort.Slice(candidates, func(i, j int) bool {
+			left := strings.TrimSpace(candidates[i].VPPInterface) + "\x00" + strings.TrimSpace(candidates[i].NextHop)
+			right := strings.TrimSpace(candidates[j].VPPInterface) + "\x00" + strings.TrimSpace(candidates[j].NextHop)
+			return left < right
+		})
+		path := candidates[0]
+		if strings.TrimSpace(path.NextHop) != "" {
+			return strings.TrimSpace(path.NextHop) + " " + strings.TrimSpace(path.VPPInterface), nil
+		}
+		return strings.TrimSpace(path.VPPInterface), nil
+	}
+	for _, group := range policy.WANGroups {
+		if group.ID == underlayID {
+			return fmt.Sprintf("ip4-lookup-in-table %d", vpp.WANGroupTableID(group.ID)), nil
+		}
+	}
+	bindings, err := server.currentWANGroupBindings(ctx)
+	if err != nil {
+		return "", err
+	}
+	path, exists := bindings[underlayID]
+	if !exists || strings.TrimSpace(path.VPPInterface) == "" {
+		return "", fmt.Errorf("proxy egress %q underlay %q has no live VPP path", egress.ID, underlayID)
+	}
+	if strings.HasPrefix(strings.TrimSpace(path.RuntimeToken), "pppoe:") || server.isPPPoEWANID(ctx, underlayID) {
+		return "pppoe-runtime:" + underlayID, nil
+	}
+	if strings.TrimSpace(path.NextHop) != "" {
+		return strings.TrimSpace(path.NextHop) + " " + strings.TrimSpace(path.VPPInterface), nil
+	}
+	return strings.TrimSpace(path.VPPInterface), nil
+}
+
+func (server *Server) isPPPoEWANID(ctx context.Context, wanID string) bool {
+	item, exists, err := server.desiredItem(ctx, "wan_link", strings.TrimSpace(wanID))
+	if err != nil || !exists || !desiredEnabled(item) {
+		return false
+	}
+	wanType := nonEmpty(stringField(item, "wan_type"), stringField(item, "type"))
+	return strings.EqualFold(strings.TrimSpace(wanType), "pppoe")
+}
+
+func (server *Server) proxyUnderlayMTU(ctx context.Context, egress proxy.Egress) (int, error) {
+	wanIDs, err := server.proxyUnderlayWANIDs(ctx, egress)
+	if err != nil {
+		return 0, err
+	}
+	if len(wanIDs) == 0 {
+		return 1500, nil
+	}
+	effectiveMTU := 0
+	for _, wanID := range wanIDs {
+		item, exists, lookupErr := server.desiredItem(ctx, "wan_link", wanID)
+		if lookupErr != nil {
+			return 0, lookupErr
+		}
+		if !exists || !desiredEnabled(item) {
+			return 0, fmt.Errorf("proxy egress %q underlay WAN %q is unavailable", egress.ID, wanID)
+		}
+		mtu, mtuErr := wanLinkEffectiveMTU(item)
+		if mtuErr != nil {
+			return 0, fmt.Errorf("proxy egress %q underlay WAN %q: %w", egress.ID, wanID, mtuErr)
+		}
+		if effectiveMTU == 0 || mtu < effectiveMTU {
+			effectiveMTU = mtu
+		}
+	}
+	return effectiveMTU, nil
+}
+
+func (server *Server) dnsServiceUnderlayMTU(ctx context.Context, egressID string) (int, error) {
+	egressID = strings.TrimSpace(egressID)
+	if item, exists, err := server.desiredItem(ctx, "proxy_egress", egressID); err != nil {
+		return 0, err
+	} else if exists {
+		if !desiredEnabled(item) {
+			return 0, fmt.Errorf("DNS service egress %q is disabled", egressID)
+		}
+		underlayID := firstStringField(item, "underlay_wan_id", "underlay_wan")
+		if underlayID == "" {
+			return 0, fmt.Errorf("DNS service proxy egress %q has no underlay WAN", egressID)
+		}
+		return server.proxyUnderlayMTU(ctx, proxy.Egress{ID: egressID, UnderlayWANID: underlayID})
+	}
+	return server.proxyUnderlayMTU(ctx, proxy.Egress{ID: "dns-service-" + egressID, UnderlayWANID: egressID})
+}
+
+func wanLinkEffectiveMTU(item map[string]any) (int, error) {
+	wanType := strings.ToLower(strings.TrimSpace(firstNonEmpty(stringField(item, "wan_type"), stringField(item, "type"))))
+	if wanType == "" {
+		if ipv4, ok := item["ipv4"].(map[string]any); ok {
+			wanType = strings.ToLower(strings.TrimSpace(stringField(ipv4, "mode")))
+		}
+	}
+	mtu := firstIntField(item, "mtu")
+	if mtu == 0 {
+		if wanType == "pppoe" {
+			mtu = 1492
+		} else {
+			mtu = 1500
+		}
+	}
+	if mru := firstIntField(item, "mru"); mru > 0 && mru < mtu {
+		mtu = mru
+	}
+	if mtu < 576 || mtu > 9000 {
+		return 0, fmt.Errorf("effective MTU %d is outside 576-9000", mtu)
+	}
+	return mtu, nil
+}
+
+func proxyLANRoutes(assignments []vpp.AddressAssignment) []string {
+	routes := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, assignment := range assignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(assignment.CIDR))
+		if err != nil || !prefix.Addr().Is4() {
+			continue
+		}
+		route := prefix.Masked().String()
+		if _, exists := seen[route]; exists {
+			continue
+		}
+		seen[route] = struct{}{}
+		routes = append(routes, route)
+	}
+	sort.Strings(routes)
+	return routes
+}
+
+func proxyServiceReturnRoutes(assignments []vpp.AddressAssignment, networks []vpp.DNSServiceNetwork, proxyEgressID string) []string {
+	routes := proxyLANRoutes(assignments)
+	seen := make(map[string]struct{}, len(routes)+len(networks))
+	for _, route := range routes {
+		seen[route] = struct{}{}
+	}
+	proxyEgressID = strings.TrimSpace(proxyEgressID)
+	for _, network := range networks {
+		if proxyEgressID == "" || strings.TrimSpace(network.WANEgressID) != proxyEgressID {
+			continue
+		}
+		address, err := netip.ParseAddr(strings.TrimSpace(network.HostAddress))
+		if err != nil || !address.Is4() {
+			continue
+		}
+		route := netip.PrefixFrom(address, 32).String()
+		if _, exists := seen[route]; exists {
+			continue
+		}
+		seen[route] = struct{}{}
+		routes = append(routes, route)
+	}
+	sort.Strings(routes)
+	return routes
+}
+
+func wanNextHop(item map[string]any) string {
+	for _, key := range []string{"next_hop", "gateway", "current_gateway", "peer", "assigned_gateway"} {
+		if value := stringField(item, key); value != "" {
+			return value
+		}
+	}
+	for _, key := range []string{"ipv4", "addressing", "settings"} {
+		if nested, ok := item[key].(map[string]any); ok {
+			for _, nestedKey := range []string{"next_hop", "gateway", "current_gateway", "peer", "assigned_gateway"} {
+				if value := stringField(nested, nestedKey); value != "" {
+					return value
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func domainIPSetEntries(items []map[string]any) []trafficpolicy.DomainIPSetEntry {
+	entries := make([]trafficpolicy.DomainIPSetEntry, 0, len(items))
+	for _, item := range items {
+		if !desiredEnabled(item) {
+			continue
+		}
+		domain := firstStringField(item, "domain", "id", "name")
+		ips := stringSliceField(item, "ips")
+		if len(ips) == 0 {
+			ips = stringSliceField(item, "addresses")
+		}
+		if domain == "" || len(ips) == 0 {
+			continue
+		}
+		entries = append(entries, trafficpolicy.DomainIPSetEntry{Domain: domain, IPs: ips, ExpiresAt: stringField(item, "expires_at")})
+	}
+	return entries
+}
+
+func (server *Server) currentInterfaceBondOperations(ctx context.Context, requestID string) ([]vpp.Operation, error) {
+	management := server.managementInterfaceID(ctx)
+	interfaces, err := server.desiredItems(ctx, "interface")
+	if err != nil {
+		return nil, err
+	}
+	operations := make([]vpp.Operation, 0)
+	for _, item := range interfaces {
+		if stringField(item, "kind") != "lan_bridge" && stringField(item, "type") != "lan_bridge" {
+			continue
+		}
+		members := stringSliceField(item, "bridge_members")
+		if len(members) == 0 {
+			members = stringSliceField(item, "members")
+		}
+		actualMembers := make([]string, 0, len(members))
+		for _, member := range members {
+			resolved := server.resolveInterfaceID(ctx, member)
+			if resolved == management && !server.managementNetworkShared(ctx) {
+				return nil, managementOperationLock(management, "vpp.l2.bridge-domain")
+			}
+			actualMembers = append(actualMembers, resolved)
+		}
+		payload := cloneObject(item)
+		payload["bridge_members"] = actualMembers
+		payload["members"] = actualMembers
+		operations = append(operations, vpp.Operation{Name: "vpp.l2.bridge-domain", RequestID: requestID, Resource: stringField(item, "id"), Payload: payload})
+	}
+	items, err := server.desiredItems(ctx, "interface_bond")
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		members := stringSliceField(item, "members")
+		if len(members) == 0 {
+			continue
+		}
+		actualMembers := make([]string, 0, len(members))
+		for _, member := range members {
+			resolved := server.resolveInterfaceID(ctx, member)
+			if resolved == management && !server.managementNetworkShared(ctx) {
+				return nil, managementOperationLock(management, "vpp.interface-bond")
+			}
+			actualMembers = append(actualMembers, resolved)
+		}
+		payload := cloneObject(item)
+		payload["members"] = actualMembers
+		operations = append(operations, vpp.Operation{Name: "vpp.interface-bond", RequestID: requestID, Resource: stringField(item, "id"), Payload: payload})
+	}
+	return operations, nil
+}
+
+func bondStatesFromOperations(operations []vpp.Operation) []vpp.BondState {
+	bonds := make([]vpp.BondState, 0)
+	for _, operation := range operations {
+		if operation.Name != "vpp.interface-bond" {
+			continue
+		}
+		payload, ok := operation.Payload.(map[string]any)
+		if !ok {
+			continue
+		}
+		bonds = append(bonds, vpp.BondState{Name: operation.Resource, Mode: nonEmpty(stringField(payload, "mode"), "xor"), Members: stringSliceField(payload, "members")})
+	}
+	return bonds
+}
+
+func managementOperationLock(management, operation string) error {
+	return &vpp.DataplaneLockedError{Prerequisites: []vpp.PrerequisiteResult{{Name: "management_excluded_from_operations", Interface: management, Passed: false, Reason: "operation " + operation + " references the management interface"}}}
+}
+
+func (server *Server) runtimeProxyEgress(ctx context.Context) (proxy.Egress, bool, error) {
+	if server.store != nil {
+		documents, storedCount, err := server.activeProxyEgressDocuments(ctx)
+		if err != nil {
+			return proxy.Egress{}, false, err
+		}
+		if len(documents) > 0 {
+			var egress proxy.Egress
+			if err := json.Unmarshal(documents[0].Payload, &egress); err != nil {
+				return proxy.Egress{}, false, err
+			}
+			return egress, true, nil
+		}
+		if storedCount > 0 {
+			return proxy.Egress{}, false, nil
+		}
+	}
+	return server.proxyEgress, server.runtimeProxyConfigured, nil
+}
+
+func (server *Server) activeProxyEgressDocuments(ctx context.Context) ([]persistence.ConfigDocument, int, error) {
+	documents, err := server.store.Configs(ctx, "proxy_egress")
+	if err != nil {
+		return nil, 0, err
+	}
+	active := make([]persistence.ConfigDocument, 0, len(documents))
+	for _, document := range documents {
+		var payload map[string]any
+		if err := json.Unmarshal(document.Payload, &payload); err != nil {
+			return nil, 0, err
+		}
+		if truthy(payload["deleted"]) {
+			continue
+		}
+		active = append(active, document)
+	}
+	sort.SliceStable(active, func(i, j int) bool {
+		return active[i].UpdatedAt.After(active[j].UpdatedAt)
+	})
+	return active, len(documents), nil
+}
+
+// proxySNATExcludedAddresses returns outside addresses claimed by other proxy
+// egresses. The interface address is intentionally shareable: egresses on the
+// same WAN use the same address. Only explicit reserved addresses are
+// exclusive, so two egresses cannot silently collide on a spare host address.
+func (server *Server) proxySNATExcludedAddresses(ctx context.Context, currentID string) ([]string, error) {
+	if server.store == nil {
+		if server.runtimeProxyConfigured && strings.TrimSpace(server.proxyEgress.ID) != strings.TrimSpace(currentID) {
+			return append([]string(nil), server.proxyEgress.SNATAddresses...), nil
+		}
+		return nil, nil
+	}
+	documents, _, err := server.activeProxyEgressDocuments(ctx)
+	if err != nil {
+		return nil, err
+	}
+	excluded := make([]string, 0)
+	for _, document := range documents {
+		var egress proxy.Egress
+		if err := json.Unmarshal(document.Payload, &egress); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(egress.ID) == strings.TrimSpace(currentID) {
+			continue
+		}
+		excluded = append(excluded, egress.SNATAddresses...)
+	}
+	return excluded, nil
+}
+
+func (server *Server) currentFlowIntent(ctx context.Context) (flow.Intent, error) {
+	if server.store != nil {
+		if documents, err := server.store.Configs(ctx, "traffic_control"); err != nil {
+			return flow.Intent{}, err
+		} else if len(documents) > 0 {
+			var payload map[string]any
+			if err := json.Unmarshal(documents[0].Payload, &payload); err != nil {
+				return flow.Intent{}, err
+			}
+			intent, err := flowIntentFromDesiredPayload(payload)
+			if err != nil {
+				return flow.Intent{}, err
+			}
+			return intent, nil
+		}
+	}
+	return server.flowIntent, nil
+}
+
+func (server *Server) runtimeFlowIntent(ctx context.Context) (flow.Intent, bool, error) {
+	if server.store != nil {
+		if documents, err := server.store.Configs(ctx, "traffic_control"); err != nil {
+			return flow.Intent{}, false, err
+		} else if len(documents) > 0 {
+			var payload map[string]any
+			if err := json.Unmarshal(documents[0].Payload, &payload); err != nil {
+				return flow.Intent{}, false, err
+			}
+			intent, err := flowIntentFromDesiredPayload(payload)
+			if err != nil {
+				return flow.Intent{}, false, err
+			}
+			return intent, true, nil
+		}
+	}
+	return server.flowIntent, server.runtimeFlowConfigured, nil
+}
+
+// dnsPolicyRuntimePlan carries the compiled DNS generation up to the point
+// where the proxy DNS endpoints are known. SmartDNS cannot be rendered before
+// that: a proxy outcome needs the loopback endpoint of the same generation.
+type dnsPolicyRuntimePlan struct {
+	Policies      []DNSPolicyResource
+	RenderID      string
+	Render        dns.SmartDNSRender
+	Upstreams     []serviceRuntime.SmartDNSUpstream
+	Cache         serviceRuntime.SmartDNSCache
+	DomainSets    map[string][]string
+	Networks      []vpp.DNSServiceNetwork
+	ProxyBindings []dns.ProxyDNSBinding
+}
+
+// render writes the SmartDNS artifacts for the planned endpoint generation.
+func (plan dnsPolicyRuntimePlan) render(endpoints serviceRuntime.ProxyDNSEndpointPlan) ([]serviceRuntime.RenderedArtifact, error) {
+	artifacts, err := serviceRuntime.RenderSmartDNSBundle([]serviceRuntime.SmartDNSPlan{{
+		ID:                plan.RenderID,
+		Render:            plan.Render,
+		Upstreams:         plan.Upstreams,
+		Cache:             plan.Cache,
+		DomainSets:        plan.DomainSets,
+		ProxyDNSEndpoints: endpoints,
+	}})
+	if err != nil {
+		var unavailable *serviceRuntime.ProxyDNSEndpointUnavailableError
+		if errors.As(err, &unavailable) {
+			return nil, fmt.Errorf("active DNS policy %q cannot be applied: %w; edit the policy to a supported upstream/protocol or delete it, then re-apply", plan.RenderID, err)
+		}
+		return nil, err
+	}
+	return artifacts, nil
+}
+
+func (server *Server) currentDNSPlan(ctx context.Context, proxyEgresses []proxy.Egress, trafficPolicy trafficpolicy.Config) (dnsPolicyRuntimePlan, error) {
+	var resources []DNSPolicyResource
+	upstreams, cache, networks, err := server.currentDNSUpstreams(ctx, trafficPolicy)
+	if err != nil {
+		return dnsPolicyRuntimePlan{}, err
+	}
+	domainSets, err := server.currentDNSDomainSets(ctx)
+	if err != nil {
+		return dnsPolicyRuntimePlan{}, err
+	}
+	if server.store != nil {
+		documents, err := server.store.Policies(ctx, "dns-policy")
+		if err != nil {
+			return dnsPolicyRuntimePlan{}, err
+		}
+		for _, document := range documents {
+			resource, err := server.dnsPolicyResource(ctx, document.PolicyID, document.PolicyID, document.Enabled, document.Payload)
+			if err != nil {
+				return dnsPolicyRuntimePlan{}, err
+			}
+			resource.Priority = normalizedDNSPolicyPriority(document.Priority)
+			resources = append(resources, resource)
+		}
+		if len(resources) > 0 {
+			// SmartDNS evaluates one global rule set.  Render the same merged
+			// first-match policy used by the decision endpoint instead of
+			// concatenating independent fragments with conflicting miss rules.
+			active, activeErr := server.activeDNSPolicyResource(ctx)
+			if activeErr != nil {
+				return dnsPolicyRuntimePlan{}, activeErr
+			}
+			return dnsPolicyRuntimePlan{
+				Policies:      resources,
+				RenderID:      "active",
+				Render:        active.Render,
+				Upstreams:     upstreams,
+				Cache:         cache,
+				DomainSets:    domainSets,
+				Networks:      networks,
+				ProxyBindings: dns.ProxyBindingsFromRender(active.Render),
+			}, nil
+		}
+	}
+	defaultOutcome := dns.Reject()
+	if len(upstreams) > 0 {
+		// An appliance with configured resolvers must not turn every LAN query
+		// into a synthetic reject when no explicit catch-all rule exists.
+		// No-upstream installations retain fail-closed NODATA semantics.
+		defaultOutcome = dns.Direct()
+	}
+	policy := dns.NewPolicy(defaultOutcome, []dns.Rule{})
+	compiled, err := dns.CompilePolicy(policy, proxyEgresses)
+	if err != nil {
+		return dnsPolicyRuntimePlan{}, err
+	}
+	dnsCapability := server.serviceCapability(ctx, serviceRuntime.SmartDNS, "smartdns", "SmartDNS service runtime is not configured")
+	resource := DNSPolicyResource{ID: "default", Kind: "policy", Name: "Default DNS Policy", Priority: 1000, Enabled: true, Policy: policy, Render: compiled.RenderSmartDNS(), Capabilities: []controlapi.CapabilityState{dnsCapability}}
+	return dnsPolicyRuntimePlan{
+		Policies:      []DNSPolicyResource{resource},
+		RenderID:      resource.ID,
+		Render:        resource.Render,
+		Upstreams:     upstreams,
+		Cache:         cache,
+		DomainSets:    domainSets,
+		Networks:      networks,
+		ProxyBindings: dns.ProxyBindingsFromRender(resource.Render),
+	}, nil
+}
+
+func (server *Server) currentDNSDomainSets(ctx context.Context) (map[string][]string, error) {
+	var consumers []map[string]any
+	if server.store != nil {
+		if documents, policyErr := server.store.Policies(ctx, "dns-policy"); policyErr == nil {
+			for _, document := range documents {
+				var payload map[string]any
+				if json.Unmarshal(document.Payload, &payload) == nil {
+					consumers = append(consumers, payload)
+				}
+			}
+		}
+	}
+	return server.currentDNSDomainSetsFor(ctx, consumers)
+}
+
+func (server *Server) currentDNSDomainSetsFor(ctx context.Context, consumers []map[string]any) (map[string][]string, error) {
+	items, err := server.desiredItems(ctx, "object_group")
+	if err != nil {
+		return nil, err
+	}
+	items, err = materializeObjectGroupItems(items, referencedObjectGroupIDs(items, consumers))
+	if err != nil {
+		return nil, err
+	}
+	sets := make(map[string][]string)
+	for _, item := range items {
+		if stringField(item, "kind") != "domain" {
+			continue
+		}
+		if enabled, exists := item["enabled"].(bool); exists && !enabled {
+			continue
+		}
+		id := stringField(item, "id")
+		if id == "" {
+			continue
+		}
+		sets[id] = objectGroupEntries(item)
+	}
+	return sets, nil
+}
+
+// dnsServiceResolverServers converts hostname-based DoH endpoints into the
+// IPv4 resolver set used by the VPP service-network underlay. SmartDNS keeps
+// the original DoH URL; VPP only needs reachable bootstrap resolvers for the
+// service-network route. Explicit IPv4 upstreams remain part of the set.
+func dnsServiceResolverServers(servers, bootstrapServers []string) []string {
+	resolvers := make([]string, 0, len(servers)+len(bootstrapServers))
+	hasDoH := false
+	for _, server := range servers {
+		if serviceRuntime.IsDoHServer(server) {
+			hasDoH = true
+			continue
+		}
+		resolvers = append(resolvers, server)
+	}
+	if hasDoH {
+		resolvers = append(resolvers, bootstrapServers...)
+	}
+	return resolvers
+}
+
+func dnsDoHHostname(server string) string {
+	if !serviceRuntime.IsDoHServer(server) {
+		return ""
+	}
+	parsed, err := url.Parse(strings.TrimSpace(server))
+	if err != nil || parsed.Hostname() == "" {
+		return ""
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if net.ParseIP(host) != nil {
+		return ""
+	}
+	return host
+}
+
+// dnsResolvedDoHHosts converts a hostname DoH endpoint into an IP endpoint at
+// apply time. SmartDNS otherwise creates the server group lazily on its first
+// request, which can make a transparent DNS client observe a transient
+// SERVFAIL immediately after a configuration change.
+func dnsResolvedDoHHosts(ctx context.Context, servers, bootstrapServers []string) map[string][]string {
+	resolved := make(map[string][]string)
+	for _, server := range servers {
+		host := dnsDoHHostname(server)
+		if host == "" {
+			continue
+		}
+		if addresses := dnsResolveHostWithBootstrap(ctx, host, bootstrapServers); len(addresses) > 0 {
+			resolved[host] = addresses
+		}
+	}
+	return resolved
+}
+
+func dnsResolveHostWithBootstrap(ctx context.Context, host string, bootstrapServers []string) []string {
+	lookupCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	for _, bootstrap := range bootstrapServers {
+		address, err := netip.ParseAddr(strings.TrimSpace(bootstrap))
+		if err != nil {
+			continue
+		}
+		resolverAddress := net.JoinHostPort(address.String(), "53")
+		resolver := &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, resolverAddress)
+			},
+		}
+		addresses, err := resolver.LookupNetIP(lookupCtx, "ip4", host)
+		if err != nil {
+			continue
+		}
+		result := canonicalIPv4Addresses(addresses)
+		if len(result) > 0 {
+			return result
+		}
+	}
+	return nil
+}
+
+// canonicalIPv4Addresses stabilizes resolver output before it becomes part of
+// a receipt-bound SmartDNS artifact. Recursive resolvers are free to rotate
+// answer order between equivalent lookups.
+func canonicalIPv4Addresses(addresses []netip.Addr) []string {
+	result := make([]string, 0, len(addresses))
+	seen := make(map[netip.Addr]struct{}, len(addresses))
+	for _, address := range addresses {
+		if !address.Is4() {
+			continue
+		}
+		if _, exists := seen[address]; exists {
+			continue
+		}
+		seen[address] = struct{}{}
+		result = append(result, address.String())
+	}
+	slices.Sort(result)
+	return result
+}
+
+// dnsBootstrapProfilesFromPolicy derives the built-in bootstrap resolver
+// profile from the DNS policy that selected each upstream.  The profile is a
+// property of the lookup rule, not of the DoH URL: a rule using a geosite
+// group must be bootstrapped through domestic resolvers, while an otherwise
+// identical DoH upstream used by a non-geosite/default rule uses foreign
+// resolvers.  Explicit bootstrap_profile/bootstrap_servers fields remain
+// authoritative and are handled by currentDNSUpstreams.
+func (server *Server) dnsBootstrapProfilesFromPolicy(ctx context.Context) (map[string]string, error) {
+	profiles := make(map[string]string)
+	if server.store == nil {
+		return profiles, nil
+	}
+	documents, err := server.store.Policies(ctx, "dns-policy")
+	if err != nil {
+		return nil, err
+	}
+	groups, err := server.desiredItems(ctx, "object_group")
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]map[string]any, len(groups))
+	for _, group := range groups {
+		if id := stringField(group, "id"); id != "" {
+			byID[id] = group
+		}
+	}
+	setProfile := func(outcome dns.Outcome, domestic bool) {
+		id := strings.TrimSpace(outcome.UpstreamID)
+		if id == "" {
+			return
+		}
+		if domestic {
+			// Domestic wins if an upstream is intentionally shared by more than
+			// one rule; using foreign bootstrap for a geosite rule is unsafe.
+			profiles[id] = string(serviceRuntime.DNSBootstrapDomestic)
+			return
+		}
+		if _, exists := profiles[id]; !exists {
+			profiles[id] = string(serviceRuntime.DNSBootstrapForeign)
+		}
+	}
+	for _, document := range documents {
+		if !document.Enabled {
+			continue
+		}
+		var policy dns.Policy
+		if err := json.Unmarshal(document.Payload, &policy); err != nil {
+			return nil, fmt.Errorf("decode DNS policy %q for bootstrap profile: %w", document.PolicyID, err)
+		}
+		setProfile(policy.Miss, false)
+		for _, rule := range policy.Rules {
+			domestic := false
+			for _, selector := range rule.DomainSetIDs {
+				selector = strings.TrimSpace(selector)
+				if selector == "" {
+					continue
+				}
+				group := byID[selector]
+				if group == nil {
+					// Keep compatibility with imported geosite selectors whose
+					// source metadata is not materialized in the desired store.
+					domestic = strings.Contains(strings.ToLower(selector), "geosite")
+				} else if dnsObjectGroupIsGeoSite(group) {
+					domestic = true
+				}
+				if domestic {
+					break
+				}
+			}
+			for _, domain := range rule.Domains {
+				if strings.HasPrefix(strings.ToLower(strings.TrimSpace(domain)), "geosite:") {
+					domestic = true
+					break
+				}
+			}
+			setProfile(rule.Outcome, domestic)
+		}
+	}
+	return profiles, nil
+}
+
+func dnsObjectGroupIsGeoSite(group map[string]any) bool {
+	source, _ := group["source"].(map[string]any)
+	format := strings.ToLower(strings.TrimSpace(firstStringField(source, "format", "type")))
+	provider := strings.ToLower(strings.TrimSpace(stringField(source, "provider")))
+	name := strings.ToLower(strings.TrimSpace(firstStringField(group, "id", "name")))
+	return format == "geosite" || strings.Contains(provider, "geosite") || strings.Contains(name, "geosite")
+}
+
+func (server *Server) currentDNSUpstreams(ctx context.Context, policy trafficpolicy.Config) ([]serviceRuntime.SmartDNSUpstream, serviceRuntime.SmartDNSCache, []vpp.DNSServiceNetwork, error) {
+	items, err := server.desiredItems(ctx, "dns_upstream")
+	if err != nil {
+		return nil, serviceRuntime.SmartDNSCache{}, nil, err
+	}
+	bootstrapProfiles, err := server.dnsBootstrapProfilesFromPolicy(ctx)
+	if err != nil {
+		return nil, serviceRuntime.SmartDNSCache{}, nil, err
+	}
+	upstreams := make([]serviceRuntime.SmartDNSUpstream, 0, len(items))
+	networks := make([]vpp.DNSServiceNetwork, 0, len(items))
+	cache := serviceRuntime.SmartDNSCache{}
+	for _, item := range items {
+		if enabled, ok := item["enabled"].(bool); ok && !enabled {
+			continue
+		}
+		wanID := stringField(item, "wan_egress_id")
+		servers := stringSliceField(item, "servers")
+		bootstrapServers := dnsUpstreamBootstrapFor(item, bootstrapProfiles[stringField(item, "id")])
+		interfaceID := server.resolveInterfaceID(ctx, stringField(item, "interface_id"))
+		if wanID != "" {
+			// A WAN-bound upstream leaves through the shared probe tap, which is a
+			// NAT44 inside path in the main VRF. The rejected alternative (a
+			// per-upstream service network with a tenant-VRF pool address) sent the
+			// query correctly but the reply was never translated back:
+			//   nat44-ed-out2in: port rewritten, daddr still the pool address
+			//   nat44-ed-in2out-output: couldn't translate packet  -> drop
+			// so every such upstream answered SERVFAIL.
+			line, found, lineErr := server.desiredItem(ctx, "wan_link", wanID)
+			if lineErr != nil {
+				return nil, serviceRuntime.SmartDNSCache{}, nil, lineErr
+			}
+			if !found || truthy(line["deleted"]) || !desiredEnabled(line) {
+				return nil, serviceRuntime.SmartDNSCache{}, nil, fmt.Errorf("DNS upstream %q binds WAN line %q, which is not an enabled line", stringField(item, "id"), wanID)
+			}
+			interfaceID = serviceProbeTapHostInterface
+		}
+		upstream := serviceRuntime.SmartDNSUpstream{ID: stringField(item, "id"), Servers: servers, BootstrapServers: bootstrapServers, ResolvedHostIPs: dnsResolvedDoHHosts(ctx, servers, bootstrapServers), Interface: interfaceID, WANEgressID: wanID}
+		upstreams = append(upstreams, upstream)
+		candidate := serviceRuntime.SmartDNSCache{Size: firstIntField(item, "cache_size"), TTLMin: firstIntField(item, "ttl_min_seconds", "rr_ttl_min"), TTLMax: firstIntField(item, "ttl_max_seconds", "rr_ttl_max"), Prefetch: truthy(item["prefetch"])}
+		if candidate != (serviceRuntime.SmartDNSCache{}) {
+			if cache != (serviceRuntime.SmartDNSCache{}) && cache != candidate {
+				return nil, serviceRuntime.SmartDNSCache{}, nil, fmt.Errorf("SmartDNS cache settings must be uniform across enabled upstreams")
+			}
+			cache = candidate
+		}
+	}
+	sort.Slice(upstreams, func(left, right int) bool { return upstreams[left].ID < upstreams[right].ID })
+	sort.Slice(networks, func(left, right int) bool { return networks[left].UpstreamID < networks[right].UpstreamID })
+	if err := vpp.AllocateDNSServiceTapIDs(networks); err != nil {
+		return nil, serviceRuntime.SmartDNSCache{}, nil, err
+	}
+	return upstreams, cache, networks, nil
+}
+
+func (server *Server) currentDHCPServers(ctx context.Context, assignments []vpp.AddressAssignment, serveDNS bool) ([]serviceRuntime.DnsmasqPlan, []serviceRuntime.RenderedArtifact, []string, error) {
+	items, err := server.desiredItems(ctx, "dhcp_server")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	reservations, err := server.currentDHCPReservations(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var plans []serviceRuntime.DnsmasqPlan
+	var warnings []string
+	// An explicit disabled dhcp_server document is an opt-out: the LAN keeps
+	// its DNS listener but must not receive a synthesized factory range.
+	disabled := map[string]bool{}
+	for _, item := range items {
+		configuredInterface := stringField(item, "interface_id")
+		canonical := server.canonicalInterfaceReference(ctx, configuredInterface)
+		resolved := server.resolveInterfaceID(ctx, firstNonEmpty(canonical, configuredInterface))
+		if explicitWANAssignment(assignments, canonical, resolved) {
+			// Fail closed. A DHCP service bound to an explicit WAN port cannot
+			// serve a LAN subnet; silently skipping it would let the operator
+			// believe clients are served. The write path rejects the same
+			// document, so this only triggers for a legacy/imported generation.
+			return nil, nil, nil, fmt.Errorf("DHCP service %s: interface %q is configured as a WAN link and cannot serve DHCP; bind the service to a LAN port with an address (move the port role to lan first), then apply again",
+				firstNonEmpty(stringField(item, "id"), configuredInterface), configuredInterface)
+		}
+		if enabled, ok := item["enabled"].(bool); ok && !enabled {
+			if controlInterface, _, ok := server.dhcpLANControlInterface(ctx, configuredInterface, assignments); ok {
+				disabled[controlInterface] = true
+			}
+			continue
+		}
+		controlInterface, lanRouter, ok := server.dhcpLANControlInterface(ctx, configuredInterface, assignments)
+		if !ok {
+			// A DHCP server whose port is not (or is no longer) a configured LAN
+			// is inert: there is no LAN subnet to serve. Failing the whole plan
+			// for it used to block every unrelated change (WAN line, policy
+			// route, port mapping, DNS) behind "DHCP service interface X is not
+			// a configured logical LAN". Keep the object, skip it, and say why.
+			warnings = append(warnings, fmt.Sprintf("dhcp: service %s skipped: %s",
+				firstNonEmpty(stringField(item, "id"), configuredInterface),
+				server.dhcpInterfaceProblem(ctx, configuredInterface, assignments)))
+			continue
+		}
+		routers := stringSliceField(item, "routers")
+		if len(routers) == 0 && lanRouter != "" {
+			routers = []string{lanRouter}
+		}
+		subnet := stringField(item, "subnet")
+		if subnet == "" {
+			subnet = dhcpLANSubnet(assignments, controlInterface)
+		}
+		plan := serviceRuntime.DnsmasqPlan{ID: stringField(item, "id"), InterfaceID: controlInterface, Subnet: subnet, Pools: stringSliceField(item, "pools"), Routers: routers, NameServers: dhcpNameServers(stringSliceField(item, "name_servers"), routers), LeaseTime: firstIntField(item, "lease_time_seconds", "valid_lifetime", "valid_lifetime_seconds"), ServeDNS: serveDNS}
+		plan.Reservations = reservationsForDHCPPlan(plan, reservations)
+		if plan.ID == "" || plan.InterfaceID == "" {
+			continue
+		}
+		if plan.Subnet == "" || len(plan.Pools) == 0 {
+			// The LAN may only be configured for IPv6; the IPv6 pass below
+			// still creates a dnsmasq plan when a prefix is available.
+			continue
+		}
+		plans = append(plans, plan)
+	}
+	plans, ipv6Warnings, err := server.dnsmasqIPv6LANPlans(ctx, plans, assignments)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	warnings = append(warnings, ipv6Warnings...)
+	// Every LAN in a multi-LAN generation is served by its own pool. The
+	// installed image ships a factory 192.168.88.0/24 pool without a stored
+	// dhcp_server document; deriving the same .100-.199 policy for each LAN
+	// keeps a second LAN from silently receiving no lease. Explicit documents
+	// win, and an explicit disabled document opts the LAN out. A single LAN
+	// outside the factory subnet keeps the previous DNS-only behavior: adding
+	// DHCP there stays an explicit dhcp_server decision.
+	covered := map[string]bool{}
+	for _, plan := range plans {
+		covered[strings.TrimSpace(plan.InterfaceID)] = true
+	}
+	lanCount := len(lanVPPInterfaces(assignments))
+	plans = append(plans, defaultDHCPServerPlans(assignments, lanCount, covered, disabled, serveDNS)...)
+	if serveDNS {
+		// The nftables capture layer redirects LAN :53 to a local resolver on
+		// every plan (single-LAN VPP path included), and SmartDNS only binds
+		// the loopback stub. dnsmasq therefore has to listen on each LAN
+		// gateway address: without a listener the redirect is a black hole.
+		// The set is rebuilt from the current assignments, so a removed LAN
+		// does not keep a listener (or a rule) behind.
+		covered = map[string]bool{}
+		for _, plan := range plans {
+			covered[strings.TrimSpace(plan.InterfaceID)] = true
+		}
+		for index, assignment := range assignments {
+			if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+				continue
+			}
+			controlInterface := vpp.LANControlPlaneHostInterface(assignment.LinuxInterface)
+			if controlInterface == "" || covered[controlInterface] {
+				continue
+			}
+			covered[controlInterface] = true
+			plans = append(plans, serviceRuntime.DnsmasqPlan{
+				ID:          "lan-dns-" + strconv.Itoa(index),
+				InterfaceID: controlInterface,
+				ServeDNS:    true,
+				DNSOnly:     true,
+			})
+		}
+	}
+	// Render even without plans: the artifact owns the installed factory
+	// drop-in, so an empty generation must replace it with a no-service file.
+	artifacts, err := serviceRuntime.RenderDnsmasqConfig(plans)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return plans, artifacts, warnings, nil
+}
+
+// The installed image exposes a factory LAN pool on 192.168.88.0/24 (see
+// packaging/rootfs-overlay/etc/dnsmasq.d/ly-route-dhcp.conf). It has no stored
+// dhcp_server document, so the runtime re-derives the same .100-.199 policy
+// from every live LAN subnet in a multi-LAN generation. A single non-factory
+// LAN is deliberately left DNS-only, preserving the pre-existing contract.
+func defaultDHCPServerPlans(assignments []vpp.AddressAssignment, lanCount int, covered, disabled map[string]bool, serveDNS bool) []serviceRuntime.DnsmasqPlan {
+	seen := make(map[string]bool, len(covered))
+	for name := range covered {
+		seen[name] = true
+	}
+	var plans []serviceRuntime.DnsmasqPlan
+	for _, assignment := range assignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(assignment.CIDR))
+		if err != nil || !prefix.Addr().Is4() {
+			continue
+		}
+		if lanCount <= 1 && prefix.Masked().String() != factoryDHCPSubnet {
+			continue
+		}
+		controlInterface := vpp.LANControlPlaneHostInterface(assignment.LinuxInterface)
+		if controlInterface == "" || seen[controlInterface] || disabled[controlInterface] {
+			continue
+		}
+		pools, ok := factoryDHCPPoolsForPrefix(prefix)
+		if !ok {
+			continue
+		}
+		seen[controlInterface] = true
+		router := prefix.Addr().String()
+		plans = append(plans, serviceRuntime.DnsmasqPlan{
+			// The id is derived from the live LCP so the rendered tag stays
+			// stable when assignments are reordered and changes only when the
+			// LAN actually moves.
+			ID:          "factory-" + controlInterface,
+			InterfaceID: controlInterface,
+			Subnet:      prefix.Masked().String(),
+			Pools:       pools,
+			Routers:     []string{router},
+			NameServers: []string{router},
+			ServeDNS:    serveDNS,
+		})
+	}
+	return plans
+}
+
+const factoryDHCPSubnet = "192.168.88.0/24"
+
+// factoryDHCPPoolsForPrefix applies the factory .100-.199 host policy to an
+// IPv4 LAN prefix. The offsets are relative to the network address, so two LANs
+// can never share a pool even when they use different subnets.
+func factoryDHCPPoolsForPrefix(prefix netip.Prefix) ([]string, bool) {
+	if !prefix.Addr().Is4() {
+		return nil, false
+	}
+	base := prefix.Masked().Addr()
+	start := ipv4Offset(base, 100)
+	end := ipv4Offset(base, 199)
+	if !prefix.Contains(start) || !prefix.Contains(end) {
+		return nil, false
+	}
+	return []string{start.String() + "-" + end.String()}, true
+}
+
+func ipv4Offset(address netip.Addr, offset uint32) netip.Addr {
+	octets := address.As4()
+	value := uint32(octets[0])<<24 | uint32(octets[1])<<16 | uint32(octets[2])<<8 | uint32(octets[3])
+	value += offset
+	return netip.AddrFrom4([4]byte{byte(value >> 24), byte(value >> 16), byte(value >> 8), byte(value)})
+}
+
+func dhcpNameServers(configured, routers []string) []string {
+	if len(configured) > 0 {
+		return append([]string(nil), configured...)
+	}
+	return append([]string(nil), routers...)
+}
+
+func (server *Server) dhcpLANControlInterface(ctx context.Context, interfaceID string, assignments []vpp.AddressAssignment) (string, string, bool) {
+	interfaceID = strings.TrimSpace(interfaceID)
+	canonical := server.canonicalInterfaceReference(ctx, interfaceID)
+	resolved := server.resolveInterfaceID(ctx, firstNonEmpty(canonical, interfaceID))
+	if resolved == "" {
+		resolved = interfaceID
+	}
+	interfaceID = firstNonEmpty(canonical, interfaceID)
+	for _, assignment := range assignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		linuxInterface := strings.TrimSpace(assignment.LinuxInterface)
+		if resolved != linuxInterface && interfaceID != strings.TrimSpace(assignment.ID) && interfaceID != strings.TrimSpace(assignment.VPPInterface) {
+			continue
+		}
+		return vpp.LANControlPlaneHostInterface(linuxInterface), dhcpLANRouter(assignment.CIDR), true
+	}
+	return "", "", false
+}
+
+// dhcpLANSubnet derives the DHCP subnet from the LAN assignment when the
+// operator leaves the subnet empty (the UI documents this as the default).
+func dhcpLANSubnet(assignments []vpp.AddressAssignment, controlInterface string) string {
+	for _, assignment := range assignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		if vpp.LANControlPlaneHostInterface(assignment.LinuxInterface) == controlInterface {
+			return strings.TrimSpace(assignment.CIDR)
+		}
+	}
+	return ""
+}
+
+func dhcpLANRouter(cidr string) string {
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
+	if err != nil {
+		return ""
+	}
+	return prefix.Addr().String()
+}
+
+func reservationsForDHCPPlan(plan serviceRuntime.DnsmasqPlan, reservations []serviceRuntime.DnsmasqReservation) []serviceRuntime.DnsmasqReservation {
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(plan.Subnet))
+	if err != nil {
+		return nil
+	}
+	filtered := make([]serviceRuntime.DnsmasqReservation, 0, len(reservations))
+	for _, reservation := range reservations {
+		address, err := netip.ParseAddr(strings.TrimSpace(reservation.IPAddress))
+		if err == nil && prefix.Contains(address) {
+			filtered = append(filtered, reservation)
+		}
+	}
+	return filtered
+}
+
+func (server *Server) currentDHCPReservations(ctx context.Context) ([]serviceRuntime.DnsmasqReservation, error) {
+	items, err := server.desiredItems(ctx, "dhcp_static_binding")
+	if err != nil {
+		return nil, err
+	}
+	reservations := make([]serviceRuntime.DnsmasqReservation, 0, len(items))
+	for _, item := range items {
+		if enabled, ok := item["enabled"].(bool); ok && !enabled {
+			continue
+		}
+		reservation := serviceRuntime.DnsmasqReservation{HWAddress: firstStringField(item, "mac", "hw_address", "hwaddr"), IPAddress: firstStringField(item, "ip_address", "ip", "address"), Hostname: firstStringField(item, "hostname", "name")}
+		if reservation.HWAddress == "" || reservation.IPAddress == "" {
+			continue
+		}
+		reservations = append(reservations, reservation)
+	}
+	return reservations, nil
+}
+
+func (server *Server) currentPPPoEPeers(ctx context.Context) ([]serviceRuntime.PPPoEPeer, []serviceRuntime.RenderedArtifact, error) {
+	items, err := server.desiredItems(ctx, "wan_link")
+	if err != nil {
+		return nil, nil, err
+	}
+	natInsideInterfaces, err := server.pppoeNATInsideInterfaces(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	var peers []serviceRuntime.PPPoEPeer
+	for _, item := range items {
+		if strings.ToLower(stringField(item, "type")) != "pppoe" {
+			continue
+		}
+		peer, err := server.pppoePeerFromDesired(ctx, item, natInsideInterfaces)
+		if err != nil {
+			return nil, nil, err
+		}
+		peers = append(peers, peer)
+	}
+	if len(peers) == 0 {
+		return peers, nil, nil
+	}
+	artifacts, err := serviceRuntime.RenderPPPoEConfig(peers)
+	return peers, artifacts, err
+}
+
+func (server *Server) applyLivePPPoEIPv6(ctx context.Context) error {
+	interfaces, err := server.desiredItems(ctx, "interface")
+	if err != nil {
+		return err
+	}
+	waited := map[string]bool{}
+	for _, lan := range interfaces {
+		ipv6, _ := lan["ipv6"].(map[string]any)
+		wanID := stringField(ipv6, "source_wan_id")
+		if strings.ToLower(stringField(ipv6, "mode")) != "delegated_prefix" || wanID == "" {
+			continue
+		}
+		if waited[wanID] {
+			continue
+		}
+		waited[wanID] = true
+		// Reconcile the complete, deterministically ordered LAN list so every
+		// LAN index maps to the same sub-delegated /64 that dnsmasq and VPP
+		// programming use.
+		_, lanInterfaces, err := server.pppoeIPv6LANConfig(ctx, wanID)
+		if err != nil {
+			return err
+		}
+		for index := range lanInterfaces {
+			if err := waitForPPPoEIPv6Convergence(ctx, wanID, lanInterfaces, index); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func waitForPPPoEIPv6Convergence(ctx context.Context, wanID string, lanInterfaces []string, index int) error {
+	if index < 0 || index >= len(lanInterfaces) {
+		return fmt.Errorf("PPPoE LAN index %d is outside the configured LAN list", index)
+	}
+	lanInterface := lanInterfaces[index]
+	statusDir := strings.TrimSpace(os.Getenv("LY_ROUTE_PPPOE_STATUS_DIR"))
+	if statusDir == "" {
+		statusDir = "/run/ly-route/pppoe"
+	}
+	deadline := pppoeIPv6ConvergenceDeadline(ctx)
+	var lastReason string
+	var lastReconcile time.Time
+	for time.Now().Before(deadline) {
+		content, err := os.ReadFile(filepath.Join(statusDir, wanID+".json"))
+		if err == nil {
+			var status struct {
+				State     string `json:"state"`
+				Interface string `json:"interface"`
+				Session   struct {
+					IPv6Ready       bool   `json:"ipv6_ready"`
+					DelegatedPrefix string `json:"delegated_prefix"`
+				} `json:"session"`
+			}
+			if json.Unmarshal(content, &status) == nil && status.State == "connected" && status.Interface != "" && status.Session.IPv6Ready {
+				prefix, parseErr := netip.ParsePrefix(strings.TrimSpace(status.Session.DelegatedPrefix))
+				if parseErr == nil && prefix.Addr().Is6() && prefix.Bits() <= 64 {
+					lanPrefix, prefixErr := serviceRuntime.DelegatedLANPrefix(prefix.String(), index)
+					if prefixErr != nil {
+						lastReason = prefixErr.Error()
+					} else {
+						raw := lanPrefix.Addr().As16()
+						raw[15] = 1
+						lanAddress := netip.PrefixFrom(netip.AddrFrom16(raw), 64).String()
+						addresses, addressErr := runLiveVPP(ctx, "show", "interface", "address", lanInterface)
+						ra, raErr := runLiveVPP(ctx, "show", "ip6", "interface", lanInterface)
+						addressReady := addressErr == nil && strings.Contains(addresses, lanAddress)
+						raReady := raErr == nil && strings.Contains(ra, "prefix "+lanPrefix.Addr().String()+", length 64")
+						if addressReady && raReady {
+							return nil
+						}
+						lastReason = fmt.Sprintf("LAN address ready=%t, RA ready=%t", addressReady, raReady)
+					}
+					if lastReconcile.IsZero() || time.Since(lastReconcile) >= time.Second {
+						lastReconcile = time.Now()
+						err := pppoeclient.ReconcileDelegatedPrefix(ctx, pppoeclient.VPPConfig{
+							Binary:            liveVPPBinary(),
+							IPv6PrefixGroup:   "ly-route-" + wanID,
+							IPv6LANInterfaces: lanInterfaces,
+						}, prefix.String())
+						if err != nil {
+							lastReason += "; reconciliation: " + err.Error()
+						}
+					}
+				} else {
+					lastReason = "delegated prefix is unavailable"
+				}
+			} else {
+				lastReason = "PPPoE IPv6CP is not ready"
+			}
+		} else {
+			lastReason = "PPPoE status is unavailable"
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("WAN %s IPv6 prefix delegation did not converge within %s: %s", wanID, pppoeIPv6ConvergenceTimeout(), lastReason)
+}
+
+// pppoeIPv6ConvergenceTimeout bounds the hot-apply wait for a delegated
+// prefix. A fresh dial has to finish PPPoE discovery, LCP, IPv6CP and the
+// first DHCPv6-PD exchange; a flat 30s window raced the client's retry timer.
+// The wait stays bounded and is capped well below the apply deadline.
+func pppoeIPv6ConvergenceTimeout() time.Duration {
+	seconds := 180
+	if raw := strings.TrimSpace(os.Getenv("LY_ROUTE_PPPOE_PD_TIMEOUT_SECONDS")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			seconds = parsed
+		}
+	}
+	if seconds < 30 {
+		seconds = 30
+	}
+	if seconds > 600 {
+		seconds = 600
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func pppoeIPv6ConvergenceDeadline(ctx context.Context) time.Time {
+	deadline := time.Now().Add(pppoeIPv6ConvergenceTimeout())
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	return deadline
+}
+
+func runLiveVPP(ctx context.Context, args ...string) (string, error) {
+	binary := liveVPPBinary()
+	output, err := exec.CommandContext(ctx, binary, args...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	}
+	text := strings.TrimSpace(string(output))
+	if strings.Contains(strings.ToLower(text), "unknown input") {
+		return "", fmt.Errorf("%s: %s", strings.Join(args, " "), text)
+	}
+	return text, nil
+}
+
+func (server *Server) verifyPPPoEArtifacts(ctx context.Context, artifacts []serviceRuntime.RenderedArtifact) error {
+	for _, artifact := range artifacts {
+		if !strings.HasPrefix(artifact.Path, "/etc/ly-route/pppoe/ly-route-") {
+			continue
+		}
+		var plan struct {
+			ID         string `json:"id"`
+			StatusFile string `json:"status_file"`
+		}
+		if err := json.Unmarshal([]byte(artifact.Content), &plan); err != nil {
+			return fmt.Errorf("PPPoE peer plan %s is invalid: %w", artifact.Path, err)
+		}
+		if strings.TrimSpace(plan.StatusFile) == "" {
+			return fmt.Errorf("PPPoE peer %q has no status file contract", plan.ID)
+		}
+		content, err := os.ReadFile(plan.StatusFile)
+		if err != nil || strings.TrimSpace(string(content)) == "" {
+			return fmt.Errorf("PPPoE peer %q status %s is not published yet", plan.ID, plan.StatusFile)
+		}
+		var status struct {
+			State     string `json:"state"`
+			Interface string `json:"interface"`
+		}
+		if err := json.Unmarshal(content, &status); err != nil {
+			return fmt.Errorf("PPPoE peer %q status is malformed: %w", plan.ID, err)
+		}
+		if strings.TrimSpace(status.State) == "" {
+			return fmt.Errorf("PPPoE peer %q status has no state", plan.ID)
+		}
+		if strings.TrimSpace(status.Interface) == "" {
+			return fmt.Errorf("PPPoE peer %q status has no session interface", plan.ID)
+		}
+		if !vppInterfacePresent(ctx, status.Interface) {
+			return fmt.Errorf("PPPoE peer %q interface %q is not present in VPP yet (state=%s)", plan.ID, status.Interface, status.State)
+		}
+	}
+	return nil
+}
+
+func vppInterfacePresent(ctx context.Context, name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(commandCtx, liveVPPBinary(), "show", "interface").Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == name {
+			return true
+		}
+	}
+	return false
+}
+
+// desiredValidationError carries a stable API error code from desired-state
+// validation to the HTTP layer. Callers fall back to invalid_desired_resource.
+type desiredValidationError struct {
+	Code    string
+	Message string
+}
+
+func (validation *desiredValidationError) Error() string { return validation.Message }
+
+// qosCapability observes the traffic-control facilities of the live VPP
+// build. A probe error is returned together with an all-unknown capability;
+// callers must report unknown, never supported.
+func (server *Server) qosCapability(ctx context.Context) (vpp.QoSCapability, error) {
+	if server.qosCapabilityProbe != nil {
+		return server.qosCapabilityProbe(ctx)
+	}
+	return vpp.ProbeQoSCapability(ctx, liveVPPBinary())
+}
+
+// qosRuntimeCapability is the legacy flow-intent view of the same observation.
+func (server *Server) qosRuntimeCapability(ctx context.Context) controlapi.RuntimeCapability {
+	component := server.qosRuntimeComponent(ctx)
+	return controlapi.RuntimeCapability{Name: "vpp_qos_push", Available: component.State == "running", Reason: component.Reason}
+}
+
+// qosRuntimeComponent reports the real traffic-control capability. It never
+// reports a skipped feature as if the policy were enforced: a build that
+// cannot run traffic-control says unsupported, a failed probe says unknown.
+func (server *Server) qosRuntimeComponent(ctx context.Context) RuntimeComponentState {
+	capability, err := server.qosCapability(ctx)
+	if err != nil {
+		return RuntimeComponentState{
+			Name:   "qos",
+			State:  string(vpp.CapabilityUnknown),
+			Reason: "traffic-control capability probe failed: " + err.Error(),
+		}
+	}
+	switch capability.Status() {
+	case vpp.CapabilitySupported:
+		return RuntimeComponentState{Name: "qos", State: "running", Available: true, Reason: capability.Summary()}
+	case vpp.CapabilityUnsupported:
+		return RuntimeComponentState{Name: "qos", State: "unsupported", Reason: capability.Summary()}
+	default:
+		return RuntimeComponentState{Name: "qos", State: string(vpp.CapabilityUnknown), Reason: capability.Summary()}
+	}
+}
+
+// applyQoSPlanState carries the plan's per-generation verdict onto the
+// capability component produced by runtimeStatusComponentsForResult.
+func (server *Server) applyQoSPlanState(components []RuntimeComponentState, skipped bool, reason string) []RuntimeComponentState {
+	for index := range components {
+		if components[index].Name != "qos" {
+			continue
+		}
+		if skipped {
+			components[index].State = "unsupported"
+			components[index].Available = false
+			if strings.TrimSpace(reason) != "" {
+				components[index].Reason = reason
+			}
+		}
+		return components
+	}
+	if !skipped {
+		return components
+	}
+	return append(components, RuntimeComponentState{Name: "qos", State: "unsupported", Reason: reason})
+}
+
+// withoutQoSPluginGroups drops object groups backed by the VPP QoS plugin.
+// ACL-based actions (vpp.acl.drop, vpp.behavior.rate, vpp.policer) use
+// different plugins and remain reconcilable.
+func withoutQoSPluginGroups(groups []flow.VPPObjectGroup) []flow.VPPObjectGroup {
+	filtered := make([]flow.VPPObjectGroup, 0, len(groups))
+	for _, group := range groups {
+		switch strings.TrimSpace(group.Kind) {
+		case "vpp.qos.classify", "vpp.qos.record", "vpp.qos.store", "vpp.qos.egress-map", "vpp.qos.mark":
+			continue
+		default:
+			filtered = append(filtered, group)
+		}
+	}
+	return filtered
+}
+
+func liveVPPBinary() string {
+	binary := strings.TrimSpace(os.Getenv("LY_ROUTE_VPPCTL"))
+	if binary == "" {
+		return "vppctl"
+	}
+	return binary
+}
+
+func (server *Server) handlePPPoEStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	statuses, operations, err := server.pppoeStatuses(r.Context(), requestID(r))
+	if err != nil {
+		writeError(w, r, http.StatusUnprocessableEntity, "pppoe_status_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": statuses, "vpp_route_handoff": operations, "request_id": requestID(r)})
+}
+
+func (server *Server) handlePPPoELifecycle(action string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+			return
+		}
+		session, ok := server.sessionFromRequest(r)
+		if !ok {
+			server.recordAudit("anonymous", "system", r.URL.Path, action, "denied", "authentication required", r)
+			writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		if session.Role != "admin" {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "denied", "readonly mutation denied", r)
+			writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+			return
+		}
+		if !server.serviceRuntimeConfigured() {
+			reason := "PPPoE service runtime is not configured"
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", reason, r)
+			writeError(w, r, http.StatusServiceUnavailable, "pppoe_lifecycle_unavailable", reason)
+			return
+		}
+		_, artifacts, err := server.currentPPPoEPeers(r.Context())
+		if err != nil {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
+			writeError(w, r, http.StatusUnprocessableEntity, "pppoe_lifecycle_failed", err.Error())
+			return
+		}
+		if len(artifacts) == 0 {
+			reason := "no PPPoE WAN is configured"
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", reason, r)
+			writeError(w, r, http.StatusConflict, "pppoe_lifecycle_failed", reason)
+			return
+		}
+		switch action {
+		case "connect":
+			err = server.services.Apply(r.Context(), artifacts)
+		case "disconnect":
+			err = server.services.Stop(r.Context(), serviceRuntime.PPPoE, artifacts)
+		default:
+			err = fmt.Errorf("unsupported PPPoE lifecycle action %q", action)
+		}
+		if err != nil {
+			reason := serviceRuntime.Redact(err.Error())
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", reason, r)
+			writeError(w, r, http.StatusServiceUnavailable, "pppoe_lifecycle_failed", reason)
+			return
+		}
+		statuses, operations, err := server.pppoeStatuses(r.Context(), requestID(r))
+		if err != nil {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
+			writeError(w, r, http.StatusUnprocessableEntity, "pppoe_lifecycle_failed", err.Error())
+			return
+		}
+		runtimeState := "connected"
+		if action == "disconnect" {
+			runtimeState = "disconnected"
+		}
+		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "success", "", r)
+		writeJSON(w, http.StatusOK, map[string]any{"status": runtimeState, "items": statuses, "vpp_route_handoff": operations, "runtime_state": runtimeState, "request_id": requestID(r)})
+	}
+}
+
+func (server *Server) pppoeStatuses(ctx context.Context, requestID string) ([]serviceRuntime.PPPoEStatus, []vpp.Operation, error) {
+	items, err := server.desiredItems(ctx, "wan_link")
+	if err != nil {
+		return nil, nil, err
+	}
+	natInsideInterfaces, err := server.pppoeNATInsideInterfaces(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	var statuses []serviceRuntime.PPPoEStatus
+	var operations []vpp.Operation
+	for _, item := range items {
+		if strings.ToLower(nonEmpty(stringField(item, "wan_type"), stringField(item, "type"))) != "pppoe" {
+			continue
+		}
+		peer, err := server.pppoePeerFromDesired(ctx, item, natInsideInterfaces)
+		if err != nil {
+			return nil, nil, err
+		}
+		state := serviceRuntime.PPPoEState(nonEmpty(nonEmpty(stringField(item, "pppoe_state"), stringField(item, "state")), "disconnected"))
+		assignedIPv4 := firstStringField(item, "assigned_ipv4", "current_address")
+		assignedIPv6 := stringField(item, "assigned_ipv6")
+		// Once a service runtime is present, live dataplane state is authoritative.
+		// A failed reconciliation receipt must not hide a healthy native PPPoE
+		// session: recovery needs the acquired WAN address to rebuild NAT, route,
+		// and port-map objects.
+		if server.services != nil {
+			if _, _, _, live := livePPPoERuntimePath(ctx, peer.ID); live {
+				if ipv4, ipv6, ok := livePPPoEAddress(ctx, peer.ID); ok {
+					state = serviceRuntime.PPPoEConnected
+					assignedIPv4, assignedIPv6 = ipv4, ipv6
+				} else {
+					state = serviceRuntime.PPPoEDisconnected
+					assignedIPv4, assignedIPv6 = "", ""
+				}
+			} else {
+				state = serviceRuntime.PPPoEDisconnected
+				assignedIPv4, assignedIPv6 = "", ""
+			}
+		}
+		status, err := serviceRuntime.NewPPPoEStatus(peer, state, assignedIPv4, assignedIPv6, intField(item, "vpp_table_id"), stringField(item, "last_error"))
+		if err != nil {
+			return nil, nil, err
+		}
+		if status.State == serviceRuntime.PPPoEConnected {
+			status.ACMAC = livePPPoEACMAC(ctx, peer.ID)
+		}
+		statuses = append(statuses, status)
+		if status.RouteReady {
+			handoff, err := serviceRuntime.PPPoEVPPRouteHandoff(status, requestID)
+			if err != nil {
+				return nil, nil, err
+			}
+			operations = append(operations, handoff...)
+		}
+	}
+	return statuses, operations, nil
+}
+
+func (server *Server) pppoePeerFromDesired(ctx context.Context, item map[string]any, natInsideInterfaces []string) (serviceRuntime.PPPoEPeer, error) {
+	id := stringField(item, "id")
+	password := firstStringField(item, "password", "pppoe_password")
+	if password == "" && server.store != nil {
+		password, _ = server.store.Secret(ctx, "wan_link", id, "pppoe_password")
+	}
+	prefixGroup, ipv6LANInterfaces, err := server.pppoeIPv6LANConfig(ctx, id)
+	if err != nil {
+		return serviceRuntime.PPPoEPeer{}, err
+	}
+	natBehavior, err := server.currentNATBehavior(ctx)
+	if err != nil {
+		return serviceRuntime.PPPoEPeer{}, err
+	}
+	return serviceRuntime.PPPoEPeer{ID: id, Interface: server.interfaceLinuxName(ctx, stringField(item, "interface_id")), Username: firstStringField(item, "username", "pppoe_username"), Password: password, MTU: intField(item, "mtu"), MRU: intField(item, "mru"), NATInsideInterfaces: append([]string(nil), natInsideInterfaces...), NATBehavior: string(natBehavior), IPv6PrefixGroup: prefixGroup, IPv6LANInterfaces: ipv6LANInterfaces}, nil
+}
+
+func (server *Server) currentNATBehavior(ctx context.Context) (nat.Behavior, error) {
+	sets := make([][]map[string]any, 0, 4)
+	for _, resourceType := range []string{"nat_static", "port_map", "wan_link", "route_policy"} {
+		items, err := server.desiredItems(ctx, resourceType)
+		if err != nil {
+			return "", err
+		}
+		sets = append(sets, items)
+	}
+	return nat.ResolveBehavior(sets...)
+}
+
+func (server *Server) pppoeNATInsideInterfaces(ctx context.Context) ([]string, error) {
+	assignments, err := server.runtimeAddressAssignments(ctx)
+	if err != nil {
+		return nil, err
+	}
+	interfaces := []string{}
+	for _, assignment := range assignments {
+		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		name := strings.TrimSpace(assignment.VPPInterface)
+		if name == "" {
+			name = vppInterfaceName(strings.TrimSpace(assignment.LinuxInterface))
+		}
+		if name != "" {
+			interfaces = appendUniqueString(interfaces, name)
+		}
+	}
+	return interfaces, nil
+}
+
+func livePPPoEAddress(ctx context.Context, peerID string) (string, string, bool) {
+	peerID = strings.TrimSpace(peerID)
+	if !validPPPoEStatusID(peerID) {
+		return "", "", false
+	}
+	select {
+	case <-ctx.Done():
+		return "", "", false
+	default:
+	}
+	output, err := os.ReadFile(filepath.Join("/run/ly-route/pppoe", peerID+".json"))
+	if err != nil {
+		return "", "", false
+	}
+	return pppAddressFromStatusJSON(output)
+}
+
+func livePPPoEACMAC(ctx context.Context, peerID string) string {
+	peerID = strings.TrimSpace(peerID)
+	if !validPPPoEStatusID(peerID) {
+		return ""
+	}
+	select {
+	case <-ctx.Done():
+		return ""
+	default:
+	}
+	output, err := os.ReadFile(filepath.Join("/run/ly-route/pppoe", peerID+".json"))
+	if err != nil {
+		return ""
+	}
+	return pppACMACFromStatusJSON(output)
+}
+
+func pppACMACFromStatusJSON(output []byte) string {
+	var status struct {
+		State   string `json:"state"`
+		Session struct {
+			ACMAC []int `json:"ac_mac"`
+		} `json:"session"`
+	}
+	if err := json.Unmarshal(output, &status); err != nil || status.State != "connected" || len(status.Session.ACMAC) != 6 {
+		return ""
+	}
+	mac := make(net.HardwareAddr, len(status.Session.ACMAC))
+	for index, value := range status.Session.ACMAC {
+		if value < 0 || value > 255 {
+			return ""
+		}
+		mac[index] = byte(value)
+	}
+	return mac.String()
+}
+
+func livePPPoEInterface(ctx context.Context, peerID string) (string, bool) {
+	interfaceName, _, connected := livePPPoEPath(ctx, peerID)
+	return interfaceName, connected
+}
+
+func livePPPoEPath(ctx context.Context, peerID string) (string, string, bool) {
+	interfaceName, nextHop, _, connected := livePPPoERuntimePath(ctx, peerID)
+	return interfaceName, nextHop, connected
+}
+
+func livePPPoERuntimePath(ctx context.Context, peerID string) (string, string, string, bool) {
+	peerID = strings.TrimSpace(peerID)
+	if !validPPPoEStatusID(peerID) {
+		return "", "", "", false
+	}
+	select {
+	case <-ctx.Done():
+		return "", "", "", false
+	default:
+	}
+	output, err := os.ReadFile(filepath.Join("/run/ly-route/pppoe", peerID+".json"))
+	if err != nil {
+		return "", "", "", false
+	}
+	interfaceName, nextHop, runtimeToken, connected := pppRuntimePathFromStatusJSON(output)
+	if !connected || !livePPPoEPathMatchesVPP(ctx, output, interfaceName) {
+		return "", "", "", false
+	}
+	return interfaceName, nextHop, runtimeToken, true
+}
+
+// The native client keeps an unrouted placeholder session when VPP has to
+// avoid reusing a contaminated PPPoE rewrite.  A status file can briefly
+// outlive the interface during reconnect, so it is not sufficient as a
+// routing-plan source by itself.  Confirm both the negotiated session and its
+// L3 address in the live VPP instance before publishing the interface name.
+func livePPPoEPathMatchesVPP(ctx context.Context, output []byte, interfaceName string) bool {
+	var status struct {
+		State   string `json:"state"`
+		Session struct {
+			SessionID    uint32 `json:"session_id"`
+			LocalAddress string `json:"local_address"`
+		} `json:"session"`
+	}
+	if err := json.Unmarshal(output, &status); err != nil || status.State != "connected" ||
+		status.Session.SessionID == 0 || status.Session.SessionID >= 0xffff {
+		return false
+	}
+	localAddress, err := netip.ParseAddr(strings.TrimSpace(status.Session.LocalAddress))
+	if err != nil || !localAddress.Is4() || localAddress.IsUnspecified() {
+		return false
+	}
+	interfaceName = strings.TrimSpace(interfaceName)
+	if !vppInterfaceNameSafe(interfaceName) {
+		return false
+	}
+	// The native Hi-Jiajun plugin exposes sessions through
+	// `show pppoe client detail`; `show pppoe session` belongs to the legacy
+	// built-in session table and prints "No pppoe sessions configured" here.
+	detail, detailErr := runLiveVPP(ctx, "show", "pppoe", "client", "detail")
+	if detailErr == nil && strings.Contains(detail, "PPPOE_CLIENT_SESSION") {
+		if !strings.Contains(detail, fmt.Sprintf("session-id %d", status.Session.SessionID)) ||
+			!strings.Contains(detail, fmt.Sprintf("runtime ipv4 local %s", localAddress)) {
+			return false
+		}
+		peer := strings.TrimSpace(pppoeDetailPeer(detail, localAddress.String()))
+		if peer == "" || peer == "0.0.0.0" {
+			return false
+		}
+	} else {
+		sessions, err := runLiveVPP(ctx, "show", "pppoe", "session")
+		if err != nil {
+			return false
+		}
+		needle := fmt.Sprintf("client-ip %s session-id %d", localAddress, status.Session.SessionID)
+		if !strings.Contains(sessions, needle) {
+			return false
+		}
+	}
+	addresses, err := runLiveVPP(ctx, "show", "interface", "address")
+	if err != nil {
+		return false
+	}
+	return vppInterfaceHasAddress(addresses, interfaceName, localAddress.String())
+}
+
+func pppoeDetailPeer(output, localAddress string) string {
+	prefix := "runtime ipv4 local " + localAddress + " peer "
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	return ""
+}
+
+func vppInterfaceHasAddress(output, interfaceName, address string) bool {
+	found := false
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, interfaceName+" ") {
+			found = true
+			continue
+		}
+		if !found {
+			continue
+		}
+		if strings.HasPrefix(line, "  L3 ") && strings.Contains(line, address+"/") {
+			return true
+		}
+		if line != "" && line[0] != ' ' {
+			return false
+		}
+	}
+	return false
+}
+
+func pppPathFromStatusJSON(output []byte) (string, string, bool) {
+	interfaceName, nextHop, _, connected := pppRuntimePathFromStatusJSON(output)
+	return interfaceName, nextHop, connected
+}
+
+func pppRuntimePathFromStatusJSON(output []byte) (string, string, string, bool) {
+	var status struct {
+		State     string `json:"state"`
+		Interface string `json:"interface"`
+		Session   struct {
+			SessionID     uint32 `json:"session_id"`
+			LocalAddress  string `json:"local_address"`
+			RemoteAddress string `json:"remote_address"`
+		} `json:"session"`
+	}
+	if err := json.Unmarshal(output, &status); err != nil || status.State != "connected" || !vppInterfaceNameSafe(strings.TrimSpace(status.Interface)) {
+		return "", "", "", false
+	}
+	interfaceName := strings.TrimSpace(status.Interface)
+	remoteAddress := strings.TrimSpace(status.Session.RemoteAddress)
+	address, err := netip.ParseAddr(remoteAddress)
+	if err != nil || !address.Is4() || address.IsUnspecified() {
+		remoteAddress = ""
+	} else {
+		remoteAddress = address.String()
+	}
+	localAddress := strings.TrimSpace(status.Session.LocalAddress)
+	if address, err := netip.ParseAddr(localAddress); err != nil || !address.Is4() || address.IsUnspecified() {
+		localAddress = ""
+	} else {
+		localAddress = address.String()
+	}
+	runtimeToken := fmt.Sprintf("pppoe:%d:%s:%s", status.Session.SessionID, localAddress, remoteAddress)
+	return interfaceName, remoteAddress, runtimeToken, true
+}
+
+func validPPPoEStatusID(peerID string) bool {
+	if peerID == "" || strings.ContainsAny(peerID, "\x00\n\r /\\\t") {
+		return false
+	}
+	for _, r := range peerID {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' && r != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func pppAddressFromStatusJSON(output []byte) (string, string, bool) {
+	var status struct {
+		State     string `json:"state"`
+		Interface string `json:"interface"`
+		Session   struct {
+			LocalAddress           string `json:"local_address"`
+			LocalIPv6              string `json:"local_ipv6"`
+			LegacyLocalIPv6Address string `json:"local_ipv6_address"`
+			DelegatedPrefix        string `json:"delegated_prefix"`
+		} `json:"session"`
+	}
+	if err := json.Unmarshal(output, &status); err != nil || status.State != "connected" || strings.TrimSpace(status.Interface) == "" {
+		return "", "", false
+	}
+	ipv4 := strings.TrimSpace(status.Session.LocalAddress)
+	ipv6 := strings.TrimSpace(firstNonEmpty(status.Session.DelegatedPrefix, status.Session.LocalIPv6, status.Session.LegacyLocalIPv6Address))
+	return ipv4, ipv6, ipv4 != "" || ipv6 != ""
+}
+
+func (server *Server) runtimeStatusComponents(ctx context.Context, artifacts []serviceRuntime.RenderedArtifact, renderedVPP bool) []RuntimeComponentState {
+	return server.runtimeStatusComponentsForResult(ctx, artifacts, renderedVPP, nil)
+}
+
+// runtimeStatusComponentsForResult lets the apply path pass its in-flight
+// result. Without it the component inventory would be classified against the
+// previous transaction's Applied list and unchanged services would be reported
+// degraded.
+func (server *Server) runtimeStatusComponentsForResult(ctx context.Context, artifacts []serviceRuntime.RenderedArtifact, renderedVPP bool, result *RuntimeApplyResult) []RuntimeComponentState {
+	if components, handled := server.orchestratorTransparentRuntimeComponents(ctx); handled {
+		return components
+	}
+	components := []RuntimeComponentState{}
+	healthByService := map[serviceRuntime.ServiceName]serviceRuntime.Health{}
+	var healthErr error
+	if server.serviceRuntimeConfigured() {
+		health, err := server.services.HealthCheck(ctx, serviceRuntime.SmartDNS, serviceRuntime.Dnsmasq, serviceRuntime.Xray, serviceRuntime.PPPoE)
+		healthErr = err
+		for _, item := range health {
+			healthByService[item.Service] = item
+		}
+	}
+	for _, service := range []struct {
+		productService product.Service
+		runtimeService serviceRuntime.ServiceName
+	}{
+		{productService: product.ServiceSmartDNS, runtimeService: serviceRuntime.SmartDNS},
+		{productService: product.ServiceDnsmasq, runtimeService: serviceRuntime.Dnsmasq},
+		{productService: product.ServiceXray, runtimeService: serviceRuntime.Xray},
+		{productService: product.ServicePPPoE, runtimeService: serviceRuntime.PPPoE},
+	} {
+		if !server.profile.AllowsService(service.productService) {
+			continue
+		}
+		component := RuntimeComponentState{Name: string(service.runtimeService)}
+		if !server.serviceRuntimeConfigured() {
+			component.State = "unavailable"
+			component.Reason = "service runtime controller is not configured"
+		} else if healthErr != nil {
+			component.State = "degraded"
+			component.Reason = healthErr.Error()
+		} else {
+			health := healthByService[service.runtimeService]
+			if !health.Available {
+				component.State = "degraded"
+				if strings.TrimSpace(health.Reason) != "" {
+					component.Reason = health.Reason
+				}
+			} else {
+				component.State = "running"
+				component.Available = true
+			}
+		}
+		components = append(components, component)
+	}
+	if server.profile.AllowsService(product.ServiceVPP) {
+		components = append(components, server.vppRuntimeComponent(ctx, renderedVPP))
+	}
+	if server.profile.Allows(product.CapabilityTrafficControl) {
+		components = append(components, server.qosRuntimeComponent(ctx))
+	}
+	if server.profile.AllowsService(product.ServiceNftables) {
+		components = append(components, server.serviceRuntimeComponent(ctx, serviceRuntime.Nftables, "nftables_tproxy", len(artifactsForService(artifacts, serviceRuntime.Nftables)) > 0, "no nftables/TProxy rules rendered"))
+	}
+	if server.profile.AllowsService(product.ServiceLinuxRouting) {
+		components = append(components, appliedScriptComponent("linux_routing", len(artifactsForService(artifacts, serviceRuntime.LinuxRouting)) > 0, "no Linux routing policy rendered"))
+	}
+	if len(artifactsForService(artifacts, serviceRuntime.IPv6RA)) > 0 {
+		components = append(components, server.serviceRuntimeComponent(ctx, serviceRuntime.IPv6RA, string(serviceRuntime.IPv6RA), true, "no IPv6 RA configuration rendered"))
+	}
+	if server.store == nil {
+		components = append(components, RuntimeComponentState{Name: "persistence", State: "unavailable", Reason: "local store is not configured"})
+	} else {
+		components = append(components, RuntimeComponentState{Name: "persistence", State: "running", Available: true})
+	}
+	evidence := server.runtimeEvidence()
+	if result != nil {
+		evidence = *result
+	}
+	components = server.applyRuntimeEvidenceForResult(components, evidence)
+	components = server.attachServiceEvidenceForResult(ctx, components, artifacts, evidence)
+	return applyCapabilityFailures(components, evidence.CapabilityFailures, evidence.TransactionID, evidence.AppliedAt)
+}
+
+func (server *Server) serviceRuntimeConfigured() bool {
+	return server.services != nil && server.services.Controller != nil
+}
+
+func renderedComponent(name string, rendered bool, reason string) RuntimeComponentState {
+	if rendered {
+		return RuntimeComponentState{Name: name, State: "rendered", Reason: reason}
+	}
+	return RuntimeComponentState{Name: name, State: "unavailable", Reason: reason}
+}
+
+func (server *Server) serviceRuntimeComponent(ctx context.Context, service serviceRuntime.ServiceName, name string, rendered bool, unavailableReason string) RuntimeComponentState {
+	if !rendered {
+		return RuntimeComponentState{Name: name, State: "unavailable", Reason: unavailableReason}
+	}
+	if !server.serviceRuntimeConfigured() {
+		return RuntimeComponentState{Name: name, State: "unavailable", Reason: "service runtime controller is not configured"}
+	}
+	health, err := server.services.HealthCheck(ctx, service)
+	if err != nil {
+		return RuntimeComponentState{Name: name, State: "degraded", Reason: err.Error()}
+	}
+	if len(health) == 0 || !health[0].Available {
+		reason := string(service) + " runtime is not active"
+		if len(health) > 0 && strings.TrimSpace(health[0].Reason) != "" {
+			reason = health[0].Reason
+		}
+		return RuntimeComponentState{Name: name, State: "degraded", Reason: reason}
+	}
+	return RuntimeComponentState{Name: name, State: "running", Available: true}
+}
+
+func appliedScriptComponent(name string, rendered bool, unavailableReason string) RuntimeComponentState {
+	if !rendered {
+		return RuntimeComponentState{Name: name, State: "unavailable", Reason: unavailableReason}
+	}
+	return RuntimeComponentState{Name: name, State: "running", Available: true}
+}
+
+type vppApplyReceipt struct {
+	TransactionID         string    `json:"transaction_id"`
+	ExecutorTransactionID string    `json:"executor_transaction_id,omitempty"`
+	Status                string    `json:"status"`
+	DryRun                bool      `json:"dry_run"`
+	DesiredGeneration     int64     `json:"desired_generation"`
+	AppliedGeneration     int64     `json:"applied_generation"`
+	DesiredHash           string    `json:"desired_hash"`
+	Partial               bool      `json:"partial"`
+	DegradedReasons       []string  `json:"degraded_reasons"`
+	AppliedAt             time.Time `json:"applied_at"`
+	ReadbackAt            time.Time `json:"readback_at"`
+	Operations            []struct {
+		Name     string `json:"name"`
+		Resource string `json:"resource"`
+		Results  []struct {
+			Command string `json:"command"`
+			Status  string `json:"status"`
+			Driver  string `json:"driver"`
+			Hook    string `json:"hook"`
+			Mode    string `json:"mode"`
+		} `json:"results"`
+	} `json:"operations"`
+}
+
+func (server *Server) vppRuntimeComponent(ctx context.Context, rendered bool) RuntimeComponentState {
+	evidence := server.runtimeEvidence()
+	if evidence.Status == RuntimeStatusCommitted && len(evidence.GatewayEvidence) > 0 && server.serviceRuntimeConfigured() {
+		health, err := server.services.HealthCheck(ctx, serviceRuntime.VPP)
+		if err == nil && len(health) > 0 && health[0].Available {
+			return RuntimeComponentState{Name: "vpp", State: "running", Available: true, Reason: "typed gateway apply and live VPP readback verified"}
+		}
+	}
+	if !rendered {
+		if !server.serviceRuntimeConfigured() {
+			return RuntimeComponentState{Name: "vpp", State: "unavailable", Reason: "service runtime controller is not configured"}
+		}
+		health, err := server.services.HealthCheck(ctx, serviceRuntime.VPP)
+		if err == nil && len(health) > 0 && health[0].Available {
+			return RuntimeComponentState{
+				Name: "vpp", State: "running", Available: true, Unchanged: true,
+				Reason: "VPP unchanged this transaction; live vpp.service health verified",
+			}
+		}
+		reason := "vpp.service is not active"
+		if err != nil {
+			reason = err.Error()
+		} else if len(health) > 0 && strings.TrimSpace(health[0].Reason) != "" {
+			reason = health[0].Reason
+		}
+		return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: reason}
+	}
+	if !server.serviceRuntimeConfigured() {
+		return RuntimeComponentState{Name: "vpp", State: "unavailable", Reason: "service runtime controller is not configured"}
+	}
+	health, err := server.services.HealthCheck(ctx, serviceRuntime.VPP)
+	if err != nil {
+		return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: err.Error()}
+	}
+	if len(health) == 0 || !health[0].Available {
+		reason := "vpp.service is not active"
+		if len(health) > 0 && strings.TrimSpace(health[0].Reason) != "" {
+			reason = health[0].Reason
+		}
+		return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: reason}
+	}
+	receipt, err := server.readVPPApplyReceipt()
+	if err != nil {
+		return RuntimeComponentState{Name: "vpp", State: "rendered", Reason: err.Error()}
+	}
+	if receipt.DryRun {
+		return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: "VPP apply receipt is dry-run only"}
+	}
+	if receipt.Status != "applied" && receipt.Status != "ready" && receipt.Status != "noop" && receipt.Status != "unchanged" {
+		return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: "VPP apply receipt status is " + receipt.Status}
+	}
+	// A live VPP process is not convergence. When the receipt carries a
+	// generation, the published generation must match it; a stale or partial
+	// receipt keeps the component degraded no matter how healthy vppctl looks.
+	if receipt.Partial {
+		// A partial flag without a concrete reason is not a failure: the
+		// previous evaluation used to persist its own message back into the
+		// receipt, so the reason grew "VPP apply receipt is partial: ..."
+		// forever and the UI showed a降级原因 with no actionable content.
+		concrete := make([]string, 0, len(receipt.DegradedReasons))
+		for _, item := range receipt.DegradedReasons {
+			item = strings.TrimSpace(item)
+			if item == "" || strings.Contains(item, "VPP apply receipt is partial") {
+				continue
+			}
+			concrete = append(concrete, item)
+		}
+		if len(concrete) > 0 {
+			reason := "VPP apply receipt is partial: " + strings.Join(concrete, "; ")
+			if len(reason) > 480 {
+				reason = reason[:480] + "..."
+			}
+			return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: reason}
+		}
+	}
+	if receipt.DesiredGeneration > 0 {
+		if receipt.AppliedGeneration != receipt.DesiredGeneration {
+			return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: fmt.Sprintf("VPP apply receipt did not converge: applied_generation=%d desired_generation=%d", receipt.AppliedGeneration, receipt.DesiredGeneration)}
+		}
+		if server.applyStateEnabled() {
+			applyState, err := server.applyGenerationState.Snapshot()
+			if err != nil {
+				return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: "apply state is unavailable: " + err.Error()}
+			}
+			if applyState.AppliedGeneration > 0 && (applyState.AppliedGeneration != receipt.DesiredGeneration || applyState.AppliedDesiredHash != receipt.DesiredHash) {
+				return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: fmt.Sprintf("VPP apply receipt generation %d/%s does not match applied state %d/%s", receipt.DesiredGeneration, shortRuntimeHash(receipt.DesiredHash), applyState.AppliedGeneration, shortRuntimeHash(applyState.AppliedDesiredHash))}
+			}
+		}
+	}
+	if receipt.TransactionID == "" || receipt.TransactionID != server.runtimeEvidence().TransactionID || receipt.AppliedAt.IsZero() || receipt.ReadbackAt.IsZero() {
+		return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: "VPP apply receipt identity or timestamps are incomplete"}
+	}
+	// The VPP apply receipt is a commit artifact: ReadbackAt records when the
+	// generation was applied. Its age must not degrade a running VPP service,
+	// otherwise every gateway silently turns degraded five minutes after a
+	// successful apply. Live availability is proved by the VPP service health
+	// probe above and by the command results recorded in the receipt.
+	if len(receipt.Operations) == 0 {
+		return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: "VPP apply receipt has no operations"}
+	}
+	for _, operation := range receipt.Operations {
+		if strings.TrimSpace(operation.Name) == "" || len(operation.Results) == 0 {
+			return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: "VPP apply receipt has incomplete operation results"}
+		}
+		for _, result := range operation.Results {
+			if result.Status != "applied" && result.Status != "ignored-failure" {
+				return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: "VPP apply command did not apply: " + result.Command}
+			}
+		}
+	}
+	return RuntimeComponentState{Name: "vpp", State: "running", Available: true, Reason: fmt.Sprintf("VPP apply receipt applied %d operations", len(receipt.Operations))}
+}
+
+func (server *Server) readVPPApplyReceipt() (vppApplyReceipt, error) {
+	path := strings.TrimSpace(server.vppReceiptPath)
+	if path == "" {
+		return vppApplyReceipt{}, fmt.Errorf("VPP apply receipt path is not configured")
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return vppApplyReceipt{}, fmt.Errorf("VPP apply receipt is not available: %v", err)
+	}
+	var receipt vppApplyReceipt
+	if err := json.Unmarshal(content, &receipt); err != nil {
+		return vppApplyReceipt{}, fmt.Errorf("VPP apply receipt is invalid: %v", err)
+	}
+	return receipt, nil
+}
+
+func (server *Server) vppReceiptPolicyHits(runtimeStateValue string) ([]map[string]any, []controlapi.CapabilityState) {
+	receipt, err := server.readVPPApplyReceipt()
+	if err != nil {
+		return []map[string]any{}, []controlapi.CapabilityState{{Name: "vpp_policy_readback", Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()}}
+	}
+	items := make([]map[string]any, 0, len(receipt.Operations))
+	for _, operation := range receipt.Operations {
+		if !isPolicyReadbackOperation(operation.Name) {
+			continue
+		}
+		applied, failed := 0, 0
+		commands := make([]map[string]any, 0, len(operation.Results))
+		for _, result := range operation.Results {
+			if result.Status == "applied" || result.Status == "ignored-failure" {
+				applied++
+			} else {
+				failed++
+			}
+			commands = append(commands, map[string]any{"command": result.Command, "status": result.Status})
+		}
+		state := "applied"
+		if failed > 0 || receipt.Status != "applied" || receipt.DryRun {
+			state = "degraded"
+		}
+		items = append(items, map[string]any{"id": operation.Resource, "operation": operation.Name, "runtime_state": runtimeStateValue, "readback_state": state, "applied_commands": applied, "failed_commands": failed, "hits": 0, "hit_source": "vpp_apply_receipt", "commands": commands})
+	}
+	if len(items) == 0 {
+		return items, []controlapi.CapabilityState{{Name: "vpp_policy_readback", Available: false, State: controlapi.CapabilityDegraded, Reason: "VPP apply receipt has no policy/NAT readback operations"}}
+	}
+	return items, []controlapi.CapabilityState{{Name: "vpp_policy_readback", Available: true, State: controlapi.CapabilityAvailable}}
+}
+
+func normalizePolicyHits(items []map[string]any, runtimeStateValue, source string) []map[string]any {
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		clone := cloneObject(item)
+		clone["runtime_state"] = runtimeStateValue
+		if stringField(clone, "hit_source") == "" {
+			clone["hit_source"] = source
+		}
+		if _, ok := clone["hits"]; !ok {
+			clone["hits"] = 0
+		}
+		result = append(result, clone)
+	}
+	return result
+}
+
+func isPolicyReadbackOperation(name string) bool {
+	switch name {
+	case "vpp.route-policy", "vpp.security-acl", "vpp.nat44-ed.static-mapping", "vpp.pbr.next-hop-group":
+		return true
+	default:
+		return false
+	}
+}
+
+func alignAddressAssignmentsWithPath(assignments []vpp.AddressAssignment, path vpp.NativePath) {
+	selected := make(map[string]string, len(path.Attachments))
+	for _, attachment := range path.Attachments {
+		name := strings.TrimSpace(attachment.LinuxInterface)
+		if name == "" || strings.TrimSpace(attachment.VPPInterface) == "" {
+			continue
+		}
+		selected[name] = strings.TrimSpace(attachment.VPPInterface)
+	}
+	for index := range assignments {
+		if vppInterface := selected[strings.TrimSpace(assignments[index].LinuxInterface)]; vppInterface != "" {
+			assignments[index].VPPInterface = vppInterface
+		}
+	}
+}
+
+func pathUsesAFPacket(path vpp.NativePath) bool {
+	for _, attachment := range path.Attachments {
+		if attachment.Hook == vpp.NativeHookAFPacket && attachment.Mode == vpp.NativeModeAFPacket {
+			return true
+		}
+	}
+	return false
+}
+
+// afPacketRuntimeComponent reports the AF_PACKET transport as a running
+// component with a performance note. AF_PACKET is only selectable after an
+// explicit consent (the env acceptance switch or the persisted dataplane
+// policy), so it forwards traffic as configured and must not turn an otherwise
+// committed gateway generation into a degraded runtime. Unconsented AF_PACKET
+// is rejected during path selection, so it can never reach this component.
+func afPacketRuntimeComponent(path vpp.NativePath) (RuntimeComponentState, bool) {
+	if !pathUsesAFPacket(path) {
+		return RuntimeComponentState{}, false
+	}
+	return RuntimeComponentState{
+		Name:      "af_packet_fallback",
+		State:     "running",
+		Available: true,
+		Reason:    vpp.AFPacketDegradedReason,
+	}, true
+}
+
+func runtimeState(components []RuntimeComponentState) string {
+	state := "running"
+	for _, component := range components {
+		// Capability-only states describe an optional feature, not dataplane
+		// convergence: an unsupported or unknown QoS facility must not mark a
+		// healthy forwarding generation degraded.
+		if component.State == "not_configured" || component.State == "skipped" || component.State == "unsupported" || component.State == "unknown" {
+			continue
+		}
+		if component.State == "unavailable" {
+			return "degraded"
+		}
+		if component.State != "running" {
+			state = "degraded"
+		}
+	}
+	return state
+}
+
+func (server *Server) recordRuntimeApply(ctx context.Context, result RuntimeApplyResult, session Session, r *http.Request) error {
+	if applyResultCommitted(result) {
+		server.setRuntimeEvidence(result)
+	} else {
+		server.publishFailedRuntimeResult(nil, result)
+	}
+	status := "success"
+	if result.Status != "committed" {
+		status = "failure"
+	}
+	server.recordAudit(session.Username, session.Role, "/api/v1/runtime/apply", "apply", status, result.Reason, r)
+	if server.store == nil {
+		return nil
+	}
+	payload, hash, err := persistence.MarshalPayload(result)
+	if err != nil {
+		return fmt.Errorf("marshal runtime apply result: %w", err)
+	}
+	event := persistence.AuditEvent{ID: "runtime-apply-" + result.TransactionID, Timestamp: result.AppliedAt, Actor: session.Username, Role: session.Role, Resource: "/api/v1/runtime/apply", Action: "apply", AfterHash: hash, Status: status, Error: auditSafeText(result.Reason), TransactionID: result.TransactionID}
+	if result.Status != RuntimeStatusCommitted || !completeRuntimeEvidence(result, server.now().UTC()) {
+		if err := server.store.SaveAuditEvents(ctx, []persistence.AuditEvent{event}); err != nil {
+			return fmt.Errorf("save runtime apply audit: %w", err)
+		}
+		return nil
+	}
+	if err := server.store.SaveApply(ctx, persistence.ApplyRecord{Snapshot: persistence.RuntimeSnapshot{ID: "snapshot-" + result.TransactionID, SourceTransactionID: result.TransactionID, Payload: payload, PayloadHash: hash, CreatedAt: result.AppliedAt}, AuditEvents: []persistence.AuditEvent{event}}); err != nil {
+		return fmt.Errorf("save committed runtime generation: %w", err)
+	}
+	return nil
+}
+
+// runtimePlanHash identifies the desired generation, not the observation that
+// produced it. The live capability proof (native path attachments, candidates,
+// observed_at/valid_until) changes on every probe, so hashing the whole runtime
+// plan made an unchanged configuration look like a new generation after every
+// restart and boot re-apply.
+func runtimePlanHash(plan RuntimePlan) string {
+	gateway := plan.GatewayPlan
+	identity := struct {
+		AddressAssignments []vpp.AddressAssignment
+		Interfaces         []vpp.InterfaceState
+		Bonds              []vpp.BondState
+		Proxy              proxy.CompiledEgress
+		Flow               flow.CompiledIntent
+		NAT                nat.CompiledConfig
+		Policy             trafficpolicy.Config
+		Security           vpp.SecurityGeneration
+		DNSInterception    bool
+		DNSABFSteering     bool
+		LANVPPInterfaces   []string
+		DNSServiceNetworks []vpp.DNSServiceNetwork
+		SkipQoS            bool
+		DataplanePolicy    DataplanePolicy
+	}{
+		AddressAssignments: gateway.AddressAssignments,
+		Interfaces:         gateway.Interfaces,
+		Bonds:              gateway.Bonds,
+		Proxy:              gateway.Proxy,
+		Flow:               gateway.Flow,
+		NAT:                gateway.NAT,
+		Policy:             gateway.Policy,
+		Security:           gateway.Security,
+		DNSInterception:    gateway.DNSInterception,
+		DNSABFSteering:     gateway.DNSABFSteering,
+		LANVPPInterfaces:   gateway.LANVPPInterfaces,
+		DNSServiceNetworks: gateway.DNSServiceNetworks,
+		SkipQoS:            gateway.SkipQoS,
+		DataplanePolicy:    plan.DataplanePolicy,
+	}
+	_, hash, err := persistence.MarshalPayload(identity)
+	if err != nil {
+		return ""
+	}
+	return hash
+}
+
+func artifactServiceNames(artifacts []serviceRuntime.RenderedArtifact) []string {
+	seen := map[string]struct{}{}
+	var names []string
+	for _, artifact := range artifacts {
+		name := string(artifact.Service)
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names
+}
+
+func summarizeRuntimeArtifacts(artifacts []serviceRuntime.RenderedArtifact) []RuntimeArtifactSummary {
+	summaries := make([]RuntimeArtifactSummary, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		summaries = append(summaries, RuntimeArtifactSummary{Service: artifact.Service, Path: artifact.Path, ContentHash: artifact.ContentHash, ReloadMode: artifact.ReloadMode})
+	}
+	return summaries
+}
+
+func summarizePPPoEPeers(peers []serviceRuntime.PPPoEPeer) []RuntimePPPoEPeerSummary {
+	summaries := make([]RuntimePPPoEPeerSummary, 0, len(peers))
+	for _, peer := range peers {
+		summaries = append(summaries, RuntimePPPoEPeerSummary{ID: peer.ID, Interface: peer.Interface, Username: peer.Username, MTU: peer.MTU, MRU: peer.MRU})
+	}
+	return summaries
+}
+
+func stringSliceField(item map[string]any, key string) []string {
+	values, ok := item[key].([]any)
+	if !ok {
+		if strings, ok := item[key].([]string); ok {
+			return append([]string(nil), strings...)
+		}
+		return nil
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+			result = append(result, text)
+		}
+	}
+	return result
+}
+
+func firstStringField(item map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := stringField(item, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (server *Server) handleConfigApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", "/api/v1/config/apply", "apply", "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "denied", "readonly mutation denied", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, "/api/v1/config/apply", "apply") {
+		return
+	}
+	// config/apply performs the same destructive VPP/daemon transition as
+	// runtime/apply. Check before the async front-end creates a worker state so
+	// a hot device does not report apply_in_progress and then fail halfway.
+	if server.rejectDestructiveThermal(w, r, session, "/api/v1/config/apply", "apply") {
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	if configApplyAsyncEnabled() && r.Header.Get(headerConfigApplyWorker) == "" {
+		server.handleConfigApplyAsync(w, r)
+		return
+	}
+	var req ConfigApplyRequest
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := decodeStrictJSON(r, &req); err != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+			return
+		}
+	}
+	if queryForce := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("force"))); queryForce == "1" || queryForce == "true" {
+		req.Force = true
+	}
+	transactionID := ""
+	if r.Header.Get(headerConfigApplyWorker) == "1" {
+		transactionID = strings.TrimSpace(r.Header.Get(headerConfigApplyTxn))
+	}
+	if transactionID == "" {
+		transactionID = "txn-" + newRequestID()
+	}
+	lease, acquired := server.beginApply("config apply", transactionID, 0)
+	if !acquired {
+		// The async front-end already rejects a second click, but a sync caller
+		// (or a worker racing a proxy reconcile) must also get an immediate
+		// answer instead of queueing behind an apply for minutes. Report the
+		// transaction that actually owns the gate so a poller follows real
+		// evidence instead of a phantom ID.
+		inFlight := server.applyState()
+		response := map[string]any{
+			"status": "apply_in_progress", "runtime_state": "applying",
+			"reason":              "another configuration apply is in progress",
+			"in_flight_apply":     inFlight,
+			"retry_after_seconds": 2,
+			"request_id":          requestID(r),
+		}
+		if inFlight.TransactionID != "" {
+			response["transaction_id"] = inFlight.TransactionID
+			response["query"] = configApplyAsyncQueryPath + "?transaction_id=" + url.QueryEscape(inFlight.TransactionID)
+		}
+		writeJSON(w, http.StatusAccepted, response)
+		return
+	}
+	defer lease.release()
+	applyCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), server.applyTimeoutOrDefault())
+	defer cancel()
+	buffered := newBufferedHTTPResponse()
+	completed := runBoundedWork(applyCtx, server.applyGraceOrDefault(), func() {
+		server.executeConfigApply(buffered, r, session, req, applyCtx, transactionID, lease)
+	})
+	if !completed {
+		cancel()
+		lease.expired.Store(true)
+		reason := applyTimeoutReason("configuration apply", server.applyTimeoutOrDefault())
+		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", reason, r)
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "apply_failed", "runtime_state": "degraded", "reason": reason, "transaction_id": transactionID, "query": configApplyAsyncQueryPath + "?transaction_id=" + url.QueryEscape(transactionID), "request_id": requestID(r)})
+		return
+	}
+	buffered.flushTo(w)
+}
+
+// executeConfigApply is the bounded body of /api/v1/config/apply, shared by the
+// synchronous handler and the asynchronous worker. The caller owns the apply
+// gate and its bounded context.
+func (server *Server) executeConfigApply(w http.ResponseWriter, r *http.Request, session Session, req ConfigApplyRequest, applyCtx context.Context, transactionID string, lease *applyLease) {
+	if server.applyWorkOverride != nil {
+		server.applyWorkOverride(applyCtx, "config apply", w)
+		return
+	}
+	// Dataplane capability is observed actively before compiling the
+	// transaction. A probe failure is a degradation reported by the plan, never
+	// a dataplane lock: the UI writes through this endpoint and a transient
+	// probe outage must not block an otherwise valid configuration change.
+	_ = server.refreshDataplaneCapability(applyCtx)
+	// WS-K apply preflight: build the dependency graph, refuse a cycle before
+	// any plan or VPP work, and skip a repeat apply whose configuration graph is
+	// unchanged and still committed.
+	graph, graphState, graphErr := server.configGraphApplyPreflight(applyCtx)
+	if graphErr != nil {
+		var cycle errDependencyCycle
+		if errors.As(graphErr, &cycle) {
+			server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", graphErr.Error(), r)
+			server.recordConfigGraphApplyStatus(applyCtx, "failed", transactionID, graphErr.Error())
+			writeJSON(w, http.StatusUnprocessableEntity, configGraphApplyFailureResponse(r, transactionID, graph, graphErr))
+			return
+		}
+		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", graphErr.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "dependency_graph_failed", graphErr.Error())
+		return
+	}
+	if decision := server.configGraphApplySkip(applyCtx, req, graph, graphState); decision.Skip {
+		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "skipped", decision.Reason, r)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":           "skipped",
+			"runtime_state":    "running",
+			"reason":           decision.Reason,
+			"graph_generation": decision.Generation,
+			"content_hash":     decision.ContentHash,
+			"transaction_id":   transactionID,
+			"dependency_plan":  server.configDependencyPlan(applyCtx),
+			"request_id":       requestID(r),
+		})
+		return
+	}
+	// The generation is now in flight. A crash or a rejected apply must not
+	// leave the previous "applied" marker authoritative, or the next click would
+	// skip work that never ran.
+	server.recordConfigGraphApplyStatus(applyCtx, "in_progress", transactionID, "")
+	runtimePlan, proxyEgress, flowIntent, err := server.configApplyPlan(applyCtx, transactionID, req.ProxyEgress, req.FlowIntent)
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", err.Error(), r)
+		server.recordConfigGraphApplyStatus(applyCtx, "failed", transactionID, err.Error())
+		writeError(w, r, http.StatusUnprocessableEntity, "config_apply_plan_failed", err.Error())
+		return
+	}
+	sourceHash, err := server.runtimeDesiredSourceHash(applyCtx)
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", err.Error(), r)
+		server.recordConfigGraphApplyStatus(applyCtx, "failed", transactionID, err.Error())
+		writeError(w, r, http.StatusUnprocessableEntity, "config_apply_source_hash_failed", err.Error())
+		return
+	}
+	// A clean boot can compile the plan before PPPoE has an address. Port maps
+	// bound to that dynamic WAN are deliberately deferred by the NAT compiler,
+	// so the first transaction would otherwise commit without them. Start the
+	// PPPoE helper from the already-rendered artifacts, wait for the live lease,
+	// then rebuild the plan before creating the transaction.
+	if configApplyAsyncEnabled() && server.portMapsAwaitingDynamicWAN(applyCtx, runtimePlan) && server.serviceRuntimeConfigured() {
+		pppoeArtifacts := artifactsForService(runtimePlan.RuntimeArtifacts, serviceRuntime.PPPoE)
+		if len(pppoeArtifacts) > 0 {
+			report := server.services.ApplyCapabilitiesForTransaction(applyCtx, transactionID, pppoeArtifacts)
+			if err := report.Err(); err != nil {
+				server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", "PPPoE bootstrap: "+err.Error(), r)
+				writeJSON(w, http.StatusAccepted, map[string]any{"status": "apply_failed", "runtime_state": "degraded", "reason": "PPPoE bootstrap: " + err.Error(), "transaction_id": transactionID, "request_id": requestID(r)})
+				return
+			}
+			deadline := server.now().Add(90 * time.Second)
+		waitLease:
+			for server.now().Before(deadline) {
+				current, currentErr := server.currentNATConfig(applyCtx)
+				if currentErr == nil && len(current.PortMappings) >= server.desiredPortMapCount(applyCtx) {
+					break
+				}
+				select {
+				case <-applyCtx.Done():
+					break waitLease
+				case <-time.After(2 * time.Second):
+				}
+			}
+			runtimePlan, proxyEgress, flowIntent, err = server.configApplyPlan(applyCtx, transactionID, req.ProxyEgress, req.FlowIntent)
+			if err != nil {
+				writeError(w, r, http.StatusUnprocessableEntity, "config_apply_plan_failed", err.Error())
+				return
+			}
+		}
+	}
+	if runtimePlan.DataplaneState == "dataplane_locked" || runtimePlan.DataplaneState == "dataplane_degraded" {
+		reason := dataplaneLockedReason(runtimePlan.DataplaneProof, runtimePlan.Warnings)
+		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", reason, r)
+		server.recordConfigGraphApplyStatus(applyCtx, "failed", transactionID, reason)
+		writeJSON(w, http.StatusLocked, map[string]any{
+			"status":                  runtimePlan.DataplaneState,
+			"runtime_state":           "degraded",
+			"reason":                  reason,
+			"dataplane_prerequisites": runtimePlan.DataplaneProof,
+			"dataplane_degradations":  runtimePlan.DataplaneDegradations,
+			"capability_source":       runtimePlan.CapabilitySource,
+			"transaction_id":          transactionID,
+			"request_id":              requestID(r),
+		})
+		return
+	}
+	serviceArtifacts := runtimeServiceArtifacts(runtimePlan.RuntimeArtifacts, server.gatewayTransaction != nil)
+	evidenceRequest := RuntimeEvidenceRequest{TransactionID: transactionID, Capability: "/api/v1/config/apply", Artifacts: serviceArtifacts}
+	appliedArtifacts := make([]serviceRuntime.RenderedArtifact, 0, len(serviceArtifacts))
+	var capabilityFailures []apply.CapabilityFailureEvidence
+	var hooks *apply.ApplyHooks
+	executor := apply.Executor{
+		Store:   server.store,
+		Now:     server.now,
+		Gateway: server.gatewayTransaction,
+		Receipt: func(ctx context.Context, _ apply.Plan) (apply.ApplyReceipt, error) {
+			return server.runtimeReceipt(ctx, evidenceRequest)
+		},
+		HealthCheck: func(healthCtx context.Context, _ apply.Plan) error {
+			if server.services == nil {
+				return errors.New("live runtime health checker is not configured")
+			}
+			if len(artifactsForService(appliedArtifacts, serviceRuntime.Xray)) == 0 {
+				return nil
+			}
+			health, err := server.services.HealthCheck(healthCtx, serviceRuntime.Xray)
+			if err != nil {
+				return err
+			}
+			for _, item := range health {
+				if !item.Available {
+					return fmt.Errorf("%s health degraded: %s", item.Service, item.Reason)
+				}
+			}
+			return nil
+		},
+		Readback: func(ctx context.Context, _ apply.Plan) (apply.Readback, error) {
+			return server.runtimeReadback(ctx, evidenceRequest)
+		},
+		CapabilityFailures: func() []apply.CapabilityFailureEvidence { return capabilityFailures },
+	}
+	configApplyIdentity := serviceRuntime.ApplyIdentity{TransactionID: transactionID, DesiredHash: sourceHash}
+	if gatewaySupportsApplyGraph(server.gatewayTransaction) {
+		hooks = server.buildApplyHooks(configApplyIdentity, serviceArtifacts, &evidenceRequest, &appliedArtifacts, &capabilityFailures)
+	} else {
+		server.configureLegacyServiceStages(&executor, configApplyIdentity, serviceArtifacts, &evidenceRequest, &appliedArtifacts, &capabilityFailures)
+	}
+	executor.BeforeCommit = server.runtimeGenerationCommitCheck(transactionID, sourceHash, serviceArtifacts, &appliedArtifacts)
+	applyLANPlan := runtimePlan.GatewayPlan
+	if assignments, err := server.runtimeAddressAssignments(applyCtx); err == nil && len(assignments) > 0 {
+		applyLANPlan.AddressAssignments = assignments
+	}
+	restoreLAN := setApplyLANVPPEnvironment(applyLANPlan)
+	defer restoreLAN()
+	result, err := executor.Run(applyCtx, apply.Request{
+		TransactionID:      transactionID,
+		Actor:              session.Username,
+		Role:               session.Role,
+		Resource:           "/api/v1/config/apply",
+		ProxyEgress:        proxyEgress,
+		FlowIntent:         flowIntent,
+		SnapshotID:         "snapshot-" + transactionID,
+		PreviousSnapshotID: server.latestRuntimeSnapshotID(applyCtx),
+		RollbackID:         "rollback-" + transactionID,
+		GatewayPlan:        runtimePlan.GatewayPlan,
+		GenerationHash:     runtimePlanHash(runtimePlan),
+		Hooks:              hooks,
+		SourceHash:         sourceHash,
+		ArtifactHashes:     runtimeArtifactHashes(serviceArtifacts),
+	})
+	if err != nil {
+		failed := degradedRuntimeResult(transactionID, err.Error(), server.now().UTC())
+		failed.Status = "apply_failed"
+		failed.RollbackReceipt = result.RollbackReceipt
+		server.publishFailedRuntimeResult(lease, failed)
+		server.recordAudit(session.Username, session.Role, "/api/v1/config/apply", "apply", "failure", err.Error(), r)
+		server.recordConfigGraphApplyStatus(applyCtx, "failed", transactionID, err.Error())
+		response := server.applyFailureResponse(failed, "runtime transaction: "+err.Error(), nil)
+		response["rollback"] = rollbackResponse(result.Rollback)
+		response["events"] = applyEventResponses(result.Events)
+		response["request_id"] = requestID(r)
+		writeJSON(w, http.StatusAccepted, response)
+		return
+	}
+	runtimeResult := RuntimeApplyResult{Status: RuntimeStatusCommitted, RuntimeState: RuntimeStateRunning, TransactionID: transactionID, Receipt: result.Receipt, Readback: result.Readback, GatewayPlan: &runtimePlan.GatewayPlan, GatewayEvidence: result.GatewayResult.Evidence, AppliedAt: result.Receipt.AppliedAt, CapabilityFailures: capabilityFailures, SnapshotHash: runtimePlanHash(runtimePlan), SourceHash: sourceHash, ArtifactHashes: runtimeArtifactHashes(serviceArtifacts), Applied: artifactServiceNames(appliedArtifacts)}
+	runtimeResult.Components = server.applyQoSPlanState(runtimeResult.Components, runtimePlan.QoSSkipped, runtimePlan.QoSReason)
+	statusCode := http.StatusOK
+	if len(capabilityFailures) > 0 {
+		runtimeResult.Status = apply.ReceiptDegraded
+		runtimeResult.RuntimeState = "degraded"
+		runtimeResult.Reason = "runtime apply completed with degraded capabilities"
+		statusCode = http.StatusAccepted
+	}
+	server.publishRuntimeResult(lease, runtimeResult)
+	server.recordConfigGraphApplied(applyCtx, transactionID, graph)
+	finalPlan := server.configDependencyPlan(applyCtx)
+	writeJSON(w, statusCode, map[string]any{"status": runtimeResult.Status, "runtime_state": runtimeResult.RuntimeState, "reason": runtimeResult.Reason, "transaction_id": transactionID, "source_hash": sourceHash, "snapshot_hash": runtimeResult.SnapshotHash, "graph_generation": finalPlan.GraphGeneration, "dependency_plan": finalPlan, "apply_receipt": result.Receipt, "readback": result.Readback, "capability_failures": capabilityFailures, "gateway_resources": result.GatewayResult.Order, "events": applyEventResponses(result.Events), "request_id": requestID(r)})
+}
+
+func configApplyAsyncEnabled() bool {
+	return envBoolOrDefault("LY_ROUTE_CONFIG_APPLY_ASYNC", false)
+}
+
+func (server *Server) handleConfigApplyAsync(w http.ResponseWriter, r *http.Request) {
+	if state, ok := server.configApplyState(""); ok && state.Status == "apply_in_progress" {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"status": "apply_in_progress", "runtime_state": "applying",
+			"reason":          "another configuration apply is in progress",
+			"transaction_id":  state.TransactionID,
+			"in_flight_apply": server.applyState(),
+			"query":           state.Query,
+			"request_id":      requestID(r),
+		})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body could not be read")
+		return
+	}
+	transactionID := "txn-" + newRequestID()
+	server.setConfigApplyState(ConfigApplyAsyncState{
+		TransactionID: transactionID, Status: "apply_in_progress", RuntimeState: "applying",
+		HTTPStatus: http.StatusAccepted, UpdatedAt: server.now().UTC(),
+		Query: configApplyAsyncQueryPath + "?transaction_id=" + url.QueryEscape(transactionID),
+	})
+	worker := r.Clone(context.WithoutCancel(r.Context()))
+	worker.Body = io.NopCloser(bytes.NewReader(body))
+	worker.Header.Set(headerConfigApplyWorker, "1")
+	worker.Header.Set(headerConfigApplyTxn, transactionID)
+	go func() {
+		recorder := httptest.NewRecorder()
+		server.handleConfigApply(recorder, worker)
+		state := ConfigApplyAsyncState{
+			TransactionID: transactionID, Status: "apply_failed", RuntimeState: "degraded",
+			HTTPStatus: recorder.Code, UpdatedAt: server.now().UTC(),
+			Query: configApplyAsyncQueryPath + "?transaction_id=" + url.QueryEscape(transactionID),
+		}
+		var response map[string]any
+		if json.Unmarshal(recorder.Body.Bytes(), &response) == nil {
+			state.Status = stringField(response, "status")
+			state.RuntimeState = stringField(response, "runtime_state")
+			state.Reason = stringField(response, "reason")
+		}
+		if state.Status == "" {
+			state.Status = "apply_failed"
+		}
+		if state.Status == "apply_in_progress" {
+			// The worker could not take the apply gate. It did not queue, so
+			// this transaction will never run: record a terminal failure instead
+			// of leaving /config/apply/status reporting apply_in_progress
+			// forever.
+			state.Status = "apply_failed"
+			state.RuntimeState = "degraded"
+			state.HTTPStatus = http.StatusAccepted
+			if strings.TrimSpace(state.Reason) == "" {
+				state.Reason = "another apply is already in progress"
+			}
+		}
+		if state.RuntimeState == "" {
+			state.RuntimeState = "degraded"
+		}
+		server.setConfigApplyState(state)
+	}()
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status": "apply_in_progress", "runtime_state": "applying", "transaction_id": transactionID,
+		"query":      configApplyAsyncQueryPath + "?transaction_id=" + url.QueryEscape(transactionID),
+		"request_id": requestID(r),
+	})
+}
+
+func (server *Server) configApplyInProgress() bool {
+	state, ok := server.configApplyState(server.latestConfigApplyAsync)
+	return ok && state.Status == "apply_in_progress"
+}
+
+// configApplyState returns one async apply state, converting a record that has
+// outlived the bounded apply window into a terminal apply_failed state. The
+// bound is enforced by the worker itself; this read-side repair covers states
+// written by an older supervisor or a process that died before it could record
+// the terminal result.
+func (server *Server) configApplyState(transactionID string) (ConfigApplyAsyncState, bool) {
+	server.configApplyAsyncMu.Lock()
+	defer server.configApplyAsyncMu.Unlock()
+	if transactionID == "" {
+		transactionID = server.latestConfigApplyAsync
+	}
+	state, ok := server.configApplyAsync[transactionID]
+	if !ok {
+		return ConfigApplyAsyncState{}, false
+	}
+	if state.Status == "apply_in_progress" {
+		// Do not race a live worker: repair only when no apply owns the gate
+		// and the record has clearly outlived both the bound and the short
+		// window in which a worker acquires the gate after the async response.
+		bound := server.applyTimeoutOrDefault() + server.applyGraceOrDefault() + 30*time.Second
+		updated := state.UpdatedAt
+		if !server.applyState().InProgress && (updated.IsZero() || server.now().UTC().Sub(updated) > bound) {
+			state.Status = "apply_failed"
+			state.RuntimeState = "degraded"
+			state.HTTPStatus = http.StatusAccepted
+			state.Reason = applyTimeoutReason("configuration apply", server.applyTimeoutOrDefault())
+			state.UpdatedAt = server.now().UTC()
+			server.configApplyAsync[transactionID] = state
+		}
+	}
+	return state, true
+}
+
+func (server *Server) setConfigApplyState(state ConfigApplyAsyncState) {
+	server.configApplyAsyncMu.Lock()
+	defer server.configApplyAsyncMu.Unlock()
+	if server.configApplyAsync == nil {
+		server.configApplyAsync = make(map[string]ConfigApplyAsyncState)
+	}
+	server.configApplyAsync[state.TransactionID] = state
+	server.latestConfigApplyAsync = state.TransactionID
+}
+
+func (server *Server) handleConfigApplyStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	if _, ok := server.sessionFromRequest(r); !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	transactionID := strings.TrimSpace(r.URL.Query().Get("transaction_id"))
+	state, ok := server.configApplyState(transactionID)
+	if !ok {
+		writeError(w, r, http.StatusNotFound, "apply_not_found", "no apply transaction matches this ID")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": state.Status, "runtime_state": state.RuntimeState, "reason": state.Reason, "transaction_id": state.TransactionID, "http_status": state.HTTPStatus, "updated_at": state.UpdatedAt, "query": state.Query, "request_id": requestID(r)})
+}
+
+// setApplyLANVPPEnvironment binds legacy VPP command placeholders to the LAN
+// assignment for the duration of one apply transaction. It is scoped here (and
+// restored before the response) so previews and concurrent readers never see a
+// mutable process-wide value.
+func setApplyLANVPPEnvironment(plan vpp.Plan) func() {
+	linux := ""
+	for _, assignment := range plan.AddressAssignments {
+		if strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			linux = strings.TrimSpace(assignment.LinuxInterface)
+			break
+		}
+	}
+	if linux == "" {
+		for _, state := range plan.Interfaces {
+			name := strings.TrimSpace(state.Name)
+			if strings.HasPrefix(name, "lyroute-") && len(state.Addresses) > 0 {
+				linux = strings.TrimPrefix(name, "lyroute-")
+				break
+			}
+		}
+	}
+	if linux == "" {
+		return func() {}
+	}
+	previous, found := os.LookupEnv("LY_ROUTE_LAN_INTERFACE")
+	_ = os.Setenv("LY_ROUTE_LAN_INTERFACE", linux)
+	return func() {
+		if found {
+			_ = os.Setenv("LY_ROUTE_LAN_INTERFACE", previous)
+			return
+		}
+		_ = os.Unsetenv("LY_ROUTE_LAN_INTERFACE")
+	}
+}
+
+func (server *Server) desiredPortMapCount(ctx context.Context) int {
+	items, err := server.desiredItems(ctx, "port_map")
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, item := range items {
+		if value, ok := item["enabled"]; ok && !truthy(value) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func (server *Server) portMapsAwaitingDynamicWAN(ctx context.Context, plan RuntimePlan) bool {
+	desired := server.desiredPortMapCount(ctx)
+	return desired > 0 && len(plan.CompiledNAT.PortMappings) < desired
+}
+
+func (server *Server) configApplyPlan(ctx context.Context, requestID string, overrideProxy *proxy.Egress, overrideFlow *flow.Intent) (RuntimePlan, proxy.Egress, flow.Intent, error) {
+	// An apply must honour a soft-deleted proxy egress.  The stored-count-aware
+	// form keeps the hidden default out of the transaction after it is deleted.
+	proxyEgress, hasProxyEgress, err := server.runtimeProxyEgress(ctx)
+	if err != nil {
+		return RuntimePlan{}, proxy.Egress{}, flow.Intent{}, err
+	}
+	if overrideProxy != nil && strings.TrimSpace(overrideProxy.ID) != "" {
+		proxyEgress = *overrideProxy
+		hasProxyEgress = true
+	}
+	if !hasProxyEgress {
+		proxyEgress = proxy.Egress{}
+	}
+	flowIntent, err := server.currentFlowIntent(ctx)
+	if err != nil {
+		return RuntimePlan{}, proxy.Egress{}, flow.Intent{}, err
+	}
+	if overrideFlow != nil {
+		flowIntent = *overrideFlow
+	}
+	plan, err := server.buildRuntimePlanFromConfig(ctx, requestID, proxyEgress, hasProxyEgress, flowIntent, true)
+	if err != nil {
+		return RuntimePlan{}, proxy.Egress{}, flow.Intent{}, err
+	}
+	return plan, proxyEgress, flowIntent, nil
+}
+
+func rollbackResponse(rollback persistence.RollbackMetadata) map[string]any {
+	if rollback.ID == "" {
+		return nil
+	}
+	return map[string]any{
+		"id":                 rollback.ID,
+		"target_snapshot_id": rollback.TargetSnapshotID,
+		"reason":             rollback.Reason,
+		"status":             rollback.Status,
+		"requested_at":       rollback.RequestedAt,
+		"completed_at":       rollback.CompletedAt,
+		"error":              rollback.Error,
+	}
+}
+
+func applyEventResponses(events []persistence.AuditEvent) []map[string]any {
+	items := make([]map[string]any, 0, len(events))
+	for _, event := range events {
+		items = append(items, map[string]any{
+			"id":             event.ID,
+			"timestamp":      event.Timestamp,
+			"actor":          event.Actor,
+			"role":           event.Role,
+			"resource":       event.Resource,
+			"action":         event.Action,
+			"before_hash":    event.BeforeHash,
+			"after_hash":     event.AfterHash,
+			"status":         event.Status,
+			"error":          auditSafeText(event.Error),
+			"transaction_id": event.TransactionID,
+		})
+	}
+	return items
+}
+
+func (server *Server) applyRuntimePlan(ctx context.Context, runtimePlan RuntimePlan, artifacts []serviceRuntime.RenderedArtifact) error {
+	return server.services.Apply(ctx, artifacts)
+}
+
+func (server *Server) rollbackRuntimePlan(ctx context.Context, runtimePlan RuntimePlan, executorPlan apply.Plan) error {
+	rollbackErrors := make([]error, 0, 2)
+	if server.gatewayTransaction != nil {
+		if err := server.gatewayTransaction.Rollback(ctx, executorPlan); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("rollback Gateway: %w", err))
+		}
+	}
+	if server.services == nil || !executorPlan.Previous.Available {
+		return errors.Join(rollbackErrors...)
+	}
+	if err := server.services.Rollback(ctx, runtimeServiceArtifacts(runtimePlan.RuntimeArtifacts, server.gatewayTransaction != nil)); err != nil {
+		rollbackErrors = append(rollbackErrors, fmt.Errorf("rollback services: %w", err))
+	}
+	return errors.Join(rollbackErrors...)
+}
+
+func (server *Server) handleConfigExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	if _, ok := server.sessionFromRequest(r); !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	state, err := server.exportDesiredConfig(r.Context())
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "config_export_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"package_manifest": configManifest(state), "payload": state, "request_id": requestID(r)})
+}
+
+func (server *Server) handleConfigImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", "/api/v1/config/import", "import", "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, "/api/v1/config/import", "import", "denied", "readonly mutation denied", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, "/api/v1/config/import", "import") {
+		return
+	}
+	var req ConfigImportRequest
+	if err := decodeStrictJSON(r, &req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+	if err := server.preflightConfigPackage(r.Context(), req.Payload, req.PackageManifest); err != nil {
+		code := "invalid_import_package"
+		if errors.Is(err, ErrConfigProductMismatch) {
+			code = "product_mismatch"
+		}
+		writeError(w, r, http.StatusUnprocessableEntity, code, err.Error())
+		return
+	}
+	if configPayloadContainsSecret(req.Payload) {
+		writeError(w, r, http.StatusUnprocessableEntity, "secret_material_rejected", "import package contains forbidden secret material")
+		return
+	}
+	documents, err := configDocumentsFromImport(req.Payload, server.now().UTC(), server.profile)
+	if err != nil {
+		writeError(w, r, http.StatusUnprocessableEntity, "invalid_import_package", err.Error())
+		return
+	}
+	orchestratorDocuments, err := server.orchestratorConfigDocuments(r.Context(), req.Payload, server.now().UTC())
+	if err != nil {
+		writeError(w, r, http.StatusUnprocessableEntity, "invalid_import_package", err.Error())
+		return
+	}
+	documents = append(documents, orchestratorDocuments...)
+	packageHash := hashConfigPayload(req.Payload)
+	diffHash := hashObject(map[string]any{"current": "desired_config", "incoming": packageHash})
+	if !req.Confirm {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "dry_run", "safe_to_apply": true, "rollback_snapshot_required": true, "package_hash": packageHash, "diff_hash": diffHash, "confirmation_package_hash": packageHash, "confirmation_diff_hash": diffHash, "confirmation_token": newRequestID(), "confirmation_actor": session.Username, "confirmation_expires_at": server.now().UTC().Add(15 * time.Minute), "request_id": requestID(r)})
+		return
+	}
+	if err := server.validateImportConfirmation(req, session.Username, packageHash, diffHash); err != nil {
+		writeError(w, r, http.StatusUnprocessableEntity, "confirmation_required", err.Error())
+		return
+	}
+	snapshot, err := server.createConfigSnapshot(r.Context(), "pre-import-"+newRequestID(), "config-import")
+	if err != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/config/import", "import", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "snapshot_create_failed", "pre-import snapshot could not be created")
+		return
+	}
+	if err := server.store.SaveConfigs(r.Context(), documents); err != nil {
+		server.recordAudit(session.Username, session.Role, "/api/v1/config/import", "import", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "config_import_failed", "desired config could not be imported")
+		return
+	}
+	server.recordAudit(session.Username, session.Role, "/api/v1/config/import", "import", "success", "", r)
+	server.bumpConfigGraphGeneration(r.Context(), "import", "config_package", packageHash, "")
+	writeJSON(w, http.StatusOK, map[string]any{"status": "persisted", "safe_to_apply": true, "runtime_state": "desired_not_applied", "package_hash": packageHash, "diff_hash": diffHash, "rollback_snapshot_id": snapshot.ID, "imported_resources": len(documents), "request_id": requestID(r)})
+}
+
+func (server *Server) handleFirmwareUpdateStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	if _, ok := server.sessionFromRequest(r); !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	server.firmwareMu.Lock()
+	status := server.firmwareStatus
+	server.firmwareMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"status": status, "request_id": requestID(r)})
+}
+
+func (server *Server) handleFirmwareUpdateStage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", "/api/v1/firmware/update/stage", "firmware_stage", "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, "/api/v1/firmware/update/stage", "firmware_stage", "denied", "readonly mutation denied", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, "/api/v1/firmware/update/stage", "firmware_stage") {
+		return
+	}
+	if err := r.ParseMultipartForm(1024 << 20); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid_multipart", "firmware package upload is required")
+		return
+	}
+	firmwareFile, _, err := r.FormFile("firmware")
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "missing_firmware", "firmware file is required")
+		return
+	}
+	defer firmwareFile.Close()
+	stageDir := server.firmwareStageDir
+	if err := os.MkdirAll(stageDir, 0o755); err != nil {
+		writeError(w, r, http.StatusInternalServerError, "firmware_stage_failed", err.Error())
+		return
+	}
+	firmwarePath := filepath.Join(stageDir, "upgrade-"+newRequestID()+".tar.zst")
+	out, err := os.OpenFile(firmwarePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "firmware_stage_failed", err.Error())
+		return
+	}
+	hash := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(out, hash), firmwareFile)
+	closeErr := out.Close()
+	if copyErr != nil {
+		writeError(w, r, http.StatusInternalServerError, "firmware_stage_failed", copyErr.Error())
+		return
+	}
+	if closeErr != nil {
+		writeError(w, r, http.StatusInternalServerError, "firmware_stage_failed", closeErr.Error())
+		return
+	}
+	imageHash := hex.EncodeToString(hash.Sum(nil))
+	if err := validateUpgradePackage(firmwarePath, server.profile.ID()); err != nil {
+		if removeErr := os.Remove(firmwarePath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			writeError(w, r, http.StatusInternalServerError, "firmware_stage_cleanup_failed", removeErr.Error())
+			return
+		}
+		server.recordAudit(session.Username, session.Role, "/api/v1/firmware/update/stage", "firmware_stage", "failure", err.Error(), r)
+		writeError(w, r, http.StatusUnprocessableEntity, "invalid_upgrade_package", err.Error())
+		return
+	}
+	configBackupPath, configBackupHash, configBackupSize, err := server.stageFirmwareConfigBackup(r.Context(), stageDir)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "config_backup_failed", err.Error())
+		return
+	}
+	server.firmwareMu.Lock()
+	server.firmwareStatus = FirmwareUpdateStatus{
+		Staged:           true,
+		ImagePath:        firmwarePath,
+		ImageHash:        imageHash,
+		ImageSize:        written,
+		ConfigBackupPath: configBackupPath,
+		ConfigBackupHash: configBackupHash,
+		ConfigBackupSize: configBackupSize,
+		StagedAt:         server.now(),
+		InstallCommand:   "校验升级包后复制 ly-route-control 到 /usr/lib/ly-route，并更新控制台前端资源后重启服务",
+	}
+	status := server.firmwareStatus
+	server.firmwareMu.Unlock()
+	server.recordAudit(session.Username, session.Role, "/api/v1/firmware/update/stage", "firmware_stage", "success", firmwarePath, r)
+	writeJSON(w, http.StatusOK, map[string]any{"status": status, "request_id": requestID(r)})
+}
+
+func (server *Server) handleFirmwareUpdateInstall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, "/api/v1/firmware/update/install", "firmware_install") {
+		return
+	}
+	var req firmwareInstallRequest
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := decodeStrictJSON(r, &req); err != nil {
+			writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+			return
+		}
+	}
+	if !req.ConfirmInstall {
+		writeError(w, r, http.StatusUnprocessableEntity, "install_not_confirmed", "firmware install requires confirm_install=true")
+		return
+	}
+	targetDir := strings.TrimSpace(req.TargetDir)
+	if targetDir == "" {
+		targetDir = "/usr/lib/ly-route"
+	}
+	if !safeFirmwareTargetDir(targetDir) {
+		writeError(w, r, http.StatusUnprocessableEntity, "invalid_target_dir", "target_dir must be /usr/lib/ly-route or /opt/ly-route-upgrades/<name>")
+		return
+	}
+	// Firmware install restarts the control plane and rewrites /usr/lib/ly-route;
+	// it is one of the most heat-intensive operations and must be refused long
+	// before a transient unit is launched.
+	if server.rejectDestructiveThermal(w, r, session, "/api/v1/firmware/update/install", "firmware_install") {
+		return
+	}
+	server.firmwareMu.Lock()
+	status := server.firmwareStatus
+	if !status.Staged || status.ImagePath == "" || status.ImageHash == "" {
+		server.firmwareMu.Unlock()
+		writeError(w, r, http.StatusConflict, "firmware_not_staged", "firmware must be uploaded and verified before install")
+		return
+	}
+	if status.Installing {
+		server.firmwareMu.Unlock()
+		writeError(w, r, http.StatusConflict, "firmware_installing", "firmware install is already running")
+		return
+	}
+	server.firmwareStatus.Installing = true
+	server.firmwareStatus.InstallStatus = "installing"
+	status = server.firmwareStatus
+	server.firmwareMu.Unlock()
+	invocation := firmwareUpgradeInstallInvocation(status.ImagePath, status.ImageHash, targetDir, req.Reboot)
+	if err := server.firmwareInstallStart(invocation); err != nil {
+		server.firmwareMu.Lock()
+		server.firmwareStatus.Installing = false
+		server.firmwareStatus.InstallStatus = "failed"
+		server.firmwareStatus.Reason = err.Error()
+		server.firmwareMu.Unlock()
+		server.recordAudit(session.Username, session.Role, "/api/v1/firmware/update/install", "firmware_install", "failure", err.Error(), r)
+		writeError(w, r, http.StatusInternalServerError, "firmware_install_failed", err.Error())
+		return
+	}
+	server.recordAudit(session.Username, session.Role, "/api/v1/firmware/update/install", "firmware_install", "accepted", status.ImageHash, r)
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": status, "target_dir": targetDir, "reboot": req.Reboot, "request_id": requestID(r)})
+}
+
+func safeFirmwareTargetDir(path string) bool {
+	if !strings.HasPrefix(path, "/") || strings.Contains(path, " ") || strings.Contains(path, "..") {
+		return false
+	}
+	if path == "/usr/lib/ly-route" {
+		return true
+	}
+	name := strings.TrimPrefix(path, "/opt/ly-route-upgrades/")
+	if name == path || name == "" || strings.Contains(name, "/") {
+		return false
+	}
+	for _, char := range name {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '.' || char == '_' || char == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (server *Server) stageFirmwareConfigBackup(ctx context.Context, stageDir string) (string, string, int64, error) {
+	state, err := server.exportDesiredConfig(ctx)
+	if err != nil {
+		return "", "", 0, err
+	}
+	packagePayload := map[string]any{"package_manifest": configManifest(state), "payload": state, "created_at": server.now().UTC()}
+	body, err := json.MarshalIndent(packagePayload, "", "  ")
+	if err != nil {
+		return "", "", 0, err
+	}
+	body = append(body, '\n')
+	backupPath := filepath.Join(stageDir, "ly-route-config-backup.json")
+	if err := os.WriteFile(backupPath, body, 0o600); err != nil {
+		return "", "", 0, err
+	}
+	hash := sha256.Sum256(body)
+	return backupPath, hex.EncodeToString(hash[:]), int64(len(body)), nil
+}
+
+func firmwareExpectedSHA256(body []byte) string {
+	fields := strings.Fields(string(body))
+	if len(fields) == 0 {
+		return ""
+	}
+	expected := strings.ToLower(strings.TrimSpace(fields[0]))
+	if len(expected) != sha256.Size*2 {
+		return ""
+	}
+	if _, err := hex.DecodeString(expected); err != nil {
+		return ""
+	}
+	return expected
+}
+
+func (server *Server) handleConfigSnapshots(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		if _, ok := server.sessionFromRequest(r); !ok {
+			writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		if server.store == nil {
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+			return
+		}
+		snapshots, err := server.store.RuntimeSnapshots(r.Context())
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "snapshot_list_failed", "snapshots could not be listed")
+			return
+		}
+		items := make([]map[string]any, 0, len(snapshots))
+		for _, snapshot := range snapshots {
+			items = append(items, snapshotResponse(snapshot, server.profile.ID()))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items, "capabilities": []controlapi.CapabilityState{{Name: "config_snapshots", Available: true, State: controlapi.CapabilityAvailable}}, "request_id": requestID(r)})
+	case http.MethodPost:
+		server.handleConfigSnapshotMutation(w, r, "create_snapshot")
+	default:
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+	}
+}
+
+func (server *Server) handleConfigSnapshotRestore(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		if _, ok := server.sessionFromRequest(r); !ok {
+			writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		if server.store == nil {
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+			return
+		}
+		id, _ := splitPathRemainder("/api/v1/config/snapshots/", r.URL.Path)
+		if id == "" {
+			writeError(w, r, http.StatusNotFound, "snapshot_not_found", "snapshot id is required")
+			return
+		}
+		snapshot, err := server.store.RuntimeSnapshot(r.Context(), id)
+		if errors.Is(err, persistence.ErrNotFound) {
+			writeError(w, r, http.StatusNotFound, "snapshot_not_found", "snapshot not found")
+			return
+		}
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "snapshot_read_failed", "snapshot could not be read")
+			return
+		}
+		if err := persistence.VerifyPayload(snapshot.Payload, snapshot.PayloadHash); err != nil {
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_snapshot", "snapshot integrity verification failed")
+			return
+		}
+		var payload ConfigPackagePayload
+		if err := json.Unmarshal(snapshot.Payload, &payload); err != nil {
+			writeError(w, r, http.StatusUnprocessableEntity, "invalid_snapshot", "snapshot payload is invalid")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"snapshot": snapshotResponse(snapshot, server.profile.ID()), "payload": payload, "request_id": requestID(r)})
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	server.handleConfigSnapshotMutation(w, r, "restore_snapshot")
+}
+
+func (server *Server) handleConfigFactoryReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	server.handleConfigSnapshotMutation(w, r, "factory_reset")
+}
+
+func (server *Server) handleConfigSnapshotMutation(w http.ResponseWriter, r *http.Request, action string) {
+	session, ok := server.sessionFromRequest(r)
+	if !ok {
+		server.recordAudit("anonymous", "system", r.URL.Path, action, "denied", "authentication required", r)
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "denied", "readonly mutation denied", r)
+		writeError(w, r, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if server.passwordChangeRequired(w, r, session, r.URL.Path, action) {
+		return
+	}
+	if server.store == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
+		return
+	}
+	switch action {
+	case "create_snapshot":
+		var req ConfigSnapshotRequest
+		if r.Body != nil && r.ContentLength != 0 {
+			if err := decodeStrictJSON(r, &req); err != nil {
+				writeError(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+				return
+			}
+		}
+		snapshot, err := server.createConfigSnapshot(r.Context(), snapshotID(req.Name), "manual")
+		if err != nil {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
+			writeError(w, r, http.StatusInternalServerError, "snapshot_create_failed", "snapshot could not be created")
+			return
+		}
+		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "success", "", r)
+		writeJSON(w, http.StatusOK, map[string]any{"status": "created", "action": action, "snapshot": snapshotResponse(snapshot, server.profile.ID()), "runtime_state": "desired_not_applied", "request_id": requestID(r)})
+	case "restore_snapshot":
+		id, _ := splitPathRemainder("/api/v1/config/snapshots/", r.URL.Path)
+		if id == "" {
+			writeError(w, r, http.StatusNotFound, "snapshot_not_found", "snapshot id is required")
+			return
+		}
+		snapshot, err := server.store.RuntimeSnapshot(r.Context(), id)
+		if err != nil {
+			writeError(w, r, http.StatusNotFound, "snapshot_not_found", "snapshot does not exist")
+			return
+		}
+		if err := server.restoreConfigSnapshot(r.Context(), snapshot); err != nil {
+			if errors.Is(err, ErrConfigProductMismatch) || errors.Is(err, persistence.ErrPayloadIntegrity) || errors.Is(err, ErrInvalidConfigPackage) {
+				code := "invalid_snapshot"
+				if errors.Is(err, ErrConfigProductMismatch) {
+					code = "product_mismatch"
+				}
+				writeError(w, r, http.StatusUnprocessableEntity, code, err.Error())
+				return
+			}
+			writeError(w, r, http.StatusInternalServerError, "snapshot_restore_failed", "snapshot could not be restored")
+			return
+		}
+		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "success", "", r)
+		server.bumpConfigGraphGeneration(r.Context(), action, "snapshot", snapshot.ID, "")
+		writeJSON(w, http.StatusOK, map[string]any{"status": "restored", "action": action, "snapshot": snapshotResponse(snapshot, server.profile.ID()), "runtime_state": "desired_not_applied", "request_id": requestID(r)})
+	case "factory_reset":
+		snapshot, err := server.createConfigSnapshot(r.Context(), "pre-factory-reset-"+newRequestID(), "factory-reset")
+		if err != nil {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
+			writeError(w, r, http.StatusInternalServerError, "snapshot_create_failed", "pre-reset snapshot could not be created")
+			return
+		}
+		defaultSnapshot, err := defaultConfigSnapshot(server.profile)
+		if err != nil {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
+			writeError(w, r, http.StatusInternalServerError, "factory_reset_failed", "factory reset package could not be created")
+			return
+		}
+		if err := server.restoreConfigSnapshot(r.Context(), defaultSnapshot); err != nil {
+			server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
+			writeError(w, r, http.StatusInternalServerError, "factory_reset_failed", "factory reset could not be applied")
+			return
+		}
+		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "success", "", r)
+		server.bumpConfigGraphGeneration(r.Context(), action, "config", snapshot.ID, "")
+		writeJSON(w, http.StatusOK, map[string]any{"status": "reset", "action": action, "preserve_admin_account": true, "preserve_management_port": true, "snapshot": snapshotResponse(snapshot, server.profile.ID()), "runtime_state": "desired_not_applied", "request_id": requestID(r)})
+	}
+}
+
+func (server *Server) exportDesiredConfig(ctx context.Context) (ConfigPackagePayload, error) {
+	resources := map[string][]json.RawMessage{}
+	for resourceType := range desiredResourceDefs {
+		if !resourceAllowed(server.profile, resourceType) {
+			continue
+		}
+		items, err := server.desiredItems(ctx, resourceType)
+		if err != nil {
+			return ConfigPackagePayload{}, err
+		}
+		resources[resourceType], err = encodeResourceItems(items)
+		if err != nil {
+			return ConfigPackagePayload{}, err
+		}
+	}
+	if resourceAllowed(server.profile, "proxy_egress") {
+		proxyItems, err := server.proxyEgressResources(ctx)
+		if err != nil {
+			return ConfigPackagePayload{}, err
+		}
+		resources["proxy_egress"], err = encodeResourceItems(proxyItems)
+		if err != nil {
+			return ConfigPackagePayload{}, err
+		}
+	}
+	if server.profile.ID() == product.Orchestrator().ID() {
+		orchestratorResources, err := server.orchestratorConfigResources(ctx)
+		if err != nil {
+			return ConfigPackagePayload{}, err
+		}
+		for resourceType, items := range orchestratorResources {
+			resources[resourceType] = items
+		}
+	}
+	excluded := []string{"rendered_config", "runtime_state", "audit_logs", "secrets", "snapshots"}
+	if server.profile.ID() == product.Orchestrator().ID() {
+		excluded = append(excluded, "orchestrator_service_chain_intents")
+	}
+	return ConfigPackagePayload{SchemaVersion: ConfigPackageSchemaVersion, ContentType: configContentType, Product: server.profile.ID(), DeviceMode: server.profile.ID().String(), Resources: resources, Excluded: excluded}, nil
+}
+
+func (server *Server) createConfigSnapshot(ctx context.Context, id, source string) (persistence.RuntimeSnapshot, error) {
+	payload, err := server.exportDesiredConfig(ctx)
+	if err != nil {
+		return persistence.RuntimeSnapshot{}, err
+	}
+	raw, hash, err := persistence.MarshalPayload(payload)
+	if err != nil {
+		return persistence.RuntimeSnapshot{}, err
+	}
+	snapshot := persistence.RuntimeSnapshot{ID: id, SourceTransactionID: source, Payload: raw, PayloadHash: hash, CreatedAt: server.now().UTC()}
+	if err := server.store.SaveRuntimeSnapshot(ctx, snapshot); err != nil {
+		return persistence.RuntimeSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
+func (server *Server) restoreConfigSnapshot(ctx context.Context, snapshot persistence.RuntimeSnapshot) error {
+	if err := persistence.VerifyPayload(snapshot.Payload, snapshot.PayloadHash); err != nil {
+		return err
+	}
+	var payload ConfigPackagePayload
+	if err := json.Unmarshal(snapshot.Payload, &payload); err != nil {
+		return err
+	}
+	if err := server.ensureOrchestratorConfigResources(ctx, &payload); err != nil {
+		return err
+	}
+	if err := payload.ValidateFor(server.profile); err != nil {
+		return err
+	}
+	documents, err := configDocumentsFromImport(payload, server.now().UTC(), server.profile)
+	if err != nil {
+		return err
+	}
+	orchestratorDocuments, err := server.orchestratorConfigDocuments(ctx, payload, server.now().UTC())
+	if err != nil {
+		return err
+	}
+	documents = append(documents, orchestratorDocuments...)
+	return server.store.ReplaceConfigsForTypes(ctx, managedConfigResourceTypes(server.profile), documents)
+}
+
+func managedConfigResourceTypes(profile product.Profile) []string {
+	types := make([]string, 0, len(desiredResourceDefs)+1)
+	for resourceType := range desiredResourceDefs {
+		if resourceAllowed(profile, resourceType) {
+			types = append(types, resourceType)
+		}
+	}
+	if resourceAllowed(profile, "proxy_egress") {
+		types = append(types, "proxy_egress")
+	}
+	if profile.ID() == product.Orchestrator().ID() {
+		types = append(types, orchestratorTopologyConfigResource, orchestratorPolicyConfigResource)
+	}
+	return types
+}
+
+func defaultConfigSnapshot(profile product.Profile) (persistence.RuntimeSnapshot, error) {
+	resources := map[string][]json.RawMessage{}
+	if profile.ID() == product.Orchestrator().ID() {
+		// A factory snapshot represents empty orchestrator state explicitly so
+		// restore removes topology and policy instead of preserving them.
+		resources[orchestratorTopologyConfigResource] = []json.RawMessage{}
+		resources[orchestratorPolicyConfigResource] = []json.RawMessage{}
+	}
+	payload := ConfigPackagePayload{SchemaVersion: ConfigPackageSchemaVersion, ContentType: configContentType, Product: profile.ID(), DeviceMode: profile.ID().String(), Resources: resources, Excluded: []string{"rendered_config", "runtime_state", "audit_logs", "secrets", "snapshots"}}
+	if profile.ID() == product.Orchestrator().ID() {
+		payload.Excluded = append(payload.Excluded, "orchestrator_service_chain_intents")
+	}
+	raw, hash, err := persistence.MarshalPayload(payload)
+	if err != nil {
+		return persistence.RuntimeSnapshot{}, fmt.Errorf("marshal default config snapshot: %w", err)
+	}
+	return persistence.RuntimeSnapshot{Payload: raw, PayloadHash: hash}, nil
+}
+
+func configDocumentsFromImport(payload ConfigPackagePayload, updatedAt time.Time, profile product.Profile) ([]persistence.ConfigDocument, error) {
+	if err := payload.ValidateFor(profile); err != nil {
+		return nil, err
+	}
+	if err := validateImportedPortMaps(payload); err != nil {
+		return nil, err
+	}
+	var documents []persistence.ConfigDocument
+	for resourceType, items := range payload.Resources {
+		if isOrchestratorConfigResource(resourceType) {
+			// Orchestrator topology and policy are compiled and persisted by
+			// orchestratorConfigDocuments so their pair is validated first.
+			continue
+		}
+		for _, item := range items {
+			var object map[string]any
+			if err := json.Unmarshal(item, &object); err != nil {
+				return nil, fmt.Errorf("resource type %q contains a non-object item", resourceType)
+			}
+			if resourceType == "object_group" && profile.ID().String() == "orchestrator" && objectGroupKind(object) != "ip" {
+				return nil, fmt.Errorf("resource type %q only supports IP groups for orchestrator", resourceType)
+			}
+			if strings.HasPrefix(resourceType, "security_") {
+				if resourceType == "security_acl" && stringField(object, "id") == "sec-acl-default-deny-wan" {
+					if degraded, _ := object["degraded"].(bool); degraded {
+						// Collection defaults are presentation fallbacks, not desired
+						// configuration. Never materialize one during import/restore.
+						continue
+					}
+				}
+				delete(object, "runtime_state")
+				delete(object, "capabilities")
+				if err := validateDesiredPayload(resourceType, object); err != nil {
+					return nil, fmt.Errorf("resource type %q contains invalid security item: %w", resourceType, err)
+				}
+			}
+			id := stringField(object, "id")
+			if id == "" {
+				return nil, fmt.Errorf("resource type %q item id is required", resourceType)
+			}
+			payload, hash, err := persistence.MarshalPayload(object)
+			if err != nil {
+				return nil, err
+			}
+			documents = append(documents, persistence.ConfigDocument{ResourceType: resourceType, ResourceID: id, Payload: payload, PayloadHash: hash, UpdatedAt: updatedAt})
+		}
+	}
+	return documents, nil
+}
+
+func validateImportedPortMaps(payload ConfigPackagePayload) error {
+	decodeItems := func(resourceType string) ([]map[string]any, error) {
+		rawItems := payload.Resources[resourceType]
+		items := make([]map[string]any, 0, len(rawItems))
+		for _, raw := range rawItems {
+			var item map[string]any
+			if err := json.Unmarshal(raw, &item); err != nil {
+				return nil, fmt.Errorf("resource type %q contains invalid JSON: %w", resourceType, err)
+			}
+			items = append(items, item)
+		}
+		return items, nil
+	}
+	portMaps, err := decodeItems("port_map")
+	if err != nil {
+		return err
+	}
+	wanLinks, err := decodeItems("wan_link")
+	if err != nil {
+		return err
+	}
+	if _, err := nat.CompileConfigWithWANs(nil, portMaps, wanLinks); err != nil {
+		return fmt.Errorf("port_map import rejected: %w", err)
+	}
+	return nil
+}
+
+func snapshotResponse(snapshot persistence.RuntimeSnapshot, productID product.ID) map[string]any {
+	return map[string]any{"id": snapshot.ID, "product": productID, "source_transaction_id": snapshot.SourceTransactionID, "payload_hash": snapshot.PayloadHash, "created_at": snapshot.CreatedAt}
+}
+
+func snapshotID(name string) string {
+	cleaned := strings.ToLower(strings.TrimSpace(name))
+	cleaned = strings.ReplaceAll(cleaned, " ", "-")
+	cleaned = strings.Trim(cleaned, "-/")
+	if cleaned == "" {
+		return "manual-" + newRequestID()
+	}
+	return "manual-" + cleaned + "-" + newRequestID()
+}
+
+func configManifest(payload ConfigPackagePayload) ConfigPackageManifest {
+	return manifestForPayload(payload)
+}
+
+func (server *Server) validateImportConfirmation(req ConfigImportRequest, actor, packageHash, diffHash string) error {
+	if strings.TrimSpace(req.ConfirmationToken) == "" {
+		return fmt.Errorf("confirmation_token is required")
+	}
+	if strings.TrimSpace(req.ConfirmationActor) != actor {
+		return fmt.Errorf("confirmation_actor must match authenticated actor")
+	}
+	if req.ConfirmationPackageHash != packageHash {
+		return fmt.Errorf("package_hash confirmation does not match payload")
+	}
+	if req.ConfirmationDiffHash != diffHash {
+		return fmt.Errorf("diff_hash confirmation does not match payload")
+	}
+	expiresAt, err := time.Parse(time.RFC3339, strings.TrimSpace(req.ConfirmationExpiresAt))
+	if err != nil {
+		return fmt.Errorf("confirmation_expires_at must be RFC3339")
+	}
+	if !server.now().UTC().Before(expiresAt) {
+		return fmt.Errorf("confirmation token has expired")
+	}
+	return nil
+}
+
+func hashObject(value any) string {
+	raw, _ := json.Marshal(value)
+	digest := sha256.Sum256(raw)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func importPackageContainsSecret(req map[string]any) bool {
+	if containsSecret(req) {
+		return true
+	}
+	for _, key := range []string{"payload", "resources", "package"} {
+		if containsSecret(req[key]) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSecret(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if configRedactionMetadata(key) {
+				continue
+			}
+			if secretToken(key) || containsSecret(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if containsSecret(child) {
+				return true
+			}
+		}
+	case string:
+		return secretToken(typed)
+	}
+	return false
+}
+
+// Exported configurations preserve secret references and redaction markers so
+// they can be restored without ever carrying the secret material itself.
+func configRedactionMetadata(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	return normalized == "credential_ref" || strings.HasSuffix(normalized, "_redacted")
+}
+
+func secretToken(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	for _, token := range []string{"password", "passwd", "secret", "token", "private_key", "private-key", "credential", "vless://", "vmess://", "trojan://", "ss://", "xray_subscription"} {
+		if strings.Contains(normalized, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func (server *Server) handleTelemetry(kind string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+			return
+		}
+		if _, ok := server.sessionFromRequest(r); !ok {
+			writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		payload, capabilities := server.telemetryPayload(r.Context(), kind)
+		writeJSON(w, http.StatusOK, map[string]any{"data": payload, "capabilities": capabilities, "request_id": requestID(r)})
+	}
+}
+
+func (server *Server) telemetryPayload(ctx context.Context, kind string) (any, []controlapi.CapabilityState) {
+	components := []RuntimeComponentState{}
+	runtimeStateValue := "degraded"
+	server.runtimeMu.Lock()
+	lastApply := server.lastRuntime
+	if lastApply != nil {
+		components = append([]RuntimeComponentState(nil), lastApply.Components...)
+		runtimeStateValue = lastApply.RuntimeState
+		if runtimeStateValue == "" {
+			runtimeStateValue = lastApply.Status
+		}
+	}
+	server.runtimeMu.Unlock()
+	if server.profile.ID() == product.Orchestrator().ID() && kind == "dashboard" {
+		if freshComponents, handled := server.orchestratorTransparentRuntimeComponents(ctx); handled {
+			components = freshComponents
+			runtimeStateValue = runtimeState(components)
+			lastApply = server.lastRuntimeApply()
+		}
+	}
+	capabilities := []controlapi.CapabilityState{{Name: "local_telemetry", Available: true, State: controlapi.CapabilityAvailable}}
+	if payload, capability, handled := server.orchestratorTelemetryPayload(ctx, kind, runtimeStateValue, components, lastApply); handled {
+		return payload, append(capabilities, capability)
+	}
+	switch kind {
+	case "dashboard":
+		if server.vppCounters != nil {
+			payload, err := server.vppCounters.Dashboard(ctx)
+			if err == nil {
+				payload["device_mode"] = "gateway"
+				payload["runtime_state"] = runtimeStateValue
+				payload["degraded"] = false
+				payload["components"] = components
+				payload["last_apply"] = lastApply
+				return payload, append(capabilities, controlapi.CapabilityState{Name: "vpp_counters", Available: true, State: controlapi.CapabilityAvailable})
+			}
+			capabilities = append(capabilities, controlapi.CapabilityState{Name: "vpp_counters", Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()})
+		}
+		if server.gatewayTelemetry != nil {
+			if err := server.collectGatewayTelemetry(ctx); err == nil {
+				sessions, throughput := server.gatewayDashboardCounters()
+				return map[string]any{"device_mode": "gateway", "degraded": false, "runtime_state": runtimeStateValue, "active_path": "vpp", "components": components, "last_apply": lastApply, "sessions": sessions, "throughput_bps": throughput, "policy_hits": 0}, append(capabilities, controlapi.CapabilityState{Name: "gateway_vpp_telemetry", Available: true, State: controlapi.CapabilityAvailable})
+			} else {
+				capabilities = append(capabilities, controlapi.CapabilityState{Name: "gateway_vpp_telemetry", Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()})
+			}
+		}
+		return map[string]any{"device_mode": "gateway", "degraded": runtimeStateValue != "running", "runtime_state": runtimeStateValue, "active_path": "vpp", "components": components, "last_apply": lastApply, "sessions": 0, "throughput_bps": 0, "policy_hits": 0}, capabilities
+	case "interfaces":
+		items, interfaceCapabilities, err := server.interfaceRuntimeSnapshot(ctx)
+		if err != nil {
+			return map[string]any{"items": []map[string]any{}, "runtime_state": runtimeStateValue, "degraded": true, "degraded_reason": err.Error()}, append(capabilities, controlapi.CapabilityState{Name: "interfaces", Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()})
+		}
+		return items, append(capabilities, interfaceCapabilities...)
+	case "policy_hits":
+		if server.policyHits != nil {
+			items, err := server.policyHits.PolicyHits(ctx)
+			if err == nil {
+				return normalizePolicyHits(items, runtimeStateValue, "vpp_acl_lookup"), append(capabilities, controlapi.CapabilityState{Name: "vpp_policy_counters", Available: true, State: controlapi.CapabilityAvailable})
+			}
+			capabilities = append(capabilities, controlapi.CapabilityState{Name: "vpp_policy_counters", Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()})
+		}
+		if server.vppCounters != nil {
+			items, err := server.vppCounters.PolicyHits(ctx)
+			if err == nil {
+				return normalizePolicyHits(items, runtimeStateValue, "vpp_counter_collector"), append(capabilities, controlapi.CapabilityState{Name: "vpp_counters", Available: true, State: controlapi.CapabilityAvailable})
+			}
+			capabilities = append(capabilities, controlapi.CapabilityState{Name: "vpp_counters", Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()})
+		}
+		items, receiptCapabilities := server.vppReceiptPolicyHits(runtimeStateValue)
+		return items, append(capabilities, receiptCapabilities...)
+	case "online_users":
+		items, leaseCapabilities, err := server.dhcpLeaseSnapshot(ctx)
+		if err != nil {
+			return map[string]any{"items": []map[string]any{}, "runtime_state": runtimeStateValue, "degraded": true, "degraded_reason": err.Error()}, append(capabilities, controlapi.CapabilityState{Name: "dnsmasq_leases", Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()})
+		}
+		neighbors := []GatewayNeighbor{}
+		neighborState := "unavailable"
+		neighborReason := "gateway telemetry collector is not configured"
+		if server.gatewayTelemetry != nil {
+			neighbors, neighborState, neighborReason = server.gatewayNeighborSnapshot(ctx)
+		}
+		onlineUsers, trafficCapability := normalizeOnlineUsersWithNeighbors(onlineUserTelemetryInput{now: server.now().UTC(), leases: items, neighbors: neighbors, runtimeState: runtimeStateValue, leaseDegraded: len(leaseCapabilities) == 0 || !leaseCapabilities[0].Available, neighborState: neighborState, neighborReason: neighborReason})
+		payload := map[string]any{"items": onlineUsers, "runtime_state": runtimeStateValue, "degraded": len(leaseCapabilities) == 0 || !leaseCapabilities[0].Available || !trafficCapability.Available}
+		if trafficCapability.Reason != "" {
+			payload["degraded_reason"] = trafficCapability.Reason
+		}
+		return payload, append(append(capabilities, leaseCapabilities...), trafficCapability)
+	case "top_sessions":
+		if server.gatewayTelemetry != nil {
+			items, state, reason := server.gatewayTopConnections(ctx)
+			available := state == "available"
+			capability := controlapi.CapabilityState{Name: "top_connections", Available: available, State: controlapi.CapabilityAvailable, Reason: reason}
+			if !available {
+				capability.State = controlapi.CapabilityDegraded
+			}
+			return map[string]any{"items": normalizeTopTelemetry(items, runtimeStateValue, !available, reason), "runtime_state": runtimeStateValue, "state": state, "degraded": !available, "degraded_reason": reason}, append(capabilities, capability)
+		}
+		if server.topTelemetry != nil {
+			items, err := server.topTelemetry.TopSessions(ctx)
+			if err == nil {
+				return map[string]any{"items": normalizeTopTelemetry(items, runtimeStateValue, false, ""), "runtime_state": runtimeStateValue, "degraded": false}, append(capabilities, controlapi.CapabilityState{Name: "top_sessions", Available: true, State: controlapi.CapabilityAvailable})
+			}
+			reason := err.Error()
+			capabilities = append(capabilities, controlapi.CapabilityState{Name: "top_sessions", Available: false, State: controlapi.CapabilityDegraded, Reason: reason})
+			return map[string]any{"items": []map[string]any{}, "runtime_state": runtimeStateValue, "degraded": true, "degraded_reason": reason}, capabilities
+		}
+		capabilities = append(capabilities, controlapi.CapabilityState{Name: "top_sessions", Available: false, State: controlapi.CapabilityDegraded, Reason: "top session collector is not configured"})
+		return map[string]any{"items": []map[string]any{}, "runtime_state": runtimeStateValue, "degraded": true, "degraded_reason": "top session collector is not configured"}, capabilities
+	case "top_domains":
+		if server.topTelemetry != nil {
+			items, err := server.topTelemetry.TopDomains(ctx)
+			if err == nil {
+				return map[string]any{"items": normalizeTopTelemetry(items, runtimeStateValue, false, ""), "runtime_state": runtimeStateValue, "degraded": false}, append(capabilities, controlapi.CapabilityState{Name: "top_domains", Available: true, State: controlapi.CapabilityAvailable})
+			}
+			reason := err.Error()
+			capabilities = append(capabilities, controlapi.CapabilityState{Name: "top_domains", Available: false, State: controlapi.CapabilityDegraded, Reason: reason})
+			return map[string]any{"items": []map[string]any{}, "runtime_state": runtimeStateValue, "degraded": true, "degraded_reason": reason}, capabilities
+		}
+		reason := "SmartDNS collector is not configured"
+		capabilities = append(capabilities, controlapi.CapabilityState{Name: "top_domains", Available: false, State: controlapi.CapabilityDegraded, Reason: reason})
+		return map[string]any{"items": []map[string]any{}, "runtime_state": runtimeStateValue, "state": "unavailable", "degraded": true, "degraded_reason": reason}, capabilities
+	default:
+		return map[string]any{"runtime_state": runtimeStateValue, "degraded": runtimeStateValue != "running"}, capabilities
+	}
+}
+
+func (server *Server) interfaceRuntimeItem(ctx context.Context, id string) (map[string]any, bool, []controlapi.CapabilityState, error) {
+	items, capabilities, err := server.interfaceRuntimeSnapshot(ctx)
+	if err != nil {
+		return nil, false, capabilities, err
+	}
+	resolved := server.resolveInterfaceID(ctx, id)
+	for _, item := range items {
+		if stringField(item, "id") == id || stringField(item, "name") == id || stringField(item, "display_name") == id || stringField(item, "alias") == id || stringField(item, "system_name") == id || stringField(item, "interface_id") == id || resolved == stringField(item, "system_name") {
+			return item, true, capabilities, nil
+		}
+	}
+	return nil, false, capabilities, nil
+}
+
+func (server *Server) interfaceRuntimeSnapshot(ctx context.Context) ([]map[string]any, []controlapi.CapabilityState, error) {
+	ctx = withInterfaceIdentities(ctx)
+	discovered := hostInterfaceInventory()
+	if server.interfaceTelemetry != nil {
+		items, err := server.interfaceTelemetry.Interfaces(ctx)
+		if err == nil {
+			items = server.mergeInterfaceInventory(ctx, discovered, items)
+			return server.normalizeInterfaceSnapshot(ctx, items, "running", "", false), []controlapi.CapabilityState{{Name: "vpp_interface_runtime", Available: true, State: controlapi.CapabilityAvailable}}, nil
+		}
+	}
+	items, err := server.desiredItems(ctx, "interface")
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(discovered) > 0 {
+		items = server.mergeInterfaceInventory(ctx, discovered, items)
+	}
+	vppComponent := server.vppRuntimeComponent(ctx, true)
+	state := vppComponent.State
+	if state == "" {
+		state = "degraded"
+	}
+	reason := vppComponent.Reason
+	if vppComponent.Available {
+		reason = "VPP interface counters unavailable from current apply receipt"
+	}
+	capability := controlapi.CapabilityState{Name: "vpp_interface_runtime", Available: vppComponent.Available, State: controlapi.CapabilityDegraded, Reason: reason}
+	if !vppComponent.Available && state == "running" {
+		capability.State = controlapi.CapabilityAvailable
+	}
+	return server.normalizeInterfaceSnapshot(ctx, items, state, reason, true), []controlapi.CapabilityState{capability}, nil
+}
+
+func (server *Server) appliedVPPDataplaneInterfaces() map[string]string {
+	receipt, err := server.readVPPApplyReceipt()
+	if err != nil || receipt.DryRun || (receipt.Status != "applied" && receipt.Status != "ready") {
+		return nil
+	}
+	applied := map[string]string{}
+	for _, operation := range receipt.Operations {
+		if operation.Name != "vpp.dataplane.attach" || strings.TrimSpace(operation.Resource) == "" {
+			continue
+		}
+		driver := "vpp_native"
+		ok := len(operation.Results) > 0
+		for _, result := range operation.Results {
+			if result.Status != "applied" && result.Status != "ignored-failure" {
+				ok = false
+				break
+			}
+			if strings.TrimSpace(result.Hook) != "" {
+				driver = strings.TrimSpace(result.Hook)
+			} else if strings.TrimSpace(result.Driver) != "" {
+				driver = strings.TrimSpace(result.Driver)
+			}
+		}
+		if ok {
+			applied[operation.Resource] = driver
+		}
+	}
+	return applied
+}
+
+var hostInterfaceInventory = localInterfaceInventory
+
+func (server *Server) mergeInterfaceInventory(ctx context.Context, primary, secondary []map[string]any) []map[string]any {
+	merged := make([]map[string]any, 0, len(primary)+len(secondary))
+	seen := map[string]int{}
+	appendOrMerge := func(item map[string]any) {
+		clone := cloneObject(item)
+		key := nonEmpty(stringField(clone, "id"), stringField(clone, "name"))
+		if key == "" {
+			merged = append(merged, clone)
+			return
+		}
+		if index, ok := seen[key]; ok {
+			for k, v := range clone {
+				if _, exists := merged[index][k]; !exists || merged[index][k] == "" || merged[index][k] == nil {
+					merged[index][k] = v
+				}
+			}
+			if _, vppRuntime := clone["vpp_interface"]; vppRuntime {
+				for _, field := range []string{"vpp_interface", "active_path", "work_mode", "runtime_state", "link_state", "rx_bps", "tx_bps", "rx_pps", "tx_pps", "rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "sessions"} {
+					if value, exists := clone[field]; exists {
+						merged[index][field] = value
+					}
+				}
+			}
+			return
+		}
+		seen[key] = len(merged)
+		merged = append(merged, clone)
+	}
+	for _, item := range primary {
+		appendOrMerge(item)
+	}
+	for _, item := range secondary {
+		appendOrMerge(item)
+	}
+	return server.overlayInterfaceDesiredMetadata(ctx, merged)
+}
+
+func (server *Server) overlayInterfaceDesiredMetadata(ctx context.Context, runtimeItems []map[string]any) []map[string]any {
+	desired, err := server.desiredItems(ctx, "interface")
+	if err != nil || len(desired) == 0 {
+		return runtimeItems
+	}
+	metadata := map[string]map[string]any{}
+	for _, item := range desired {
+		clone := cloneObject(item)
+		for _, key := range []string{stringField(clone, "id"), stringField(clone, "name"), stringField(clone, "system_name")} {
+			if key != "" {
+				metadata[key] = clone
+			}
+		}
+	}
+	merged := make([]map[string]any, 0, len(runtimeItems))
+	matched := map[string]bool{}
+	for _, item := range runtimeItems {
+		clone := cloneObject(item)
+		desiredItem, ok := metadata[stringField(clone, "id")]
+		if !ok {
+			desiredItem, ok = metadata[stringField(clone, "name")]
+		}
+		if !ok {
+			// Runtime telemetry is keyed by the kernel netdev until
+			// normalizeInterfaceSnapshot renames it; the desired document is
+			// keyed by the product id and carries the netdev in system_name.
+			desiredItem, ok = metadata[stringField(clone, "system_name")]
+		}
+		if ok {
+			applyInterfaceDesiredMetadata(clone, desiredItem)
+			matched[stringField(desiredItem, "id")] = true
+			matched[stringField(desiredItem, "name")] = true
+			matched[stringField(desiredItem, "system_name")] = true
+		}
+		merged = append(merged, clone)
+	}
+	for _, item := range desired {
+		if matched[stringField(item, "id")] || matched[stringField(item, "name")] || matched[stringField(item, "system_name")] {
+			continue
+		}
+		merged = append(merged, cloneObject(item))
+	}
+	return server.fillInterfaceIdentityHardware(ctx, merged)
+}
+
+// fillInterfaceIdentityHardware restores the hardware identity of a port that
+// VPP owns destructively. A DPDK port has no /sys/class/net entry, so the
+// runtime inventory and the stored desired document both lack the MAC; the
+// identity union keeps it in ownership.json. Without this, /api/v1/interfaces
+// reported mac=null after a takeover.
+func (server *Server) fillInterfaceIdentityHardware(ctx context.Context, items []map[string]any) []map[string]any {
+	identities := server.interfaceIdentities(ctx)
+	if len(identities) == 0 {
+		return items
+	}
+	byName := make(map[string]interfaceIdentity, len(identities))
+	for _, identity := range identities {
+		if name := strings.TrimSpace(identity.LinuxInterface); name != "" {
+			byName[name] = identity
+		}
+	}
+	for _, item := range items {
+		name := strings.TrimSpace(firstNonEmpty(stringField(item, "system_name"), stringField(item, "name")))
+		identity, ok := byName[name]
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(stringField(item, "mac")) == "" && identity.MAC != "" {
+			item["mac"] = identity.MAC
+		}
+		if strings.TrimSpace(stringField(item, "pci")) == "" && identity.PCI != "" {
+			item["pci"] = identity.PCI
+		}
+	}
+	return items
+}
+
+func applyInterfaceDesiredMetadata(target, desired map[string]any) {
+	if role, _ := interfaceDesiredRole(desired); role == "" {
+		// The desired document is authoritative about having no role. Do not
+		// let a telemetry/inventory clone resurrect a direction after a clear.
+		for _, key := range []string{"gateway_role", "role", "mode_role", "role_configured"} {
+			delete(target, key)
+		}
+	}
+	for _, key := range []string{"display_name", "mode_role", "gateway_role", "role", "candidate_scopes"} {
+		if value, ok := desired[key]; ok {
+			target[key] = value
+		}
+	}
+	if cidr := strings.TrimSpace(firstNonEmpty(stringField(desired, "cidr"), stringField(desired, "ip_cidr"), stringField(desired, "address"), stringField(desired, "ip"))); cidr != "" {
+		if strings.TrimSpace(stringField(target, "cidr")) == "" {
+			target["cidr"] = cidr
+		}
+		if strings.TrimSpace(firstNonEmpty(stringField(target, "address"), stringField(target, "ip"))) == "" {
+			target["address"] = cidr
+		}
+	}
+}
+
+func (server *Server) normalizeInterfaceDesiredPayload(ctx context.Context, payload map[string]any, explicitID string) {
+	requested := strings.TrimSpace(firstNonEmpty(explicitID, stringField(payload, "interface_id"), stringField(payload, "id"), stringField(payload, "name"), stringField(payload, "system_name")))
+	canonical := server.canonicalInterfaceReference(ctx, requested)
+	if canonical == "" {
+		canonical = requested
+	}
+	linux := server.interfaceLinuxName(ctx, canonical)
+	if linux == "" {
+		linux = canonical
+	}
+	// Plan B: the document is keyed by the product id. The kernel netdev is an
+	// internal attribute (`system_name`) because only the dataplane needs it.
+	payload["id"] = canonical
+	payload["interface_id"] = canonical
+	payload["system_name"] = linux
+	payload["name"] = canonical
+	if strings.TrimSpace(stringField(payload, "display_name")) == "" {
+		payload["display_name"] = canonical
+	}
+}
+
+func (server *Server) normalizeWANLinkDesiredPayload(ctx context.Context, payload map[string]any, explicitID string) {
+	requested := strings.TrimSpace(firstNonEmpty(stringField(payload, "interface_id"), stringField(payload, "system_name")))
+	if requested == "" && strings.TrimSpace(explicitID) != "" {
+		if existing, found, err := server.desiredItem(ctx, "wan_link", strings.TrimSpace(explicitID)); err == nil && found {
+			requested = strings.TrimSpace(firstNonEmpty(stringField(existing, "interface_id"), stringField(existing, "system_name")))
+		}
+	}
+	canonical := server.canonicalInterfaceReference(ctx, requested)
+	if canonical == "" {
+		canonical = requested
+	}
+	if canonical == "" {
+		return
+	}
+	linux := server.interfaceLinuxName(ctx, canonical)
+	if linux == "" {
+		linux = canonical
+	}
+	// The line points at the product id; the kernel netdev stays as the
+	// internal `system_name` attribute the dataplane resolves.
+	payload["interface_id"] = canonical
+	payload["system_name"] = linux
+	// display_name is derived, never user input: after a NIC change the stale
+	// name from the previous binding made the readback claim the line was still
+	// on the old port (the UI then reported "no NIC assigned").
+	payload["display_name"] = canonical
+}
+
+func (server *Server) resolveInterfaceID(ctx context.Context, id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	// Prefer the persisted identity service: its union of live netdevs and
+	// ownership records keeps a product id resolvable while VPP owns the port.
+	for _, identity := range server.interfaceIdentities(ctx) {
+		if strings.EqualFold(identity.ID, id) ||
+			strings.EqualFold(identity.LinuxInterface, id) ||
+			(identity.PCI != "" && strings.EqualFold(identity.PCI, id)) ||
+			(identity.MAC != "" && strings.EqualFold(identity.MAC, id)) {
+			if name := strings.TrimSpace(identity.LinuxInterface); name != "" {
+				return name
+			}
+			return id
+		}
+	}
+	for _, item := range server.interfaceAliasSnapshot(ctx) {
+		actual := strings.TrimSpace(firstNonEmpty(stringField(item, "system_name"), stringField(item, "id"), stringField(item, "name")))
+		if actual == "" {
+			continue
+		}
+		if id == actual || id == server.displayInterfaceName(ctx, actual) {
+			return actual
+		}
+	}
+	return id
+}
+
+func (server *Server) displayInterfaceName(ctx context.Context, actual string) string {
+	return server.canonicalInterfaceID(ctx, actual)
+}
+
+func (server *Server) interfaceAliasSnapshot(ctx context.Context) []map[string]any {
+	if cache := interfaceAliasCacheFromContext(ctx); cache != nil {
+		return cache.snapshot()
+	}
+	items := hostInterfaceInventory()
+	sort.SliceStable(items, func(i, j int) bool {
+		left := strings.TrimSpace(nonEmpty(stringField(items[i], "id"), stringField(items[i], "name")))
+		right := strings.TrimSpace(nonEmpty(stringField(items[j], "id"), stringField(items[j], "name")))
+		return left < right
+	})
+	return items
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func localInterfaceInventory() []map[string]any {
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return nil
+	}
+	items := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		name := strings.TrimSpace(entry.Name())
+		if name == "" || name == "lo" {
+			continue
+		}
+		path := filepath.Join("/sys/class/net", name)
+		if _, err := os.Stat(filepath.Join(path, "device")); err != nil && !envBoolOrDefault("LY_ROUTE_INCLUDE_VIRTUAL_INTERFACES", false) {
+			continue
+		}
+		if _, err := net.InterfaceByName(name); err != nil {
+			continue
+		}
+		mtu := 1500
+		if data, err := os.ReadFile(filepath.Join(path, "mtu")); err == nil {
+			if parsed, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil && parsed > 0 {
+				mtu = parsed
+			}
+		}
+		linkState := "unknown"
+		if data, err := os.ReadFile(filepath.Join(path, "operstate")); err == nil {
+			linkState = strings.TrimSpace(string(data))
+		}
+		pci := ""
+		if resolved, resolveErr := filepath.EvalSymlinks(filepath.Join(path, "device")); resolveErr == nil {
+			pci = normalizePCICandidate(filepath.Base(resolved))
+		}
+		items = append(items, map[string]any{"id": name, "name": name, "pci": pci, "admin_state": "up", "link_state": linkState, "speed": localInterfaceSpeed(path), "mtu": mtu, "mac": localInterfaceMAC(name), "addresses": localInterfaceAddresses(name), "work_mode": "kernel_stack", "active_path": "kernel_stack", "mode_role": map[string]any{"gateway": nil, "bridge": nil}, "candidate_scopes": []string{"lan", "wan", "internal", "external"}, "capability": defaultDatapathCapability()})
+	}
+	return items
+}
+
+func localInterfaceMAC(name string) string {
+	iface, err := net.InterfaceByName(name)
+	if err != nil || iface == nil {
+		return ""
+	}
+	return iface.HardwareAddr.String()
+}
+
+func localInterfaceAddresses(name string) []string {
+	iface, err := net.InterfaceByName(name)
+	if err != nil || iface == nil {
+		return nil
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil
+	}
+	values := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		if addr != nil {
+			values = append(values, addr.String())
+		}
+	}
+	return values
+}
+
+func localInterfaceSpeed(path string) string {
+	data, err := os.ReadFile(filepath.Join(path, "speed"))
+	if err != nil {
+		return "unknown"
+	}
+	speed := strings.TrimSpace(string(data))
+	if speed == "" || strings.HasPrefix(speed, "-") {
+		return "unknown"
+	}
+	return speed + "Mb/s"
+}
+
+func (server *Server) dhcpLeaseSnapshot(ctx context.Context) ([]map[string]any, []controlapi.CapabilityState, error) {
+	if server.dhcpLeases != nil {
+		items, err := server.dhcpLeases.Leases(ctx)
+		if err == nil {
+			return normalizeDHCPLeases(items, "running", "", false), []controlapi.CapabilityState{{Name: "dnsmasq_leases", Available: true, State: controlapi.CapabilityAvailable}}, nil
+		}
+		return nil, []controlapi.CapabilityState{{Name: "dnsmasq_leases", Available: false, State: controlapi.CapabilityDegraded, Reason: err.Error()}}, err
+	}
+	items, err := server.desiredItems(ctx, "dhcp_lease")
+	if err != nil {
+		return nil, nil, err
+	}
+	reason := "Dnsmasq lease collector is not configured"
+	return normalizeDHCPLeases(items, "degraded", reason, true), []controlapi.CapabilityState{{Name: "dnsmasq_leases", Available: false, State: controlapi.CapabilityDegraded, Reason: reason}}, nil
+}
+
+func normalizeDHCPLeases(items []map[string]any, state, reason string, degraded bool) []map[string]any {
+	leases := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		clone := cloneObject(item)
+		clone["runtime_state"] = state
+		clone["degraded"] = degraded
+		if reason != "" {
+			clone["degraded_reason"] = reason
+		}
+		if stringField(clone, "id") == "" {
+			if id := firstStringField(clone, "ip_address", "address", "mac", "hw_address"); id != "" {
+				clone["id"] = id
+			}
+		}
+		leases = append(leases, clone)
+	}
+	return leases
+}
+
+func normalizeOnlineUsers(leases []map[string]any, state string, leaseDegraded bool) ([]map[string]any, controlapi.CapabilityState) {
+	users := make([]map[string]any, 0, len(leases))
+	trafficAvailable := false
+	for _, lease := range leases {
+		clone := cloneObject(lease)
+		ip := firstStringField(clone, "ip_address", "address", "ip")
+		mac := firstStringField(clone, "mac", "hw_address", "hwaddr")
+		if ip != "" {
+			clone["ip"] = ip
+			clone["ip_address"] = ip
+		}
+		if mac != "" {
+			clone["mac"] = mac
+		}
+		if hostname := firstStringField(clone, "hostname", "client_hostname", "name"); hostname != "" {
+			clone["hostname"] = hostname
+		}
+		copyStringAlias(clone, "lease_start", "lease_start", "starts", "valid_from", "cltt")
+		copyStringAlias(clone, "lease_end", "lease_end", "expires", "valid_until", "expire_time")
+		copyStringAlias(clone, "last_traffic_time", "last_traffic_time", "last_seen", "last_activity")
+		if status := firstStringField(clone, "online_status", "status", "state"); status != "" && status != "running" && status != "degraded" {
+			clone["online_status"] = status
+		} else if leaseDegraded {
+			clone["online_status"] = "unknown"
+		} else {
+			clone["online_status"] = "online"
+		}
+		hasTraffic := copyNumberAlias(clone, "rx_bps", "rx_bps", "in_bps", "download_bps")
+		hasTraffic = copyNumberAlias(clone, "tx_bps", "tx_bps", "out_bps", "upload_bps") || hasTraffic
+		hasTraffic = copyNumberAlias(clone, "rx_bytes", "rx_bytes", "in_bytes", "download_bytes", "bytes_rx") || hasTraffic
+		hasTraffic = copyNumberAlias(clone, "tx_bytes", "tx_bytes", "out_bytes", "upload_bytes", "bytes_tx") || hasTraffic
+		if _, ok := clone["last_traffic_time"]; ok {
+			hasTraffic = true
+		}
+		if hasTraffic {
+			trafficAvailable = true
+			clone["traffic_activity_state"] = "available"
+		} else {
+			clone["rx_bps"] = 0
+			clone["tx_bps"] = 0
+			clone["rx_bytes"] = 0
+			clone["tx_bytes"] = 0
+			clone["traffic_activity_state"] = "degraded"
+			clone["traffic_activity_reason"] = "recent VPP per-user traffic activity is not configured"
+		}
+		clone["runtime_state"] = state
+		users = append(users, clone)
+	}
+	if trafficAvailable {
+		return users, controlapi.CapabilityState{Name: "vpp_user_traffic", Available: true, State: controlapi.CapabilityAvailable}
+	}
+	return users, controlapi.CapabilityState{Name: "vpp_user_traffic", Available: false, State: controlapi.CapabilityDegraded, Reason: "recent VPP per-user traffic activity is not configured"}
+}
+
+func copyStringAlias(item map[string]any, target string, keys ...string) bool {
+	value := firstStringField(item, keys...)
+	if value == "" {
+		return false
+	}
+	item[target] = value
+	return true
+}
+
+func copyNumberAlias(item map[string]any, target string, keys ...string) bool {
+	value, ok := numberField(item, keys...)
+	if !ok {
+		return false
+	}
+	item[target] = value
+	return true
+}
+
+func normalizeTopTelemetry(items []map[string]any, state string, degraded bool, reason string) []map[string]any {
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		clone := cloneObject(item)
+		clone["runtime_state"] = state
+		clone["degraded"] = degraded
+		if reason != "" {
+			clone["degraded_reason"] = reason
+		}
+		result = append(result, clone)
+	}
+	return result
+}
+
+func (server *Server) normalizeInterfaceSnapshot(ctx context.Context, items []map[string]any, state, reason string, degraded bool) []map[string]any {
+	managementInterface := server.managementInterfaceID(ctx)
+	appliedVPP := server.appliedVPPDataplaneInterfaces()
+	desiredCIDRs := server.desiredInterfaceCIDRs(ctx)
+	vppNames := server.vppInterfaceNames(ctx)
+	items = server.augmentOwnedInterfaceItems(ctx, items)
+	snapshot := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		clone := cloneObject(item)
+		name := strings.TrimSpace(nonEmpty(stringField(clone, "id"), stringField(clone, "name")))
+		// name may already be a product id (eth1) in desired/telemetry items.
+		// Resolve it back to the persisted Linux name before looking anything up.
+		linuxName := server.interfaceLinuxName(ctx, name)
+		if cidr := strings.TrimSpace(desiredCIDRs[linuxName]); cidr != "" {
+			if strings.TrimSpace(firstNonEmpty(stringField(clone, "cidr"), stringField(clone, "ip_cidr"), stringField(clone, "ip"))) == "" {
+				clone["cidr"] = cidr
+			}
+			if strings.TrimSpace(stringField(clone, "address")) == "" {
+				clone["address"] = cidr
+			}
+		}
+		displayName := server.canonicalInterfaceID(ctx, linuxName)
+		if identity, ok := server.interfaceIdentityForLinuxName(ctx, linuxName); ok {
+			if strings.TrimSpace(stringField(clone, "mac")) == "" && identity.MAC != "" {
+				clone["mac"] = identity.MAC
+			}
+			if strings.TrimSpace(stringField(clone, "pci")) == "" && identity.PCI != "" {
+				clone["pci"] = identity.PCI
+			}
+		}
+		if strings.TrimSpace(stringField(clone, "mac")) == "" {
+			// A uio/vfio-bound port has no netdev to read the address from and
+			// its persisted records may predate the MAC field. VPP still knows
+			// the hardware address.
+			if snapshot, ok := server.vppLinkSnapshotFor(ctx, linuxName, stringField(clone, "pci")); ok && snapshot.MAC != "" {
+				clone["mac"] = snapshot.MAC
+			}
+		}
+		if displayName != "" {
+			clone["system_name"] = linuxName
+			clone["id"] = displayName
+			clone["name"] = displayName
+			clone["interface_id"] = displayName
+		}
+		if linuxName == managementInterface || name == managementInterface || displayName == managementInterface {
+			clone["active_path"] = "kernel_stack"
+			clone["work_mode"] = "kernel_stack"
+			clone["gateway_role"] = "management"
+			clone["mode_role"] = map[string]any{"gateway": "management", "bridge": nil}
+		} else if !degraded && strings.TrimSpace(stringField(clone, "active_path")) != "" && stringField(clone, "active_path") != "kernel_stack" {
+			if strings.TrimSpace(stringField(clone, "work_mode")) == "" {
+				clone["work_mode"] = stringField(clone, "active_path")
+			}
+		} else if driver := strings.TrimSpace(appliedVPP[linuxName]); driver != "" {
+			clone["active_path"] = driver
+			clone["work_mode"] = driver
+			clone["vpp_interface"] = "lyroute-" + linuxName
+		} else {
+			clone["active_path"] = "kernel_stack"
+			clone["work_mode"] = "kernel_stack"
+		}
+		_, gatewayRolePresent := clone["gateway_role"]
+		_, rolePresent := clone["role"]
+		if !gatewayRolePresent && !rolePresent && stringField(clone, "gateway_role") == "" {
+			if modeRole, ok := clone["mode_role"].(map[string]any); ok {
+				if gatewayRole, ok := modeRole["gateway"].(string); ok && strings.TrimSpace(gatewayRole) != "" {
+					clone["gateway_role"] = strings.TrimSpace(gatewayRole)
+				}
+			}
+		}
+		for _, key := range []string{"rx_bps", "tx_bps", "rx_pps", "tx_pps", "sessions"} {
+			if _, ok := clone[key]; !ok {
+				clone[key] = 0
+			}
+		}
+		clone["stats"] = map[string]any{"rx_bps": clone["rx_bps"], "tx_bps": clone["tx_bps"], "rx_pps": clone["rx_pps"], "tx_pps": clone["tx_pps"], "sessions": clone["sessions"]}
+		for key, value := range server.interfaceTakeoverStatus(ctx, linuxName, clone, vppNames) {
+			clone[key] = value
+		}
+		stripInternalInterfaceFields(clone)
+		clone["runtime_state"] = state
+		clone["degraded"] = degraded
+		if reason != "" {
+			clone["degraded_reason"] = reason
+		} else {
+			delete(clone, "degraded_reason")
+		}
+		snapshot = append(snapshot, clone)
+	}
+	// Keep the physical-port order stable even when a VPP-owned item was
+	// synthesized after the kernel inventory.
+	sort.SliceStable(snapshot, func(left, right int) bool {
+		return interfaceIDLess(stringField(snapshot[left], "id"), stringField(snapshot[right], "id"))
+	})
+	return snapshot
+}
+
+// interfaceIDLess compares product ids (eth0 < eth1 < eth10) numerically so a
+// synthesized port never reorders the operator's interface list.
+func interfaceIDLess(left, right string) bool {
+	leftNumber, leftOK := interfaceIDNumber(left)
+	rightNumber, rightOK := interfaceIDNumber(right)
+	if leftOK && rightOK {
+		return leftNumber < rightNumber
+	}
+	if leftOK != rightOK {
+		return leftOK
+	}
+	return strings.TrimSpace(left) < strings.TrimSpace(right)
+}
+
+func interfaceIDNumber(value string) (int, bool) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "eth") || len(value) <= 3 {
+		return 0, false
+	}
+	number, err := strconv.Atoi(value[3:])
+	if err != nil {
+		return 0, false
+	}
+	return number, true
+}
+
+func (server *Server) handleAuditEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	if _, ok := server.sessionFromRequest(r); !ok {
+		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	events, err := server.auditEvents(r.Context())
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "audit_read_failed", "audit events are unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": events, "request_id": requestID(r)})
+}
+
+func (server *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	if capability, known := routeCapability(r.URL.Path); known && !server.profile.Allows(capability) {
+		writeCapabilityError(w, r, capability)
+		return
+	}
+	writeError(w, r, http.StatusNotFound, "not_found", "unknown API route")
+}
+
+func requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSpace(r.Header.Get(HeaderRequestID))
+		if id == "" {
+			id = newRequestID()
+		}
+		ctx := context.WithValue(r.Context(), requestIDKey{}, id)
+		w.Header().Set(HeaderRequestID, id)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+type requestIDKey struct{}
+
+func requestID(r *http.Request) string {
+	if id, ok := r.Context().Value(requestIDKey{}).(string); ok && id != "" {
+		return id
+	}
+	return strings.TrimSpace(r.Header.Get(HeaderRequestID))
+}
+
+func (server *Server) sessionFromRequest(r *http.Request) (Session, bool) {
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		if session, ok := server.sessions.get(cookie.Value); ok {
+			return session, true
+		}
+	}
+	if token := bearerToken(r.Header.Get("Authorization")); token != "" {
+		return server.sessions.get(token)
+	}
+	return Session{}, false
+}
+
+func (server *Server) recordAudit(actor, role, resource, action, status, eventError string, r *http.Request) {
+	server.recordAuditWithTransaction(actor, role, resource, action, status, eventError, requestID(r))
+}
+
+func (server *Server) recordAuditWithTransaction(actor, role, resource, action, status, eventError, transactionID string) {
+	eventError = auditSafeText(eventError)
+	server.auditMu.Lock()
+	defer server.auditMu.Unlock()
+	event := AuditEvent{
+		ID:        newRequestID(),
+		Timestamp: serverNow(server),
+		Actor:     actor,
+		Role:      role,
+		Resource:  resource,
+		Action:    action,
+		Status:    status,
+		Error:     eventError,
+		RequestID: transactionID,
+	}
+	server.audit = append(server.audit, event)
+	if server.store != nil {
+		_ = server.store.SaveAuditEvents(context.WithoutCancel(context.Background()), []persistence.AuditEvent{{
+			ID:            event.ID,
+			Timestamp:     event.Timestamp,
+			Actor:         event.Actor,
+			Role:          event.Role,
+			Resource:      event.Resource,
+			Action:        event.Action,
+			Status:        event.Status,
+			Error:         event.Error,
+			TransactionID: transactionID,
+		}})
+	}
+}
+
+func (server *Server) auditEvents(ctx context.Context) ([]AuditEvent, error) {
+	if server.store != nil {
+		persisted, err := server.store.AuditEvents(ctx, "")
+		if err != nil {
+			return nil, err
+		}
+		events := make([]AuditEvent, 0, len(persisted))
+		for _, event := range persisted {
+			events = append(events, AuditEvent{
+				ID:        event.ID,
+				Timestamp: event.Timestamp,
+				Actor:     event.Actor,
+				Role:      event.Role,
+				Resource:  event.Resource,
+				Action:    event.Action,
+				Status:    event.Status,
+				Error:     auditSafeText(event.Error),
+				RequestID: event.TransactionID,
+			})
+		}
+		return appendFirmwareRollbackAudit(events), nil
+	}
+	server.auditMu.Lock()
+	defer server.auditMu.Unlock()
+	events := make([]AuditEvent, len(server.audit))
+	copy(events, server.audit)
+	return appendFirmwareRollbackAudit(events), nil
+}
+
+// The installer may replace a failed control binary and restart it before it
+// can persist an audit row. It leaves a durable marker instead; surface that
+// marker through the same audit feed so stage/install/rollback remains
+// traceable across the restart.
+func appendFirmwareRollbackAudit(events []AuditEvent) []AuditEvent {
+	data, err := os.ReadFile("/var/lib/ly-route/firmware-update/rollback-audit.jsonl")
+	if err != nil {
+		return events
+	}
+	for lineNumber, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var item struct {
+			Timestamp string `json:"timestamp"`
+			Backup    string `json:"backup"`
+			Reason    string `json:"reason"`
+		}
+		if json.Unmarshal([]byte(line), &item) != nil {
+			continue
+		}
+		timestamp, _ := time.Parse(time.RFC3339, item.Timestamp)
+		events = append(events, AuditEvent{
+			ID:        fmt.Sprintf("firmware-rollback-%d-%s", lineNumber, item.Timestamp),
+			Timestamp: timestamp,
+			Actor:     "system",
+			Role:      "system",
+			Resource:  "/api/v1/firmware/update/install",
+			Action:    "firmware_rollback",
+			Status:    "success",
+			Error:     item.Reason + " backup=" + item.Backup,
+		})
+	}
+	return events
+}
+
+// ingestFirmwareRollbackAudit moves the installer's durable rollback marker
+// into audit_events once control starts again. The marker exists because the
+// failed control binary may be unable to persist an audit row before it is
+// replaced; the API feed still falls back to the marker if ingestion has not
+// happened yet.
+func (server *Server) ingestFirmwareRollbackAudit() {
+	path := "/var/lib/ly-route/firmware-update/rollback-audit.jsonl"
+	data, err := os.ReadFile(path)
+	if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+		return
+	}
+	var events []AuditEvent
+	for lineNumber, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var item struct {
+			Timestamp string `json:"timestamp"`
+			Backup    string `json:"backup"`
+			Reason    string `json:"reason"`
+		}
+		if json.Unmarshal([]byte(line), &item) != nil {
+			continue
+		}
+		timestamp, err := time.Parse(time.RFC3339, item.Timestamp)
+		if err != nil {
+			timestamp = server.now().UTC()
+		}
+		events = append(events, AuditEvent{
+			ID:        fmt.Sprintf("firmware-rollback-ingested-%d-%d", lineNumber, timestamp.UnixNano()),
+			Timestamp: timestamp.UTC(),
+			Actor:     "system",
+			Role:      "system",
+			Resource:  "/api/v1/firmware/update/install",
+			Action:    "firmware_rollback",
+			Status:    "failure",
+			Error:     auditSafeText(item.Reason + " backup=" + item.Backup),
+		})
+	}
+	if len(events) == 0 {
+		return
+	}
+	server.audit = append(server.audit, events...)
+	if server.store != nil {
+		persisted := make([]persistence.AuditEvent, 0, len(events))
+		for _, event := range events {
+			persisted = append(persisted, persistence.AuditEvent{
+				ID:            event.ID,
+				Timestamp:     event.Timestamp,
+				Actor:         event.Actor,
+				Role:          event.Role,
+				Resource:      event.Resource,
+				Action:        event.Action,
+				Status:        event.Status,
+				Error:         event.Error,
+				TransactionID: event.RequestID,
+			})
+		}
+		if err := server.store.SaveAuditEvents(context.Background(), persisted); err != nil {
+			return
+		}
+	}
+	_ = os.Rename(path, path+".ingested")
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	// The status and headers are already committed. A client disconnect is not a
+	// server fault and must not turn into a recovered net/http panic.
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	writeJSON(w, status, ErrorResponse{Error: ErrorBody{Code: code, Message: message, RequestID: requestID(r)}})
+}
+
+func writeCapabilityError(w http.ResponseWriter, r *http.Request, capability product.Capability) {
+	writeJSON(w, http.StatusNotFound, ErrorResponse{Error: ErrorBody{
+		Code:       "capability_not_supported",
+		Message:    "resource is not supported by the active product",
+		RequestID:  requestID(r),
+		Capability: capability,
+	}})
+}
+
+func decodeStrictJSON(r *http.Request, out any) error {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(out)
+}
+
+func newRequestID() string {
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		panic(fmt.Errorf("request id: %w", err))
+	}
+	return hex.EncodeToString(bytes[:])
+}
+
+func ListenAndServe(addr string, server *Server) error {
+	if server == nil {
+		server = New()
+	}
+	err := http.ListenAndServe(addr, server.Handler())
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
