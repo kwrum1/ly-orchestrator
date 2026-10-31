@@ -692,6 +692,9 @@ ly_orch_workers_snapshot (u32 rules, u32 groups)
   return snapshot;
 }
 
+static ly_orch_group_bypass_t *ly_orch_group_bypass_build (
+  ly_orch_config_t *config);
+
 static clib_error_t *
 ly_orch_commit (unformat_input_t *input)
 {
