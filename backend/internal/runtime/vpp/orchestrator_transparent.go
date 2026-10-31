@@ -716,12 +716,16 @@ func (adapter Adapter) ApplyTransparentOrchestrator(ctx context.Context, request
 	}
 	if config.Mirror != nil || len(config.MirrorCleanup) > 0 {
 		span := ""
+		foundSpan := false
 		for _, result := range payload.CommandResults {
 			if result.Command == "show interface span" {
 				span = result.Stdout
+				foundSpan = true
 			}
 		}
-		if span == "" {
+		// An empty table is valid evidence (mirror cleared), so presence of the
+		// command — not a non-empty stdout — is what must be proven here.
+		if !foundSpan {
 			return TransparentOrchestratorReadback{}, fmt.Errorf("%w: port mirror readback command is missing", ErrSnapshotIncomplete)
 		}
 		if err := MirrorReadbackMatches(span, config.Mirror); err != nil {
