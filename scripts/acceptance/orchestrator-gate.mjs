@@ -307,8 +307,7 @@ async function putTopology(item) {
   return (await put("/api/v1/orchestrator/topology", doc)).item;
 }
 async function groups() { return (await get("/api/v1/orchestrator/orchestration-groups")).items || []; }
-async function bypassConfig() { return (await get("/api/v1/orchestrator/bypass")).config; }
-async function putBypassGroup(name, state) {
+async function bypassConfig() { return (await get("/api/v1/orchestrator/bypass")).config; }async function putBypassGroup(name, state) {
   const config = await bypassConfig();
   const kept = (config.groups || []).filter((g) => g.name !== name);
   if (state) {
@@ -326,6 +325,22 @@ async function putBypassGroup(name, state) {
 }
 async function vppSpan() {
   return ssh("vppctl show interface span", 30000);
+}
+async function clearMirrorRoleAPI() {
+  const topo = await topology();
+  delete (topo.port_roles || {}).eth5;
+  await putTopology(topo);
+  await patch("/api/v1/interfaces/eth5", { id: "eth5", name: "eth5", mirror: false, mirror_sources: [] });
+  await applyAndWait();
+  await waitRuntimeConverged();
+}
+async function restoreMirrorRoleAPI(sources) {
+  const topo = await topology();
+  topo.port_roles = { ...(topo.port_roles || {}), eth5: "mirror" };
+  await putTopology(topo);
+  await patch("/api/v1/interfaces/eth5", { id: "eth5", name: "eth5", mirror: true, mirror_sources: sources });
+  await applyAndWait();
+  await waitRuntimeConverged();
 }
 function spanHas(output, source, destination, direction) {
   const lines = output.split(/\r?\n/);
@@ -609,8 +624,7 @@ PY`, 30000);
   });
 
   await check("O2.3", "无镜像口时添加按钮禁用并提示", async () => {
-    await setRoleUI(page, "eth5", "");
-    await page.waitForTimeout(1500);
+    await clearMirrorRoleAPI();
     await mirrorList(page);
     const disabled = await page.locator("#add-policy").isDisabled();
     const warning = await page.locator("#no-target").isVisible();
@@ -620,20 +634,20 @@ PY`, 30000);
     assert(warning, "no-target warning is not visible");
     assert(/镜像口/.test(title || ""), "tooltip does not explain the disabled button");
     // restore the mirror role and the original sources
-    await setRoleUI(page, "eth5", "mirror");
+    await restoreMirrorRoleAPI(cleanupMirror.sources);
     await mirrorList(page);
-    for (const source of cleanupMirror.sources) await addMirrorPolicy(page, source.interface, source.direction || "both");
     const sources = (await iface("eth5")).mirror_sources || [];
     assert(cleanupMirror.sources.length === sources.length, `restored ${sources.length}/${cleanupMirror.sources.length} sources`);
-    const span = await vppSpan();
-    saveText("vppctl/span-restored.txt", span);
+    const restoredSpan = await waitSpan((text) => text.includes("lyroute-ens193") && text.includes("lyroute-ens160"));
+    saveText("vppctl/span-restored.txt", restoredSpan.text);
+    assert(restoredSpan.ok, "SPAN was not restored after the mirror role came back");
     return "disabled + warning shown, mirror role and sources restored";
   });
 
   // ================= O3 =================
   await check("O3.1", "编排组旁路：新增组 + 两个开关 + 阈值秒 + 回显 + 删除清理", async () => {
     // free eth4/eth5 from mirror so a temporary group can use them
-    await setRoleUI(page, "eth5", "");
+    await clearMirrorRoleAPI();
     await page.waitForTimeout(1500);
     // tag them so the group dialog offers them
     const topo = await topology();
