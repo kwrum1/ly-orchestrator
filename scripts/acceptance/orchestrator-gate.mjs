@@ -193,7 +193,7 @@ async function openRole(page, port) {
   await waitRuntimeConverged(60000);
   let row = null;
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    await gotoReady(page, "/interfaces");
+    await gotoReady(page, "/topology");
     if (await interfacesReady(page)) {
       row = page.locator("table tbody tr", { hasText: port }).first();
       if (await row.count().catch(() => 0)) {
@@ -426,7 +426,7 @@ async function run() {
 
   await check("O0.3", "UI 加载无 JS 错误", async () => {
     await loginUI(page);
-    await page.goto(BASE + "/interfaces", { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.goto(BASE + "/topology", { waitUntil: "domcontentloaded", timeout: 60000 });
     await page.waitForTimeout(2500);
     await shot(page, "screens/o0-interfaces.png");
     assert(page.errors.length === 0, `JS errors: ${page.errors.join(" | ")}`);
