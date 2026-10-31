@@ -33,8 +33,7 @@
 
   var VIEWS = {
     mirror: { html: "/mirror.html", script: "/mirror.js", factory: "LyExtrasMirrorView" },
-    bypass: { html: "/bypass.html", script: "/bypass.js", factory: "LyExtrasBypassView" },
-    groups: { html: "/groups.html", script: "/groups.js", factory: "LyExtrasGroupsView" }
+    bypass: { html: "/bypass.html", script: "/bypass.js", factory: "LyExtrasBypassView" }
   };
 
   var active = null;      // { kind, container, hidden, cleanup }
@@ -47,7 +46,6 @@
   function kindFromPath(path) {
     if (path === "/mirror" || path === "/mirror.html") return "mirror";
     if (path === "/bypass" || path === "/bypass.html") return "bypass";
-    if (path === "/groups") return "groups";
     return "";
   }
 
@@ -67,9 +65,7 @@
 
   function setActive(kind) {
     document.querySelectorAll("nav.side-nav a.nav-item").forEach(function (link) {
-      var matches = kind === "groups"
-        ? link.getAttribute("href") === "/groups"
-        : link.getAttribute("data-extras-kind") === kind;
+      var matches = link.getAttribute("data-extras-kind") === kind;
       link.classList.toggle("is-active", matches);
       if (matches) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
@@ -101,8 +97,8 @@
     refresh.textContent = "刷新";
     var save = document.createElement("button");
     save.className = "btn btn-sm btn-primary";
-    save.id = kind === "mirror" ? "save" : kind === "bypass" ? "save-config" : "save-groups";
-    save.textContent = kind === "mirror" ? "保存并应用" : kind === "bypass" ? "保存探测配置" : "保存编排组";
+    save.id = kind === "mirror" ? "save" : "save-config";
+    save.textContent = kind === "mirror" ? "保存并应用" : "保存探测配置";
     actions.appendChild(refresh);
     actions.appendChild(save);
     head.appendChild(actions);
@@ -126,8 +122,8 @@
   }
 
   function openView(kind, updateHistory) {
-    var item = itemByKind(kind) || { path: kind === "groups" ? "/groups" : "/" };
-    if (!VIEWS[kind]) return;
+    var item = itemByKind(kind);
+    if (!item) return;
     if (active && active.kind === kind) return;
     if (loading) return;
     var mainInner = document.querySelector(".main-inner");
@@ -237,7 +233,6 @@
     var link = event.target.closest ? event.target.closest("a.nav-item") : null;
     if (!link) return;
     var kind = link.getAttribute("data-extras-kind");
-    if (!kind && link.getAttribute("href") === "/groups") kind = "groups";
     if (kind) {
       event.preventDefault();
       openView(kind, true);
