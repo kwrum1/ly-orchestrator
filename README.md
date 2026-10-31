@@ -19,14 +19,13 @@ LY Route 编排器（Orchestrator）独立仓库：控制面二进制 `orchestra
 具体哪些内容已分离、哪些仍共享、后续怎么抽公共库，见 [`docs/REPO-BOUNDARY.md`](docs/REPO-BOUNDARY.md)。
 在公共库抽出之前，**修改 `backend/internal/httpapi` 等共享包必须同时在两个仓库对齐**。
 
-## 编排器 UI：源码构建，无 controller-shell
+## 编排器 UI：冻结基线 + 增量页面（唯一 UI）
 
-编排器界面是 React/Vite 应用，源码在本仓库 `frontend/`。部署与升级包统一使用
-`scripts/build-orchestrator-ui.sh` / `scripts/build-orchestrator-upgrade-package.sh`
-从源码构建的产物，写入 `/opt/ly-route/admin`。
-
-`packaging/orchestrator-ui-baseline/` 仅保留为 2026-10-27 的历史参考（导航/布局），
-不再作为部署产物，也不再校验其 `app.js` 大小或 sha256。
+唯一有效的编排器 UI 是 `packaging/orchestrator-ui-baseline/` 的冻结外观，加上
+`packaging/orchestrator-ui-extras/` 的镜像口/故障旁路/编排组页内页面。
+`scripts/build-orchestrator-ui.sh` 负责组合这两部分（不改基线 app.js，只注入一行
+`orchestrator-extras.js`），升级包从组合结果构建。`frontend/` 重建 shell 不再参与
+部署或打包。
 
 已淘汰的 controller-shell 静态 UI 已彻底删除：`frontend/orchestrator/`（13 个源码文件）、
 仓库内固定的 `packaging/orchestrator-frontend/`（旧 11 页 bundle + manifest）、

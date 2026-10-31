@@ -42,9 +42,14 @@ for file in $found; do
   fi
 done
 
-# 4. The React/Vite source tree lives in frontend/ and must stay buildable.
-for required in frontend/package.json frontend/index.html frontend/vite.config.ts frontend/src/main.tsx; do
-  [ -f "$required" ] || fail "orchestrator UI source is incomplete: $required"
+# 4. The deployed UI is the frozen baseline shell plus the extras pages.
+for required in \
+  packaging/orchestrator-ui-baseline/app.js \
+  packaging/orchestrator-ui-baseline/index.html \
+  packaging/orchestrator-ui-extras/orchestrator-extras.js \
+  packaging/orchestrator-ui-extras/mirror.js \
+  packaging/orchestrator-ui-extras/bypass.js; do
+  [ -f "$required" ] || fail "orchestrator UI artifact is missing: $required"
 done
 
 # 5. No script may reference the retired builder or bundle again. Documentation

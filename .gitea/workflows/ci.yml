@@ -73,14 +73,6 @@ jobs:
           cd backend
           go test ./internal/httpapi ./internal/runtime/vpp -run 'Mirror' -count=1 -timeout 600s
 
-      - name: orchestrator ui build
-        run: |
-          set -euo pipefail
-          cd frontend
-          pnpm install --frozen-lockfile
-          pnpm exec tsc -b
-          pnpm exec vite build
-
       - name: retired controller-shell UI boundary
         run: |
           set -euo pipefail

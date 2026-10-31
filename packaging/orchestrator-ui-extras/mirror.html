@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="noindex,nofollow" />
+    <title>镜像口 · ly Orchestrator</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <style>
+      body { padding: 0; }
+      [hidden] { display: none !important; }
+      .extras-topbar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 14px; height: 56px; padding: 0 22px; border-bottom: 1px solid var(--border); background: #fff; }
+      .extras-topbar .brand { display: flex; align-items: center; gap: 9px; font-weight: 700; }
+      .extras-topbar .brand-mark { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 8px; background: linear-gradient(135deg, #2563eb, #4f8df7); color: #fff; font-size: 13px; }
+      .extras-topbar .spacer { flex: 1; }
+      .extras-wrap { display: flex; flex-direction: column; gap: 16px; max-width: 1280px; margin: 0 auto; padding: 20px 24px 40px; }
+      .extras-topbar a.back { color: var(--text-secondary); text-decoration: none; font-size: 12px; }
+      .extras-topbar a.back:hover { color: var(--accent); }
+      .session { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+      .session:last-child { border-bottom: 0; }
+      .session .meta { min-width: 0; }
+      .session strong { display: block; font-size: 12px; }
+      .session small { display: block; color: var(--text-tertiary); font-size: 10px; }
+      .source-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+      .source-row { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-md); background: #fff; }
+      .source-row.checked { border-color: #c7ddf7; background: #f8fbff; }
+      .source-row .name { flex: 1; min-width: 0; }
+      .source-row .name strong { display: block; font-size: 12px; }
+      .source-row .name small { display: block; color: var(--text-tertiary); font-size: 10px; }
+      .source-row select { width: 108px; }
+      .muted { color: var(--text-tertiary); font-size: 11px; }
+      @media (max-width: 900px) { .source-list { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body data-extras-page="mirror">
+    <header class="extras-topbar">
+      <a class="back" href="/">← 返回控制台</a>
+      <div class="brand"><span class="brand-mark">LR</span>ly Orchestrator</div>
+      <div class="spacer"></div>
+      <button class="btn btn-sm" id="refresh">刷新</button>
+      <button class="btn btn-sm btn-primary" id="save">保存并应用</button>
+    </header>
+
+    <main class="extras-wrap">
+      <div class="page-head">
+        <div>
+          <h1>镜像口</h1>
+          <p>把一个物理数据口设为镜像目标口，把其它物理口的数据复制到该口用于抓包分析。保存后立即 apply。</p>
+        </div>
+      </div>
+
+      <div id="error" class="error-state" hidden></div>
+
+      <section class="card">
+        <div class="card-head">
+          <div class="card-title"><h2>当前状态</h2><p>来自运行时 mirror 组件与 show interface span 读回</p></div>
+          <div class="card-actions"><span id="state-badge" class="badge badge-neutral">未配置</span></div>
+        </div>
+        <div class="card-body" id="status"><div class="muted">正在读取…</div></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><div class="card-title"><h2>镜像配置</h2><p>镜像目标口只能有一个；源口可多选并分别设置方向</p></div></div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="field span-2">
+              <span class="field-label">镜像目标口</span>
+              <select class="select" id="target"></select>
+              <span class="field-hint">只能选择已接管的物理数据口，且不能是管理口或已配置 LAN/WAN 角色的口。</span>
+            </div>
+          </div>
+          <div class="section-title">镜像源</div>
+          <div class="source-list" id="sources"></div>
+          <div class="button-row" style="margin-top: 14px">
+            <button class="btn btn-sm btn-danger" id="cancel">取消镜像</button>
+          </div>
+          <div class="inline-warning" style="margin-top: 14px">
+            保存会先 PATCH 接口资源，再调用 /api/v1/runtime/apply 下发 VPP SPAN 会话；取消会 disable 全部会话。目标口无载波时只告警，源口转发不受影响。
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/mirror.js"></script>
+  </body>
+</html>

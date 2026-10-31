@@ -12,8 +12,8 @@ scripts/build-orchestrator-upgrade-package.sh --version 0.1 --out dist \
   --vpp-apply /path/to/vpp-apply
 ```
 
-The script rebuilds the console from `frontend/` (never from or into the frozen
-`packaging/orchestrator-ui-baseline/`), builds the control binary with
+The script composes the console from `packaging/orchestrator-ui-baseline/` plus
+`packaging/orchestrator-ui-extras/`, builds the control binary with
 `-X ly-route/backend/orchestrator.buildVersion=<version>`, and writes:
 
 ```text

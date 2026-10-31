@@ -11,8 +11,8 @@
 #   opt/ly-route/admin/...             built console (app.js/index.html/...)
 #   etc/ly-route/version.env           LY_ROUTE_VERSION=<version>
 #
-# The frozen baseline packaging/orchestrator-ui-baseline/ is never modified or
-# used as input here: the console is rebuilt from frontend/.
+# The console is the frozen baseline plus packaging/orchestrator-ui-extras/;
+# frontend/ is not used by this deployment path.
 #
 # Usage:
 #   scripts/build-orchestrator-upgrade-package.sh --version 0.1 [--out dist]
