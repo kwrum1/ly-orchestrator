@@ -1,6 +1,9 @@
 /* Orchestrator UI extras: injected into the frozen baseline index.html.
- * Adds two menu entries and renders their pages inside the baseline content
- * area, keeping the sidebar/topbar (no full page reload, no new window). */
+ * Keeps the baseline shell and content area. Adds the 流量镜像 page and two
+ * in-place enhancements:
+ *   - 网卡设置 → 角色配置 gains 镜像口 / 未配置
+ *   - 新增/编辑编排组 gains 接口故障旁路 / 业务故障旁路
+ */
 (function () {
   "use strict";
 
@@ -10,34 +13,50 @@
       id: "extras-mirror",
       after: 'a[href="/topology"]',
       path: "/mirror",
-      label: "镜像口",
-      title: "物理口镜像到专用抓包口",
+      label: "流量镜像",
+      title: "把物理口流量镜像到镜像口",
       icon:
         '<path d="M17 21v-2a1 1 0 0 1-1-1v-1a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v1a1 1 0 0 1-1 1"></path>' +
         '<path d="M19 15V6.5a1 1 0 0 0-7 0v11a1 1 0 0 1-7 0V9"></path>' +
         '<path d="M21 21v-2h-4"></path><path d="M3 5h4V3"></path>' +
         '<path d="M7 5a1 1 0 0 1 1 1v1a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a1 1 0 0 1 1-1V3"></path>'
-    },
-    {
-      kind: "bypass",
-      id: "extras-bypass",
-      after: 'a[href="/groups"]',
-      path: "/bypass",
-      label: "故障旁路",
-      title: "按组检测故障并仅旁路该组策略",
-      icon:
-        '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"></path>' +
-        '<path d="M12 8v4"></path><path d="M12 16h.01"></path>'
     }
   ];
 
   var VIEWS = {
-    mirror: { html: "/mirror.html", script: "/mirror.js", factory: "LyExtrasMirrorView" },
-    bypass: { html: "/bypass.html", script: "/bypass.js", factory: "LyExtrasBypassView" }
+    mirror: { html: "/mirror.html", script: "/mirror.js", factory: "LyExtrasMirrorView" }
   };
 
   var active = null;      // { kind, container, hidden, cleanup }
   var loading = false;
+  var roleModal = null;   // { port, role, previous, sources }
+  var groupModal = null;  // { name, editing }
+  var pendingGroupBypass = null; // { name, state, at } set when a group save is clicked
+  var skipRoleInject = false;    // guards internal topology writes from the role interceptor
+
+  function api(path, options) {
+    var opts = options || {};
+    var headers = Object.assign({ Accept: "application/json" }, opts.headers || {});
+    if (opts.body !== undefined && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+    return fetch(path, {
+      method: opts.method || "GET",
+      credentials: "same-origin",
+      headers: headers,
+      body: opts.body === undefined ? undefined : (typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body))
+    }).then(function (response) {
+      return response.text().then(function (text) {
+        var body = null;
+        try { body = text ? JSON.parse(text) : null; } catch (err) { body = text; }
+        if (!response.ok) {
+          var detail = body && body.error ? (body.error.message || body.error.code) : null;
+          var error = new Error(detail || body || ("HTTP " + response.status));
+          error.status = response.status;
+          throw error;
+        }
+        return body;
+      });
+    });
+  }
 
   function itemByKind(kind) {
     return ITEMS.find(function (item) { return item.kind === kind; }) || null;
@@ -45,7 +64,6 @@
 
   function kindFromPath(path) {
     if (path === "/mirror" || path === "/mirror.html") return "mirror";
-    if (path === "/bypass" || path === "/bypass.html") return "bypass";
     return "";
   }
 
@@ -91,16 +109,20 @@
     if (!head) return;
     var actions = document.createElement("div");
     actions.className = "page-actions";
-    var refresh = document.createElement("button");
-    refresh.className = "btn btn-sm";
-    refresh.id = "refresh";
-    refresh.textContent = "刷新";
-    var save = document.createElement("button");
-    save.className = "btn btn-sm btn-primary";
-    save.id = kind === "mirror" ? "save" : "save-config";
-    save.textContent = kind === "mirror" ? "保存并应用" : "保存探测配置";
-    actions.appendChild(refresh);
-    actions.appendChild(save);
+    // The mirror page inserts its own single primary action and refreshes
+    // itself after every write, so it gets no generic buttons here.
+    if (kind !== "mirror") {
+      var refresh = document.createElement("button");
+      refresh.className = "btn btn-sm";
+      refresh.id = "refresh";
+      refresh.textContent = "刷新";
+      actions.appendChild(refresh);
+      var save = document.createElement("button");
+      save.className = "btn btn-sm btn-primary";
+      save.id = "save";
+      save.textContent = "保存并应用";
+      actions.appendChild(save);
+    }
     head.appendChild(actions);
   }
 
@@ -127,7 +149,16 @@
     if (active && active.kind === kind) return;
     if (loading) return;
     var mainInner = document.querySelector(".main-inner");
-    if (!mainInner) return;
+    if (!mainInner) {
+      // The extras script can run before React mounts the shell.
+      if (!openView.retries) openView.retries = 0;
+      if (openView.retries < 15) {
+        openView.retries += 1;
+        window.setTimeout(function () { openView(kind, false); }, 300);
+      }
+      return;
+    }
+    openView.retries = 0;
 
     loading = true;
     closeView();
@@ -154,6 +185,11 @@
         var parsed = new DOMParser().parseFromString(html, "text/html");
         var wrap = parsed.querySelector(".extras-wrap");
         if (!wrap) throw new Error("页面模板缺失");
+        // The page template keeps its layout in <style>; when embedded only
+        // .extras-wrap is copied, so carry the styles into the view as well.
+        parsed.querySelectorAll("style").forEach(function (node) {
+          container.appendChild(node.cloneNode(true));
+        });
         while (wrap.firstChild) container.appendChild(wrap.firstChild);
         addActions(container, kind);
         return loadScript(VIEWS[kind].script);
@@ -206,6 +242,840 @@
     }
   }
 
+  // ---------- shared port helpers ----------
+
+  function portName(item) {
+    return item.name || item.id;
+  }
+
+  function portLabel(item) {
+    var name = portName(item);
+    return item.system_name && item.system_name !== name ? name + " · " + item.system_name : name;
+  }
+
+  function isManagement(item) {
+    return item.management === true || item.gateway_role === "management" || item.takeover_state === "management";
+  }
+
+  function currentPorts() {
+    return api("/api/v1/interfaces").then(function (data) { return (data && data.items) || []; });
+  }
+
+  function currentTopology() {
+    return api("/api/v1/orchestrator/topology").then(function (data) { return (data && data.item) || {}; });
+  }
+
+  // Marking a port as the mirror destination is a two-part change: the console
+  // role (topology port_roles) and the interface resource that the dataplane
+  // compiles into a SPAN session.
+  function setPortMirror(port, enabled) {
+    return currentTopology().then(function (topo) {
+      var roles = Object.assign({}, topo.port_roles || {});
+      if (enabled) roles[port] = "mirror";
+      else if (roles[port] === "mirror") delete roles[port];
+      topo.port_roles = roles;
+      delete topo.checksum;
+      return api("/api/v1/orchestrator/topology", { method: "PUT", body: topo });
+    }).then(function () {
+      return currentPorts();
+    }).then(function (ports) {
+      var item = ports.find(function (p) { return p.id === port || p.name === port; });
+      if (!item) return null;
+      if (enabled) {
+        return api("/api/v1/interfaces/" + encodeURIComponent(item.id), {
+          method: "PATCH",
+          body: { id: item.id, name: portName(item), mirror: true }
+        });
+      }
+      return api("/api/v1/interfaces/" + encodeURIComponent(item.id), {
+        method: "PATCH",
+        body: { id: item.id, name: portName(item), mirror: false, mirror_sources: [] }
+      });
+    }).then(function () {
+      return api("/api/v1/runtime/apply", { method: "POST", body: {} }).catch(function () { return null; });
+    });
+  }
+
+  window.LyOrchExtras = window.LyOrchExtras || {};
+  window.LyOrchExtras.setPortMirror = setPortMirror;
+  window.LyOrchExtras.currentPorts = currentPorts;
+  window.LyOrchExtras.portLabel = portLabel;
+  window.LyOrchExtras.isManagement = isManagement;
+
+  // ---------- 角色配置: LAN / WAN / 镜像口 / 未配置 ----------
+
+  function enhanceRoleModal(modal) {
+    var heading = modal.querySelector(".modal-head h2");
+    if (!heading || heading.textContent.trim() !== "角色配置") return;
+    if (modal.dataset.roleEnhanced === "1") return;
+    var subtitle = (modal.querySelector(".modal-head p") || {}).textContent || "";
+    var port = subtitle.split("·")[0].trim();
+    var select = modal.querySelector("select");
+    if (!port || !select) return;
+    modal.dataset.roleEnhanced = "1";
+    // The baseline renders WAN/LAN. Append the two extra choices instead of
+    // rebuilding the select: replacing React-owned <option> nodes makes the
+    // baseline crash when it unmounts the modal.
+    [["mirror", "镜像口"], ["", "未配置"]].forEach(function (pair) {
+      if (select.querySelector('option[value="' + pair[0] + '"]')) return;
+      var option = document.createElement("option");
+      option.value = pair[0];
+      option.textContent = pair[1];
+      option.setAttribute("data-extras-option", "1");
+      select.appendChild(option);
+    });
+    ["lan", "wan", "mirror", ""].forEach(function (value) {
+      var option = select.querySelector('option[value="' + value + '"]');
+      if (option) select.appendChild(option);
+    });
+    roleModal = { port: port, role: select.value, previous: "", sources: [] };
+    Promise.all([currentTopology(), currentPorts()]).then(function (results) {
+      if (modal.dataset.roleEnhanced !== "1" || !document.body.contains(modal)) return;
+      var topo = results[0] || {};
+      var ports = results[1] || [];
+      var item = ports.find(function (p) { return p.id === port || p.name === port || p.system_name === port; });
+      var previous = (topo.port_roles || {})[port] || "";
+      var role = previous;
+      if (!role && item && item.mirror === true) role = "mirror";
+      select.value = role;
+      roleModal = {
+        port: port,
+        role: role,
+        previous: previous,
+        sources: (item && item.mirror_sources) || []
+      };
+    }).catch(function () { /* keep the baseline selection */ });
+    select.addEventListener("change", function () {
+      if (roleModal) roleModal.role = select.value;
+    });
+  }
+
+  // ---------- 编排组: 接口 / 业务故障旁路 ----------
+
+  function bypassBlock() {
+    var wrap = document.createElement("div");
+    wrap.className = "field span-2";
+    wrap.dataset.bypassBlock = "1";
+    wrap.innerHTML =
+      '<span class="field-label">故障旁路</span>' +
+      '<div class="bypass-options">' +
+      '  <label class="check-card"><input type="checkbox" data-bypass-iface>' +
+      "    <span><strong>接口故障旁路</strong><small>网口 down 时自动旁路该组，其它组不受影响</small></span></label>" +
+      '  <label class="check-card"><input type="checkbox" data-bypass-biz>' +
+      "    <span><strong>业务故障旁路</strong><small>被动探测请求无响应时自动旁路该组</small></span></label>" +
+      "</div>" +
+      '<div class="bypass-fields" data-bypass-fields hidden>' +
+      '  <label class="field"><span class="field-label">目的地址</span><input class="input" data-bypass-ip placeholder="例如 192.168.10.82"></label>' +
+      '  <label class="field"><span class="field-label">目的端口</span><input class="input" data-bypass-port type="number" min="1" max="65535" placeholder="例如 80"></label>' +
+      '  <label class="field"><span class="field-label">协议</span><select class="select" data-bypass-proto><option value="tcp">TCP</option><option value="udp">UDP</option></select></label>' +
+      '  <label class="field"><span class="field-label">故障阈值（秒）</span><input class="input" data-bypass-threshold type="number" min="1" max="300" value="10"><span class="field-hint">窗口内所有请求都没有收到答复才旁路</span></label>' +
+      "</div>" +
+      '<span class="field-hint">接口旁路看网口 down；业务旁路在设定秒数内所有请求都没有答复（拒绝、重置、丢包都不算答复）才旁路。两类可独立开启，业务旁路需填写目的地址与端口。</span>';
+    return wrap;
+  }
+
+  function enhanceGroupModal(modal) {
+    var heading = modal.querySelector(".modal-head h2");
+    if (!heading) return;
+    var title = heading.textContent.trim();
+    if (!/编排组/.test(title)) return;
+    if (modal.dataset.bypassEnhanced === "1") return;
+    var body = modal.querySelector(".modal-body");
+    if (!body) return;
+    modal.dataset.bypassEnhanced = "1";
+    var block = bypassBlock();
+    body.appendChild(block);
+
+    var nameInput = body.querySelector('input.input');
+    var editing = /编辑/.test(title);
+    var name = editing && nameInput ? nameInput.value.trim() : "";
+    groupModal = { name: name, editing: editing, modal: modal };
+
+    var iface = block.querySelector("[data-bypass-iface]");
+    var biz = block.querySelector("[data-bypass-biz]");
+    var fields = block.querySelector("[data-bypass-fields]");
+    var ip = block.querySelector("[data-bypass-ip]");
+    var port = block.querySelector("[data-bypass-port]");
+    var proto = block.querySelector("[data-bypass-proto]");
+    var threshold = block.querySelector("[data-bypass-threshold]");
+
+    biz.addEventListener("change", function () { fields.hidden = !biz.checked; });
+
+    if (editing && name) {
+      api("/api/v1/orchestrator/bypass").then(function (data) {
+        if (!document.body.contains(modal)) return;
+        var config = (data && data.config) || {};
+        var entry = (config.groups || []).find(function (item) { return item.name === name; });
+        if (!entry) return;
+        // interface_bypass is optional in older configurations; omitted means on.
+        iface.checked = entry.interface_bypass !== false;
+        var target = (entry.flow_targets || [])[0];
+        if (target) {
+          biz.checked = true;
+          fields.hidden = false;
+          ip.value = target.dst_ip || "";
+          port.value = target.dst_port || "";
+          proto.value = (target.protocol || "tcp").toLowerCase();
+        }
+        if (entry.window_seconds) threshold.value = String(entry.window_seconds);
+      }).catch(function () { /* the group still saves without prefill */ });
+    }
+
+    function readState() {
+      return {
+        iface: iface.checked,
+        biz: biz.checked,
+        ip: String(ip.value || "").trim(),
+        port: Number(port.value),
+        proto: proto.value,
+        threshold: Number(threshold.value) || 10
+      };
+    }
+
+    // Block the save when business bypass is enabled without a target, and
+    // remember the switches so the group-save response can persist them.
+    var footer = modal.querySelector(".modal-footer");
+    var primary = footer ? footer.querySelector(".btn-primary") : null;
+    if (primary) {
+      primary.addEventListener("click", function (event) {
+        if (biz.checked) {
+          var missing = [];
+          if (!String(ip.value || "").trim()) missing.push("目的地址");
+          var p = Number(port.value);
+          if (!Number.isInteger(p) || p < 1 || p > 65535) missing.push("目的端口");
+          if (missing.length) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            var warning = block.querySelector(".bypass-error");
+            if (!warning) {
+              warning = document.createElement("div");
+              warning.className = "inline-warning bypass-error";
+              block.appendChild(warning);
+            }
+            warning.textContent = "业务故障旁路缺少" + missing.join("、") + "；补全或关闭业务旁路后再保存。";
+            return;
+          }
+        }
+        var groupName = String((nameInput && nameInput.value) || "").trim();
+        if (groupName) {
+          pendingGroupBypass = { name: groupName, state: readState(), at: Date.now() };
+        }
+      }, true);
+    }
+
+    groupModal.read = function () {
+      return readState();
+    };
+  }
+
+  function saveBypassForGroup(name, state, enabled) {
+    if (!name) return Promise.resolve(null);
+    return api("/api/v1/orchestrator/bypass").then(function (data) {
+      var config = Object.assign({}, (data && data.config) || {});
+      var existing = (config.groups || []).find(function (item) { return item.name === name; });
+      var groups = (config.groups || []).filter(function (item) { return item.name !== name; });
+      if (enabled && state && (state.iface || state.biz)) {
+        var entry = {
+          name: name,
+          interface_bypass: Boolean(state.iface),
+          window_seconds: state.threshold || 10,
+          failure_threshold: (existing && existing.failure_threshold) || 3,
+          recovery_threshold: (existing && existing.recovery_threshold) || 3
+        };
+        if (state.biz) {
+          entry.flow_targets = [{
+            dst_ip: state.ip,
+            dst_port: state.port,
+            protocol: state.proto === "udp" ? "udp" : "tcp"
+          }];
+        }
+        groups.push(entry);
+      }
+      config.groups = groups;
+      return api("/api/v1/orchestrator/bypass/config", { method: "PUT", body: config });
+    });
+  }
+
+  function removeBypassGroup(name) {
+    if (!name) return Promise.resolve(null);
+    return api("/api/v1/orchestrator/bypass").then(function (data) {
+      var config = Object.assign({}, (data && data.config) || {});
+      var groups = (config.groups || []).filter(function (item) { return item.name !== name; });
+      if (groups.length === (config.groups || []).length) return null;
+      config.groups = groups;
+      return api("/api/v1/orchestrator/bypass/config", { method: "PUT", body: config });
+    });
+  }
+
+  // ---------- toast + mirror role column ----------
+
+  function showToast(message, tone) {
+    var node = document.getElementById("extras-toast");
+    if (!node) {
+      node = document.createElement("div");
+      node.id = "extras-toast";
+      node.className = "extras-toast";
+      document.body.appendChild(node);
+    }
+    node.textContent = String(message);
+    node.setAttribute("data-tone", tone || "info");
+    node.hidden = false;
+    window.clearTimeout(showToast.timer);
+    showToast.timer = window.setTimeout(function () {
+      node.hidden = true;
+    }, 9000);
+  }
+
+  var mirrorIds = {};
+  var mirrorIdsAt = 0;
+  var mirrorIdsPromise = null;
+
+  function refreshMirrorIds(force) {
+    if (!force && Date.now() - mirrorIdsAt < 5000) return Promise.resolve(mirrorIds);
+    if (mirrorIdsPromise) return mirrorIdsPromise;
+    mirrorIdsPromise = currentPorts().then(function (ports) {
+      var ids = {};
+      ports.forEach(function (item) {
+        if (item.mirror !== true) return;
+        [item.id, item.name, item.system_name].forEach(function (value) {
+          if (value) ids[String(value)] = true;
+        });
+      });
+      mirrorIds = ids;
+      mirrorIdsAt = Date.now();
+      mirrorIdsPromise = null;
+      return ids;
+    }).catch(function () {
+      mirrorIdsPromise = null;
+      return mirrorIds;
+    });
+    return mirrorIdsPromise;
+  }
+
+  // The baseline maps lan/wan to labels and renders everything else as
+  // 未配置, so a mirror port would read as unconfigured. Rewrite only that
+  // cell; rows showing 入口/出口, 聚合组 or 编排组 are left alone.
+  function relabelMirrorRoles() {
+    var ids = Object.keys(mirrorIds);
+    if (!ids.length) return;
+    document.querySelectorAll("table").forEach(function (table) {
+      var headers = Array.prototype.slice.call(table.querySelectorAll("thead th"));
+      var index = -1;
+      headers.forEach(function (th) {
+        if (index === -1 && th.textContent.trim() === "方向") index = th.cellIndex;
+      });
+      if (index < 0) return;
+      table.querySelectorAll("tbody tr").forEach(function (row) {
+        var first = row.cells[0];
+        if (!first || !row.cells[index]) return;
+        var text = first.innerText.trim();
+        var isMirror = ids.some(function (id) {
+          return text === id || text.indexOf(id + " ") === 0 || text.indexOf("· " + id) !== -1;
+        });
+        if (!isMirror) return;
+        var cell = row.cells[index];
+        var current = cell.innerText.trim();
+        if (current === "镜像口") return;
+        if (current !== "未配置" && current !== "mirror") return;
+        var badge = cell.querySelector(".badge") || cell.firstElementChild;
+        if (badge) {
+          badge.textContent = "镜像口";
+          if (badge.className && badge.className.indexOf("badge") !== -1) badge.className = "badge badge-info";
+        } else {
+          cell.textContent = "镜像口";
+        }
+      });
+    });
+  }
+
+  function scheduleRelabel() {
+    refreshMirrorIds(false).then(function () {
+      relabelMirrorRoles();
+      decorateInterfacesPage();
+    });
+  }
+
+  // ---------- 网卡设置: compact overview + table columns ----------
+
+  var nicFacts = { at: 0, ports: [], topology: {}, groups: [] };
+
+  function refreshNicFacts() {
+    if (Date.now() - nicFacts.at < 8000) return Promise.resolve(nicFacts);
+    return Promise.all([
+      currentPorts(),
+      currentTopology().catch(function () { return {}; }),
+      api("/api/v1/orchestrator/orchestration-groups").catch(function () { return { items: [] }; })
+    ]).then(function (results) {
+      nicFacts = {
+        at: Date.now(),
+        ports: results[0] || [],
+        topology: results[1] || {},
+        groups: (results[2] && results[2].items) || []
+      };
+      return nicFacts;
+    }).catch(function () { return nicFacts; });
+  }
+
+  function portLookup(ports, key) {
+    return ports.find(function (item) {
+      return item.id === key || item.name === key || item.system_name === key;
+    }) || null;
+  }
+
+  function interfacePage() {
+    var main = document.querySelector(".main-inner");
+    if (!main) return null;
+    var h1 = main.querySelector("h1");
+    if (!h1 || h1.textContent.trim() !== "网卡设置") return null;
+    return main.querySelector(".page");
+  }
+
+  function takeoverLabel(item) {
+    if (!item) return "—";
+    if (isManagement(item)) return "管理口";
+    if (item.takeover_class === "compatibility" || item.takeover_mode === "af_packet") return "兼容模式";
+    if (item.takeover_state === "taken_over") return "高性能";
+    if (item.takeover_capability === "supported") return "可接管";
+    return "不支持";
+  }
+
+  function takeoverSummary(ports) {
+    var taken = ports.filter(function (item) { return item.takeover_state === "taken_over"; }).length;
+    var compat = ports.filter(function (item) {
+      return item.takeover_class === "compatibility" || item.takeover_mode === "af_packet";
+    }).length;
+    var parts = ["已接管 " + taken + " 张"];
+    if (compat) parts.push("兼容模式 " + compat + " 张");
+    return parts.join(" · ");
+  }
+
+  function overviewSummary(facts) {
+    var ports = facts.ports || [];
+    var topology = facts.topology || {};
+    var roles = topology.port_roles || {};
+    var members = {};
+    ((topology.interfaces) || []).forEach(function (item) {
+      var port = item.port || (item.bond && item.bond.name) || "";
+      if (port) members[port] = item.role === "wan" ? "出口" : "入口";
+    });
+    (facts.groups || []).forEach(function (group) {
+      (group.ports || []).forEach(function (port) {
+        if (port.interface) members[port.interface] = "编排组";
+      });
+    });
+    var counts = { 管理口: 0, 入口: 0, 出口: 0, 编排组: 0, 镜像口: 0, 其他: 0 };
+    ports.forEach(function (item) {
+      var keys = [item.id, item.name, item.system_name].filter(Boolean);
+      var role = "";
+      keys.some(function (key) { if (roles[key]) { role = roles[key]; return true; } return false; });
+      var group = keys.some(function (key) { return members[key] === "编排组"; });
+      var logical = "";
+      keys.some(function (key) { if (members[key] && members[key] !== "编排组") { logical = members[key]; return true; } return false; });
+      if (isManagement(item)) counts["管理口"] += 1;
+      else if (group) counts["编排组"] += 1;
+      else if (logical) counts[logical] += 1;
+      else if (item.mirror === true || role === "mirror") counts["镜像口"] += 1;
+      else counts["其他"] += 1;
+    });
+    var parts = [ports.length + " 个端口"];
+    ["管理口", "入口", "出口", "编排组", "镜像口", "其他"].forEach(function (key) {
+      if (counts[key]) parts.push(key + " " + counts[key]);
+    });
+    return parts.join(" · ");
+  }
+
+  function ensureTakeoverCard(page, facts) {
+    var cards = Array.prototype.slice.call(page.querySelectorAll("section.card"));
+    var card = cards.find(function (node) {
+      var h2 = node.querySelector(".card-head h2");
+      return h2 && h2.textContent.trim() === "网卡接管";
+    });
+    if (!card) return;
+    var factsBox = card.querySelector(".takeover-facts");
+    if (factsBox && factsBox.dataset.extrasSummary !== "1") {
+      factsBox.dataset.extrasSummary = "1";
+      factsBox.innerHTML = '<span><i class="status-dot status-dot-success"></i>' +
+        takeoverSummary(facts.ports || []) + "</span>";
+    }
+    var note = card.querySelector(".takeover-panel p, .card-body > p.muted");
+    if (note) note.style.display = "none";
+    var headActions = card.querySelector(".card-actions");
+    var close = card.querySelector(".card-body button");
+    if (headActions && close && close.parentElement !== headActions) {
+      close.classList.add("btn-sm");
+      headActions.appendChild(close);
+    }
+    var oldBadge = headActions ? headActions.querySelector(".badge") : null;
+    if (oldBadge) oldBadge.style.display = "none";
+  }
+
+  function ensureOverviewCard(page, facts) {
+    var cards = Array.prototype.slice.call(page.querySelectorAll("section.card"));
+    var card = cards.find(function (node) {
+      var h2 = node.querySelector(".card-head h2");
+      return h2 && h2.textContent.trim() === "接口总览";
+    });
+    if (!card) return;
+    var grid = card.querySelector(".port-grid");
+    if (grid) grid.style.display = "none";
+    var body = card.querySelector(".card-body");
+    if (!body) return;
+    var summary = body.querySelector(".nic-summary");
+    if (!summary) {
+      summary = document.createElement("div");
+      summary.className = "nic-summary";
+      body.appendChild(summary);
+    }
+    var text = overviewSummary(facts);
+    if (summary.textContent !== text) summary.textContent = text;
+    card.style.marginBottom = "10px";
+  }
+
+  function ensureInterfaceTable(page, facts) {
+    var table = page.querySelector("table");
+    if (!table) return;
+    var headers = Array.prototype.slice.call(table.querySelectorAll("thead th"));
+    var takeoverTh = headers.find(function (th) { return th.textContent.trim() === "接管能力"; });
+    if (takeoverTh && takeoverTh.dataset.extrasMode !== "1") {
+      takeoverTh.dataset.extrasMode = "1";
+      var button = takeoverTh.querySelector(".th-button");
+      if (button) button.textContent = "接管模式";
+      else takeoverTh.textContent = "接管模式";
+    }
+    if (takeoverTh && !takeoverTh.dataset.extrasStatus) {
+      var statusTh = document.createElement("th");
+      statusTh.dataset.extrasStatus = "1";
+      statusTh.style.width = "84px";
+      statusTh.innerHTML = '<button type="button" class="th-button">网卡状态</button>';
+      takeoverTh.parentNode.insertBefore(statusTh, takeoverTh.nextSibling);
+      table.classList.add("extras-auto-table");
+    }
+    var index = takeoverTh ? takeoverTh.cellIndex : -1;
+    var rows = table.querySelectorAll("tbody tr");
+    Array.prototype.forEach.call(rows, function (row) {
+      var first = row.cells[0];
+      if (!first) return;
+      var key = first.innerText.trim().split("\n")[0];
+      var item = portLookup(facts.ports || [], key);
+      var modeCell = row.cells[index];
+      if (modeCell) {
+        var badge = modeCell.querySelector(".badge");
+        if (badge) {
+          var label = takeoverLabel(item);
+          if (badge.textContent !== label) badge.textContent = label;
+        }
+      }
+      if (index < 0) return;
+      var existing = row.querySelector("td[data-extras-status]");
+      if (!existing) {
+        existing = document.createElement("td");
+        existing.dataset.extrasStatus = "1";
+        row.insertBefore(existing, row.cells[index + 1] || null);
+      }
+      var state = item && item.link_state ? String(item.link_state).toLowerCase() : "";
+      var text = state === "up" ? "UP" : state === "down" ? "DOWN" : "—";
+      var tone = state === "up" ? "badge-success" : state === "down" ? "badge-danger" : "badge-neutral";
+      var current = existing.querySelector(".badge");
+      if (!current) {
+        current = document.createElement("span");
+        current.className = "badge " + tone;
+        existing.appendChild(current);
+      }
+      if (current.textContent !== text) current.textContent = text;
+      if (current.className !== "badge " + tone) current.className = "badge " + tone;
+    });
+  }
+
+  function enhanceBondModal(page, facts) {
+    var modal = Array.prototype.slice.call(document.querySelectorAll(".modal")).find(function (node) {
+      var h2 = node.querySelector(".modal-head h2");
+      return h2 && h2.textContent.trim() === "创建聚合";
+    });
+    if (!modal || modal.dataset.extrasCompat === "1") return;
+    var grid = modal.querySelector(".check-grid");
+    if (!grid) return;
+    modal.dataset.extrasCompat = "1";
+    var cards = Array.prototype.slice.call(grid.querySelectorAll(".check-card"));
+    var blocked = 0;
+    cards.forEach(function (card) {
+      var label = card.querySelector("strong");
+      var name = label ? label.textContent.trim() : "";
+      var item = portLookup(facts.ports || [], name);
+      var compat = item && (item.takeover_class === "compatibility" || item.takeover_mode === "af_packet");
+      if (!compat) return;
+      blocked += 1;
+      card.style.opacity = "0.55";
+      card.title = "兼容模式（af_packet）的网卡不能加入聚合组";
+      var box = card.querySelector('input[type="checkbox"]');
+      if (box) { box.disabled = true; box.checked = false; }
+    });
+    if (!blocked) return;
+    var body = modal.querySelector(".modal-body");
+    if (body && !body.querySelector(".bond-compat-warning")) {
+      var warning = document.createElement("div");
+      warning.className = "inline-warning bond-compat-warning";
+      warning.style.marginBottom = "10px";
+      warning.textContent =
+        "兼容模式（af_packet）的网卡无法证明聚合能力，已在下方禁用；请先把网卡切换到高性能接管，再创建聚合。";
+      body.insertBefore(warning, body.firstChild);
+    }
+    var usable = cards.length - blocked;
+    var primary = modal.querySelector(".modal-footer .btn-primary");
+    if (primary && usable === 0) {
+      primary.disabled = true;
+      primary.title = "没有可用于聚合的网卡：当前所有物理口都在兼容模式";
+    }
+  }
+
+  function decorateInterfacesPage() {
+    var page = interfacePage();
+    if (!page) return;
+    refreshNicFacts().then(function (facts) {
+      if (!document.body.contains(page)) return;
+      ensureTakeoverCard(page, facts);
+      ensureOverviewCard(page, facts);
+      ensureInterfaceTable(page, facts);
+      enhanceBondModal(page, facts);
+    });
+  }
+
+  // The role save only writes topology metadata; the dataplane needs the
+  // interface mirror flag (and an apply) to actually create or drop the SPAN.
+  function putTopologyInternal(doc) {
+    skipRoleInject = true;
+    return api("/api/v1/orchestrator/topology", { method: "PUT", body: doc }).then(function (result) {
+      skipRoleInject = false;
+      return result;
+    }, function (error) {
+      skipRoleInject = false;
+      throw error;
+    });
+  }
+
+  function syncMirrorAfterRole(port, role, sources) {
+    // The baseline save may not carry the new role (its React state can be
+    // replaced when the confirm dialog opens), so verify and repair it here.
+    return currentTopology().then(function (topo) {
+      var roles = Object.assign({}, topo.port_roles || {});
+      var current = roles[port] || "";
+      if (current === role) return null;
+      if (role === "") delete roles[port];
+      else roles[port] = role;
+      var doc = Object.assign({}, topo, { port_roles: roles });
+      delete doc.checksum;
+      return putTopologyInternal(doc);
+    }).then(function () {
+      return currentPorts();
+    }).then(function (ports) {
+      var item = ports.find(function (p) { return p.id === port || p.name === port || p.system_name === port; });
+      if (!item) return null;
+      if (role === "mirror") {
+        // Always send the current source list: the topology save can drop it,
+        // and a role re-save must not erase the mirror policies.
+        var keep = sources && sources.length ? sources : (item.mirror_sources || []);
+        return api("/api/v1/interfaces/" + encodeURIComponent(item.id), {
+          method: "PATCH",
+          body: { id: item.id, name: portName(item), mirror: true, mirror_sources: keep }
+        });
+      }
+      if (role !== "mirror" && item.mirror === true) {
+        return api("/api/v1/interfaces/" + encodeURIComponent(item.id), {
+          method: "PATCH",
+          body: { id: item.id, name: portName(item), mirror: false, mirror_sources: [] }
+        });
+      }
+      return null;
+    }).then(function () {
+      return api("/api/v1/runtime/apply", { method: "POST", body: {} }).catch(function () { return null; });
+    }).then(function () {
+      return refreshMirrorIds(true);
+    }).then(function () {
+      relabelMirrorRoles();
+    });
+  }
+
+  // A mirror-role change that the dataplane rejects (second mirror port, a port
+  // owned by a group, ...) must not leave the console ahead of the device.
+  function revertRole(snapshot, error) {
+    showToast("镜像口设置失败：" + (error && error.message ? error.message : error), "error");
+    currentTopology().then(function (topo) {
+      var roles = Object.assign({}, topo.port_roles || {});
+      if (snapshot.previous) roles[snapshot.port] = snapshot.previous;
+      else delete roles[snapshot.port];
+      var doc = Object.assign({}, topo, { port_roles: roles });
+      delete doc.checksum;
+      return putTopologyInternal(doc);
+    }).then(function () {
+      return refreshMirrorIds(true);
+    }).catch(function () { /* the next reload repairs the table */ });
+  }
+
+  function roleConflictResponse(message) {
+    return new Response(JSON.stringify({ error: { code: "mirror_conflict", message: message } }), {
+      status: 409,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  function groupWriteRequest(url, method) {
+    if (method === "POST" && /\/api\/v1\/orchestrator\/orchestration-groups$/.test(url)) return true;
+    if (method === "PUT" && /\/api\/v1\/orchestrator\/orchestration-groups\/[^/]+$/.test(url)) return true;
+    return false;
+  }
+
+  // ---------- fetch interception ----------
+
+  var rawFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    var url = typeof input === "string" ? input : (input && input.url) || "";
+    var opts = init || {};
+    var method = String(opts.method || "GET").toUpperCase();
+    var bodyText = typeof opts.body === "string" ? opts.body : "";
+    var topologySave = method === "PUT" && /\/api\/v1\/orchestrator\/topology$/.test(url);
+    var roleSnapshot = topologySave && !skipRoleInject && roleModal
+      ? {
+          port: roleModal.port,
+          role: roleModal.role,
+          previous: roleModal.previous || "",
+          sources: roleModal.sources || []
+        }
+      : null;
+
+    if (roleSnapshot && bodyText) {
+      try {
+        var doc = JSON.parse(bodyText);
+        doc.port_roles = doc.port_roles || {};
+        if (roleSnapshot.role === "") delete doc.port_roles[roleSnapshot.port];
+        else doc.port_roles[roleSnapshot.port] = roleSnapshot.role;
+        opts = Object.assign({}, opts, { body: JSON.stringify(doc) });
+      } catch (err) { /* keep the original body */ }
+    }
+
+    // Reject a second mirror port before the console records the role; the
+    // synthetic 409 carries a message the baseline shows in its toast.
+    if (roleSnapshot && roleSnapshot.role === "mirror") {
+      return currentPorts().then(function (ports) {
+        var other = ports.find(function (item) {
+          return item.mirror === true && item.id !== roleSnapshot.port && item.name !== roleSnapshot.port;
+        });
+        if (other) {
+          return roleConflictResponse(
+            "接口 " + portLabel(other) + " 已经是镜像口；请先把它的角色改回 LAN/WAN/未配置，再设置本端口。"
+          );
+        }
+        return rawFetch(input, opts).then(function (response) {
+          if (response.ok) {
+            syncMirrorAfterRole(roleSnapshot.port, roleSnapshot.role, roleSnapshot.sources).catch(function (error) {
+              revertRole(roleSnapshot, error);
+            });
+          }
+          return response;
+        });
+      });
+    }
+
+    if (roleSnapshot) {
+      return rawFetch(input, opts).then(function (response) {
+        if (response.ok) {
+          syncMirrorAfterRole(roleSnapshot.port, roleSnapshot.role, roleSnapshot.sources).catch(function (error) {
+            revertRole(roleSnapshot, error);
+          });
+        }
+        return response;
+      });
+    }
+
+    if (groupWriteRequest(url, method)) {
+      return rawFetch(input, opts).then(function (response) {
+        if (response.ok && pendingGroupBypass && Date.now() - pendingGroupBypass.at < 120000) {
+          var pending = pendingGroupBypass;
+          var name = "";
+          try { name = String((JSON.parse(bodyText || "{}") || {}).name || ""); } catch (err) { name = ""; }
+          if (!name) name = decodeURIComponent(url.split("/").pop() || "");
+          if (name && name === pending.name) {
+            pendingGroupBypass = null;
+            saveBypassForGroup(pending.name, pending.state, true).catch(function (error) {
+              showToast("故障旁路保存失败：" + (error && error.message ? error.message : error), "error");
+            });
+          }
+        } else if (!response.ok) {
+          pendingGroupBypass = null;
+        }
+        return response;
+      });
+    }
+
+    if (method === "DELETE" && /\/api\/v1\/orchestrator\/orchestration-groups\/[^/]+$/.test(url)) {
+      return rawFetch(input, opts).then(function (response) {
+        if (response.ok) {
+          var name = decodeURIComponent(url.split("/").pop() || "");
+          removeBypassGroup(name).catch(function () { /* the prune loop retries */ });
+        }
+        return response;
+      });
+    }
+
+    return rawFetch(input, opts);
+  };
+
+  // ---------- DOM observation ----------
+
+  function relabelConfirmTitle() {
+    if (!roleModal) return;
+    document.querySelectorAll(".modal").forEach(function (modal) {
+      var heading = modal.querySelector(".modal-head h2");
+      if (!heading) return;
+      var text = heading.textContent.trim();
+      if (!/^将 .+ 配置为 /.test(text)) return;
+      var port = roleModal.port;
+      var wanted = roleModal.role === "mirror"
+        ? "将 " + port + " 配置为 镜像口？"
+        : roleModal.role === ""
+          ? "清除 " + port + " 的角色配置？"
+          : "";
+      if (wanted && text !== wanted) heading.textContent = wanted;
+    });
+  }
+
+  function scan() {
+    document.querySelectorAll(".modal").forEach(function (modal) {
+      var heading = modal.querySelector(".modal-head h2");
+      if (!heading) return;
+      if (heading.textContent.trim() === "角色配置") enhanceRoleModal(modal);
+      else if (/编排组/.test(heading.textContent)) enhanceGroupModal(modal);
+    });
+    if (!document.querySelector(".modal[data-role-enhanced='1']")) roleModal = null;
+    if (!document.querySelector(".modal[data-bypass-enhanced='1']")) groupModal = null;
+    relabelConfirmTitle();
+    inject();
+    scheduleRelabel();
+  }
+
+  function pruneBypassGroups() {
+    if (document.hidden) return;
+    api("/api/v1/orchestrator/orchestration-groups").then(function (groups) {
+      var names = {};
+      ((groups && groups.items) || []).forEach(function (item) { names[item.name] = true; });
+      return api("/api/v1/orchestrator/bypass").then(function (data) {
+        var config = (data && data.config) || {};
+        var existing = config.groups || [];
+        var kept = existing.filter(function (item) { return names[item.name]; });
+        if (kept.length === existing.length) return null;
+        config.groups = kept;
+        return api("/api/v1/orchestrator/bypass/config", { method: "PUT", body: config });
+      });
+    }).catch(function () { /* best effort */ });
+  }
+
+  var scanTimer = null;
+  function scheduleScan() {
+    if (scanTimer) return;
+    scanTimer = window.setTimeout(function () {
+      scanTimer = null;
+      scan();
+    }, 120);
+  }
+
   function start() {
     if (!document.getElementById("extras-view-style")) {
       var style = document.createElement("style");
@@ -214,7 +1084,28 @@
         "[hidden]{display:none!important}" +
         "#extras-view{display:flex;flex-direction:column;gap:16px}" +
         "#extras-view .extras-wrap{max-width:none;margin:0;padding:0}" +
-        "#extras-view .page-head{margin:0}";
+        "#extras-view .page-head{margin:0}" +
+        ".bypass-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:6px}" +
+        ".bypass-options .check-card{align-items:flex-start}" +
+        ".bypass-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 14px;margin-top:10px;padding:12px;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-sunken,#f8fafc)}" +
+        ".bypass-error{margin-top:8px}" +
+        ".extras-toast{position:fixed;right:24px;bottom:24px;z-index:1000;max-width:420px;padding:11px 14px;border-radius:var(--radius-md);border:1px solid var(--border);background:#fff;box-shadow:0 12px 30px rgba(15,23,42,.16);font-size:12px;line-height:1.5;color:var(--text-secondary)}" +
+        ".extras-toast[data-tone=error]{border-color:#fecaca;background:#fff7f7;color:#b42318}" +
+        ".nic-summary{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:var(--text-secondary)}" +
+        ".takeover-facts{flex-wrap:wrap;gap:6px 16px}" +
+        ".takeover-facts>span{font-size:12px}" +
+        ".toast-stack .toast-success{display:none!important}" +
+        ".metric-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}" +
+        ".extras-auto-table{table-layout:auto}" +
+        ".metric{min-height:112px;padding:14px 16px}" +
+        ".metric strong{font-size:24px}" +
+        ".traffic-chart{min-height:clamp(160px,20vh,240px)}" +
+        ".trend-empty{min-height:clamp(200px,26vh,300px)}" +
+        ".port-grid-large{grid-template-columns:repeat(4,minmax(0,1fr))}" +
+        "@media(min-width:1181px){.overview-main-grid .span-8{grid-column:span 8}.overview-main-grid .span-4{grid-column:span 4}.overview-secondary-grid .span-7,.overview-bottom-grid .span-7{grid-column:span 7}.overview-secondary-grid .span-5,.overview-bottom-grid .span-5{grid-column:span 5}}" +
+        "@media(max-width:1180px){.overview-main-grid .span-8,.overview-main-grid .span-4,.overview-secondary-grid .span-7,.overview-secondary-grid .span-5,.overview-bottom-grid .span-7,.overview-bottom-grid .span-5{grid-column:span 12}}" +
+        "@media(max-width:1500px){.metric{padding:14px 16px}.metric strong{font-size:24px}.metric-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}}" +
+        "@media(max-width:1280px){.metric-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}}";
       document.head.appendChild(style);
     }
     inject();
@@ -223,8 +1114,14 @@
       var observer = new MutationObserver(function () { inject(); });
       observer.observe(nav, { childList: true, subtree: false });
     }
+    if (window.MutationObserver) {
+      var bodyObserver = new MutationObserver(scheduleScan);
+      bodyObserver.observe(document.body, { childList: true, subtree: true });
+    }
     var wanted = kindFromPath(window.location.pathname);
     if (wanted) openView(wanted, false);
+    scheduleScan();
+    window.setInterval(pruneBypassGroups, 30000);
   }
 
   // Keep the baseline shell: only the content area is swapped. Clicking any
@@ -238,13 +1135,13 @@
       openView(kind, true);
       return;
     }
-    closeView();
-  }, true);
+    if (active) closeView();
+  });
 
   window.addEventListener("popstate", function () {
     var kind = kindFromPath(window.location.pathname);
     if (kind) openView(kind, false);
-    else closeView();
+    else if (active) closeView();
   });
 
   if (document.readyState === "loading") {
@@ -252,13 +1149,4 @@
   } else {
     start();
   }
-  var tries = 0;
-  var timer = setInterval(function () {
-    inject();
-    if (!active) {
-      var wanted = kindFromPath(window.location.pathname);
-      if (wanted) openView(wanted, false);
-    }
-    if (++tries > 40 && document.querySelector("nav.side-nav")) clearInterval(timer);
-  }, 250);
 })();

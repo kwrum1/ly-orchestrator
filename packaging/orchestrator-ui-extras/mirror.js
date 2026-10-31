@@ -1,18 +1,29 @@
-/* Port mirror page for the frozen orchestrator UI. Uses the orchestrator
- * interface resource + runtime apply contract; never talks to VPP directly. */
+/* 流量镜像 page for the frozen orchestrator UI.
+ *
+ * One row in the table is one physical source port mirrored into the single
+ * mirror destination port (selected in 网卡设置 → 角色配置). The add/edit
+ * dialog mirrors the 流量编排 policy dialog: a modal-xl with .policy-form
+ * sections, .form-grid fields, native <select> controls and the same footer.
+ */
 window.LyExtrasMirrorView = function (root) {
   "use strict";
 
   var state = {
-    items: [],
-    targetId: "",
-    sources: {}, // port id -> direction
-    mirror: null,
+    ports: [],
     component: null,
     busy: false
   };
 
   var $ = function (id) { return root ? root.querySelector("#" + id) : document.getElementById(id); };
+  var helpers = window.LyOrchExtras || {};
+  var portLabel = helpers.portLabel || function (item) { return item.name || item.id; };
+  var isManagement = helpers.isManagement || function (item) {
+    return item.management === true || item.gateway_role === "management" || item.takeover_state === "management";
+  };
+  var iconClose =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" ' +
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x">' +
+    '<path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>';
 
   function api(path, options) {
     var opts = options || {};
@@ -42,6 +53,7 @@ window.LyExtrasMirrorView = function (root) {
 
   function showError(message) {
     var box = $("error");
+    if (!box) return;
     if (!message) { box.hidden = true; box.textContent = ""; return; }
     box.hidden = false;
     box.innerHTML = "";
@@ -53,221 +65,223 @@ window.LyExtrasMirrorView = function (root) {
     box.appendChild(p);
   }
 
-  function isManagement(item) {
-    return item.management === true || item.gateway_role === "management" || item.takeover_state === "management";
-  }
-
   function isPhysical(item) {
     return Boolean(item.system_name) && !isManagement(item);
   }
 
-  function portName(item) {
-    return item.name || item.id;
-  }
-
-  function portLabel(item) {
-    var name = portName(item);
-    return item.system_name && item.system_name !== name ? name + " · " + item.system_name : name;
+  function mirrorPort() {
+    return state.ports.find(function (item) { return item.mirror === true; }) || null;
   }
 
   function portByReference(reference) {
-    return state.items.find(function (item) {
+    return state.ports.find(function (item) {
       return item.id === reference || item.name === reference || item.system_name === reference;
     }) || null;
   }
 
-  function currentMirror() {
-    return state.items.find(function (item) { return item.mirror === true; }) || null;
+  function sources() {
+    var port = mirrorPort();
+    return port && port.mirror_sources ? port.mirror_sources : [];
   }
 
-  function sourceDirections(item) {
-    var result = {};
-    (item && item.mirror_sources ? item.mirror_sources : []).forEach(function (source) {
-      if (!source || !source.interface) return;
-      result[source.interface] = source.direction || "both";
-    });
-    return result;
+  function running() {
+    return Boolean(state.component && state.component.state === "running");
   }
 
-  function renderTargetOptions() {
-    var select = $("target");
-    select.innerHTML = "";
-    var none = document.createElement("option");
-    none.value = "";
-    none.textContent = "未选择";
-    select.appendChild(none);
-    state.items.filter(isPhysical).forEach(function (item) {
-      var role = String(item.gateway_role || "").toLowerCase();
-      if (role === "lan" || role === "wan") return;
-      var option = document.createElement("option");
-      option.value = item.id;
-      option.textContent = portLabel(item) + (item.mirror ? "（当前镜像口）" : "");
-      select.appendChild(option);
-    });
-    select.value = state.targetId;
+  function directionLabel(value) {
+    return value === "rx" ? "仅接收" : value === "tx" ? "仅发送" : "双向";
   }
 
-  function renderSources() {
-    var list = $("sources");
-    list.innerHTML = "";
-    var candidates = state.items.filter(function (item) {
-      return isPhysical(item) && item.id !== state.targetId;
-    });
-    if (!candidates.length) {
-      var empty = document.createElement("div");
-      empty.className = "muted";
-      empty.textContent = "没有可用作镜像源的已接管物理网卡。";
-      list.appendChild(empty);
-      return;
+  function renderTable() {
+    var port = mirrorPort();
+    var rows = $("policy-rows");
+    if (!rows) return;
+    rows.innerHTML = "";
+    var list = sources();
+    var empty = $("empty");
+    if (empty) empty.hidden = Boolean(list.length) || !port;
+    var noTarget = $("no-target");
+    if (noTarget) noTarget.hidden = Boolean(port);
+    var subtitle = $("policy-subtitle");
+    if (subtitle) {
+      subtitle.textContent = port
+        ? "共 " + list.length + " 条 · 输出口 " + portLabel(port)
+        : "源接口为物理数据口（不含管理口），输出口固定为镜像口";
     }
-    candidates.forEach(function (item) {
-      var reference = state.sources.hasOwnProperty(item.id)
-        ? item.id
-        : (state.sources.hasOwnProperty(item.system_name) ? item.system_name : item.name);
-      var checked = Boolean(reference && state.sources.hasOwnProperty(reference));
-      var direction = checked ? state.sources[reference] : "both";
 
-      var row = document.createElement("label");
-      row.className = "source-row" + (checked ? " checked" : "");
+    list.forEach(function (source) {
+      var item = portByReference(source.interface) || { id: source.interface, name: source.interface };
+      var tr = document.createElement("tr");
 
-      var box = document.createElement("input");
-      box.type = "checkbox";
-      box.checked = checked;
-      box.addEventListener("change", function () {
-        if (box.checked) state.sources[item.id] = direction;
-        else { delete state.sources[item.id]; delete state.sources[item.system_name]; }
-        renderSources();
-      });
-
-      var name = document.createElement("span");
-      name.className = "name";
+      var name = document.createElement("td");
       var strong = document.createElement("strong");
       strong.textContent = portLabel(item);
-      var small = document.createElement("small");
-      var role = String(item.gateway_role || "").toLowerCase();
-      small.textContent = (item.link_state || "未知") + (role === "lan" ? " · LAN" : role === "wan" ? " · WAN" : "");
       name.appendChild(strong);
-      name.appendChild(small);
 
-      var select = document.createElement("select");
-      select.className = "select";
-      [["both", "双向"], ["rx", "仅接收"], ["tx", "仅发送"]].forEach(function (pair) {
-        var option = document.createElement("option");
-        option.value = pair[0];
-        option.textContent = pair[1];
-        select.appendChild(option);
-      });
-      select.value = direction;
-      select.disabled = !box.checked;
-      select.addEventListener("click", function (event) { event.preventDefault(); event.stopPropagation(); });
-      select.addEventListener("change", function () {
-        if (box.checked) state.sources[item.id] = select.value;
-      });
+      var dir = document.createElement("td");
+      dir.textContent = directionLabel(source.direction);
 
-      row.appendChild(box);
-      row.appendChild(name);
-      row.appendChild(select);
-      list.appendChild(row);
+      var out = document.createElement("td");
+      out.textContent = port ? portLabel(port) : "—";
+
+      var status = document.createElement("td");
+      var badge = document.createElement("span");
+      badge.className = "badge " + (running() ? "badge-success" : "badge-warning");
+      badge.textContent = running() ? "已生效" : "未生效";
+      status.appendChild(badge);
+
+      var actions = document.createElement("td");
+      var wrap = document.createElement("div");
+      wrap.className = "row-actions";
+      var edit = document.createElement("button");
+      edit.className = "btn btn-sm btn-text";
+      edit.textContent = "编辑";
+      edit.disabled = state.busy;
+      edit.addEventListener("click", function () { openDialog(source.interface); });
+      var remove = document.createElement("button");
+      remove.className = "btn btn-sm btn-text";
+      remove.textContent = "删除";
+      remove.disabled = state.busy;
+      remove.addEventListener("click", function () { removeSource(source.interface); });
+      wrap.appendChild(edit);
+      wrap.appendChild(remove);
+      actions.appendChild(wrap);
+
+      tr.appendChild(name);
+      tr.appendChild(dir);
+      tr.appendChild(out);
+      tr.appendChild(status);
+      tr.appendChild(actions);
+      rows.appendChild(tr);
     });
   }
 
-  function renderStatus() {
-    var mirror = currentMirror();
-    var status = $("status");
-    var badge = $("state-badge");
-    status.innerHTML = "";
-
-    if (!mirror) {
-      badge.className = "badge badge-neutral";
-      badge.textContent = "未配置";
-      var empty = document.createElement("div");
-      empty.className = "muted";
-      empty.textContent = "尚未配置镜像口。选择目标口与源口后点击“保存并应用”。";
-      status.appendChild(empty);
-      return;
-    }
-
-    var component = state.component;
-    var running = component && component.state === "running";
-    badge.className = "badge " + (running ? "badge-success" : "badge-warning");
-    badge.textContent = running ? "已生效" : "未生效";
-
-    var head = document.createElement("div");
-    head.className = "notice-block";
-    var title = document.createElement("strong");
-    title.textContent = "镜像目标口 " + portLabel(mirror);
-    var detail = document.createElement("span");
-    detail.textContent = "链路 " + (mirror.link_state || "未知") + " · MAC " + (mirror.mac || "无") +
-      " · 源口 " + ((mirror.mirror_sources || []).length);
-    head.appendChild(title);
-    head.appendChild(detail);
-    status.appendChild(head);
-
-    var list = document.createElement("div");
-    (mirror.mirror_sources || []).forEach(function (source) {
-      var item = portByReference(source.interface);
-      var row = document.createElement("div");
-      row.className = "session";
-      var meta = document.createElement("div");
-      meta.className = "meta";
-      var strong = document.createElement("strong");
-      strong.textContent = (item ? portLabel(item) : source.interface) + " → " + portLabel(mirror);
-      var small = document.createElement("small");
-      var direction = source.direction || "both";
-      small.textContent = "方向 " + (direction === "rx" ? "仅接收" : direction === "tx" ? "仅发送" : "双向") + " · 三层镜像（l2 关闭）";
-      meta.appendChild(strong);
-      meta.appendChild(small);
-      var stateBadge = document.createElement("span");
-      stateBadge.className = "badge " + (running ? "badge-success" : "badge-warning");
-      stateBadge.textContent = running ? "已生效" : "未生效";
-      row.appendChild(meta);
-      row.appendChild(stateBadge);
-      list.appendChild(row);
-    });
-    if (!(mirror.mirror_sources || []).length) {
-      var none = document.createElement("div");
-      none.className = "inline-warning";
-      none.textContent = "镜像口还没有镜像源。";
-      list.appendChild(none);
-    }
-    status.appendChild(list);
-
-    if (component && component.reason) {
-      var reason = document.createElement("div");
-      reason.className = running ? "notice-block" : "inline-warning";
-      reason.style.marginTop = "10px";
-      var reasonTitle = document.createElement("strong");
-      reasonTitle.textContent = running ? "运行时回执" : "运行时未确认会话";
-      var reasonText = document.createElement("span");
-      reasonText.textContent = component.reason;
-      reason.appendChild(reasonTitle);
-      reason.appendChild(reasonText);
-      status.appendChild(reason);
-    }
+  function closeDialog() {
+    var backdrops = document.querySelectorAll(".modal-backdrop[data-mirror-dialog]");
+    Array.prototype.forEach.call(backdrops, function (node) { node.remove(); });
   }
 
-  function render() {
-    renderTargetOptions();
-    renderSources();
-    renderStatus();
+  function candidates() {
+    var port = mirrorPort();
+    return state.ports.filter(function (item) {
+      return isPhysical(item) && (!port || item.id !== port.id);
+    });
   }
 
-  function load() {
-    return Promise.all([
-      api("/api/v1/interfaces"),
-      api("/api/v1/runtime/status").catch(function () { return null; })
-    ]).then(function (results) {
-      state.items = (results[0] && results[0].items) || [];
-      var components = (results[1] && results[1].components) || [];
-      state.component = components.find(function (component) { return component.name === "mirror"; }) || null;
-      var mirror = currentMirror();
-      state.mirror = mirror;
-      state.targetId = mirror ? mirror.id : "";
-      state.sources = sourceDirections(mirror);
-      render();
-    }).catch(function (error) {
-      showError(error.message || error);
+  function openDialog(editInterface) {
+    if (!mirrorPort()) { showError("请先在网卡设置里把一个端口配置为镜像口"); return; }
+    closeDialog();
+    var editSource = editInterface ? sources().find(function (item) { return item.interface === editInterface; }) : null;
+
+    var backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+    backdrop.setAttribute("data-mirror-dialog", "1");
+    var modal = document.createElement("div");
+    modal.className = "modal modal-xl";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.innerHTML =
+      '<header class="modal-head"><div><h2>' + (editInterface ? "编辑镜像策略" : "添加镜像策略") + '</h2>' +
+      '<p>源口流量复制到镜像口；保存后立即下发 SPAN</p></div>' +
+      '<button class="icon-btn" type="button" data-close aria-label="关闭" title="关闭">' + iconClose + '</button></header>' +
+      '<div class="modal-body"><div class="policy-form">' +
+      '<section><h3>镜像规则</h3><div class="form-grid">' +
+      '  <label class="field"><span class="field-label">源接口</span>' +
+      '    <select class="select" data-source></select>' +
+      '    <span class="field-hint">每个源接口一条策略；管理口和镜像口不在列表中</span></label>' +
+      '  <label class="field"><span class="field-label">方向</span><select class="select" data-direction>' +
+      '    <option value="both">双向</option><option value="rx">仅接收</option><option value="tx">仅发送</option></select></label>' +
+      '  <label class="field"><span class="field-label">输出口</span><select class="select" data-output></select>' +
+      '    <span class="field-hint">只列出角色为「镜像口」的端口</span></label>' +
+      '</div></section></div></div>' +
+      '<footer class="modal-footer"><button class="btn btn-secondary" type="button" data-close>取消</button>' +
+      '<button class="btn btn-primary" type="button" data-save>保存策略</button></footer>';
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+
+    var source = modal.querySelector("[data-source]");
+    var options = candidates();
+    if (!options.length) {
+      var none = document.createElement("option");
+      none.value = "";
+      none.textContent = "没有可用的物理数据口";
+      source.appendChild(none);
+      source.disabled = true;
+    }
+    options.forEach(function (item) {
+      var option = document.createElement("option");
+      option.value = item.id;
+      option.textContent = portLabel(item);
+      source.appendChild(option);
     });
+    if (editSource) {
+      source.value = editSource.interface;
+      if (!source.value) {
+        var current = document.createElement("option");
+        current.value = editSource.interface;
+        current.textContent = portLabel(portByReference(editSource.interface) || { id: editSource.interface });
+        source.appendChild(current);
+        source.value = editSource.interface;
+      }
+      source.disabled = true;
+      source.title = "源接口是这条策略的主键，编辑时不可修改";
+    } else if (options.length) {
+      var used = sources().map(function (item) { return item.interface; });
+      var firstFree = options.find(function (item) { return used.indexOf(item.id) === -1; });
+      source.value = (firstFree || options[0]).id;
+    }
+
+    var direction = modal.querySelector("[data-direction]");
+    direction.value = editSource ? (editSource.direction || "both") : "both";
+
+    var output = modal.querySelector("[data-output]");
+    var port = mirrorPort();
+    state.ports.filter(function (item) { return item.mirror === true && isPhysical(item); }).forEach(function (item) {
+      var option = document.createElement("option");
+      option.value = item.id;
+      option.textContent = portLabel(item);
+      output.appendChild(option);
+    });
+    output.value = port ? port.id : "";
+
+    modal.querySelectorAll("[data-close]").forEach(function (node) {
+      node.addEventListener("click", closeDialog);
+    });
+    backdrop.addEventListener("mousedown", function (event) {
+      if (event.target === backdrop) closeDialog();
+    });
+    var onKey = function (event) {
+      if (event.key === "Escape") { closeDialog(); document.removeEventListener("keydown", onKey); }
+    };
+    document.addEventListener("keydown", onKey);
+
+    modal.querySelector("[data-save]").addEventListener("click", function () {
+      var id = source.value;
+      if (!id) { showDialogError(modal, "请选择一个源接口"); return; }
+      saveSource(id, direction.value, modal);
+    });
+  }
+
+  function showDialogError(modal, message) {
+    var old = modal.querySelector(".mirror-error");
+    if (old) old.remove();
+    var box = document.createElement("div");
+    box.className = "inline-warning mirror-error";
+    box.style.marginTop = "10px";
+    box.textContent = message;
+    modal.querySelector(".modal-body").appendChild(box);
+  }
+
+  function setBusy(busy, modal) {
+    state.busy = busy;
+    if (modal) {
+      var save = modal.querySelector("[data-save]");
+      if (save) {
+        save.disabled = busy;
+        save.textContent = busy ? "应用中…" : "保存策略";
+      }
+    }
+    renderTable();
   }
 
   function waitForApply() {
@@ -278,16 +292,14 @@ window.LyExtrasMirrorView = function (root) {
         api("/api/v1/runtime/status").then(function (status) {
           var components = (status && status.components) || [];
           var component = components.find(function (item) { return item.name === "mirror"; });
-          var desired = currentMirror();
-          var settled = desired ? (component && component.state === "running") : !component;
-          if (settled || tries >= 40) {
+          if ((component && component.state === "running") || tries >= 40) {
             clearInterval(timer);
             resolve();
           }
         }).catch(function () {
           if (tries >= 40) { clearInterval(timer); resolve(); }
         });
-      }, 1500);
+      }, 700);
     });
   }
 
@@ -301,66 +313,92 @@ window.LyExtrasMirrorView = function (root) {
     });
   }
 
-  function setBusy(busy) {
-    state.busy = busy;
-    $("save").disabled = busy;
-    $("cancel").disabled = busy;
-    $("refresh").disabled = busy;
-    $("save").textContent = busy ? "应用中…" : "保存并应用";
+  function patchSources(next) {
+    var port = mirrorPort();
+    if (!port) throw new Error("请先在网卡设置里配置镜像口");
+    return api("/api/v1/interfaces/" + encodeURIComponent(port.id), {
+      method: "PATCH",
+      body: { id: port.id, name: port.name || port.id, mirror: true, mirror_sources: next }
+    });
   }
 
-  function save() {
-    var target = state.items.find(function (item) { return item.id === state.targetId; });
-    if (!target) { showError("请先选择镜像目标口"); return; }
-    var sources = Object.keys(state.sources).map(function (reference) {
-      var item = portByReference(reference) || { id: reference };
-      return { interface: item.id, direction: state.sources[reference] || "both" };
+  function nextSources(interfaceID, direction) {
+    var list = sources().map(function (source) {
+      return { interface: source.interface, direction: source.direction || "both" };
+    });
+    var found = list.find(function (item) { return item.interface === interfaceID; });
+    if (found) found.direction = direction;
+    else list.push({ interface: interfaceID, direction: direction });
+    return list;
+  }
+
+  function saveSource(interfaceID, direction, modal) {
+    setBusy(true, modal);
+    showError("");
+    patchSources(nextSources(interfaceID, direction)).then(apply).then(function () {
+      closeDialog();
+      return load();
+    }).catch(function (error) {
+      showDialogError(modal, error.message || String(error));
+    }).then(function () { setBusy(false, modal); });
+  }
+
+  function removeSource(interfaceID) {
+    if (state.busy) return;
+    var next = sources().filter(function (source) { return source.interface !== interfaceID; }).map(function (source) {
+      return { interface: source.interface, direction: source.direction || "both" };
     });
     setBusy(true);
     showError("");
-    api("/api/v1/interfaces/" + encodeURIComponent(target.id), {
-      method: "PATCH",
-      body: { id: target.id, name: portName(target), mirror: true, mirror_sources: sources }
-    }).then(apply).then(function () {
-      return load();
+    patchSources(next).then(apply).then(load).catch(function (error) {
+      showError(error.message || error);
+    }).then(function () { setBusy(false); });
+  }
+
+  function load() {
+    return Promise.all([
+      api("/api/v1/interfaces"),
+      api("/api/v1/runtime/status").catch(function () { return null; })
+    ]).then(function (results) {
+      state.ports = (results[0] && results[0].items) || [];
+      var components = (results[1] && results[1].components) || [];
+      state.component = components.find(function (component) { return component.name === "mirror"; }) || null;
+      renderTable();
+      syncAddButton();
     }).catch(function (error) {
       showError(error.message || error);
-    }).then(function () {
-      setBusy(false);
     });
   }
 
-  function cancelMirror() {
-    var mirror = currentMirror();
-    if (!mirror) { showError("当前没有镜像口"); return; }
-    if (!window.confirm("取消 " + portLabel(mirror) + " 的镜像口并清除全部会话？")) return;
-    setBusy(true);
-    showError("");
-    api("/api/v1/interfaces/" + encodeURIComponent(mirror.id), {
-      method: "PATCH",
-      body: { id: mirror.id, name: portName(mirror), mirror: false, mirror_sources: [] }
-    }).then(apply).then(function () {
-      return load();
-    }).catch(function (error) {
-      showError(error.message || error);
-    }).then(function () {
-      setBusy(false);
-    });
+  function syncAddButton() {
+    var add = $("add-policy");
+    if (!add) return;
+    var hasTarget = Boolean(mirrorPort());
+    add.disabled = !hasTarget;
+    add.title = hasTarget ? "添加一条镜像策略" : "还没有镜像口：请先在网卡设置里把一个端口设为镜像口";
   }
 
-  $("target").addEventListener("change", function (event) {
-    state.targetId = event.target.value;
-    state.sources = {};
-    var mirror = currentMirror();
-    if (mirror && mirror.id === state.targetId) state.sources = sourceDirections(mirror);
-    render();
-  });
-  $("save").addEventListener("click", save);
-  $("cancel").addEventListener("click", cancelMirror);
-  $("refresh").addEventListener("click", function () { load(); });
+  function mountHeaderButton() {
+    var head = root.querySelector(".page-head");
+    if (!head) return;
+    var actions = head.querySelector(".page-actions");
+    if (!actions) {
+      actions = document.createElement("div");
+      actions.className = "page-actions";
+      head.appendChild(actions);
+    }
+    if (actions.querySelector("#add-policy")) return;
+    var add = document.createElement("button");
+    add.id = "add-policy";
+    add.className = "btn btn-sm btn-primary";
+    add.textContent = "添加镜像策略";
+    add.addEventListener("click", function () { openDialog(""); });
+    actions.insertBefore(add, actions.firstChild);
+  }
 
+  mountHeaderButton();
   load();
-  return function () {};
+  return function () { closeDialog(); };
 };
 
 if (document.body && document.body.dataset.extrasPage === "mirror") {
