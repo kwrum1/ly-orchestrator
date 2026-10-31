@@ -20,6 +20,9 @@ import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
 
+// The lab console uses a self-signed certificate.
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_PATH || "/root/work/ui-test/node_modules/playwright");
 
