@@ -31,14 +31,14 @@ const (
 )
 
 type bypassPersistedState struct {
-	Version   int                       `json:"version"`
+	Version   int                          `json:"version"`
 	Config    orchestratorapi.BypassConfig `json:"config"`
-	Enabled   bool                      `json:"enabled"`
-	Forced    bool                      `json:"forced"`
-	Cause     string                    `json:"cause,omitempty"`
-	Reason    string                    `json:"reason,omitempty"`
-	Since     time.Time                 `json:"since,omitempty"`
-	UpdatedAt time.Time                 `json:"updated_at"`
+	Enabled   bool                         `json:"enabled"`
+	Forced    bool                         `json:"forced"`
+	Cause     string                       `json:"cause,omitempty"`
+	Reason    string                       `json:"reason,omitempty"`
+	Since     time.Time                    `json:"since,omitempty"`
+	UpdatedAt time.Time                    `json:"updated_at"`
 }
 
 // bypassController is the fail-open supervisor for the transparent

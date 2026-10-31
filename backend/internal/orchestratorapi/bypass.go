@@ -54,14 +54,14 @@ type BypassState struct {
 	Enabled bool `json:"enabled"`
 	// Forced is true when an operator forced the bypass and automatic
 	// recovery is suspended.
-	Forced bool   `json:"forced"`
-	Cause  string `json:"cause,omitempty"`
-	Reason string `json:"reason,omitempty"`
+	Forced bool      `json:"forced"`
+	Cause  string    `json:"cause,omitempty"`
+	Reason string    `json:"reason,omitempty"`
 	Since  time.Time `json:"since,omitempty"`
 
-	ConsecutiveFailures  int  `json:"consecutive_failures"`
-	ConsecutiveSuccesses int  `json:"consecutive_successes"`
-	LastProbeOK          bool `json:"last_probe_ok"`
+	ConsecutiveFailures  int       `json:"consecutive_failures"`
+	ConsecutiveSuccesses int       `json:"consecutive_successes"`
+	LastProbeOK          bool      `json:"last_probe_ok"`
 	LastProbeAt          time.Time `json:"last_probe_at,omitempty"`
 
 	Probes []BypassProbe `json:"probes,omitempty"`

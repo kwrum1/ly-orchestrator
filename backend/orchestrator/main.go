@@ -618,12 +618,12 @@ func (runtime *productionOrchestratorRuntime) BypassSnapshot() orchestratorapi.B
 	runtime.bypassMu.RLock()
 	defer runtime.bypassMu.RUnlock()
 	return orchestratorapi.BypassRuntimeState{
-		Enabled: runtime.bypassActive,
-		Forced:  runtime.bypassForced,
-		Cause:   runtime.bypassCause,
-		Reason:  runtime.bypassReason,
-		Since:   runtime.bypassSince,
-		Packets: runtime.bypassPackets,
+		Enabled:    runtime.bypassActive,
+		Forced:     runtime.bypassForced,
+		Cause:      runtime.bypassCause,
+		Reason:     runtime.bypassReason,
+		Since:      runtime.bypassSince,
+		Packets:    runtime.bypassPackets,
 		Generation: runtime.transparentGeneration,
 	}
 }
