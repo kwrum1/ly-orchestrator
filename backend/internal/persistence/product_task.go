@@ -133,7 +133,15 @@ func scanProductTask(row scanner) (ProductTask, error) {
 	}
 	task.Product = profile.ID()
 	task.Payload = json.RawMessage(payload)
-	task.CreatedAt = decodeTime(createdAt)
-	task.UpdatedAt = decodeTime(updatedAt)
+	created, err := decodeTime(createdAt)
+	if err != nil {
+		return task, err
+	}
+	updated, err := decodeTime(updatedAt)
+	if err != nil {
+		return task, err
+	}
+	task.CreatedAt = created
+	task.UpdatedAt = updated
 	return task, nil
 }

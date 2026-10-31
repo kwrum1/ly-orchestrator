@@ -184,17 +184,15 @@ async function loginUI(page) {
   }
 }
 async function openRole(page, port) {
-  await page.goto(BASE + "/interfaces", { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForTimeout(2200);
-  try {
-    await page.locator("table tbody tr").first().waitFor({ timeout: 15000 });
-  } catch {
-    // A slow apply can make the first table load miss; retry once.
+  await waitRuntimeConverged(60000);
+  await gotoReady(page, "/interfaces");
+  let row = page.locator("table tbody tr", { hasText: port }).first();
+  if (!(await row.count().catch(() => 0))) {
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForTimeout(2500);
+    row = page.locator("table tbody tr", { hasText: port }).first();
   }
-  const row = page.locator("table tbody tr", { hasText: port }).first();
-  await row.locator('button:has-text("角色配置")').first().click({ timeout: 20000 });
+  await row.locator('button:has-text("角色配置")').first().click({ timeout: 25000 });
   await page.waitForTimeout(500);
   return page.locator(".modal").last();
 }
@@ -223,10 +221,11 @@ async function setRoleUI(page, port, value) {
   return result;
 }
 async function mirrorList(page) {
-  await page.goto(BASE + "/mirror", { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForTimeout(2200);
+  await waitRuntimeConverged(60000);
+  await gotoReady(page, "/mirror");
 }
 async function addMirrorPolicy(page, source, direction) {
+  await waitRuntimeConverged(60000);
   await page.locator("#add-policy").click();
   await page.waitForTimeout(500);
   const modal = page.locator(".modal").last();
@@ -235,12 +234,45 @@ async function addMirrorPolicy(page, source, direction) {
   await modal.locator("[data-save]").click();
   await page.waitForTimeout(1500);
   await waitUntil(async () => (await page.locator("#policy-rows tr", { hasText: source }).count()) > 0, 20000);
+  await waitRuntimeConverged(60000);
 }
 async function waitUntil(check, timeout = 15000, interval = 500) {
   const deadline = now() + timeout;
   while (now() < deadline) {
     if (await check()) return true;
     await sleep(interval);
+  }
+  return false;
+}
+
+// Wait until every runtime component is out of applying/recovering/pending.
+// Saves issued while a generation is in flight are dropped by the device.
+async function waitRuntimeConverged(timeout = 90000) {
+  const deadline = now() + timeout;
+  while (now() < deadline) {
+    try {
+      const status = await get("/api/v1/runtime/status");
+      const components = status.components || [];
+      const busy = components.some((c) => /applying|recovering|pending/.test(String(c.state)));
+      if (!busy) return true;
+    } catch { /* retry */ }
+    await sleep(800);
+  }
+  return false;
+}
+
+async function gotoReady(page, pathname) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await page.goto(BASE + pathname, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.waitForTimeout(2200);
+    const shell = await page.locator(".main-inner").count().catch(() => 0);
+    if (!shell) continue;
+    if (pathname === "/mirror") {
+      if (await page.locator("#add-policy").count().catch(() => 0)) return true;
+    } else if (await page.locator("table tbody tr, .empty-state").count().catch(() => 0)) {
+      return true;
+    }
+    await sleep(1500);
   }
   return false;
 }
@@ -528,6 +560,7 @@ PY`, 30000);
     assert((await page.locator("#policy-rows tr", { hasText: "eth3" }).count()) === 1, "eth3 row missing");
 
     const row = page.locator("#policy-rows tr", { hasText: "eth3" }).first();
+    await waitRuntimeConverged(60000);
     await row.locator('button:has-text("编辑")').click();
     await page.waitForTimeout(400);
     const modal = page.locator(".modal").last();
@@ -542,6 +575,7 @@ PY`, 30000);
     assert(editSpan.ok && spanHas(span, "lyroute-ens192", "lyroute-ens224", "rx"), "SPAN direction did not change to rx");
 
     const row2 = page.locator("#policy-rows tr", { hasText: "eth3" }).first();
+    await waitRuntimeConverged(60000);
     await row2.locator('button:has-text("删除")').click();
     await waitUntil(async () => !(await iface("eth5")).mirror_sources.some((s) => s.interface === "eth3"), 20000);
     const goneSpan = await waitSpan((text) => !text.includes("lyroute-ens192"));
@@ -582,9 +616,10 @@ PY`, 30000);
     const topo = await topology();
     topo.port_roles = { ...(topo.port_roles || {}), eth4: "lan", eth5: "wan" };
     await putTopology(topo);
+    await sleep(1500);
 
-    await page.goto(BASE + "/groups", { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(2500);
+    await gotoReady(page, "/groups");
+    await waitRuntimeConverged(60000);
     await page.locator('button:has-text("新增编排组")').click();
     await page.waitForTimeout(600);
     let modal = page.locator(".modal").last();
@@ -651,7 +686,28 @@ PY`, 30000);
   });
 
   await check("O3.2", "接口故障旁路：网口 down 触发该组 bypass，up 后恢复", async () => {
-    // bind the group to the dataplane first
+    // Independent of O3.1: make sure the temporary group really exists.
+    if (((await interfaces()).find((i) => i.id === "eth5") || {}).mirror) {
+      const cleared = await topology();
+      delete (cleared.port_roles || {}).eth5;
+      await putTopology(cleared);
+      await patch("/api/v1/interfaces/eth5", { id: "eth5", name: "eth5", mirror: false, mirror_sources: [] });
+      await applyAndWait();
+    }
+    const tagged = await topology();
+    tagged.port_roles = { ...(tagged.port_roles || {}), eth4: "lan", eth5: "wan" };
+    await putTopology(tagged);
+    if (!(await groups()).some((g) => g.name === "acc-grp")) {
+      await post("/api/v1/orchestrator/orchestration-groups", {
+        name: "acc-grp",
+        ports: [
+          { interface: "ens193", direction: "lan_facing" },
+          { interface: "ens224", direction: "wan_facing" }
+        ]
+      });
+      await putBypassGroup("acc-grp", { iface: true, biz: true, ip: "192.168.10.106", port: 8080, proto: "tcp", threshold: 20 });
+    }
+    await waitRuntimeConverged();
     await applyAndWait();
     await sleep(3000);
     const before = await get("/api/v1/orchestrator/bypass");
@@ -685,8 +741,8 @@ PY`, 30000);
   });
 
   await check("O3.4", "删除编排组清理旁路条目", async () => {
-    await page.goto(BASE + "/groups", { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(2200);
+    await waitRuntimeConverged(60000);
+    await gotoReady(page, "/groups");
     const row = page.locator("table tbody tr", { hasText: "acc-grp" }).first();
     await row.locator('button:has-text("删除")').first().click();
     await page.waitForTimeout(600);

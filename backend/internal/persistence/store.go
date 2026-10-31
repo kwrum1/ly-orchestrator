@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -481,7 +482,10 @@ FROM config_documents WHERE resource_type = ? ORDER BY resource_id`, resourceTyp
 	for rows.Next() {
 		document, err := scanConfig(rows)
 		if err != nil {
-			return nil, err
+			// One corrupt row must not hide every other resource: warn and
+			// skip it instead of failing the whole collection.
+			log.Printf("persistence: skip malformed config row while listing %s: %v", resourceType, err)
+			continue
 		}
 		documents = append(documents, document)
 	}
@@ -714,8 +718,15 @@ func scanConfig(row scanner) (ConfigDocument, error) {
 	if err := row.Scan(&document.ResourceType, &document.ResourceID, &payload, &document.PayloadHash, &updatedAt); err != nil {
 		return document, convertScanError(err)
 	}
+	decoded, err := decodeTime(updatedAt)
+	if err != nil {
+		// A foreign or corrupted row must not take the whole control plane
+		// down (this used to panic inside the dataplane watcher).
+		log.Printf("persistence: skipping config document %s/%s: %v", document.ResourceType, document.ResourceID, err)
+		return document, err
+	}
 	document.Payload = json.RawMessage(payload)
-	document.UpdatedAt = decodeTime(updatedAt)
+	document.UpdatedAt = decoded
 	return document, nil
 }
 
@@ -727,9 +738,13 @@ func scanPolicy(row scanner) (PolicyDocument, error) {
 	if err := row.Scan(&document.Namespace, &document.PolicyID, &document.Priority, &enabled, &payload, &document.PayloadHash, &updatedAt); err != nil {
 		return document, convertScanError(err)
 	}
+	decoded, err := decodeTime(updatedAt)
+	if err != nil {
+		return document, err
+	}
 	document.Enabled = enabled == 1
 	document.Payload = json.RawMessage(payload)
-	document.UpdatedAt = decodeTime(updatedAt)
+	document.UpdatedAt = decoded
 	return document, nil
 }
 
@@ -740,8 +755,12 @@ func scanAuthUser(row scanner) (AuthUser, error) {
 	if err := row.Scan(&user.Username, &user.Role, &user.PasswordHash, &changeRequired, &updatedAt); err != nil {
 		return user, convertScanError(err)
 	}
+	decoded, err := decodeTime(updatedAt)
+	if err != nil {
+		return user, err
+	}
 	user.PasswordChangeRequired = changeRequired == 1
-	user.UpdatedAt = decodeTime(updatedAt)
+	user.UpdatedAt = decoded
 	user.Stored = true
 	return user, nil
 }
@@ -753,8 +772,12 @@ func scanSnapshot(row scanner) (RuntimeSnapshot, error) {
 	if err := row.Scan(&snapshot.ID, &snapshot.SourceTransactionID, &payload, &snapshot.PayloadHash, &createdAt); err != nil {
 		return snapshot, convertScanError(err)
 	}
+	decoded, err := decodeTime(createdAt)
+	if err != nil {
+		return snapshot, err
+	}
 	snapshot.Payload = json.RawMessage(payload)
-	snapshot.CreatedAt = decodeTime(createdAt)
+	snapshot.CreatedAt = decoded
 	return snapshot, nil
 }
 
@@ -766,9 +789,16 @@ func scanRollback(row scanner) (RollbackMetadata, error) {
 	if err := row.Scan(&rollback.ID, &rollback.TargetSnapshotID, &rollback.Reason, &rollback.Status, &requestedAt, &completedAt, &errText); err != nil {
 		return rollback, convertScanError(err)
 	}
-	rollback.RequestedAt = decodeTime(requestedAt)
+	decodedRequested, err := decodeTime(requestedAt)
+	if err != nil {
+		return rollback, err
+	}
+	rollback.RequestedAt = decodedRequested
 	if completedAt.Valid {
-		decoded := decodeTime(completedAt.String)
+		decoded, err := decodeTime(completedAt.String)
+		if err != nil {
+			return rollback, err
+		}
 		rollback.CompletedAt = &decoded
 	}
 	if errText.Valid {
@@ -787,7 +817,11 @@ func scanAuditEvent(row scanner) (AuditEvent, error) {
 	if err := row.Scan(&event.ID, &timestamp, &event.Actor, &event.Role, &event.Resource, &event.Action, &beforeHash, &afterHash, &event.Status, &errText, &transactionID); err != nil {
 		return event, convertScanError(err)
 	}
-	event.Timestamp = decodeTime(timestamp)
+	decoded, err := decodeTime(timestamp)
+	if err != nil {
+		return event, err
+	}
+	event.Timestamp = decoded
 	if beforeHash.Valid {
 		event.BeforeHash = beforeHash.String
 	}
@@ -818,12 +852,12 @@ func encodeTime(value time.Time) string {
 	return value.UTC().Format(time.RFC3339Nano)
 }
 
-func decodeTime(value string) time.Time {
+func decodeTime(value string) (time.Time, error) {
 	decoded, err := time.Parse(time.RFC3339Nano, value)
 	if err != nil {
-		panic(fmt.Sprintf("invalid persisted timestamp %q: %v", value, err))
+		return time.Time{}, fmt.Errorf("invalid persisted timestamp %q: %w", value, err)
 	}
-	return decoded
+	return decoded, nil
 }
 
 func boolInt(value bool) int {
