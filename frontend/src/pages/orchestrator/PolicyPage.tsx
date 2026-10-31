@@ -229,7 +229,7 @@ export function OrchestratorPolicyPage() {
     <div className="page">
       <PageHeader
         title="流量编排"
-        subtitle="单机本地策略：IP 对象、策略组、规则与默认动作；保存即同步透明编排"
+        subtitle="单机本地策略：IP 对象、策略组、规则与默认动作；保存即同步服务链"
         actions={<><Button size="sm" variant="primary" icon={<Save size={14} />} loading={busy} onClick={save} disabled={readonly || !topology.data?.item}>保存策略</Button></>}
         meta={<><span className="meta-item">策略 checksum {text(policyQuery.data?.checksum, "未保存")}</span><span className="meta-item">拓扑 {topology.data?.item ? "已配置" : "未配置"}</span></>}
       />

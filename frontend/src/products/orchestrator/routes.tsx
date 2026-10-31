@@ -2,13 +2,11 @@ import { Route, Routes } from "react-router-dom";
 import { AppShell } from "../../app/AppShell";
 import { ORCHESTRATOR_ALL_PAGES, ORCHESTRATOR_COMMAND_ACTIONS, ORCHESTRATOR_NAV_GROUPS } from "../../app/orchestrator-nav";
 import { NotFoundPage } from "../../pages/NotFoundPage";
-import { OrchestratorOverviewPage } from "../../pages/orchestrator/OverviewPage";
 import { OrchestratorTopologyPage } from "../../pages/orchestrator/TopologyPage";
 import { OrchestratorPortMirrorPage } from "../../pages/orchestrator/PortMirrorPage";
 import { OrchestratorBypassPage } from "../../pages/orchestrator/BypassPage";
 import { OrchestratorGroupsPage } from "../../pages/orchestrator/GroupsPage";
 import { OrchestratorPolicyPage } from "../../pages/orchestrator/PolicyPage";
-import { OrchestratorTransparentPage } from "../../pages/orchestrator/TransparentPage";
 import { OrchestratorTelemetryPage } from "../../pages/orchestrator/TelemetryPage";
 import { OrchestratorUpgradesPage } from "../../pages/orchestrator/UpgradesPage";
 import { OrchestratorConversionsPage } from "../../pages/orchestrator/ConversionsPage";
@@ -30,13 +28,12 @@ export default function OrchestratorRoutes() {
           />
         }
       >
-        <Route index element={<OrchestratorOverviewPage />} />
+        <Route index element={<OrchestratorTelemetryPage />} />
         <Route path="topology" element={<OrchestratorTopologyPage />} />
         <Route path="mirror" element={<OrchestratorPortMirrorPage />} />
         <Route path="bypass" element={<OrchestratorBypassPage />} />
         <Route path="groups" element={<OrchestratorGroupsPage />} />
         <Route path="policy" element={<OrchestratorPolicyPage />} />
-        <Route path="transparent" element={<OrchestratorTransparentPage />} />
         <Route path="telemetry" element={<OrchestratorTelemetryPage />} />
         <Route path="runtime" element={<RuntimePage />} />
         <Route path="config" element={<ConfigPage />} />

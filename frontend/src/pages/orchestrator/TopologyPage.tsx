@@ -143,7 +143,7 @@ export function OrchestratorTopologyPage() {
   const removeGroup = async (index: number) => {
     if (!draft) return;
     const group = draft.orchestration_groups[index];
-    if (!(await confirm({ title: `移除编排组 ${group.name}？`, message: "保存拓扑后会立即触发透明编排；失败时后端会回滚。", confirmLabel: "移除", danger: true }))) return;
+    if (!(await confirm({ title: `移除编排组 ${group.name}？`, message: "保存拓扑后会立即下发服务链；失败时后端会回滚。", confirmLabel: "移除", danger: true }))) return;
     setDraft({ ...draft, orchestration_groups: draft.orchestration_groups.filter((_, position) => position !== index) });
   };
 
@@ -196,7 +196,7 @@ export function OrchestratorTopologyPage() {
         meta={<><span className="meta-item">本机唯一拓扑</span><span className="meta-item">校验值 {text(topologyQuery.data?.checksum, "未保存")}</span></>}
       />
 
-      {!topologyQuery.data && <div className="inline-warning">当前还没有已保存的编排拓扑。填写 LAN/WAN 与可选编排组后保存；首次保存会触发透明编排。</div>}
+      {!topologyQuery.data && <div className="inline-warning">当前还没有已保存的编排拓扑。填写 LAN/WAN 与可选编排组后保存；首次保存会下发服务链。</div>}
       {error && <div className="error-state"><strong>保存失败</strong><p>{error}</p></div>}
 
       <div className="orch-topology-grid">
@@ -301,7 +301,7 @@ export function OrchestratorTopologyPage() {
         ) : <p className="muted">暂无编排组；没有编排组时只能做 LAN/WAN 直通策略。</p>}
       </Card>
 
-      <div className="inline-warning"><Network size={14} /> 拓扑保存是同步事务：后端会先下发透明编排，失败时回滚；不会自动创建多站点或跨网关心跳。</div>
+      <div className="inline-warning"><Network size={14} /> 拓扑保存是同步事务：后端会先下发服务链，失败时回滚；不会自动创建多站点或跨网关心跳。</div>
     </div>
   );
 }
