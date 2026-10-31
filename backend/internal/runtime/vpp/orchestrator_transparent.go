@@ -23,7 +23,32 @@ type TransparentOrchestratorConfig struct {
 type TransparentOrchestratorReadback struct {
 	Generation string `json:"generation"`
 	State      string `json:"state"`
-	Output     string `json:"output"`
+	// Default is the terminal action the plugin is actually enforcing.  It is
+	// read back from `show ly-route orchestrator` so the control plane can
+	// compare the configuration's default action with the data-plane one
+	// instead of trusting a generation string alone.
+	Default string `json:"default,omitempty"`
+	Output  string `json:"output"`
+}
+
+// ParseTransparentOrchestratorOutput extracts the state, committed generation
+// and the default action from `show ly-route orchestrator` output.
+func ParseTransparentOrchestratorOutput(output string) (state, generation, defaultAction string) {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) != 2 {
+			continue
+		}
+		switch fields[0] {
+		case "state":
+			state = fields[1]
+		case "generation":
+			generation = fields[1]
+		case "default":
+			defaultAction = fields[1]
+		}
+	}
+	return state, generation, defaultAction
 }
 
 func BuildTransparentOrchestratorDisableCommands() []string {
@@ -281,7 +306,14 @@ func (adapter Adapter) ApplyTransparentOrchestrator(ctx context.Context, request
 	if err := verifyTransparentOrchestratorReadback(show.Stdout, config, commands); err != nil {
 		return TransparentOrchestratorReadback{}, err
 	}
-	return TransparentOrchestratorReadback{Generation: config.Generation, State: "running", Output: show.Stdout}, nil
+	state, generation, defaultAction := ParseTransparentOrchestratorOutput(show.Stdout)
+	if state == "" {
+		state = "running"
+	}
+	if generation == "" {
+		generation = config.Generation
+	}
+	return TransparentOrchestratorReadback{Generation: generation, State: state, Default: defaultAction, Output: show.Stdout}, nil
 }
 
 func (adapter Adapter) ObserveTransparentOrchestrator(ctx context.Context, requestID string) (TransparentOrchestratorReadback, error) {
@@ -303,19 +335,8 @@ func (adapter Adapter) ObserveTransparentOrchestrator(ctx context.Context, reque
 		return TransparentOrchestratorReadback{}, fmt.Errorf("%w: transparent orchestrator observation is incomplete", ErrSnapshotIncomplete)
 	}
 	output := payload.CommandResults[0].Stdout
-	readback := TransparentOrchestratorReadback{Output: output}
-	for _, line := range strings.Split(output, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		switch fields[0] {
-		case "state":
-			readback.State = fields[1]
-		case "generation":
-			readback.Generation = fields[1]
-		}
-	}
+	state, generation, defaultAction := ParseTransparentOrchestratorOutput(output)
+	readback := TransparentOrchestratorReadback{State: state, Generation: generation, Default: defaultAction, Output: output}
 	if readback.State == "" || (readback.State == "running" && readback.Generation == "") {
 		return TransparentOrchestratorReadback{}, fmt.Errorf("%w: transparent orchestrator state/generation is missing", ErrSnapshotIncomplete)
 	}

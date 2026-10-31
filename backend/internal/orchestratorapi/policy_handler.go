@@ -108,6 +108,9 @@ func (handler *Handler) handlePolicy(writer http.ResponseWriter, request *http.R
 			writePolicyRepositoryError(writer, err)
 			return
 		}
+		if !handler.requireConverged(writer, request.Context(), topology, &stored) {
+			return
+		}
 		handler.recordAudit(request, PolicyPath, "update", "success", checksum)
 		writeJSON(writer, http.StatusOK, map[string]any{"item": stored.View(), "checksum": checksum})
 	case http.MethodDelete:
@@ -135,6 +138,9 @@ func (handler *Handler) handlePolicy(writer http.ResponseWriter, request *http.R
 		}
 		if err := handler.commitTransparentTransaction(request.Context()); err != nil {
 			writeAPIError(writer, http.StatusInternalServerError, err)
+			return
+		}
+		if !handler.requireConverged(writer, request.Context(), topology, nil) {
 			return
 		}
 		handler.recordAudit(request, PolicyPath, "delete", "success", "")

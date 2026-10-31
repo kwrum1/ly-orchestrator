@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"ly-route/backend/internal/orchestrator"
@@ -36,6 +37,13 @@ type Handler struct {
 	managementShared func(context.Context, string) bool
 	ports            PortResolver
 	reconcile        reconcileState
+	// mutationMu serialises every configuration mutation from decoding to
+	// persistence.  Apply used to hold only the runtime mutex and released it
+	// before the record was persisted, so an overlapping topology/policy save
+	// could commit its (older) desired state to VPP after the newer record was
+	// stored.  The data plane then disagreed with the configuration until the
+	// next manual apply.
+	mutationMu sync.Mutex
 }
 
 // PortResolver maps a product interface id (eth2) to the kernel netdev that
@@ -58,12 +66,30 @@ type TransparentDisableRuntime interface {
 	DisableTransparent(context.Context, string) error
 }
 
+// TransparentReconcileRuntime verifies the committed VPP generation/default
+// against the configuration that was just persisted and re-applies it when the
+// readback disagrees.
+type TransparentReconcileRuntime interface {
+	ReconcileTransparent(context.Context, string, orchestrator.Topology, *orchestrator.Policy) error
+}
+
 type TransparentRuntimeEvidence struct {
 	TransactionID string    `json:"transaction_id"`
 	Generation    string    `json:"generation"`
 	State         string    `json:"state"`
 	AppliedAt     time.Time `json:"applied_at"`
 	ObservedAt    time.Time `json:"observed_at"`
+	// PolicyGeneration is the generation derived from the persisted
+	// configuration; VPPGeneration is what the plugin reports.  They are equal
+	// only when the data plane enforces the configured policy.
+	PolicyGeneration  string    `json:"policy_generation"`
+	VPPGeneration     string    `json:"vpp_generation"`
+	ConfiguredDefault string    `json:"configured_default"`
+	ObservedDefault   string    `json:"observed_default"`
+	Repairs           int       `json:"reconcile_repairs"`
+	ReconcileFailures int       `json:"reconcile_failures"`
+	LastDriftReason   string    `json:"last_drift_reason,omitempty"`
+	LastReconciledAt  time.Time `json:"last_reconciled_at"`
 }
 
 type TransparentRuntimeEvidenceProvider interface {
@@ -172,10 +198,25 @@ func interfaceIsNil(value any) bool {
 }
 
 func (handler *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc(TopologyPath, handler.handleTopology)
-	mux.HandleFunc(OrchestrationGroupsPath, handler.handleGroups)
-	mux.HandleFunc(OrchestrationGroupsPath+"/", handler.handleGroup)
-	mux.HandleFunc(PolicyPath, handler.handlePolicy)
+	// Every write handler is wrapped so the whole "decode -> apply to VPP ->
+	// persist -> commit journal" transaction is serialised with respect to
+	// other configuration writes. Reads stay lock-free.
+	mutate := func(handle http.HandlerFunc) http.HandlerFunc {
+		return func(writer http.ResponseWriter, request *http.Request) {
+			switch request.Method {
+			case http.MethodGet, http.MethodHead, http.MethodOptions:
+				handle(writer, request)
+				return
+			}
+			handler.mutationMu.Lock()
+			defer handler.mutationMu.Unlock()
+			handle(writer, request)
+		}
+	}
+	mux.HandleFunc(TopologyPath, mutate(handler.handleTopology))
+	mux.HandleFunc(OrchestrationGroupsPath, mutate(handler.handleGroups))
+	mux.HandleFunc(OrchestrationGroupsPath+"/", mutate(handler.handleGroup))
+	mux.HandleFunc(PolicyPath, mutate(handler.handlePolicy))
 	mux.HandleFunc(PolicyCompilePath, handler.handlePolicyCompile)
 	if _, transparent := handler.runtime.(TransparentRuntime); !transparent {
 		mux.HandleFunc(ServiceChainCompilePath, handler.handleServiceChainCompile)
@@ -256,6 +297,9 @@ func (handler *Handler) handleTopology(writer http.ResponseWriter, request *http
 		}
 		if err := handler.commitTransparentTransaction(request.Context()); err != nil {
 			writeAPIError(writer, http.StatusInternalServerError, err)
+			return
+		}
+		if !handler.requireConverged(writer, request.Context(), topology, policy) {
 			return
 		}
 		handler.recordAudit(request, TopologyPath, "update", "success", "")
@@ -352,6 +396,9 @@ func (handler *Handler) handleGroups(writer http.ResponseWriter, request *http.R
 			writeAPIError(writer, http.StatusInternalServerError, err)
 			return
 		}
+		if !handler.requireConverged(writer, request.Context(), candidate, policy) {
+			return
+		}
 		handler.recordAudit(request, OrchestrationGroupsPath+"/"+group.Name(), "create", "success", "")
 		handler.writeGroup(writer, request, group.Name(), http.StatusCreated)
 	default:
@@ -421,6 +468,9 @@ func (handler *Handler) handleGroup(writer http.ResponseWriter, request *http.Re
 			writeAPIError(writer, http.StatusInternalServerError, err)
 			return
 		}
+		if !handler.requireConverged(writer, request.Context(), candidate, policy) {
+			return
+		}
 		handler.recordAudit(request, OrchestrationGroupsPath+"/"+name, "update", "success", "")
 		handler.writeGroup(writer, request, name, http.StatusOK)
 	case http.MethodDelete:
@@ -458,6 +508,9 @@ func (handler *Handler) handleGroup(writer http.ResponseWriter, request *http.Re
 		}
 		if err := handler.commitTransparentTransaction(request.Context()); err != nil {
 			writeAPIError(writer, http.StatusInternalServerError, err)
+			return
+		}
+		if !handler.requireConverged(writer, request.Context(), candidate, policy) {
 			return
 		}
 		handler.recordAudit(request, OrchestrationGroupsPath+"/"+name, "delete", "success", "")
@@ -547,6 +600,29 @@ func (handler *Handler) commitTransparentTransaction(ctx context.Context) error 
 		return fmt.Errorf("commit transparent transaction journal: %w", err)
 	}
 	return nil
+}
+
+// reconcileTransparent is the post-persist readback: the configuration is
+// already durable, so this compares the plugin's committed generation and
+// default action with that durable state and re-applies it when they differ.
+func (handler *Handler) reconcileTransparent(ctx context.Context, topology orchestrator.Topology, policy *orchestrator.Policy) error {
+	runtime, ok := handler.runtime.(TransparentReconcileRuntime)
+	if !ok {
+		return nil
+	}
+	requestID := fmt.Sprintf("orchestrator-reconcile-%d", time.Now().UnixNano())
+	return runtime.ReconcileTransparent(ctx, requestID, topology, policy)
+}
+
+// requireConverged reports a 500 when the data plane did not converge on the
+// configuration that was just persisted. The record is kept (and the periodic
+// reconciler retries), but the API must not claim success.
+func (handler *Handler) requireConverged(writer http.ResponseWriter, ctx context.Context, topology orchestrator.Topology, policy *orchestrator.Policy) bool {
+	if err := handler.reconcileTransparent(ctx, topology, policy); err != nil {
+		writeAPIError(writer, http.StatusInternalServerError, fmt.Errorf("configuration persisted but transparent dataplane did not converge: %w", err))
+		return false
+	}
+	return true
 }
 
 func (handler *Handler) writeTopology(writer http.ResponseWriter, request *http.Request) {
