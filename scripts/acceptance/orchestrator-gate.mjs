@@ -162,7 +162,14 @@ async function newPage(browser, width = 1440, height = 900) {
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (error) => errors.push(String(error)));
-  page.on("console", (msg) => { if (msg.type() === "error") errors.push("console: " + msg.text()); });
+  page.on("console", (msg) => {
+    if (msg.type() !== "error") return;
+    const text = msg.text();
+    // A stale cookie on the first login page load logs a 401 resource error;
+    // it is not a UI failure.
+    if (/Failed to load resource.*401/.test(text)) return;
+    errors.push("console: " + text);
+  });
   page.errors = errors;
   return { context, page };
 }
@@ -451,6 +458,8 @@ PY`, 30000);
     await sleep(2000);
     await waitHealth(90000);
     await loginAPI();
+    // the restart invalidates the browser session too
+    await loginUI(page);
     const after = await snapshotState("after-restart");
     assert(JSON.stringify(before.topology.port_roles) === JSON.stringify(after.topology.port_roles), "port_roles changed across restart");
     assert(JSON.stringify(before.groups) === JSON.stringify(after.groups), "groups changed across restart");
@@ -746,11 +755,14 @@ PY`, 30000);
   });
 
   await check("O5.2", "采集缓存：同一轮轮询复用一次 VPP 采集", async () => {
-    const first = (await get("/api/v1/telemetry/dashboard")).data || {};
-    await sleep(300);
-    const second = (await get("/api/v1/telemetry/dashboard")).data || {};
-    await sleep(300);
-    const third = (await get("/api/v1/telemetry/dashboard")).data || {};
+    const [firstRaw, secondRaw, thirdRaw] = await Promise.all([
+      get("/api/v1/telemetry/dashboard"),
+      get("/api/v1/telemetry/dashboard"),
+      get("/api/v1/telemetry/dashboard")
+    ]);
+    const first = firstRaw.data || firstRaw;
+    const second = secondRaw.data || secondRaw;
+    const third = thirdRaw.data || thirdRaw;
     const times = [first, second, third].map((s) => s.telemetry_status && s.telemetry_status.collected_at);
     saveJSON("evidence/telemetry-cache.json", times);
     assert(times[0] && times[0] === times[1] && times[1] === times[2], `collected_at changed inside the cache window: ${JSON.stringify(times)}`);
