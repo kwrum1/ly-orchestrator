@@ -71,6 +71,12 @@ func ParseTransparentOrchestratorBypass(output string) (enabled bool, cause, rea
 			}
 		}
 	}
+	if cause == "none" {
+		cause = ""
+	}
+	if reason == "none" {
+		reason = ""
+	}
 	return enabled, cause, reason, forced, packets
 }
 

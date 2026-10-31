@@ -684,6 +684,7 @@ ly_orch_workers_snapshot (u32 rules, u32 groups)
         clib_memcpy_fast (snapshot[index].group_bypass_packets,
                           om->workers[index].group_bypass_packets,
                           sizeof (u64) * groups);
+      snapshot[index].bypass_packets = om->workers[index].bypass_packets;
       clib_memcpy_fast (snapshot[index].flows, om->workers[index].flows,
                         sizeof (ly_orch_flow_t) * LY_ORCH_FLOW_SLOTS);
     }
@@ -840,7 +841,7 @@ static clib_error_t *
 ly_orch_bypass_command (unformat_input_t *input, vlib_main_t *vm)
 {
   u8 *cause = 0, *reason = 0;
-  u8 active;
+  u8 active, forced = 0;
   if (unformat (input, "on"))
     active = 1;
   else if (unformat (input, "off"))
@@ -864,9 +865,12 @@ ly_orch_bypass_command (unformat_input_t *input, vlib_main_t *vm)
     cause = format (cause, "%s", "manual");
   if (!reason)
     reason = format (reason, "%s", active ? "manual_force" : "manual_clear");
+  /* Only an operator-forced bypass is terminal.  An automatic bypass stays
+   * under the supervisor's recovery threshold. */
+  forced = active && cause && strcmp ((char *) cause, "manual") == 0;
   {
     clib_error_t *error =
-      ly_orch_set_bypass (vm, active, active, cause, reason);
+      ly_orch_set_bypass (vm, active, forced, cause, reason);
     vec_free (cause);
     vec_free (reason);
     return error;
