@@ -215,6 +215,7 @@
       var style = document.createElement("style");
       style.id = "extras-view-style";
       style.textContent =
+        "[hidden]{display:none!important}" +
         "#extras-view{display:flex;flex-direction:column;gap:16px}" +
         "#extras-view .extras-wrap{max-width:none;margin:0;padding:0}" +
         "#extras-view .page-head{margin:0}";
