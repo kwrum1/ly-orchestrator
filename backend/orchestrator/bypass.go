@@ -1020,7 +1020,12 @@ func (controller *bypassController) probeGroups(ctx context.Context, config orch
 		if roundFailed {
 			state.failures++
 			state.successes = 0
-		} else if roundConfigured && (!flowActive || state.windowAttempts > 0) {
+		} else if roundConfigured {
+			// Absence of business traffic is not evidence of failure. Counting
+			// the round as healthy lets an interface/TCP recovery proceed when
+			// no passive request was observed in the window; a group that
+			// bypassed on a link fault must not stay stranded because the
+			// business path was idle.
 			state.successes++
 			state.failures = 0
 		}
@@ -1063,9 +1068,10 @@ func (controller *bypassController) probeGroups(ctx context.Context, config orch
 		}
 
 		// Recovery needs positive evidence: interface/TCP rounds OK and, when
-		// passive targets exist, successful responses inside the window.
+		// passive traffic actually tried, successful responses inside the
+		// window.  Zero attempts means the business path was idle, not broken.
 		recovered := !roundFailed && state.successes >= groupConfig.RecoveryThreshold
-		if flowActive {
+		if flowActive && state.windowAttempts > 0 {
 			recovered = recovered && state.windowSuccess > 0 &&
 				state.windowSuccess >= uint64(groupConfig.RecoveryThreshold)
 		}

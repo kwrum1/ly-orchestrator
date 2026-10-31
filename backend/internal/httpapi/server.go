@@ -4279,6 +4279,12 @@ func (server *Server) objectGroupReferences(ctx context.Context, id string) ([]m
 	consumers := []string{"route_policy", "security_acl", "nat_static", "port_map", "dns_policy", "traffic_control"}
 	var references []map[string]any
 	for _, resourceType := range consumers {
+		// Gateway-only consumer types are not part of the orchestrator store;
+		// asking the store for them fails the whole scan (and made IP group
+		// deletion a 500 on the orchestrator).
+		if !server.profile.AllowsConfigResource(resourceType) {
+			continue
+		}
 		items, err := server.desiredItems(ctx, resourceType)
 		if err != nil {
 			return nil, err

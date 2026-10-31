@@ -262,16 +262,6 @@ window.LyExtrasMirrorView = function (root) {
     });
   }
 
-  function showDialogError(modal, message) {
-    var old = modal.querySelector(".mirror-error");
-    if (old) old.remove();
-    var box = document.createElement("div");
-    box.className = "inline-warning mirror-error";
-    box.style.marginTop = "10px";
-    box.textContent = message;
-    modal.querySelector(".modal-body").appendChild(box);
-  }
-
   function setBusy(busy, modal) {
     state.busy = busy;
     if (modal) {
@@ -282,6 +272,7 @@ window.LyExtrasMirrorView = function (root) {
       }
     }
     renderTable();
+    syncAddButton();
   }
 
   function waitForApply() {
@@ -303,10 +294,39 @@ window.LyExtrasMirrorView = function (root) {
     });
   }
 
-  function apply() {
+  function delay(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function runtimeIdle() {
+    return api("/api/v1/runtime/status").then(function (status) {
+      var components = (status && status.components) || [];
+      return !components.some(function (item) {
+        return /applying|recovering|pending/.test(String(item.state));
+      });
+    }).catch(function () { return true; });
+  }
+
+  function waitRuntimeIdle(tries) {
+    return runtimeIdle().then(function (idle) {
+      if (idle || tries <= 0) return null;
+      return delay(800).then(function () { return waitRuntimeIdle(tries - 1); });
+    });
+  }
+
+  function apply(tries) {
+    var attempt = tries || 0;
     return api("/api/v1/runtime/apply", { method: "POST", body: {} }).then(function (result) {
       var status = result && (result.status || result.runtime_state);
-      if (status && /fail|error|locked/.test(String(status))) {
+      var text = String(status || "");
+      if (/apply_in_progress|applying/i.test(text)) {
+        // Another apply owns the device; our PATCH is newer than that
+        // generation, so re-issue instead of waiting on the stale one.
+        if (attempt >= 20) throw new Error("设备仍在处理上一次下发，请稍后重试");
+        var wait = Math.max(1, Number(result.retry_after_seconds) || 1) * 1000;
+        return delay(wait).then(function () { return apply(attempt + 1); });
+      }
+      if (status && /fail|error|locked/.test(text)) {
         throw new Error(result.reason || ("应用失败：" + status));
       }
       return waitForApply();
@@ -335,11 +355,19 @@ window.LyExtrasMirrorView = function (root) {
   function saveSource(interfaceID, direction, modal) {
     setBusy(true, modal);
     showError("");
-    patchSources(nextSources(interfaceID, direction)).then(apply).then(function () {
+    waitRuntimeIdle(15).then(function () {
+      return patchSources(nextSources(interfaceID, direction));
+    }).then(function () {
+      // The row is already saved on the device: close the dialog and show it
+      // as 未生效 instead of blocking the operator for the whole apply.
       closeDialog();
       return load();
+    }).then(function () {
+      return apply();
+    }).then(function () {
+      return load();
     }).catch(function (error) {
-      showDialogError(modal, error.message || String(error));
+      showError(error.message || String(error));
     }).then(function () { setBusy(false, modal); });
   }
 
@@ -350,7 +378,15 @@ window.LyExtrasMirrorView = function (root) {
     });
     setBusy(true);
     showError("");
-    patchSources(next).then(apply).then(load).catch(function (error) {
+    waitRuntimeIdle(15).then(function () {
+      return patchSources(next);
+    }).then(function () {
+      return load();
+    }).then(function () {
+      return apply();
+    }).then(function () {
+      return load();
+    }).catch(function (error) {
       showError(error.message || error);
     }).then(function () { setBusy(false); });
   }
@@ -374,8 +410,10 @@ window.LyExtrasMirrorView = function (root) {
     var add = $("add-policy");
     if (!add) return;
     var hasTarget = Boolean(mirrorPort());
-    add.disabled = !hasTarget;
-    add.title = hasTarget ? "添加一条镜像策略" : "还没有镜像口：请先在网卡设置里把一个端口设为镜像口";
+    add.disabled = !hasTarget || state.busy;
+    add.title = hasTarget
+      ? (state.busy ? "正在下发，请稍候" : "添加一条镜像策略")
+      : "还没有镜像口：请先在网卡设置里把一个端口设为镜像口";
   }
 
   function mountHeaderButton() {

@@ -249,8 +249,13 @@
   }
 
   function portLabel(item) {
-    var name = portName(item);
-    return item.system_name && item.system_name !== name ? name + " · " + item.system_name : name;
+    // eth-only display rule: the console speaks product port names, never the
+    // kernel/system name (ens*/enp*/eno*). Backend ids stay untouched.
+    var id = String(item.id || "");
+    if (/^eth\d+$/i.test(id)) return id;
+    var name = String(item.name || id);
+    if (/^eth\d+$/i.test(name)) return name;
+    return name;
   }
 
   function isManagement(item) {
@@ -329,6 +334,7 @@
       if (option) select.appendChild(option);
     });
     roleModal = { port: port, role: select.value, previous: "", sources: [] };
+    var touched = false;
     Promise.all([currentTopology(), currentPorts()]).then(function (results) {
       if (modal.dataset.roleEnhanced !== "1" || !document.body.contains(modal)) return;
       var topo = results[0] || {};
@@ -337,15 +343,18 @@
       var previous = (topo.port_roles || {})[port] || "";
       var role = previous;
       if (!role && item && item.mirror === true) role = "mirror";
-      select.value = role;
+      // A fast operator can change the select before this prefill lands; the
+      // device read must never overwrite that choice.
+      if (!touched) select.value = role;
       roleModal = {
         port: port,
-        role: role,
+        role: touched ? select.value : role,
         previous: previous,
         sources: (item && item.mirror_sources) || []
       };
     }).catch(function () { /* keep the baseline selection */ });
     select.addEventListener("change", function () {
+      touched = true;
       if (roleModal) roleModal.role = select.value;
     });
   }
@@ -593,6 +602,49 @@
       relabelMirrorRoles();
       decorateInterfacesPage();
     });
+    refreshPortNameMap().then(rewriteSystemNames);
+  }
+
+  // eth-only display rule: the frozen baseline renders the kernel name in a few
+  // places (orchestration-group port cells, hints). Rewrite the text node only;
+  // React state and API payloads keep the kernel names.
+  var portNameMap = { at: 0, map: {} };
+
+  function refreshPortNameMap() {
+    if (Date.now() - portNameMap.at < 10000) return Promise.resolve(portNameMap.map);
+    return currentPorts().then(function (ports) {
+      var map = {};
+      (ports || []).forEach(function (item) {
+        var id = String(item.id || "");
+        var system = String(item.system_name || "");
+        if (/^eth\d+$/i.test(id) && system && system !== id) map[system] = id;
+      });
+      portNameMap = { at: Date.now(), map: map };
+      return map;
+    }).catch(function () { return portNameMap.map; });
+  }
+
+  function rewriteSystemNames() {
+    var keys = Object.keys(portNameMap.map);
+    if (!keys.length) return;
+    var root = document.querySelector(".main-inner");
+    if (!root) return;
+    var pattern = new RegExp("\\b(" + keys.map(function (key) {
+      return key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }).join("|") + ")\\b", "g");
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    var node = walker.nextNode();
+    while (node) {
+      var parent = node.parentElement;
+      var tag = parent ? parent.tagName : "";
+      if (tag !== "SCRIPT" && tag !== "STYLE" && tag !== "TEXTAREA" && /ens|enp|eno/.test(node.nodeValue)) {
+        var replaced = node.nodeValue.replace(pattern, function (match) {
+          return portNameMap.map[match] || match;
+        });
+        if (replaced !== node.nodeValue) node.nodeValue = replaced;
+      }
+      node = walker.nextNode();
+    }
   }
 
   // ---------- 网卡设置: compact overview + table columns ----------
