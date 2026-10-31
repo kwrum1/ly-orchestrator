@@ -28,10 +28,134 @@ type TransparentOrchestratorReadback struct {
 	// compare the configuration's default action with the data-plane one
 	// instead of trusting a generation string alone.
 	Default string `json:"default,omitempty"`
-	Output  string `json:"output"`
+	// Bypass reflects the fault-bypass flag inside the plugin.  Bypass does
+	// not change the committed generation; it only makes the data path skip
+	// policy evaluation until the flag is cleared.
+	Bypass        bool   `json:"bypass"`
+	BypassCause   string `json:"bypass_cause,omitempty"`
+	BypassReason  string `json:"bypass_reason,omitempty"`
+	BypassForced  bool   `json:"bypass_forced,omitempty"`
+	BypassPackets uint64 `json:"bypass_packets,omitempty"`
+	Output        string `json:"output"`
 }
 
-// ParseTransparentOrchestratorOutput extracts the state, committed generation
+// ParseTransparentOrchestratorBypass extracts the fault-bypass state from
+// `show ly-route orchestrator` output.  Older plugin builds do not print these
+// lines, in which case the bypass is reported as off.
+func ParseTransparentOrchestratorBypass(output string) (enabled bool, cause, reason string, forced bool, packets uint64) {
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "bypass ") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 2 {
+			continue
+		}
+		switch fields[1] {
+		case "state":
+			enabled = len(fields) >= 3 && fields[2] == "on"
+		case "cause":
+			if len(fields) >= 3 {
+				cause = fields[2]
+			}
+		case "reason":
+			if len(trimmed) > len("bypass reason ") {
+				reason = strings.TrimSpace(trimmed[len("bypass reason "):])
+			}
+		case "forced":
+			forced = len(fields) >= 3 && fields[2] == "yes"
+		case "packets":
+			if len(fields) >= 3 {
+				packets, _ = strconv.ParseUint(fields[2], 10, 64)
+			}
+		}
+	}
+	if cause == "none" {
+		cause = ""
+	}
+	if reason == "none" {
+		reason = ""
+	}
+	return enabled, cause, reason, forced, packets
+}
+
+func transparentBypassToken(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	var builder strings.Builder
+	for _, character := range value {
+		switch {
+		case character >= 'a' && character <= 'z', character >= 'A' && character <= 'Z',
+			character >= '0' && character <= '9', strings.ContainsRune("-_.:/@", character):
+			builder.WriteRune(character)
+		default:
+			builder.WriteByte('_')
+		}
+		if builder.Len() >= 128 {
+			break
+		}
+	}
+	if builder.Len() == 0 {
+		return fallback
+	}
+	return builder.String()
+}
+
+// BuildTransparentOrchestratorBypassCommands toggles the plugin bypass flag
+// without touching the candidate or the committed generation.
+func BuildTransparentOrchestratorBypassCommands(enabled bool, cause, reason string) []string {
+	cause = transparentBypassToken(cause, "manual")
+	reason = transparentBypassToken(reason, "unspecified")
+	if enabled {
+		return []string{
+			fmt.Sprintf("set ly-route orchestrator bypass on cause %s reason %s", cause, reason),
+			"show ly-route orchestrator",
+		}
+	}
+	return []string{
+		fmt.Sprintf("set ly-route orchestrator bypass off cause %s reason %s", cause, reason),
+		"show ly-route orchestrator",
+	}
+}
+
+func (adapter Adapter) SetTransparentOrchestratorBypass(ctx context.Context, requestID string, enabled bool, cause, reason string) (TransparentOrchestratorReadback, error) {
+	if adapter.Client == nil {
+		return TransparentOrchestratorReadback{}, VPPError{Operation: "vpp.transparent-orchestrator.bypass", RequestID: requestID, Err: errors.New("vpp client is not configured")}
+	}
+	channel, err := adapter.Client.OpenChannel(ctx)
+	if err != nil {
+		return TransparentOrchestratorReadback{}, VPPError{Operation: "open_channel", RequestID: requestID, Err: err}
+	}
+	defer channel.Close()
+	commands := BuildTransparentOrchestratorBypassCommands(enabled, cause, reason)
+	operation := Operation{Name: "vpp.transparent-orchestrator.bypass", RequestID: requestID, Resource: "active", VPPCtlCommands: commands}
+	reply, err := channel.Do(ctx, operation)
+	if err != nil {
+		return TransparentOrchestratorReadback{}, VPPError{Operation: operation.Name, RequestID: requestID, Err: err}
+	}
+	payload, ok := reply.Payload.(VPPCTLReplyPayload)
+	if !ok || len(payload.CommandResults) == 0 {
+		return TransparentOrchestratorReadback{}, fmt.Errorf("%w: transparent orchestrator bypass results are missing", ErrSnapshotIncomplete)
+	}
+	show := payload.CommandResults[len(payload.CommandResults)-1]
+	if show.Command != "show ly-route orchestrator" || show.Retval != 0 {
+		return TransparentOrchestratorReadback{}, fmt.Errorf("%w: transparent orchestrator bypass readback is missing", ErrSnapshotIncomplete)
+	}
+	state, generation, defaultAction := ParseTransparentOrchestratorOutput(show.Stdout)
+	bypass, bypassCause, bypassReason, forced, packets := ParseTransparentOrchestratorBypass(show.Stdout)
+	if bypass != enabled {
+		return TransparentOrchestratorReadback{}, fmt.Errorf("%w: transparent orchestrator bypass state is %t, want %t", ErrSnapshotIncomplete, bypass, enabled)
+	}
+	return TransparentOrchestratorReadback{
+		Generation: generation, State: state, Default: defaultAction,
+		Bypass: bypass, BypassCause: bypassCause, BypassReason: bypassReason,
+		BypassForced: forced, BypassPackets: packets, Output: show.Stdout,
+	}, nil
+}
+
 // and the default action from `show ly-route orchestrator` output.
 func ParseTransparentOrchestratorOutput(output string) (state, generation, defaultAction string) {
 	for _, line := range strings.Split(output, "\n") {
@@ -307,13 +431,14 @@ func (adapter Adapter) ApplyTransparentOrchestrator(ctx context.Context, request
 		return TransparentOrchestratorReadback{}, err
 	}
 	state, generation, defaultAction := ParseTransparentOrchestratorOutput(show.Stdout)
+	bypass, bypassCause, bypassReason, bypassForced, bypassPackets := ParseTransparentOrchestratorBypass(show.Stdout)
 	if state == "" {
 		state = "running"
 	}
 	if generation == "" {
 		generation = config.Generation
 	}
-	return TransparentOrchestratorReadback{Generation: generation, State: state, Default: defaultAction, Output: show.Stdout}, nil
+	return TransparentOrchestratorReadback{Generation: generation, State: state, Default: defaultAction, Bypass: bypass, BypassCause: bypassCause, BypassReason: bypassReason, BypassForced: bypassForced, BypassPackets: bypassPackets, Output: show.Stdout}, nil
 }
 
 func (adapter Adapter) ObserveTransparentOrchestrator(ctx context.Context, requestID string) (TransparentOrchestratorReadback, error) {
@@ -336,7 +461,8 @@ func (adapter Adapter) ObserveTransparentOrchestrator(ctx context.Context, reque
 	}
 	output := payload.CommandResults[0].Stdout
 	state, generation, defaultAction := ParseTransparentOrchestratorOutput(output)
-	readback := TransparentOrchestratorReadback{State: state, Generation: generation, Default: defaultAction, Output: output}
+	bypass, bypassCause, bypassReason, bypassForced, bypassPackets := ParseTransparentOrchestratorBypass(output)
+	readback := TransparentOrchestratorReadback{State: state, Generation: generation, Default: defaultAction, Bypass: bypass, BypassCause: bypassCause, BypassReason: bypassReason, BypassForced: bypassForced, BypassPackets: bypassPackets, Output: output}
 	if readback.State == "" || (readback.State == "running" && readback.Generation == "") {
 		return TransparentOrchestratorReadback{}, fmt.Errorf("%w: transparent orchestrator state/generation is missing", ErrSnapshotIncomplete)
 	}

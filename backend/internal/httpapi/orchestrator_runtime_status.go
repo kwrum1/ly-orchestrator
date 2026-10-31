@@ -104,7 +104,13 @@ func (server *Server) orchestratorRuntimeCapability(ctx context.Context) *contro
 	if evidence.State != "running" {
 		return &controlapi.CapabilityState{Name: "orchestrator_runtime", Available: false, State: controlapi.CapabilityDegraded, Reason: serviceRuntime.Redact("transparent orchestrator state is " + evidence.State)}
 	}
-	return &controlapi.CapabilityState{Name: "orchestrator_runtime", Available: true, State: controlapi.CapabilityAvailable}
+	reason := ""
+	bypassReason := ""
+	if evidence.Bypass {
+		reason = fmt.Sprintf("fault bypass active (%s): %s", nonEmpty(evidence.BypassCause, "unknown"), nonEmpty(evidence.BypassReason, "unspecified"))
+		bypassReason = evidence.BypassReason
+	}
+	return &controlapi.CapabilityState{Name: "orchestrator_runtime", Available: true, State: controlapi.CapabilityAvailable, Reason: serviceRuntime.Redact(reason), Bypass: evidence.Bypass, BypassReason: serviceRuntime.Redact(bypassReason)}
 }
 
 // transparentRuntimeReason names the committed generation, the default action
@@ -122,6 +128,9 @@ func transparentRuntimeReason(evidence orchestratorapi.TransparentRuntimeEvidenc
 	}
 	if strings.TrimSpace(evidence.LastDriftReason) != "" {
 		reason += "; last drift: " + evidence.LastDriftReason
+	}
+	if evidence.Bypass {
+		reason += fmt.Sprintf("; fault bypass active (%s): %s", nonEmpty(evidence.BypassCause, "unknown"), nonEmpty(evidence.BypassReason, "unspecified"))
 	}
 	return reason
 }

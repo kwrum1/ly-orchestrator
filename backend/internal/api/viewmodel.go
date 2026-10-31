@@ -25,6 +25,10 @@ type CapabilityState struct {
 	Available bool   `json:"available"`
 	State     string `json:"state"`
 	Reason    string `json:"reason,omitempty"`
+	// Bypass is set when the orchestrator data plane is forwarding outside
+	// the configured policy because a fault was detected (or forced).
+	Bypass       bool   `json:"bypass,omitempty"`
+	BypassReason string `json:"bypass_reason,omitempty"`
 }
 
 type ProductProfile struct {

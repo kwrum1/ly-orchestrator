@@ -13,6 +13,7 @@ typedef enum
   LY_ORCH_ERROR_NOT_OURS,
   LY_ORCH_ERROR_FLOODED,
   LY_ORCH_ERROR_LOOPED,
+  LY_ORCH_ERROR_BYPASS,
   LY_ORCH_N_ERROR,
 } ly_orch_error_t;
 
@@ -24,6 +25,7 @@ static char *ly_orch_error_strings[] = {
   "unicast packets for another host ignored",
   "unicast packets flooded to learn the next-hop MAC",
   "own transmitted frames ignored (loop breaker)",
+  "packets forwarded by fault bypass",
 };
 
 typedef struct
@@ -589,7 +591,7 @@ VLIB_NODE_FN (ly_orch_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 buffers[VLIB_FRAME_SIZE];
   u16 nexts[VLIB_FRAME_SIZE];
   u32 forwarded = 0, dropped = 0, non_ip = 0, no_next_hop_mac = 0;
-  u32 not_ours = 0, flooded = 0, looped = 0, index;
+  u32 not_ours = 0, flooded = 0, looped = 0, bypassed = 0, index;
 
   for (index = 0; index < frame->n_vectors; index++)
     {
@@ -646,7 +648,18 @@ VLIB_NODE_FN (ly_orch_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
        * orientation and has to be reversed before matching. */
       if (!ingress.client_side && tuple.valid)
         ly_orch_reverse_tuple (&tuple);
-      if (!drop && tuple.valid)
+      if (!drop && om->bypass_active)
+        {
+          /* Fault bypass: do not evaluate any rule (including drop/default
+           * drop).  The packet is forwarded through the plain transparent
+           * port-pair path below, exactly like a configuration with no
+           * matching policy. */
+          path_count = 0;
+          if (worker)
+            worker->bypass_packets++;
+          bypassed++;
+        }
+      else if (!drop && tuple.valid)
         path_count = ly_orch_build_path (config, &tuple, path, worker,
                                          packet_bytes, &drop);
       else
@@ -722,6 +735,8 @@ VLIB_NODE_FN (ly_orch_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
                                flooded);
   vlib_node_increment_counter (vm, node->node_index, LY_ORCH_ERROR_LOOPED,
                                looped);
+  vlib_node_increment_counter (vm, node->node_index, LY_ORCH_ERROR_BYPASS,
+                               bypassed);
   return frame->n_vectors;
 }
 

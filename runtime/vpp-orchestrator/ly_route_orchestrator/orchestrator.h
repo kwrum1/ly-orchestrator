@@ -16,6 +16,8 @@
 #define LY_ORCH_MAC_ENTRIES 4096
 #define LY_ORCH_MAC_PROBES 8
 #define LY_ORCH_MAC_TTL_SECONDS 300.0
+#define LY_ORCH_BYPASS_CAUSE_LEN 32
+#define LY_ORCH_BYPASS_REASON_LEN 160
 #define LY_ORCH_INVALID_INDEX ((u32) ~0)
 
 typedef enum
@@ -142,6 +144,7 @@ typedef struct
 {
   ly_orch_rule_counter_t *rule_counters;
   u64 *group_bypass_packets;
+  u64 bypass_packets;
   ly_orch_flow_t *flows;
 } ly_orch_worker_t;
 
@@ -156,6 +159,17 @@ typedef struct
   ly_orch_mac_entry_t *mac_entries;
   ly_orch_addr_entry_t *addr_entries;
   clib_spinlock_t mac_lock;
+  /* Fault bypass.  When active the data path ignores every orchestration
+   * policy rule (including drop/default drop) and forwards like a plain
+   * transparent port pair, so a detected uplink/port fault cannot black-hole
+   * the business flow.  The committed generation and candidate policy are
+   * left untouched, so clearing the flag restores the configured policy
+   * without a re-apply. */
+  u8 bypass_active;
+  u8 bypass_forced;
+  u8 bypass_cause[LY_ORCH_BYPASS_CAUSE_LEN];
+  u8 bypass_reason[LY_ORCH_BYPASS_REASON_LEN];
+  f64 bypass_since;
 } ly_orch_main_t;
 
 extern ly_orch_main_t ly_orch_main;
