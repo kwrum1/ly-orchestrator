@@ -29,6 +29,17 @@ func (server *Server) buildOrchestratorRuntimePlan(ctx context.Context, requestI
 	}
 
 	interfaces := server.runtimeDataInterfaces(ctx)
+	// A mirror destination usually has no LAN/WAN role and therefore no
+	// address assignment. Without adding it (and its sources) to the native
+	// attachment set its VPP interface is not part of this generation and the
+	// SPAN command cannot be compiled. The Gateway plan has always done this;
+	// the Orchestrator plan must too, otherwise the 镜像口 page persists a
+	// session that apply never creates.
+	mirrorConfig, err := server.runtimeMirrorConfig(ctx)
+	if err != nil {
+		return RuntimePlan{}, err
+	}
+	interfaces = appendMirrorDataInterfaces(mirrorConfig, interfaces)
 	server.persistDataplaneInventory(ctx, interfaces)
 	dataplanePolicy := server.dataplanePolicy(ctx)
 	observation := server.observeDataplaneCapability(ctx, interfaces)
@@ -48,7 +59,7 @@ func (server *Server) buildOrchestratorRuntimePlan(ctx context.Context, requestI
 	if composition, ok := server.gatewayTransaction.(apply.ProductionGatewayComposition); ok {
 		dataplanePrepared = composition.HasDataplaneController()
 	}
-	gatewayPlan := vpp.Plan{RequestID: requestID, NativePath: nativePath, DataplanePrepared: dataplanePrepared, Flow: compiledFlow, Policy: compiledPolicy}
+	gatewayPlan := vpp.Plan{RequestID: requestID, NativePath: nativePath, DataplanePrepared: dataplanePrepared, Flow: compiledFlow, Policy: compiledPolicy, Mirror: mirrorConfig}
 	operations, buildErr := vpp.BuildOperations(gatewayPlan)
 	dataplaneState := "native_ready"
 	var dataplaneProof []vpp.PrerequisiteResult

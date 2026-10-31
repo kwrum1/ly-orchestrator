@@ -69,14 +69,32 @@ func (server *Server) orchestratorStatusComponents(ctx context.Context) ([]Runti
 		return nil, false
 	}
 	if components, handled := server.orchestratorTransparentRuntimeComponents(ctx); handled {
-		return components, true
+		return server.appendMirrorRuntimeComponent(ctx, components), true
 	}
 	reason := "transparent orchestrator runtime evidence is not configured"
 	server.setRuntimeEvidence(degradedRuntimeResult("orchestrator-observe", reason, server.now().UTC()))
-	return server.applyRuntimeEvidence([]RuntimeComponentState{
+	return server.appendMirrorRuntimeComponent(ctx, server.applyRuntimeEvidence([]RuntimeComponentState{
 		{Name: "vpp", State: "degraded", Available: false, Reason: reason},
 		{Name: "persistence", State: "running", Available: server.store != nil, Reason: persistenceRuntimeReason(server.store != nil)},
-	}), true
+	})), true
+}
+
+// appendMirrorRuntimeComponent adds the port-mirror evidence to the
+// Orchestrator inventory. The mirror page reads this component to show every
+// desired SPAN session as 已生效/未生效; the Gateway component list already
+// carries it, but the Orchestrator status path returns its own fixed inventory.
+func (server *Server) appendMirrorRuntimeComponent(ctx context.Context, components []RuntimeComponentState) []RuntimeComponentState {
+	component, configured := server.mirrorRuntimeComponent(ctx)
+	if !configured {
+		return components
+	}
+	for position := range components {
+		if components[position].Name == component.Name {
+			components[position] = component
+			return components
+		}
+	}
+	return append(components, component)
 }
 
 // orchestratorRuntimeCapability makes /health reflect the committed
