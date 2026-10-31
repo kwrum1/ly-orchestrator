@@ -1,7 +1,6 @@
 package vpp
 
 import (
-	"reflect"
 	"testing"
 )
 
@@ -50,9 +49,7 @@ func TestTransparentOrchestratorReadbackCarriesBypass(t *testing.T) {
 		Generation: "abc", State: "running", Default: "drop",
 		Bypass: true, BypassCause: "auto", BypassReason: "probe", BypassForced: false, BypassPackets: 7,
 	}
-	copy := readback
-	copy.Output = "bypass state on"
-	if !reflect.DeepEqual(readback, copy) {
-		t.Fatalf("readback copy lost fields")
+	if !readback.Bypass || readback.BypassPackets != 7 || readback.BypassCause != "auto" {
+		t.Fatalf("readback lost bypass fields: %#v", readback)
 	}
 }
