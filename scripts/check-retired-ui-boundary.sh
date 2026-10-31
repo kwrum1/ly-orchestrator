@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 # Boundary guard: the retired controller-shell Orchestrator UI must never return.
 #
-# The Orchestrator UI is a React/Vite build of ly-route's frontend/gateway with
-# LY_ROUTE_PRODUCT=orchestrator. The shipped bundle is pinned at
+# The Orchestrator UI source is frontend/ (React/Vite/TypeScript, single
+# product) and it is built in CI. The shipped bundle is still the pinned
 # packaging/orchestrator-ui-baseline/ and is not rebuilt by CI. The obsolete
 # controller-shell (static frontend/orchestrator + concatenated ~185 KB app.js)
 # was removed because it was deployed over the current UI by mistake.
@@ -18,7 +18,6 @@ fail() {
 
 # 1. The retired source tree, bundle, builder and build-profile helper stay gone.
 for gone in \
-  frontend \
   frontend/orchestrator \
   packaging/orchestrator-frontend \
   scripts/build-controller-shell.sh \
@@ -44,7 +43,12 @@ for file in $found; do
   fi
 done
 
-# 4. The pinned React baseline is the only UI artifact this repository ships.
+# 4. The React/Vite source tree lives in frontend/ and must stay buildable.
+for required in frontend/package.json frontend/index.html frontend/vite.config.ts frontend/src/main.tsx; do
+  [ -f "$required" ] || fail "orchestrator UI source is incomplete: $required"
+done
+
+# 5. The pinned React baseline is the only UI artifact this repository ships.
 #    If it is ever moved or replaced, update this guard together with the move.
 baseline="packaging/orchestrator-ui-baseline"
 product_build_require() { [ -f "$1" ] || fail "$2"; }
@@ -56,7 +60,7 @@ size=$(wc -c <"$baseline/app.js" | tr -d ' ')
 grep -q 'id="root"' "$baseline/index.html" || \
   fail "pinned orchestrator UI is not a React bundle (index.html lacks the #root mount point)"
 
-# 5. No script may reference the retired builder or bundle again. Documentation
+# 6. No script may reference the retired builder or bundle again. Documentation
 #    may name the removed paths so the decision stays discoverable.
 if grep -R -n --exclude-dir=.git --exclude-dir=docs --exclude=README.md \
   --exclude=check-retired-ui-boundary.sh \

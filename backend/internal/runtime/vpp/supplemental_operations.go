@@ -330,7 +330,7 @@ func ValidateSupplementalReadback(plan Plan, owner SupplementalOwner, actual []S
 
 func supplementalOperationOwner(operation Operation) SupplementalOwner {
 	switch operation.Name {
-	case "vpp.dataplane.attach", "vpp.lan-control-lcp", "vpp.management-lcp":
+	case "vpp.dataplane.attach", "vpp.lan-control-lcp", "vpp.management-lcp", "vpp.interface-span":
 		return SupplementalInterfaces
 	case "vpp.proxy-service.network", "vpp.dns-service.network":
 		return SupplementalServiceNetworks
@@ -629,6 +629,8 @@ func supplementalCleanupCommands(operation Operation) ([]string, error) {
 		return managementLCPCleanupCommands(), nil
 	case DNSTransparentInterception:
 		return dnsTransparentCleanupCommands(payload), nil
+	case MirrorConfig:
+		return MirrorCleanupCommands(payload), nil
 	default:
 		return nil, &UnsupportedOperationError{Name: operation.Name, Resource: operation.Resource}
 	}

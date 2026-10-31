@@ -84,6 +84,12 @@ func verifySupplementalOperation(operation Operation, results []VPPCTLCommandRes
 		return verifyDNSTransparentReadback(payload, results)
 	case SecurityGeneration:
 		return verifySecurityGenerationReadback(payload, results)
+	case MirrorConfig:
+		output, err := mirrorSpanReadback(results)
+		if err != nil {
+			return err
+		}
+		return MirrorReadbackMatches(output, payload.desired())
 	default:
 		return &UnsupportedOperationError{Name: operation.Name, Resource: operation.Resource}
 	}

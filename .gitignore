@@ -46,8 +46,9 @@ PanabitOEM_TANGr7p8_20260414_Linux3.tar.gz
 
 # Dependencies and OS/editor noise
 node_modules/
+/frontend/node_modules/
 .DS_Store
 
 # Product UI build outputs
-frontend/gateway/dist/
+/frontend/dist/
 *.tsbuildinfo

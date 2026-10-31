@@ -154,6 +154,9 @@ func (server *Server) statusHealthComponents(ctx context.Context) []RuntimeCompo
 	} else {
 		components = append(components, RuntimeComponentState{Name: "persistence", State: "running", Available: true})
 	}
+	if component, configured := server.mirrorRuntimeComponent(ctx); configured {
+		components = append(components, component)
+	}
 	return components
 }
 

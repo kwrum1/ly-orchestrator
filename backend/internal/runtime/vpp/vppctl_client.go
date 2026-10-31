@@ -87,6 +87,13 @@ const (
 
 func (channel vppctlChannel) Do(ctx context.Context, operation Operation) (Reply, error) {
 	operation = rewriteOperationLANInterface(operation, channel.lanVPPInterface)
+	if operation.Name == "vpp.interface-span" {
+		// Read-only show outputs are cached for a few seconds. The span
+		// operation mutates VPP and ends with `show interface span`, so a
+		// status/health poll taken just before apply would otherwise feed the
+		// verification the pre-apply (empty) table and fail a converged apply.
+		channel.cache.invalidate()
+	}
 	if channel.dynamicACL && operation.Name == "vpp.security-acl.snapshot" {
 		operation.VPPCtlCommands = []string{"show acl-plugin acl"}
 	}

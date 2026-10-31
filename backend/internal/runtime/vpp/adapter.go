@@ -49,7 +49,11 @@ type Plan struct {
 	// NAT return-guard attachments must cover all of them, not just the first.
 	LANVPPInterfaces   []string            `json:"lan_vpp_interfaces,omitempty"`
 	DNSServiceNetworks []DNSServiceNetwork `json:"dns_service_networks,omitempty"`
-	DataplanePrepared  bool                `json:"-"`
+	// Mirror is the desired port-mirroring (SPAN) generation. It is applied
+	// through a supplemental interface operation so a VPP restart replays it
+	// from the durable operations file.
+	Mirror            *MirrorConfig `json:"mirror,omitempty"`
+	DataplanePrepared bool          `json:"-"`
 	// AllowUnprovenOperations lets reconciliation derive the operation graph
 	// from declarative plan data even when the live dataplane capability proof
 	// is no longer valid. Apply paths must leave it false so an unprovable
@@ -307,7 +311,7 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 	if plan.SkipQoS {
 		flowGroups = WithoutQoSPluginGroups(flowGroups)
 	}
-	needsDataplane := plan.DNSInterception || len(plan.DNSServiceNetworks) > 0 || len(plan.NativePath.Assignments) > 0 || len(plan.AddressAssignments) > 0 || len(plan.Proxy.VPPSteering) > 0 || len(flowGroups) > 0 || len(plan.Flow.Targets) > 0 || len(plan.NAT.StaticMappings) > 0 || len(plan.NAT.PortMappings) > 0 || len(plan.Policy.WANGroups) > 0 || len(plan.Policy.RoutePolicies) > 0 || len(plan.Policy.SecurityACLs) > 0 || len(plan.Security.ACLs) > 0 || len(plan.Security.MACIP) > 0 || len(plan.Security.AttackRules) > 0
+	needsDataplane := plan.DNSInterception || plan.Mirror != nil || len(plan.DNSServiceNetworks) > 0 || len(plan.NativePath.Assignments) > 0 || len(plan.AddressAssignments) > 0 || len(plan.Proxy.VPPSteering) > 0 || len(flowGroups) > 0 || len(plan.Flow.Targets) > 0 || len(plan.NAT.StaticMappings) > 0 || len(plan.NAT.PortMappings) > 0 || len(plan.Policy.WANGroups) > 0 || len(plan.Policy.RoutePolicies) > 0 || len(plan.Policy.SecurityACLs) > 0 || len(plan.Security.ACLs) > 0 || len(plan.Security.MACIP) > 0 || len(plan.Security.AttackRules) > 0
 	if !needsDataplane {
 		return operations, nil
 	}
@@ -361,6 +365,11 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 	}
 	for _, attachment := range nativePath.Attachments {
 		operations = append(operations, DataplaneAttachOperation(plan.RequestID, attachment))
+	}
+	if mirrorOperation, err := mirrorSpanOperation(plan, nativePath.Attachments); err != nil {
+		return nil, err
+	} else if mirrorOperation != nil {
+		operations = append(operations, *mirrorOperation)
 	}
 	seenLANControlPlanes := map[string]bool{}
 	// VPP keeps one local path for 255.255.255.255. Re-adding the broadcast
@@ -947,6 +956,61 @@ func interfaceAddressCommands(assignment AddressAssignment) []string {
 		fmt.Sprintf("?set interface ip address %s %s", name, cidr),
 		fmt.Sprintf("show interface address %s", name),
 	}
+}
+
+// mirrorSpanOperation renders the disable-first SPAN generation. It is emitted
+// for every plan that owns at least one VPP attachment: an empty desired mirror
+// must actively clear a session left behind by the previous generation, which
+// is also what makes "remove the mirror port" converge instead of leaving the
+// old session in VPP.
+func mirrorSpanOperation(plan Plan, attachments []NativeAttachment) (*Operation, error) {
+	if len(attachments) == 0 {
+		return nil, nil
+	}
+	takenOver := make(map[string]struct{}, len(attachments))
+	cleanup := make([]string, 0, len(attachments))
+	for _, attachment := range attachments {
+		name := strings.TrimSpace(attachment.VPPInterface)
+		if name == "" {
+			continue
+		}
+		takenOver[name] = struct{}{}
+		cleanup = append(cleanup, name)
+	}
+	payload := MirrorConfig{}
+	if plan.Mirror != nil {
+		payload = *plan.Mirror
+		destination := strings.TrimSpace(payload.Destination)
+		if destination == "" {
+			return nil, fmt.Errorf("mirror generation has no destination interface")
+		}
+		if _, ok := takenOver[destination]; !ok {
+			return nil, fmt.Errorf("mirror port %s is not taken over by the dataplane", nonEmptyMirrorName(payload.LinuxInterface, destination))
+		}
+		for _, source := range payload.Sources {
+			if _, ok := takenOver[strings.TrimSpace(source.Interface)]; !ok {
+				return nil, fmt.Errorf("mirror source %s is not taken over by the dataplane", nonEmptyMirrorName(source.LinuxInterface, source.Interface))
+			}
+		}
+	}
+	resource := "mirror"
+	if payload.LinuxInterface != "" {
+		resource = payload.LinuxInterface
+	}
+	return &Operation{
+		Name:           "vpp.interface-span",
+		RequestID:      plan.RequestID,
+		Resource:       resource,
+		Payload:        payload,
+		VPPCtlCommands: MirrorSpanCommands(plan.Mirror, cleanup),
+	}, nil
+}
+
+func nonEmptyMirrorName(preferred, fallback string) string {
+	if strings.TrimSpace(preferred) != "" {
+		return preferred
+	}
+	return fallback
 }
 
 func DataplaneAttachOperation(requestID string, attachment NativeAttachment) Operation {

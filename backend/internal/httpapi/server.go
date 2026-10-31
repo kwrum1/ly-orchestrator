@@ -5722,6 +5722,9 @@ func (server *Server) validateDesiredRuntimePayload(ctx context.Context, resourc
 		if err := server.validateInterfaceLineRole(ctx, payload); err != nil {
 			return err
 		}
+		if err := server.validateInterfaceMirror(ctx, payload); err != nil {
+			return err
+		}
 		if err := server.validateInterfaceRoleReferences(ctx, payload); err != nil {
 			// force=true is the explicit rebuild acknowledgement handled by
 			// configGraphIdentityConflict; the persisted generation is the
@@ -7588,6 +7591,19 @@ func (server *Server) reprobeRuntimeComponents(ctx context.Context, components [
 			updated[position] = live
 		}
 	}
+	if component, configured := server.mirrorRuntimeComponent(ctx); configured {
+		replaced := false
+		for position := range updated {
+			if updated[position].Name == component.Name {
+				updated[position] = component
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			updated = append(updated, component)
+		}
+	}
 	return server.applyRuntimeEvidence(updated)
 }
 
@@ -7633,6 +7649,10 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		}()
 	}
 	addressAssignments, err := server.runtimeAddressAssignments(ctx)
+	if err != nil {
+		return RuntimePlan{}, err
+	}
+	mirrorConfig, err := server.runtimeMirrorConfig(ctx)
 	if err != nil {
 		return RuntimePlan{}, err
 	}
@@ -7843,6 +7863,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	mark("pppoe-peers")
 	artifacts = append(artifacts, pppoeArtifacts...)
 	dataInterfaces := server.runtimeDataplaneInterfaces(ctx)
+	dataInterfaces = appendMirrorDataInterfaces(mirrorConfig, dataInterfaces)
 	server.persistDataplaneInventory(ctx, dataInterfaces)
 	dataplanePolicy := server.dataplanePolicy(ctx)
 	observation := server.observeDataplaneCapability(ctx, dataInterfaces)
@@ -7908,7 +7929,7 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	if err := vpp.ResolveFlowShapingInterfaces(&gatewayFlow, addressAssignments); err != nil {
 		return RuntimePlan{}, err
 	}
-	canonicalGatewayPlan := vpp.Plan{RequestID: requestID, NativePath: nativePath, DataplanePrepared: dataplanePrepared, AddressAssignments: addressAssignments, Proxy: compiledProxy, Flow: gatewayFlow, NAT: compiledNAT, Policy: gatewayPolicy, RetiredRoutePolicyIDs: retiredRoutePolicyIDs, Security: securityGeneration, DNSInterception: dnsInterceptionEnabled, DNSABFSteering: dnsABFSteering, LANVPPInterfaces: lanVPPInterfaces(addressAssignments), DNSServiceNetworks: dnsServiceNetworks, SkipQoS: qosSkipAll}
+	canonicalGatewayPlan := vpp.Plan{RequestID: requestID, NativePath: nativePath, DataplanePrepared: dataplanePrepared, AddressAssignments: addressAssignments, Proxy: compiledProxy, Flow: gatewayFlow, NAT: compiledNAT, Policy: gatewayPolicy, RetiredRoutePolicyIDs: retiredRoutePolicyIDs, Security: securityGeneration, DNSInterception: dnsInterceptionEnabled, DNSABFSteering: dnsABFSteering, LANVPPInterfaces: lanVPPInterfaces(addressAssignments), DNSServiceNetworks: dnsServiceNetworks, Mirror: mirrorConfig, SkipQoS: qosSkipAll}
 	operations, err := vpp.BuildOperations(canonicalGatewayPlan)
 	mark("build-operations")
 	dataplaneState := "native_ready"
@@ -8000,6 +8021,9 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	components := server.runtimeStatusComponents(componentCtx, artifacts, len(operations) > 0)
 	cancelComponents()
 	components = server.applyQoSPlanState(components, qosSkipped, qosSkipReason)
+	if mirrorComponent, configured := server.mirrorRuntimeComponent(componentCtx); configured {
+		components = append(components, mirrorComponent)
+	}
 	mark("components")
 	if proxyRuntimeWarning != "" {
 		components = markComponentDegraded(components, string(serviceRuntime.Xray), proxyRuntimeWarning)
@@ -13274,6 +13298,7 @@ func (server *Server) normalizeInterfaceSnapshot(ctx context.Context, items []ma
 	managementInterface := server.managementInterfaceID(ctx)
 	appliedVPP := server.appliedVPPDataplaneInterfaces()
 	desiredCIDRs := server.desiredInterfaceCIDRs(ctx)
+	desiredMirrorFields := server.desiredInterfaceMirrorFields(ctx)
 	vppNames := server.vppInterfaceNames(ctx)
 	items = server.augmentOwnedInterfaceItems(ctx, items)
 	snapshot := make([]map[string]any, 0, len(items))
@@ -13283,6 +13308,16 @@ func (server *Server) normalizeInterfaceSnapshot(ctx context.Context, items []ma
 		// name may already be a product id (eth1) in desired/telemetry items.
 		// Resolve it back to the persisted Linux name before looking anything up.
 		linuxName := server.interfaceLinuxName(ctx, name)
+		if fields, ok := desiredMirrorFields[linuxName]; ok {
+			for key, value := range fields {
+				clone[key] = value
+			}
+		} else {
+			// Telemetry never carries mirror attributes: an unstored/cleared flag
+			// must render as "not a mirror port" instead of inheriting a stale copy.
+			delete(clone, "mirror")
+			delete(clone, "mirror_sources")
+		}
 		if cidr := strings.TrimSpace(desiredCIDRs[linuxName]); cidr != "" {
 			if strings.TrimSpace(firstNonEmpty(stringField(clone, "cidr"), stringField(clone, "ip_cidr"), stringField(clone, "ip"))) == "" {
 				clone["cidr"] = cidr

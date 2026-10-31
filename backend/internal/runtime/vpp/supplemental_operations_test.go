@@ -393,7 +393,7 @@ func TestSupplementalOwnersIncludeLANControlPlaneAndTransparentDNS(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantInterfaces := []string{"vpp.dataplane.attach", "vpp.lan-control-lcp", "vpp.management-lcp"}
+	wantInterfaces := []string{"vpp.dataplane.attach", "vpp.interface-span", "vpp.lan-control-lcp", "vpp.management-lcp"}
 	if got := operationNames(interfaces); !reflect.DeepEqual(got, wantInterfaces) {
 		t.Fatalf("interface supplemental operations = %#v, want %#v", got, wantInterfaces)
 	}
@@ -490,6 +490,26 @@ func matchingNativeReadbacks(t *testing.T, plan Plan) []SupplementalOperationRea
 			readbacks = append(readbacks, SupplementalOperationReadback{Name: operation.Name, Resource: operation.Resource, PayloadHash: hash, Shows: []VPPCTLCommandResult{
 				{Command: "show hardware-interfaces " + payload.VPPInterface, Stdout: payload.VPPInterface + "\n  netdev " + payload.LinuxInterface},
 				{Command: "show interface " + payload.VPPInterface, Stdout: "interface " + payload.VPPInterface},
+			}})
+		case MirrorConfig:
+			output := ""
+			if payload.Destination != "" {
+				lines := []string{"Source                           Destination                       Device       L2"}
+				for _, source := range payload.Sources {
+					l2 := "none"
+					if source.L2 {
+						l2 = "both"
+					}
+					direction := source.Direction
+					if direction == "" {
+						direction = "both"
+					}
+					lines = append(lines, payload.Destination+" "+source.Interface+" ("+direction+") ("+l2+")")
+				}
+				output = strings.Join(lines, "\n")
+			}
+			readbacks = append(readbacks, SupplementalOperationReadback{Name: operation.Name, Resource: operation.Resource, PayloadHash: hash, Shows: []VPPCTLCommandResult{
+				{Command: "show interface span", Stdout: output},
 			}})
 		case ManagementLCP:
 			output := "lcp default netns '<unset>'\n"
