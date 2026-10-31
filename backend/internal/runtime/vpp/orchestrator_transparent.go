@@ -18,6 +18,13 @@ type TransparentOrchestratorConfig struct {
 	Generation string
 	Topology   orchestrator.TopologyView
 	Policy     *orchestrator.PolicyView
+	// Mirror is the desired port-mirroring (SPAN) generation.  It is applied
+	// in the same VPP operation as the plugin generation so a topology save and
+	// the 镜像口 page converge together; the readback is verified before apply
+	// returns.  MirrorCleanup lists VPP interface names whose sessions must be
+	// disabled first, including ports retired by an earlier mirror generation.
+	Mirror        *MirrorConfig
+	MirrorCleanup []string
 }
 
 type TransparentOrchestratorReadback struct {
@@ -80,7 +87,6 @@ type GroupProbeTarget struct {
 	Protocol      string
 	WindowSeconds float64
 }
-
 
 // ParseTransparentOrchestratorBypass extracts the fault-bypass state from
 // `show ly-route orchestrator` output.  Older plugin builds do not print these
@@ -283,8 +289,8 @@ func (adapter Adapter) SetTransparentOrchestratorGroupBypass(ctx context.Context
 		Generation: generation, State: state, Default: defaultAction,
 		Bypass: bypass, BypassCause: bypassCause, BypassReason: bypassReason,
 		BypassForced: forced, BypassPackets: packets, Output: show.Stdout,
-		GroupBypass: groups,
-		GroupProbes: ParseTransparentOrchestratorGroupProbes(show.Stdout),
+		GroupBypass:  groups,
+		GroupProbes:  ParseTransparentOrchestratorGroupProbes(show.Stdout),
 		ProbeTargets: ParseTransparentOrchestratorProbeTargets(show.Stdout),
 	}, nil
 }
@@ -416,8 +422,8 @@ func (adapter Adapter) SetTransparentOrchestratorBypass(ctx context.Context, req
 		Generation: generation, State: state, Default: defaultAction,
 		Bypass: bypass, BypassCause: bypassCause, BypassReason: bypassReason,
 		BypassForced: forced, BypassPackets: packets, Output: show.Stdout,
-		GroupBypass: ParseTransparentOrchestratorGroupBypass(show.Stdout),
-		GroupProbes: ParseTransparentOrchestratorGroupProbes(show.Stdout),
+		GroupBypass:  ParseTransparentOrchestratorGroupBypass(show.Stdout),
+		GroupProbes:  ParseTransparentOrchestratorGroupProbes(show.Stdout),
 		ProbeTargets: ParseTransparentOrchestratorProbeTargets(show.Stdout),
 	}, nil
 }
@@ -672,6 +678,18 @@ func (adapter Adapter) ApplyTransparentOrchestrator(ctx context.Context, request
 	if err != nil {
 		return TransparentOrchestratorReadback{}, err
 	}
+	// Port mirroring is a supplemental VPP interface operation: the plugin does
+	// not own SPAN sessions. Run it in the same channel just before the plugin
+	// readback so the committed generation and the session are proven by one
+	// apply result. Disable-first ordering is inside MirrorSpanCommands.
+	if config.Mirror != nil || len(config.MirrorCleanup) > 0 {
+		mirrorCommands := MirrorSpanCommands(config.Mirror, config.MirrorCleanup)
+		if last := len(commands) - 1; last >= 0 && commands[last] == "show ly-route orchestrator" {
+			commands = append(append(commands[:last:last], mirrorCommands...), commands[last])
+		} else {
+			commands = append(commands, mirrorCommands...)
+		}
+	}
 	if adapter.Client == nil {
 		return TransparentOrchestratorReadback{}, VPPError{Operation: "vpp.transparent-orchestrator", RequestID: requestID, Err: errors.New("vpp client is not configured")}
 	}
@@ -695,6 +713,20 @@ func (adapter Adapter) ApplyTransparentOrchestrator(ctx context.Context, request
 	}
 	if err := verifyTransparentOrchestratorReadback(show.Stdout, config, commands); err != nil {
 		return TransparentOrchestratorReadback{}, err
+	}
+	if config.Mirror != nil || len(config.MirrorCleanup) > 0 {
+		span := ""
+		for _, result := range payload.CommandResults {
+			if result.Command == "show interface span" {
+				span = result.Stdout
+			}
+		}
+		if span == "" {
+			return TransparentOrchestratorReadback{}, fmt.Errorf("%w: port mirror readback command is missing", ErrSnapshotIncomplete)
+		}
+		if err := MirrorReadbackMatches(span, config.Mirror); err != nil {
+			return TransparentOrchestratorReadback{}, fmt.Errorf("%w: %v", ErrSnapshotIncomplete, err)
+		}
 	}
 	state, generation, defaultAction := ParseTransparentOrchestratorOutput(show.Stdout)
 	bypass, bypassCause, bypassReason, bypassForced, bypassPackets := ParseTransparentOrchestratorBypass(show.Stdout)

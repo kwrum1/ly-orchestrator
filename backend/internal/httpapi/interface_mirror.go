@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"ly-route/backend/internal/runtime/vpp"
@@ -347,6 +348,69 @@ func (server *Server) orchestratorGroupPorts(ctx context.Context) map[string]boo
 		}
 	}
 	return ports
+}
+
+// OrchestratorMirrorProvider exposes the desired SPAN generation and the VPP
+// interface names whose sessions must be disabled first. The Orchestrator
+// runtime is built before the HTTP server, so main installs this callback after
+// NewServer; every transparent apply then converges the mirror in the same VPP
+// operation as the plugin generation.
+func (server *Server) OrchestratorMirrorProvider() func(context.Context) (*vpp.MirrorConfig, []string, error) {
+	return func(ctx context.Context) (*vpp.MirrorConfig, []string, error) {
+		mirror, err := server.runtimeMirrorConfig(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		cleanup, err := server.mirrorCleanupInterfaces(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return mirror, cleanup, nil
+	}
+}
+
+// mirrorCleanupInterfaces lists every VPP interface a stale SPAN session could
+// still name. Disabling a session that does not exist is a no-op (`?set`), and
+// the inventory is small, so this also covers a destination/source that was
+// retired by "取消镜像" (whose document no longer lists the old sources).
+func (server *Server) mirrorCleanupInterfaces(ctx context.Context) ([]string, error) {
+	names := map[string]struct{}{}
+	addLinux := func(linux string) {
+		linux = strings.TrimSpace(linux)
+		if linux == "" {
+			return
+		}
+		names[vppInterfaceName(linux)] = struct{}{}
+	}
+	for _, item := range hostInterfaceInventory() {
+		addLinux(nonEmpty(stringField(item, "name"), stringField(item, "id")))
+	}
+	items, err := server.desiredItems(ctx, "interface")
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if truthy(item["deleted"]) {
+			continue
+		}
+		_, hasMirror := item["mirror"]
+		sources := interfaceMirrorSourcesOf(item)
+		if !hasMirror && len(sources) == 0 {
+			continue
+		}
+		if id := strings.TrimSpace(nonEmpty(stringField(item, "interface_id"), stringField(item, "id"))); id != "" {
+			addLinux(server.resolveInterfaceID(ctx, id))
+		}
+		for _, source := range sources {
+			addLinux(server.resolveInterfaceID(ctx, source.Interface))
+		}
+	}
+	result := make([]string, 0, len(names))
+	for name := range names {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result, nil
 }
 
 // mirrorRuntimeComponent reports every desired mirror session and whether the

@@ -188,6 +188,9 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("initialize control API: %w", err)
 	}
+	if recoveryRuntime != nil {
+		recoveryRuntime.SetMirrorProvider(server.OrchestratorMirrorProvider())
+	}
 	recoveryCtx, stopRecovery := context.WithCancel(context.Background())
 	defer stopRecovery()
 	if recoveryRepository != nil && recoveryRuntime != nil {
@@ -262,6 +265,12 @@ type productionOrchestratorRuntime struct {
 	managementInterface           string
 	linuxInterface                func(context.Context, string) string
 	proofCommand                  string
+	// mirrorProvider returns the desired SPAN generation plus the VPP interface
+	// names whose sessions must be disabled first. The HTTP layer owns the
+	// interface documents, so it installs this callback after the server is
+	// built; every transparent apply (topology save, explicit apply, recovery)
+	// then converges the mirror in the same transaction.
+	mirrorProvider func(context.Context) (*vpp.MirrorConfig, []string, error)
 }
 
 func (runtime *productionOrchestratorRuntime) ApplyTransparent(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) error {
@@ -270,12 +279,38 @@ func (runtime *productionOrchestratorRuntime) ApplyTransparent(ctx context.Conte
 	return runtime.applyTransparentLocked(ctx, requestID, topology, policy)
 }
 
+// SetMirrorProvider installs the desired port-mirror source. It must be called
+// once during startup, before the control API starts accepting writes.
+func (runtime *productionOrchestratorRuntime) SetMirrorProvider(provider func(context.Context) (*vpp.MirrorConfig, []string, error)) {
+	runtime.mirrorProvider = provider
+}
+
+func (runtime *productionOrchestratorRuntime) desiredMirror(ctx context.Context) (*vpp.MirrorConfig, []string, error) {
+	if runtime.mirrorProvider == nil {
+		return nil, nil, nil
+	}
+	return runtime.mirrorProvider(ctx)
+}
+
 func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) error {
 	// The persisted topology is the operator's intent and may still carry
 	// product ids from an older build. Resolve every port once and use the same
 	// kernel-name view for the probe, the bonds, the generation and VPP.
 	topologyView := runtime.resolveTopologyView(ctx, topology.View())
 	interfaces := transparentTopologyInterfaces(topologyView)
+	mirror, mirrorCleanup, mirrorErr := runtime.desiredMirror(ctx)
+	if mirrorErr != nil {
+		return mirrorErr
+	}
+	if mirror != nil {
+		// The mirror destination usually has no LAN/WAN role, so it is not part
+		// of the topology interface set. Attach it (and every source) or VPP
+		// never creates the interface the SPAN command refers to.
+		interfaces = appendTransparentInterfaces(interfaces, mirror.LinuxInterface)
+		for _, source := range mirror.Sources {
+			interfaces = appendTransparentInterfaces(interfaces, source.LinuxInterface)
+		}
+	}
 	path, err := runtime.selectAndPrepare(ctx, requestID, interfaces, topologyView.ManagementShared)
 	if err != nil {
 		return err
@@ -305,7 +340,7 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 			return err
 		}
 	}
-	readback, err := runtime.adapter.ApplyTransparentOrchestrator(ctx, requestID, vpp.TransparentOrchestratorConfig{Generation: generation, Topology: topologyView, Policy: policyView})
+	readback, err := runtime.adapter.ApplyTransparentOrchestrator(ctx, requestID, vpp.TransparentOrchestratorConfig{Generation: generation, Topology: topologyView, Policy: policyView, Mirror: mirror, MirrorCleanup: mirrorCleanup})
 	if err != nil {
 		var rollbackErr error
 		if len(previousBonds) > 0 || len(desiredBonds) > 0 {
@@ -957,6 +992,30 @@ func transparentTopologyInterfaces(topology orchestrator.TopologyView) []string 
 		}
 	}
 	sort.Strings(result)
+	return result
+}
+
+// appendTransparentInterfaces adds mirror-owned ports to the attachment set
+// without duplicating a port already requested by the topology.
+func appendTransparentInterfaces(interfaces []string, extra ...string) []string {
+	seen := make(map[string]bool, len(interfaces)+len(extra))
+	result := make([]string, 0, len(interfaces)+len(extra))
+	for _, name := range interfaces {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		result = append(result, name)
+	}
+	for _, name := range extra {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		result = append(result, name)
+	}
 	return result
 }
 
