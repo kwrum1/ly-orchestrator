@@ -21,6 +21,7 @@ var (
 	ErrManagementMembership  = errors.New("management interface is Linux-owned and globally excluded")
 	ErrLogicalMembership     = errors.New("orchestration groups cannot contain logical LAN or WAN interfaces")
 	ErrDuplicateGroup        = errors.New("orchestration group name must be unique")
+	ErrInvalidPortRole       = errors.New("invalid port role")
 	ErrTopologyNotFound      = errors.New("orchestrator topology not found")
 	ErrTopologyConflict      = errors.New("orchestrator topology changed during mutation")
 	ErrGroupNotFound         = errors.New("orchestration group not found")
@@ -84,6 +85,10 @@ type Topology struct {
 	lan              LogicalInterface
 	wan              LogicalInterface
 	groups           []Group
+	// portRoles is the optional LAN/WAN tag per physical port (see
+	// TopologyInput.PortRoles).  It is metadata for the console; LAN/WAN
+	// ownership stays with the two logical interfaces above.
+	portRoles map[InterfaceName]Role
 }
 
 func (topology Topology) withGroups(groups []Group) (Topology, error) {

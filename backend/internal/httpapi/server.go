@@ -4996,7 +4996,7 @@ func (server *Server) handleDesiredMutation(w http.ResponseWriter, r *http.Reque
 			return
 		}
 	}
-	if err := server.validateDesiredRuntimePayload(r.Context(), resourceType, action, payload, force); err != nil {
+	if err := server.validateDesiredRuntimePayload(r.Context(), resourceType, action, payload, force, requestedLineFields); err != nil {
 		server.recordAudit(session.Username, session.Role, r.URL.Path, action, "failure", err.Error(), r)
 		code := "invalid_desired_resource"
 		var coded *desiredValidationError
@@ -5697,7 +5697,7 @@ func (server *Server) validatePortMapCandidate(ctx context.Context, payload map[
 	return err
 }
 
-func (server *Server) validateDesiredRuntimePayload(ctx context.Context, resourceType, action string, payload map[string]any, force bool) error {
+func (server *Server) validateDesiredRuntimePayload(ctx context.Context, resourceType, action string, payload map[string]any, force bool, callerLineFields map[string]any) error {
 	switch resourceType {
 	case "interface":
 		// A physical port write must name a port this device has. Logical
@@ -5719,7 +5719,7 @@ func (server *Server) validateDesiredRuntimePayload(ctx context.Context, resourc
 				return fmt.Errorf("management interface cannot be configured as lan or wan")
 			}
 		}
-		if err := server.validateInterfaceLineRole(ctx, payload); err != nil {
+		if err := server.validateInterfaceLineRole(ctx, payload, callerLineFields); err != nil {
 			return err
 		}
 		if err := server.validateInterfaceMirror(ctx, payload); err != nil {

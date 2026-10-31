@@ -117,6 +117,8 @@ export const API = {
     serviceChainApply: "/api/v1/orchestrator/service-chains/apply",
     serviceChainStatus: "/api/v1/orchestrator/service-chains/status",
     operations: "/api/v1/orchestrator/operations/current",
+    bypass: "/api/v1/orchestrator/bypass",
+    bypassConfig: "/api/v1/orchestrator/bypass/config",
     upgrades: "/api/v1/orchestrator/upgrades",
     upgrade: (id: string) => `/api/v1/orchestrator/upgrades/${encodeURIComponent(id)}`,
     upgradeInstall: (id: string) => `/api/v1/orchestrator/upgrades/${encodeURIComponent(id)}/install`,

@@ -175,6 +175,54 @@ func TestHandler_group_write_persists_kernel_netdev_names(t *testing.T) {
 	}
 }
 
+func TestHandler_topology_persists_and_echoes_port_roles(t *testing.T) {
+	// The frozen console's 网卡设置 → 角色配置 sends port_roles together with
+	// the topology. Before the DTO declared it the strict decoder answered
+	// `unknown field "port_roles"` and the role was never saved.
+	repository, handler, server := newTestHTTPServerWithHandler(t)
+	handler.SetPortResolver(staticPortResolver{"eth0": "ens32", "eth1": "ens192", "eth2": "ens256", "eth3": "ens160", "eth4": "ens224"})
+	body := []byte(`{"schema_version":1,"management_interface":"eth0","interfaces":[{"name":"lan0","role":"lan","port":"eth1"},{"name":"wan0","role":"wan","port":"eth2"}],"orchestration_groups":[],"port_roles":{"eth1":"lan","eth2":"wan"}}`)
+
+	put := sendRequest(t, server, http.MethodPut, TopologyPath, body)
+	if put.StatusCode != http.StatusOK {
+		t.Fatalf("PUT topology with port_roles status = %d, want 200: %s", put.StatusCode, put.Body)
+	}
+	var readback topologyResponse
+	decodeResponse(t, put.Body, &readback)
+	if readback.Item.PortRoles["eth1"] != orchestrator.RoleLAN || readback.Item.PortRoles["eth2"] != orchestrator.RoleWAN {
+		t.Fatalf("port_roles readback = %#v, want eth1=lan eth2=wan", readback.Item.PortRoles)
+	}
+
+	// The tags are part of the persisted document, not just the response.
+	topology, _, err := repository.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if stored := topology.View().PortRoles; stored["eth1"] != orchestrator.RoleLAN || stored["eth2"] != orchestrator.RoleWAN {
+		t.Fatalf("stored port_roles = %#v", stored)
+	}
+
+	// A later group mutation re-parses the topology; the tags must survive.
+	created := sendRequest(t, server, http.MethodPost, OrchestrationGroupsPath, []byte(`{"name":"grp-a","ports":[{"interface":"eth3","direction":"lan_facing"},{"interface":"eth4","direction":"wan_facing"}]}`))
+	if created.StatusCode != http.StatusCreated {
+		t.Fatalf("POST group status = %d: %s", created.StatusCode, created.Body)
+	}
+	get := sendRequest(t, server, http.MethodGet, TopologyPath, nil)
+	if get.StatusCode != http.StatusOK || !bytes.Contains(get.Body, []byte(`"port_roles":{"eth1":"lan","eth2":"wan"}`)) {
+		t.Fatalf("GET topology after group mutation = %d %s, want port_roles preserved", get.StatusCode, get.Body)
+	}
+}
+
+func TestHandler_topology_rejects_unknown_port_role(t *testing.T) {
+	_, server := newTestHTTPServer(t)
+	body := []byte(`{"schema_version":1,"management_interface":"eth0","interfaces":[{"name":"lan0","role":"lan","port":"eth1"},{"name":"wan0","role":"wan","port":"eth2"}],"orchestration_groups":[],"port_roles":{"eth1":"dmz"}}`)
+
+	response := sendRequest(t, server, http.MethodPut, TopologyPath, body)
+	if response.StatusCode != http.StatusUnprocessableEntity || !bytes.Contains(response.Body, []byte(`"code":"invalid_topology"`)) {
+		t.Fatalf("PUT invalid port role = %d %s, want 422 invalid_topology", response.StatusCode, response.Body)
+	}
+}
+
 func TestHandler_policy_validation_errors_are_422_with_reason(t *testing.T) {
 	// Given: a valid topology and a policy whose protocol is unknown.
 	_, server := newTestHTTPServer(t)

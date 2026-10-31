@@ -1,5 +1,20 @@
 # Orchestration group ports as real entry/exit ports
 
+## LAN/WAN port tags (`port_roles`)
+
+`PUT /api/v1/orchestrator/topology` accepts the frozen console's
+`port_roles: { "<iface>": "lan" | "wan" }` map alongside `interfaces` and
+`orchestration_groups`.  It used to be rejected by the strict decoder
+(`unknown field "port_roles"`).
+
+- The map is persisted with the topology document and echoed by `GET`.
+- Tags are operator metadata: they do not change logical LAN/WAN ownership
+  (`interfaces[].role/port`).  The console uses them as the side hint when
+  selecting a group port, and the 网卡设置 page shows them.
+- Values are restricted to `lan`/`wan`; an unknown value is a 422
+  `invalid_topology`.
+- Config export/import (`/api/v1/config/...`) carries the same field.
+
 ## Problem
 
 The transparent orchestrator only routed traffic that entered through the LAN

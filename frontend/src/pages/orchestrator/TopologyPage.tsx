@@ -95,6 +95,25 @@ export function OrchestratorTopologyPage() {
     setDraft({ ...draft, interfaces });
   };
 
+  // 网卡设置 → 角色配置: a LAN/WAN tag per physical port. It is persisted in
+  // the topology's `port_roles` map (the same contract the frozen console
+  // used) and only acts as the side hint for the orchestration-group port
+  // selectors; logical LAN/WAN ownership stays in `interfaces`.
+  const portRole = (name: string) => draft?.port_roles?.[name] || "";
+  const setPortRole = (name: string, role: string) => {
+    setDraft((current) => {
+      if (!current) return current;
+      const portRoles = { ...(current.port_roles || {}) };
+      if (role) portRoles[name] = role;
+      else delete portRoles[name];
+      return { ...current, port_roles: portRoles };
+    });
+  };
+  const groupPortLabel = (name: string) => {
+    const role = portRole(name);
+    return role === "lan" ? `${name} · LAN 标记` : role === "wan" ? `${name} · WAN 标记` : name;
+  };
+
   const addGroup = () => {
     if (!draft) return;
     setDraft({
@@ -151,6 +170,7 @@ export function OrchestratorTopologyPage() {
           name: group.name.trim(),
           ports: group.ports.map((port) => ({ interface: port.interface, direction: port.direction })),
         })),
+        port_roles: draft.port_roles || {},
       };
       const result = await putJson<any>(API.orchestrator.topology, payload, 30_000);
       toast("拓扑已保存", "success");
@@ -220,18 +240,35 @@ export function OrchestratorTopologyPage() {
           </div>
         </Card>
 
-        <Card title="物理端口使用" subtitle="接管能力与链路状态分开显示">
+        <Card title="物理端口使用" subtitle="接管能力与链路状态分开显示；未使用的口可标记 LAN/WAN，供编排组选择端口">
           <div className="orch-port-list">
             {physicalInventory.map((item) => {
               const name = item.name || item.id;
               const used = usedPorts.has(name);
               const role = name === draft.management_interface ? "管理口" : interfaceFor(draft, "lan")?.port === name ? "LAN" : interfaceFor(draft, "wan")?.port === name ? "WAN" : draft.orchestration_groups.some((group) => group.ports.some((port) => port.interface === name)) ? "编排组" : used ? "聚合成员" : "未使用";
               const capability = name === draft.management_interface ? "管理口" : takeoverInfo(item).label;
+              const canTag = !used && name !== draft.management_interface && !item.mirror;
               return (
                 <div className="orch-port-row" key={item.id}>
                   <span className="port-icon"><Cable size={15} /></span>
                   <div><strong>{name}</strong><small>{capability} · <LinkChips item={item} /></small></div>
+                  {item.mirror && <Badge tone="warning">镜像口</Badge>}
                   <Badge tone={role === "管理口" ? "neutral" : role === "LAN" ? "success" : role === "WAN" ? "info" : role === "未使用" ? "neutral" : "warning"}>{role}</Badge>
+                  {canTag ? (
+                    <Select
+                      className="port-role-select"
+                      aria-label={`${name} 的 LAN/WAN 角色标记`}
+                      value={portRole(name)}
+                      disabled={session?.role === "readonly"}
+                      onChange={(event) => setPortRole(name, event.target.value)}
+                    >
+                      <option value="">未标记</option>
+                      <option value="lan">标记为 LAN</option>
+                      <option value="wan">标记为 WAN</option>
+                    </Select>
+                  ) : portRole(name) ? (
+                    <Badge tone="neutral">{portRole(name).toUpperCase()} 标记</Badge>
+                  ) : null}
                 </div>
               );
             })}
@@ -248,13 +285,13 @@ export function OrchestratorTopologyPage() {
                 <Field label="LAN-facing 端口">
                   <Select value={group.ports.find((port) => port.direction === "lan_facing")?.interface || ""} onChange={(event) => updateGroupPort(index, "lan_facing", event.target.value)}>
                     <option value="">请选择</option>
-                    {physicalPorts.map((port) => <option key={port.id} value={port.name || port.id}>{port.name || port.id}</option>)}
+                    {physicalPorts.map((port) => <option key={port.id} value={port.name || port.id}>{groupPortLabel(port.name || port.id)}</option>)}
                   </Select>
                 </Field>
                 <Field label="WAN-facing 端口">
                   <Select value={group.ports.find((port) => port.direction === "wan_facing")?.interface || ""} onChange={(event) => updateGroupPort(index, "wan_facing", event.target.value)}>
                     <option value="">请选择</option>
-                    {physicalPorts.map((port) => <option key={port.id} value={port.name || port.id}>{port.name || port.id}</option>)}
+                    {physicalPorts.map((port) => <option key={port.id} value={port.name || port.id}>{groupPortLabel(port.name || port.id)}</option>)}
                   </Select>
                 </Field>
                 <Button size="sm" variant="text" icon={<Trash2 size={13} />} onClick={() => removeGroup(index)} disabled={session?.role === "readonly"}>移除</Button>

@@ -30,10 +30,37 @@ func ParseTopology(input TopologyInput) (Topology, error) {
 	}
 
 	topology := Topology{management: management, managementShared: input.ManagementShared, lan: interfaces[RoleLAN], wan: interfaces[RoleWAN], groups: groups}
+	portRoles, err := parsePortRoles(input.PortRoles)
+	if err != nil {
+		return Topology{}, err
+	}
+	topology.portRoles = portRoles
 	if err := validateOwnership(topology); err != nil {
 		return Topology{}, err
 	}
 	return topology, nil
+}
+
+// parsePortRoles validates the optional physical-port LAN/WAN tags.  The map is
+// operator metadata; it is accepted for any device port (the console refuses
+// management/logical/group ports itself), so an older or newer console can tag
+// a port without changing topology ownership.
+func parsePortRoles(input map[string]Role) (map[InterfaceName]Role, error) {
+	if len(input) == 0 {
+		return nil, nil
+	}
+	roles := make(map[InterfaceName]Role, len(input))
+	for rawName, role := range input {
+		name, err := parseName(rawName)
+		if err != nil {
+			return nil, fmt.Errorf("port role: %w", err)
+		}
+		if role != RoleLAN && role != RoleWAN {
+			return nil, fmt.Errorf("%w: %q has %q", ErrInvalidPortRole, name, role)
+		}
+		roles[name] = role
+	}
+	return roles, nil
 }
 
 func ParseGroup(input GroupInput) (Group, error) {

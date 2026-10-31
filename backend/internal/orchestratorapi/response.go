@@ -117,7 +117,7 @@ func codeForError(err error) string {
 		return "password_change_required"
 	case errors.Is(err, ErrAdminRequired):
 		return "forbidden"
-	case errors.Is(err, orchestrator.ErrInvalidName), errors.Is(err, orchestrator.ErrInvalidInterface), errors.Is(err, orchestrator.ErrInvalidBond):
+	case errors.Is(err, orchestrator.ErrInvalidName), errors.Is(err, orchestrator.ErrInvalidInterface), errors.Is(err, orchestrator.ErrInvalidBond), errors.Is(err, orchestrator.ErrInvalidPortRole):
 		return "invalid_topology"
 	case isPolicyValidationError(err):
 		return "invalid_policy"

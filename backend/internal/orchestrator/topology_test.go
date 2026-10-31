@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -213,6 +214,48 @@ func TestParseTopology_allowsManagementInterfaceOnlyAsSharedLANPort(t *testing.T
 	input.Interfaces[1] = InterfaceInput{Name: "wan", Role: RoleWAN, Port: "eth0"}
 	if _, err := ParseTopology(input); !errors.Is(err, ErrManagementMembership) {
 		t.Fatalf("shared management WAN error = %v, want %v", err, ErrManagementMembership)
+	}
+}
+
+func TestParseTopology_persists_port_roles_and_round_trips_view(t *testing.T) {
+	input := validTopologyInput()
+	input.PortRoles = map[string]Role{"eth1": RoleLAN, "eth3": RoleWAN}
+
+	topology, err := ParseTopology(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := topology.View()
+	if view.PortRoles["eth1"] != RoleLAN || view.PortRoles["eth3"] != RoleWAN || len(view.PortRoles) != 2 {
+		t.Fatalf("port roles = %#v, want eth1=lan eth3=wan", view.PortRoles)
+	}
+
+	// The persisted view is parsed again on every mutation (repository.Replace,
+	// group CRUD, snapshot restore); the tags must survive that round trip.
+	reparsed, err := ParseTopology(view.input())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reparsed.View().PortRoles; !reflect.DeepEqual(got, view.PortRoles) {
+		t.Fatalf("port roles after round trip = %#v, want %#v", got, view.PortRoles)
+	}
+}
+
+func TestParseTopology_rejects_unknown_port_role(t *testing.T) {
+	input := validTopologyInput()
+	input.PortRoles = map[string]Role{"eth1": Role("dmz")}
+
+	if _, err := ParseTopology(input); !errors.Is(err, ErrInvalidPortRole) {
+		t.Fatalf("ParseTopology error = %v, want %v", err, ErrInvalidPortRole)
+	}
+}
+
+func TestParseTopology_rejects_malformed_port_role_interface(t *testing.T) {
+	input := validTopologyInput()
+	input.PortRoles = map[string]Role{"": RoleLAN}
+
+	if _, err := ParseTopology(input); !errors.Is(err, ErrInvalidName) {
+		t.Fatalf("ParseTopology error = %v, want %v", err, ErrInvalidName)
 	}
 }
 

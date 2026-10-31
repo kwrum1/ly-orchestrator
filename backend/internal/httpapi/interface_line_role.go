@@ -10,14 +10,21 @@ import (
 // stored role does not match. The installer dialog used to offer every data
 // port, so an operator could create a LAN line on a WAN port (or the reverse)
 // and silently change that port's role as a side effect.
-func (server *Server) validateInterfaceLineRole(ctx context.Context, payload map[string]any) error {
+//
+// callerLineFields holds only the line-scoped values this request supplied.
+// The merged document always carries a display_name derived from the port id
+// (normalizeInterfaceDesiredPayload), so inspecting the merged payload made
+// the very first "set this port to LAN/WAN" PATCH look like "create a line on
+// an unmarked port" and rejected it with the self-defeating advice "set its
+// role in 网卡设置 first".  Only an explicitly supplied line counts.
+func (server *Server) validateInterfaceLineRole(ctx context.Context, payload map[string]any, callerLineFields map[string]any) error {
 	role, _ := interfaceDesiredRole(payload)
 	if role != "lan" && role != "wan" {
 		return nil
 	}
-	lineField := strings.TrimSpace(stringField(payload, "display_name"))
+	lineField := strings.TrimSpace(stringField(callerLineFields, "display_name"))
 	if lineField == "" {
-		lineField = strings.TrimSpace(nonEmpty(stringField(payload, "cidr"), stringField(payload, "address")))
+		lineField = strings.TrimSpace(nonEmpty(stringField(callerLineFields, "cidr"), stringField(callerLineFields, "address")))
 	}
 	if lineField == "" {
 		return nil

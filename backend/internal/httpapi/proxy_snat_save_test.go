@@ -44,7 +44,7 @@ func proxySNATSavePayload(snat ...string) map[string]any {
 // field-level 422 instead of committing a generation that cannot apply.
 func TestProxyEgressSaveRequiresSNATForStaticWAN(t *testing.T) {
 	server := proxySNATSaveTestServer(t)
-	err := server.validateDesiredRuntimePayload(context.Background(), "proxy_egress", "create", proxySNATSavePayload(), false)
+	err := server.validateDesiredRuntimePayload(context.Background(), "proxy_egress", "create", proxySNATSavePayload(), false, nil)
 	if err == nil {
 		t.Fatal("static WAN egress without snat_addresses was accepted")
 	}
@@ -61,7 +61,7 @@ func TestProxyEgressSaveRequiresSNATForStaticWAN(t *testing.T) {
 
 func TestProxyEgressSaveAcceptsExplicitSNATForStaticWAN(t *testing.T) {
 	server := proxySNATSaveTestServer(t)
-	if err := server.validateDesiredRuntimePayload(context.Background(), "proxy_egress", "create", proxySNATSavePayload("10.1.18.250"), false); err != nil {
+	if err := server.validateDesiredRuntimePayload(context.Background(), "proxy_egress", "create", proxySNATSavePayload("10.1.18.250"), false, nil); err != nil {
 		t.Fatalf("explicit snat_addresses was rejected: %v", err)
 	}
 }
@@ -72,7 +72,7 @@ func TestProxyEgressSaveAllowsUnboundDraftWithoutSNAT(t *testing.T) {
 	server := proxySNATSaveTestServer(t)
 	payload := proxySNATSavePayload()
 	delete(payload, "node_id")
-	if err := server.validateDesiredRuntimePayload(context.Background(), "proxy_egress", "create", payload, false); err != nil {
+	if err := server.validateDesiredRuntimePayload(context.Background(), "proxy_egress", "create", payload, false, nil); err != nil {
 		t.Fatalf("unbound draft was rejected: %v", err)
 	}
 }
@@ -91,7 +91,7 @@ func TestProxyEgressSaveAllowsLegacyUnderlayWithoutSNAT(t *testing.T) {
 	}
 	payload := proxySNATSavePayload()
 	payload["underlay_wan_id"] = "wan-dhcp"
-	if err := server.validateDesiredRuntimePayload(ctx, "proxy_egress", "create", payload, false); err != nil {
+	if err := server.validateDesiredRuntimePayload(ctx, "proxy_egress", "create", payload, false, nil); err != nil {
 		t.Fatalf("legacy DHCP underlay without snat_addresses was rejected: %v", err)
 	}
 }

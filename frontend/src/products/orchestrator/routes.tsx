@@ -5,6 +5,7 @@ import { NotFoundPage } from "../../pages/NotFoundPage";
 import { OrchestratorOverviewPage } from "../../pages/orchestrator/OverviewPage";
 import { OrchestratorTopologyPage } from "../../pages/orchestrator/TopologyPage";
 import { OrchestratorPortMirrorPage } from "../../pages/orchestrator/PortMirrorPage";
+import { OrchestratorBypassPage } from "../../pages/orchestrator/BypassPage";
 import { OrchestratorGroupsPage } from "../../pages/orchestrator/GroupsPage";
 import { OrchestratorPolicyPage } from "../../pages/orchestrator/PolicyPage";
 import { OrchestratorTransparentPage } from "../../pages/orchestrator/TransparentPage";
@@ -32,6 +33,7 @@ export default function OrchestratorRoutes() {
         <Route index element={<OrchestratorOverviewPage />} />
         <Route path="topology" element={<OrchestratorTopologyPage />} />
         <Route path="mirror" element={<OrchestratorPortMirrorPage />} />
+        <Route path="bypass" element={<OrchestratorBypassPage />} />
         <Route path="groups" element={<OrchestratorGroupsPage />} />
         <Route path="policy" element={<OrchestratorPolicyPage />} />
         <Route path="transparent" element={<OrchestratorTransparentPage />} />

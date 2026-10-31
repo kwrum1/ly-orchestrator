@@ -30,6 +30,7 @@ type orchestratorTopologyPackage struct {
 	ManagementShared    bool                        `json:"management_shared,omitempty"`
 	Interfaces          []orchestratorInterfacePack `json:"interfaces"`
 	Groups              []orchestratorGroupPack     `json:"orchestration_groups"`
+	PortRoles           map[string]string           `json:"port_roles,omitempty"`
 }
 
 type orchestratorInterfacePack struct {
@@ -81,6 +82,12 @@ func (pack orchestratorTopologyPackage) input() orchestrator.TopologyInput {
 			parsed.Ports = append(parsed.Ports, item)
 		}
 		input.Groups = append(input.Groups, parsed)
+	}
+	if len(pack.PortRoles) > 0 {
+		input.PortRoles = make(map[string]orchestrator.Role, len(pack.PortRoles))
+		for name, role := range pack.PortRoles {
+			input.PortRoles[name] = orchestrator.Role(role)
+		}
 	}
 	return input
 }

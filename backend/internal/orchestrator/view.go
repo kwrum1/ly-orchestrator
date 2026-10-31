@@ -8,6 +8,11 @@ type TopologyView struct {
 	ManagementShared    bool            `json:"management_shared,omitempty"`
 	Interfaces          []InterfaceView `json:"interfaces"`
 	Groups              []GroupView     `json:"orchestration_groups"`
+	// PortRoles echoes the operator's LAN/WAN tag per physical port.  The
+	// frozen console writes it (网卡设置 → 角色配置) and reads it back to
+	// suggest the LAN/WAN facing ports for orchestration groups.  It is
+	// additive: a document saved before this field existed decodes as empty.
+	PortRoles map[string]Role `json:"port_roles,omitempty"`
 }
 
 type InterfaceView struct {
@@ -48,7 +53,19 @@ func (topology Topology) View() TopologyView {
 		ManagementShared:    topology.managementShared,
 		Interfaces:          []InterfaceView{topology.lan.view(), topology.wan.view()},
 		Groups:              groupViews,
+		PortRoles:           topology.portRolesView(),
 	}
+}
+
+func (topology Topology) portRolesView() map[string]Role {
+	if len(topology.portRoles) == 0 {
+		return nil
+	}
+	roles := make(map[string]Role, len(topology.portRoles))
+	for name, role := range topology.portRoles {
+		roles[name.String()] = role
+	}
+	return roles
 }
 
 func (logical LogicalInterface) view() InterfaceView {
@@ -99,6 +116,12 @@ func (view TopologyView) input() TopologyInput {
 	input.Groups = make([]GroupInput, 0, len(view.Groups))
 	for _, group := range view.Groups {
 		input.Groups = append(input.Groups, group.input())
+	}
+	if len(view.PortRoles) > 0 {
+		input.PortRoles = make(map[string]Role, len(view.PortRoles))
+		for name, role := range view.PortRoles {
+			input.PortRoles[name] = role
+		}
 	}
 	return input
 }

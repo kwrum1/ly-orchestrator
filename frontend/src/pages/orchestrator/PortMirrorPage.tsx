@@ -3,7 +3,7 @@ import { Cable, Copy, RefreshCw, Trash2 } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { API } from "../../api/endpoints";
 import { patchJson } from "../../api/client";
-import { useInterfacesResource } from "../../api/hooks";
+import { useInterfacesResource, useRuntime } from "../../api/hooks";
 import type { InterfaceItem } from "../../api/types";
 import { Badge, Button, Card, EmptyState, Field, PageHeader, Select, useToast } from "../../components/ui";
 import { useApply, useAuth, useConfirm } from "../../state/providers";
@@ -48,9 +48,18 @@ export function OrchestratorPortMirrorPage() {
   const guard = useDependencyGuard();
   const { session } = useAuth();
   const resource = useInterfacesResource();
+  const runtime = useRuntime();
   const [destination, setDestination] = useState("");
   const [sources, setSources] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
+
+  // The runtime `mirror` component proves every desired SPAN session with a
+  // `show interface span` readback. A down destination is only a warning: the
+  // source keeps forwarding, so the component stays `running`.
+  const mirrorComponent = (runtime.data?.components || []).find((component) => component.name === "mirror");
+  const mirrorApplied = mirrorComponent?.state === "running";
+  const mirrorReason = String(mirrorComponent?.reason || "");
+  const mirrorWarning = mirrorReason.includes("告警") || mirrorReason.includes("无载波");
 
   const items = (resource.data?.items || []) as InterfaceItem[];
   const ports = useMemo(
@@ -92,6 +101,7 @@ export function OrchestratorPortMirrorPage() {
 
   const refresh = () => {
     void resource.refetch();
+    void runtime.refetch();
   };
 
   const invalidate = async () => {
@@ -192,17 +202,30 @@ export function OrchestratorPortMirrorPage() {
                 {" "}{Math.max((mirrorPort.mirror_sources || []).length, 0)} 个镜像源
               </span>
             </div>
-            <div className="check-grid">
+            <div className="orch-port-list">
               {ports.filter((item) => sourceDirections[portKey(item)]).map((item) => (
-                <div className="check-card" key={portKey(item)}>
-                  <span>
-                    <strong>{item.name || portKey(item)}</strong>
-                    <small>镜像源 · {mirrorDirectionLabel(sourceDirections[portKey(item)])}</small>
-                  </span>
+                <div className="orch-port-row" key={portKey(item)}>
+                  <span className="port-icon"><Cable size={15} /></span>
+                  <div>
+                    <strong>{item.name || portKey(item)} → {mirrorPort.name || portKey(mirrorPort)}</strong>
+                    <small>方向 {mirrorDirectionLabel(sourceDirections[portKey(item)])} · 三层镜像（l2 关闭）</small>
+                  </div>
+                  <Badge tone={mirrorApplied ? "success" : "warning"}>{mirrorApplied ? "已生效" : "未生效"}</Badge>
                 </div>
               ))}
               {!(mirrorPort.mirror_sources || []).length && <div className="inline-warning">镜像口还没有镜像源。</div>}
             </div>
+            {mirrorReason && (
+              <div className={mirrorWarning ? "inline-warning" : "notice-block"}>
+                <strong>{mirrorApplied ? (mirrorWarning ? "镜像会话已生效（有告警）" : "镜像会话已生效") : "镜像会话未生效"}</strong>
+                <span>{mirrorReason}</span>
+              </div>
+            )}
+            {!mirrorComponent && (
+              <div className="inline-warning">
+                <span>尚未读到运行状态：保存后会立即应用，应用完成后这里显示每个会话的生效情况。</span>
+              </div>
+            )}
             <div>
               <Button variant="danger" onClick={clearMirror} disabled={busy || Boolean(readonly)}>
                 <Trash2 size={15} />取消镜像

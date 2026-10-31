@@ -106,6 +106,12 @@ export interface InterfaceStats {
   sessions?: number;
 }
 
+export interface InterfaceMirrorSource {
+  interface: string;
+  direction?: "rx" | "tx" | "both" | string;
+  l2?: boolean;
+}
+
 export interface InterfaceItem {
   id: string;
   name?: string;
@@ -123,6 +129,7 @@ export interface InterfaceItem {
   admin_state?: string;
   speed?: string;
   mac?: string;
+  pci?: string;
   rx_bps?: number;
   tx_bps?: number;
   rx_pps?: number;
@@ -140,7 +147,7 @@ export interface InterfaceItem {
   // Port mirroring ("镜像口"). The marked port is the mirror destination and
   // mirror_sources lists the physical ports mirrored into it.
   mirror?: boolean;
-  mirror_sources?: Array<{ interface: string; direction?: string; l2?: boolean }>;
+  mirror_sources?: InterfaceMirrorSource[];
   // Runtime takeover contract. Read-only: the backend selects the mode.
   takeover?: string | AnyRecord;
   takeover_state?: string;
@@ -696,6 +703,109 @@ export interface Topology {
   management_shared?: boolean;
   interfaces: TopologyInterface[];
   orchestration_groups: OrchestrationGroup[];
+  // Operator LAN/WAN tag per physical port (网卡设置 → 角色配置). Persisted and
+  // echoed by the API; the group port selectors use it as the side hint.
+  port_roles?: Record<string, string>;
+}
+
+export interface BypassFlowTarget {
+  dst_ip: string;
+  dst_port: number;
+  protocol?: "tcp" | "udp" | string;
+}
+
+export interface BypassTCPTarget {
+  target: string;
+  source?: string;
+}
+
+export interface BypassProbe {
+  name: string;
+  kind: string;
+  target: string;
+  ok: boolean;
+  detail?: string;
+  checked_at?: string;
+}
+
+export interface BypassFlowStats {
+  group?: string;
+  dst_ip: string;
+  dst_port: number;
+  protocol: string;
+  attempts: number;
+  syn?: number;
+  synack?: number;
+  rst?: number;
+  responses?: number;
+  success: number;
+  timeouts?: number;
+  icmp_unreachable?: number;
+}
+
+export interface BypassGroupConfig {
+  name: string;
+  interfaces?: string[];
+  tcp_targets?: BypassTCPTarget[];
+  flow_targets?: BypassFlowTarget[];
+  window_seconds?: number;
+  failure_threshold?: number;
+  recovery_threshold?: number;
+}
+
+export interface BypassConfig {
+  enabled: boolean;
+  interval_seconds?: number;
+  timeout_ms?: number;
+  failure_threshold?: number;
+  recovery_threshold?: number;
+  interfaces?: string[];
+  tcp_targets?: string[];
+  icmp_targets?: string[];
+  groups?: BypassGroupConfig[];
+}
+
+export interface BypassGroupState {
+  group: string;
+  health: "unknown" | "healthy" | "faulty" | "bypass" | string;
+  enabled: boolean;
+  forced: boolean;
+  cause?: string;
+  reason?: string;
+  since?: string;
+  consecutive_failures?: number;
+  consecutive_successes?: number;
+  last_probe_ok?: boolean;
+  last_probe_at?: string;
+  probes?: BypassProbe[];
+  window_seconds?: number;
+  interfaces?: string[];
+  tcp_targets?: BypassTCPTarget[];
+  flow_targets?: BypassFlowTarget[];
+  flow_attempts?: number;
+  flow_success?: number;
+  flow_rst?: number;
+  flow_timeouts?: number;
+  flow_stats?: BypassFlowStats[];
+  bypass_packets?: number;
+}
+
+export interface BypassState {
+  enabled: boolean;
+  forced?: boolean;
+  cause?: string;
+  reason?: string;
+  since?: string;
+  consecutive_failures?: number;
+  consecutive_successes?: number;
+  last_probe_ok?: boolean;
+  last_probe_at?: string;
+  probes?: BypassProbe[];
+  config: BypassConfig;
+  groups?: BypassGroupState[];
+  generation?: string;
+  bypass_packets?: number;
+  request_id?: string;
 }
 
 export interface TopologyEnvelope {

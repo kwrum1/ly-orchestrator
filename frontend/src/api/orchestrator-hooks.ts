@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { getJson } from "./client";
 import { API } from "./endpoints";
 import type {
+  BypassState,
   ConversionList,
   DataEnvelope,
   OrchestratorOperation,
@@ -25,6 +26,7 @@ export const orchKeys = {
   topology: ["orchestrator", "topology"] as const,
   policy: ["orchestrator", "policy"] as const,
   operation: ["orchestrator", "operation"] as const,
+  bypass: ["orchestrator", "bypass"] as const,
   upgrades: ["orchestrator", "upgrades"] as const,
   conversions: ["orchestrator", "conversions"] as const,
   dashboard: ["orchestrator", "telemetry", "dashboard"] as const,
@@ -54,6 +56,18 @@ export function useOrchestratorOperation() {
     queryFn: () => getJson(API.orchestrator.operations),
     refetchInterval: 5_000,
     staleTime: 2_000,
+  });
+}
+
+// Fault bypass is polled faster than the rest of the console: the page shows
+// live window counters and an operator expects the flag to flip promptly after
+// a manual force or recovery.
+export function useOrchestratorBypass() {
+  return useQuery<BypassState>({
+    queryKey: orchKeys.bypass,
+    queryFn: () => getJson<BypassState>(API.orchestrator.bypass, 20_000),
+    refetchInterval: 3_000,
+    staleTime: 1_000,
   });
 }
 

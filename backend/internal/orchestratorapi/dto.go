@@ -1,6 +1,10 @@
 package orchestratorapi
 
-import "ly-route/backend/internal/orchestrator"
+import (
+	"strings"
+
+	"ly-route/backend/internal/orchestrator"
+)
 
 type topologyDTO struct {
 	SchemaVersion       int            `json:"schema_version"`
@@ -8,6 +12,11 @@ type topologyDTO struct {
 	ManagementShared    bool           `json:"management_shared,omitempty"`
 	Interfaces          []interfaceDTO `json:"interfaces"`
 	Groups              []groupDTO     `json:"orchestration_groups"`
+	// PortRoles is the frozen console's `port_roles` map
+	// ({ "<iface>": "lan"|"wan" }).  It was rejected before the topology DTO
+	// declared it, which surfaced as `unknown field "port_roles"` when saving
+	// 网卡设置 → 角色配置.  It is persisted and echoed by GET topology.
+	PortRoles map[string]string `json:"port_roles,omitempty"`
 }
 
 type interfaceDTO struct {
@@ -50,6 +59,12 @@ func (dto topologyDTO) input() orchestrator.TopologyInput {
 	}
 	for _, group := range dto.Groups {
 		input.Groups = append(input.Groups, group.input())
+	}
+	if len(dto.PortRoles) > 0 {
+		input.PortRoles = make(map[string]orchestrator.Role, len(dto.PortRoles))
+		for name, role := range dto.PortRoles {
+			input.PortRoles[name] = orchestrator.Role(strings.TrimSpace(role))
+		}
 	}
 	return input
 }
