@@ -80,8 +80,8 @@ func TestPassiveWindowAllRSTIsFaulty(t *testing.T) {
 	config := orchestratorapi.BypassGroupConfig{Name: "grp-a", FlowTargets: []orchestratorapi.BypassFlowTarget{{DstIP: "192.0.2.10", DstPort: 443, Protocol: "tcp"}}}
 	now := time.Now().UTC()
 	failing := []orchestratorapi.BypassFlowStats{{Group: "grp-a", DstIP: "192.0.2.10", DstPort: 443, Protocol: "tcp", Attempts: 5, Syn: 5, RST: 5}}
-	state.observeFlow(now, failing, 10*time.Second)
-	state.observeFlow(now.Add(11*time.Second), failing, 10*time.Second)
+	state.observeFlow(now, nil, 10*time.Second)
+	state.observeFlow(now.Add(2*time.Second), failing, 10*time.Second)
 	if state.windowAttempts != 5 || state.windowSuccess != 0 || state.windowRST != 5 {
 		t.Fatalf("window = attempts %d success %d rst %d", state.windowAttempts, state.windowSuccess, state.windowRST)
 	}
@@ -97,7 +97,7 @@ func TestPassiveWindowUDPResponseRecovers(t *testing.T) {
 	config := orchestratorapi.BypassGroupConfig{Name: "grp-a", FlowTargets: []orchestratorapi.BypassFlowTarget{{DstIP: "192.0.2.53", DstPort: 53, Protocol: "udp"}}}
 	now := time.Now().UTC()
 	stats := []orchestratorapi.BypassFlowStats{{Group: "grp-a", DstIP: "192.0.2.53", DstPort: 53, Protocol: "udp", Attempts: 4, Responses: 4, Success: 4}}
-	state.observeFlow(now, stats, 10*time.Second)
+	state.observeFlow(now, nil, 10*time.Second)
 	state.observeFlow(now.Add(2*time.Second), stats, 10*time.Second)
 	if state.windowSuccess != 4 {
 		t.Fatalf("window success = %d", state.windowSuccess)
