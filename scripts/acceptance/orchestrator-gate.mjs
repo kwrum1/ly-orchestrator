@@ -186,8 +186,15 @@ async function loginUI(page) {
 async function openRole(page, port) {
   await page.goto(BASE + "/interfaces", { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(2200);
+  try {
+    await page.locator("table tbody tr").first().waitFor({ timeout: 15000 });
+  } catch {
+    // A slow apply can make the first table load miss; retry once.
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(2500);
+  }
   const row = page.locator("table tbody tr", { hasText: port }).first();
-  await row.locator('button:has-text("角色配置")').first().click();
+  await row.locator('button:has-text("角色配置")').first().click({ timeout: 20000 });
   await page.waitForTimeout(500);
   return page.locator(".modal").last();
 }
@@ -272,6 +279,19 @@ function spanHas(output, source, destination, direction) {
   const lines = output.split(/\r?\n/);
   return lines.some((line) => line.includes(source) && line.includes(destination) &&
     (!direction || line.includes(`(${direction})`)));
+}
+function spanLine(output, source) {
+  return output.split(/\r?\n/).find((line) => line.includes(source)) || "";
+}
+async function waitSpan(predicate, timeout = 25000) {
+  const deadline = now() + timeout;
+  let text = "";
+  while (now() < deadline) {
+    text = await vppSpan();
+    if (predicate(text)) return { ok: true, text };
+    await sleep(800);
+  }
+  return { ok: false, text };
 }
 
 // ---------- case runner ----------
@@ -501,9 +521,10 @@ PY`, 30000);
     const before = await vppSpan();
     await addMirrorPolicy(page, "eth3", "both");
     await waitUntil(async () => (await iface("eth5")).mirror_sources.some((s) => s.interface === "eth3"), 20000);
-    let span = await vppSpan();
+    const addSpan = await waitSpan((text) => /\(\s*both\)/.test(spanLine(text, "lyroute-ens192")));
+    let span = addSpan.text;
     saveText("vppctl/span-after-add.txt", span);
-    assert(spanHas(span, "lyroute-ens192", "lyroute-ens224", "both"), "SPAN session for eth3 was not created");
+    assert(addSpan.ok && spanHas(span, "lyroute-ens192", "lyroute-ens224", "both"), "SPAN session for eth3 was not created");
     assert((await page.locator("#policy-rows tr", { hasText: "eth3" }).count()) === 1, "eth3 row missing");
 
     const row = page.locator("#policy-rows tr", { hasText: "eth3" }).first();
@@ -515,16 +536,18 @@ PY`, 30000);
     await modal.locator("[data-direction]").selectOption("rx");
     await modal.locator("[data-save]").click();
     await waitUntil(async () => (await iface("eth5")).mirror_sources.some((s) => s.interface === "eth3" && s.direction === "rx"), 20000);
-    span = await vppSpan();
+    const editSpan = await waitSpan((text) => /\(\s*rx\)/.test(spanLine(text, "lyroute-ens192")));
+    span = editSpan.text;
     saveText("vppctl/span-after-edit.txt", span);
-    assert(spanHas(span, "lyroute-ens192", "lyroute-ens224", "rx"), "SPAN direction did not change to rx");
+    assert(editSpan.ok && spanHas(span, "lyroute-ens192", "lyroute-ens224", "rx"), "SPAN direction did not change to rx");
 
     const row2 = page.locator("#policy-rows tr", { hasText: "eth3" }).first();
     await row2.locator('button:has-text("删除")').click();
     await waitUntil(async () => !(await iface("eth5")).mirror_sources.some((s) => s.interface === "eth3"), 20000);
-    span = await vppSpan();
+    const goneSpan = await waitSpan((text) => !text.includes("lyroute-ens192"));
+    span = goneSpan.text;
     saveText("vppctl/span-after-delete.txt", span);
-    assert(!spanHas(span, "lyroute-ens192"), "SPAN session for eth3 survived deletion");
+    assert(goneSpan.ok && !spanHas(span, "lyroute-ens192"), "SPAN session for eth3 survived deletion");
     return "add/edit(rx)/delete all reflected in vppctl show interface span";
   });
 
@@ -668,7 +691,9 @@ PY`, 30000);
     await row.locator('button:has-text("删除")').first().click();
     await page.waitForTimeout(600);
     const confirm = page.locator(".modal").last();
-    await confirm.locator(".modal-footer .btn-primary").click();
+    const dangerButton = confirm.locator('.modal-footer button:has-text("删除")');
+    if (await dangerButton.count()) await dangerButton.click();
+    else await confirm.locator(".modal-footer .btn-primary").click();
     await waitUntil(async () => !(await groups()).some((g) => g.name === "acc-grp"), 20000);
     await waitUntil(async () => !((await bypassConfig()).groups || []).some((g) => g.name === "acc-grp"), 20000);
     saveJSON("api/bypass-after-group-delete.json", await bypassConfig());
