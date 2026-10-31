@@ -36,6 +36,10 @@
 | 整机镜像 / 安装器 | `packaging/rootfs-overlay`、`iso-assets`、`installer/`、`deploy/`、`pingora/` |
 | 镜像口 | **无**：镜像口是编排器功能，网关不再提供 API 与 UI |
 
+本仓库不再包含 `backend/gateway/` 与 `backend/cmd/gateway-control`：网关二进制只由
+`ly-route` 构建。删掉它们之后 `cd backend && go build ./... && go vet ./...` 仍然通过，
+说明编排器控制面不依赖网关入口。
+
 ## 两侧同名但独立的包
 
 拆分后两侧仍各有一份同名包（`internal/httpapi`、`internal/product`、
