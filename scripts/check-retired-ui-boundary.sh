@@ -1,11 +1,10 @@
 #!/usr/bin/env sh
 # Boundary guard: the retired controller-shell Orchestrator UI must never return.
 #
-# The Orchestrator UI source is frontend/ (React/Vite/TypeScript, single
-# product) and it is built in CI. The shipped bundle is still the pinned
-# packaging/orchestrator-ui-baseline/ and is not rebuilt by CI. The obsolete
-# controller-shell (static frontend/orchestrator + concatenated ~185 KB app.js)
-# was removed because it was deployed over the current UI by mistake.
+# The Orchestrator UI is built from frontend/ (React/Vite/TypeScript, single
+# product) and that build is the deployment artifact. The frozen
+# packaging/orchestrator-ui-baseline/ directory is kept as a historical
+# reference only: its size/hash is no longer a deployment gate.
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -34,7 +33,7 @@ found=$(find . -path ./.git -prune -o -path ./node_modules -prune -o -type f \
 $found"
 
 # 3. A built controller-shell bundle is a small concatenated app.js (~185 KB)
-#    carrying the product entrypoint marker. The React bundle is ~985 KB.
+#    carrying the product entrypoint marker. The React bundle is much larger.
 found=$(find . -path ./.git -prune -o -path ./node_modules -prune -o \
   -type f -name app.js -size -400k -print)
 for file in $found; do
@@ -48,19 +47,7 @@ for required in frontend/package.json frontend/index.html frontend/vite.config.t
   [ -f "$required" ] || fail "orchestrator UI source is incomplete: $required"
 done
 
-# 5. The pinned React baseline is the only UI artifact this repository ships.
-#    If it is ever moved or replaced, update this guard together with the move.
-baseline="packaging/orchestrator-ui-baseline"
-product_build_require() { [ -f "$1" ] || fail "$2"; }
-product_build_require "$baseline/app.js" "pinned orchestrator React UI baseline is missing: $baseline/app.js"
-product_build_require "$baseline/index.html" "pinned orchestrator React UI baseline is missing: $baseline/index.html"
-size=$(wc -c <"$baseline/app.js" | tr -d ' ')
-[ "$size" -ge 900000 ] || \
-  fail "pinned orchestrator UI app.js is ${size} bytes; a ~185 KB controller-shell build must never replace the React bundle"
-grep -q 'id="root"' "$baseline/index.html" || \
-  fail "pinned orchestrator UI is not a React bundle (index.html lacks the #root mount point)"
-
-# 6. No script may reference the retired builder or bundle again. Documentation
+# 5. No script may reference the retired builder or bundle again. Documentation
 #    may name the removed paths so the decision stays discoverable.
 if grep -R -n --exclude-dir=.git --exclude-dir=docs --exclude=README.md \
   --exclude=check-retired-ui-boundary.sh \

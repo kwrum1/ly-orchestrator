@@ -19,12 +19,14 @@ LY Route 编排器（Orchestrator）独立仓库：控制面二进制 `orchestra
 具体哪些内容已分离、哪些仍共享、后续怎么抽公共库，见 [`docs/REPO-BOUNDARY.md`](docs/REPO-BOUNDARY.md)。
 在公共库抽出之前，**修改 `backend/internal/httpapi` 等共享包必须同时在两个仓库对齐**。
 
-## 编排器 UI：固定 React baseline，无 controller-shell
+## 编排器 UI：源码构建，无 controller-shell
 
-编排器界面是 React/Vite 应用。源码暂在 `kurumi/ly-route` 的 `frontend/gateway`，
-以 `LY_ROUTE_PRODUCT=orchestrator` 构建（产物 `app.js` 约 985 KB）。本仓库只保留
-**已发布的固定产物** `packaging/orchestrator-ui-baseline/`，部署时整体复制到
-`/opt/ly-route/admin`；CI 不重建它。
+编排器界面是 React/Vite 应用，源码在本仓库 `frontend/`。部署与升级包统一使用
+`scripts/build-orchestrator-ui.sh` / `scripts/build-orchestrator-upgrade-package.sh`
+从源码构建的产物，写入 `/opt/ly-route/admin`。
+
+`packaging/orchestrator-ui-baseline/` 仅保留为 2026-10-27 的历史参考（导航/布局），
+不再作为部署产物，也不再校验其 `app.js` 大小或 sha256。
 
 已淘汰的 controller-shell 静态 UI 已彻底删除：`frontend/orchestrator/`（13 个源码文件）、
 仓库内固定的 `packaging/orchestrator-frontend/`（旧 11 页 bundle + manifest）、
@@ -34,8 +36,7 @@ LY Route 编排器（Orchestrator）独立仓库：控制面二进制 `orchestra
 
 `scripts/check-retired-ui-boundary.sh` 在 CI 与发布流水线中把关：旧路径、controller-shell
 源码（`nic-settings.js` / `group-settings.js` / `forms.css` / `responsive.css`）、
-约 185 KB 的 shell bundle 重新出现即失败；同时校验 pinned baseline 仍是 React 产物
-（`app.js` ≥ 900 KB 且 `index.html` 有 `#root`），防止它被静态 shell 覆盖。
+约 185 KB 的 shell bundle 重新出现即失败。历史 baseline 不再参与部署或 hash 门禁。
 
 ## 构建
 

@@ -6,15 +6,14 @@ usage() {
 Usage: scripts/build-orchestrator-ui.sh --out DIRECTORY [--dist DIRECTORY]
 
 Builds the orchestrator console from frontend/ (Vite + TypeScript) and writes a
-bundle with the same static layout as the frozen baseline
-(packaging/orchestrator-ui-baseline/):
+bundle with the static layout the console serves:
 
   index.html  app.js  app.js.sha256  styles.css
   capabilities.json  shell.js  commercial.css  product.css
 
 --dist skips the build and packages an existing frontend/dist directory.
-The frozen baseline stays the deployment artifact: this script never writes to
-packaging/orchestrator-ui-baseline/.
+This source build is the deployment artifact; packaging/orchestrator-ui-baseline/
+is historical reference only and is never written by this script.
 EOF
 }
 
