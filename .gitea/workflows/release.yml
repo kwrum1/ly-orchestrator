@@ -47,6 +47,11 @@ jobs:
           cd backend
           go build ./...
 
+      - name: retired controller-shell UI boundary
+        run: |
+          set -euo pipefail
+          sh scripts/check-retired-ui-boundary.sh
+
       - name: orchestrator contracts
         run: |
           set -euo pipefail
@@ -77,59 +82,3 @@ jobs:
           bash scripts/ci-upload-release.sh "$VERSION" dist/orchestrator-control-linux-amd64
           bash scripts/ci-upload-release.sh "$VERSION" dist/orchestrator-control-linux-arm64
           bash scripts/ci-upload-release.sh "$VERSION" dist/SHA256SUMS
-
-  frontend-bundle:
-    runs-on: x86-physical
-    timeout-minutes: 20
-    steps:
-      - name: checkout
-        run: |
-          set -euo pipefail
-          git init -q .
-          git remote add origin "http://127.0.0.1:10000/${GITHUB_REPOSITORY}.git"
-          git fetch --depth 1 origin "${GITHUB_REF}"
-          git checkout -q FETCH_HEAD
-
-      - name: resolve version
-        run: |
-          set -euo pipefail
-          case "${GITHUB_REF}" in
-            refs/tags/*) VERSION="${GITHUB_REF_NAME#v}" ;;
-            *) VERSION="dev-$(git rev-parse --short HEAD)" ;;
-          esac
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-
-      - name: verify pinned bundle hash and UI contract
-        run: |
-          set -euo pipefail
-          sh scripts/test-orchestrator-ui-bundle-contract.sh
-          python3 - <<'PY'
-          import hashlib, json, pathlib, sys
-          profile = json.loads(pathlib.Path("packaging/build-profiles/orchestrator.json").read_text())
-          pin = profile["frontend_app_sha256"]
-          bundle = pathlib.Path(profile["frontend_bundle"])
-          digest = hashlib.sha256((bundle / "app.js").read_bytes()).hexdigest()
-          if digest != pin:
-              sys.exit(f"orchestrator bundle app.js sha256 {digest} != pinned {pin}")
-          manifest = json.loads((bundle.parent / "manifest.json").read_text())
-          for name, expected in manifest["files"].items():
-              actual = hashlib.sha256((bundle / name).read_bytes()).hexdigest()
-              if actual != expected:
-                  sys.exit(f"bundle file {name} sha256 mismatch: {actual} != {expected}")
-          print(f"orchestrator bundle verified against pin {pin}")
-          PY
-
-      - name: package frontend bundle
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          out="dist/ly-orchestrator-frontend-${VERSION}.tar.zst"
-          tar --zstd -cf "$out" -C packaging/orchestrator-frontend .
-          ( cd dist && sha256sum "$(basename "$out")" > "ly-orchestrator-frontend-${VERSION}.sha256" )
-          ls -l dist
-
-      - name: upload frontend bundle
-        run: |
-          set -euo pipefail
-          bash scripts/ci-upload-release.sh "$VERSION" "dist/ly-orchestrator-frontend-${VERSION}.tar.zst"
-          bash scripts/ci-upload-release.sh "$VERSION" "dist/ly-orchestrator-frontend-${VERSION}.sha256"

@@ -67,11 +67,10 @@ jobs:
           set -euo pipefail
           sh scripts/test-orchestrator-dataplane-contract.sh
 
-      - name: orchestrator UI bundle contract
+      - name: retired controller-shell UI boundary
         run: |
           set -euo pipefail
-          node --version
-          sh scripts/test-orchestrator-ui-bundle-contract.sh
+          sh scripts/check-retired-ui-boundary.sh
 
       - name: orchestrator-control builds
         run: |

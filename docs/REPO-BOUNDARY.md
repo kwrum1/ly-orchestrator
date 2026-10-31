@@ -14,16 +14,31 @@
 | 控制面启动逻辑 | `backend/orchestrator/` | 编排器启动、装配 |
 | 编排器领域模型 | `backend/internal/orchestrator/` | topology / policy / bond / service-chain |
 | 编排器 HTTP API | `backend/internal/orchestratorapi/` | 编排器专属 handler、DTO、reconcile |
-| 编排器静态 UI | `frontend/orchestrator/` | controller-shell 13 个文件，自包含 |
-| 已验收 UI bundle | `packaging/orchestrator-frontend/` | 11 页 React 产物 + manifest 哈希 |
-| 编排器 build profile | `packaging/build-profiles/orchestrator*.json` | 含 frontend bundle sha256 钉 |
+| 已发布 UI 固定产物 | `packaging/orchestrator-ui-baseline/` | React build（`app.js` 985 KB），部署时整体复制，CI 不重建 |
+| 编排器 build profile | `packaging/build-profiles/orchestrator*.json` | 控制面 + 默认配置，无 UI 钉 |
 | 编排器 product profile | `packaging/product-profiles/orchestrator.json` | 能力清单 |
-| 编排器契约测试 | `scripts/test-orchestrator-*.sh`、`test-orchestrator-ui-bundle-contract.sh` | 策略/反例/数据面/UI bundle/升级转换 |
+| 编排器契约测试 | `scripts/test-orchestrator-*.sh` | 策略/反例/数据面/升级转换 |
+| 旧 UI 边界门禁 | `scripts/check-retired-ui-boundary.sh` | 旧 shell 源码/bundle/builder 重现即失败 |
 | 编排器容器与 VPP 验收 | `scripts/test-orchestrator-container-api.sh`、`test-orchestrator-vpp-*.sh`、`test-vpp-orchestrator-transparent.sh` | 需要 Docker/VPP 主机 |
 | 编排器文档 | `docs/ORCHESTRATOR-POLICY-ORDER.md` | 策略执行顺序语义 |
-| 构建脚本 | `scripts/build-controller-shell.sh`、`scripts/lib/product-build-profile.sh` | UI/产物装配 |
 | 发布脚本 | `scripts/ci-upload-release.sh` | Gitea Release 资产上传 |
 | CI / 发布流水线 | `.gitea/workflows/ci.yml`、`release.yml` | runner label `x86-physical` |
+
+### 淘汰的 controller-shell UI 已彻底删除
+
+controller-shell 静态 UI 是淘汰界面，曾因误部署覆盖线上新 UI，现已删除：
+`frontend/orchestrator/`（13 个源码文件）、`packaging/orchestrator-frontend/`
+（旧 11 页 bundle + manifest）、`scripts/build-controller-shell.sh`、
+`scripts/lib/product-build-profile.sh`，以及 `test-orchestrator-ui-bundle-contract.sh`、
+`test-controller-shell-orchestrator-ui.mjs`、`test-orchestrator-demo-ui.mjs` 三个只服务
+该 shell 的测试。
+
+编排器 UI 的源码与构建仍是 `ly-route/frontend/gateway` 以
+`LY_ROUTE_PRODUCT=orchestrator` 的 React/Vite 构建（`app.js` 约 985 KB）。本仓库只保留
+已发布的固定产物 `packaging/orchestrator-ui-baseline/`，供部署时复制到
+`/opt/ly-route/admin`；发布流水线只产出 `orchestrator-control`（amd64/arm64），不再
+构建或上传 UI bundle。后续把 React UI 源码迁入本仓库时，同步更新
+`scripts/check-retired-ui-boundary.sh`。
 
 ## 仍共享（两边都有，且必须手动同步）
 
@@ -50,9 +65,9 @@
 
 ## 有意不搬的内容
 
-- `frontend/gateway/`（182 MB）：网关 React/Vite 源码，编排器的 11 页 bundle 是它的
-  构建产物，已作为固定产物放在 `packaging/orchestrator-frontend/` 并带 sha256 钉。
-  重建该 bundle 仍需回到 `ly-route`。
+- `frontend/gateway/`（182 MB）：网关 React/Vite 源码，也是编排器 UI 的唯一源码
+  （`LY_ROUTE_PRODUCT=orchestrator` 构建）。本仓库不复制源码，只固定一份已发布产物
+  `packaging/orchestrator-ui-baseline/`；不要再引入第二份会漂移的 UI 副本。
 - `packaging/geodata/`（29 MB）：路由地理库，`internal/httpapi` 的 geodata 测试在文件缺失时
   自动 `t.Skip`，构建不需要。
 - `packaging/rootfs-overlay`、`iso-assets`、`runtime`、`deploy/`、`installer/`、`e2e/`、

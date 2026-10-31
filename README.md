@@ -1,7 +1,8 @@
 # Ly Route Orchestrator
 
 LY Route 编排器（Orchestrator）独立仓库：控制面二进制 `orchestrator-control`、编排策略 API、
-编排 UI（controller-shell 静态页 + 已验收 11 页 React bundle）、以及编排器的 product/build profile。
+以及编排器的 product/build profile。编排器 UI 是 React/Vite 应用，源码暂在 `ly-route`，
+本仓库不再包含任何 UI 源码或 UI 构建产物（见下节）。
 
 本仓库从 `kurumi/ly-route` 拆分而来，用于让编排器拥有独立的构建、测试与发布节奏，
 不再阻塞也不再被网关的发布流程牵连。
@@ -17,6 +18,24 @@ LY Route 编排器（Orchestrator）独立仓库：控制面二进制 `orchestra
 
 具体哪些内容已分离、哪些仍共享、后续怎么抽公共库，见 [`docs/REPO-BOUNDARY.md`](docs/REPO-BOUNDARY.md)。
 在公共库抽出之前，**修改 `backend/internal/httpapi` 等共享包必须同时在两个仓库对齐**。
+
+## 编排器 UI：固定 React baseline，无 controller-shell
+
+编排器界面是 React/Vite 应用。源码暂在 `kurumi/ly-route` 的 `frontend/gateway`，
+以 `LY_ROUTE_PRODUCT=orchestrator` 构建（产物 `app.js` 约 985 KB）。本仓库只保留
+**已发布的固定产物** `packaging/orchestrator-ui-baseline/`，部署时整体复制到
+`/opt/ly-route/admin`；CI 不重建它。
+
+已淘汰的 controller-shell 静态 UI 已彻底删除：`frontend/orchestrator/`（13 个源码文件）、
+仓库内固定的 `packaging/orchestrator-frontend/`（旧 11 页 bundle + manifest）、
+`scripts/build-controller-shell.sh`、`scripts/lib/product-build-profile.sh`，以及只服务
+它的 `test-orchestrator-ui-bundle-contract.sh`、`test-controller-shell-orchestrator-ui.mjs`、
+`test-orchestrator-demo-ui.mjs`。它曾被误部署到 VM，覆盖了新 UI。
+
+`scripts/check-retired-ui-boundary.sh` 在 CI 与发布流水线中把关：旧路径、controller-shell
+源码（`nic-settings.js` / `group-settings.js` / `forms.css` / `responsive.css`）、
+约 185 KB 的 shell bundle 重新出现即失败；同时校验 pinned baseline 仍是 React 产物
+（`app.js` ≥ 900 KB 且 `index.html` 有 `#root`），防止它被静态 shell 覆盖。
 
 ## 构建
 
@@ -48,8 +67,8 @@ sh scripts/test-orchestrator-policy-contract.sh
 sh scripts/test-orchestrator-negative-contract.sh
 sh scripts/test-orchestrator-dataplane-contract.sh
 
-# UI bundle 契约（单入口、单 capability manifest、无网关词汇）
-sh scripts/test-orchestrator-ui-bundle-contract.sh
+# 已淘汰 UI 的边界门禁（旧 shell 源码/bundle 重新出现即失败）
+sh scripts/check-retired-ui-boundary.sh
 ```
 
 需要在真实数据面主机上运行的完整验收脚本仍保留在 `scripts/`，但**不在 CI 中执行**：
@@ -58,7 +77,10 @@ sh scripts/test-orchestrator-ui-bundle-contract.sh
   `/usr/lib/ly-route/runtime-check.sh`）
 - `test-orchestrator-container-api.sh`、`test-orchestrator-vpp-*.sh`、
   `test-vpp-orchestrator-transparent.sh`（需要 Docker + VPP）
-- `test-orchestrator-demo-ui.mjs`、`test-controller-shell-orchestrator-ui.mjs`（需要 Playwright 和在线实例）
+
+旧 controller-shell 的 Playwright 用例（`test-orchestrator-demo-ui.mjs`、
+`test-controller-shell-orchestrator-ui.mjs`）已随 UI 一起删除；编排器 UI 的浏览器验收
+放在 `ly-route` 的 React/Vite 工程里。
 
 ## 发布
 
@@ -66,9 +88,10 @@ sh scripts/test-orchestrator-ui-bundle-contract.sh
 
 - `orchestrator-control-linux-amd64`
 - `orchestrator-control-linux-arm64`
-- `ly-orchestrator-frontend.tar.zst`
+- `SHA256SUMS`
 
-上传走 `scripts/ci-upload-release.sh`（Gitea Release API）。
+发布只产出控制面二进制，不再构建或上传 UI bundle（UI 由 `ly-route` 的
+`frontend/gateway` 工程构建）。上传走 `scripts/ci-upload-release.sh`（Gitea Release API）。
 
 ## 目录
 
@@ -77,8 +100,9 @@ sh scripts/test-orchestrator-ui-bundle-contract.sh
 | `backend/` | Go module `ly-route/backend`（当前全量共享） |
 | `backend/cmd/orchestrator-control` | 编排器控制面入口 |
 | `backend/orchestrator` | 控制面启动入口 (`orchestrator.Run()`) |
-| `frontend/orchestrator` | controller-shell 静态编排 UI 源码 |
-| `packaging/orchestrator-frontend` | 已验收 11 页 React bundle（随仓库固定的产物） |
 | `packaging/build-profiles`, `packaging/product-profiles` | 编排器 build / product profile |
-| `scripts/` | 编排器构建、契约测试、发布脚本 |
+| `packaging/orchestrator-ui-baseline` | 已发布 React UI 固定产物（部署用，CI 不重建） |
+| `scripts/` | 编排器构建、契约测试、发布脚本、旧 UI 边界门禁 |
 | `docs/` | 编排器文档与仓库边界说明 |
+
+本仓库没有 `frontend/`：UI 源码与 React 构建都在 `ly-route`。
