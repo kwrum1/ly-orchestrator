@@ -28,6 +28,16 @@ func (controller *bypassTestController) SetBypass(_ context.Context, enabled boo
 	return controller.state, nil
 }
 
+func (controller *bypassTestController) SetGroupBypass(_ context.Context, group string, enabled bool, reason string) (BypassState, error) {
+	controller.updates++
+	controller.forced = &enabled
+	controller.state.Enabled = enabled
+	controller.state.Forced = enabled
+	controller.state.Reason = reason
+	controller.state.Groups = []BypassGroupState{{Group: group, Enabled: enabled, Forced: enabled, Reason: reason}}
+	return controller.state, nil
+}
+
 func (controller *bypassTestController) UpdateBypassConfig(_ context.Context, config BypassConfig) (BypassState, error) {
 	controller.config = &config
 	controller.state.Config = config

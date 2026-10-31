@@ -692,6 +692,9 @@ ly_orch_workers_snapshot (u32 rules, u32 groups)
   return snapshot;
 }
 
+static ly_orch_group_bypass_t *ly_orch_group_bypass_build (
+  ly_orch_config_t *config);
+
 static clib_error_t *
 ly_orch_commit (unformat_input_t *input)
 {
@@ -700,6 +703,8 @@ ly_orch_commit (unformat_input_t *input)
   ly_orch_config_t old_config;
   ly_orch_worker_t *old_workers;
   ly_orch_worker_t *new_workers;
+  ly_orch_group_bypass_t *new_group_bypass;
+  ly_orch_group_bypass_t *old_group_bypass;
   u8 *generation = 0;
   u32 index, max_sw_if_index = 0;
   clib_error_t *error;
@@ -734,6 +739,7 @@ ly_orch_commit (unformat_input_t *input)
   vec_free (generation);
   new_workers = ly_orch_workers_create (vec_len (candidate->rules),
                                         vec_len (candidate->groups));
+  new_group_bypass = ly_orch_group_bypass_build (candidate);
 
   if (vec_len (om->vnet_main->interface_main.sw_interfaces))
     max_sw_if_index =
@@ -759,8 +765,24 @@ ly_orch_commit (unformat_input_t *input)
       }
   old_config = om->active;
   old_workers = om->workers;
+  old_group_bypass = om->group_bypass;
   om->active = *candidate;
   om->workers = new_workers;
+  om->group_bypass = new_group_bypass;
+  /* Re-align passive targets with the committed group order; a target whose
+   * group disappeared is dropped (its counters no longer have a meaning). */
+  for (index = 0; index < vec_len (om->probe_targets); index++)
+    {
+      int position =
+        ly_orch_find_group (&om->active, om->probe_targets[index].group);
+      if (position < 0)
+        {
+          vec_del1 (om->probe_targets, index);
+          index--;
+          continue;
+        }
+      om->probe_targets[index].group_position = position;
+    }
   clib_memset (candidate, 0, sizeof (*candidate));
   candidate->wan_sw_if_index = LY_ORCH_INVALID_INDEX;
   candidate->lan_sw_if_index = LY_ORCH_INVALID_INDEX;
@@ -769,6 +791,7 @@ ly_orch_commit (unformat_input_t *input)
 
   ly_orch_config_free (&old_config);
   ly_orch_workers_free (old_workers);
+  vec_free (old_group_bypass);
   return 0;
 }
 
@@ -778,6 +801,7 @@ ly_orch_disable (void)
   ly_orch_main_t *om = &ly_orch_main;
   ly_orch_config_t old_config;
   ly_orch_worker_t *old_workers;
+  ly_orch_group_bypass_t *old_group_bypass;
   u32 index;
 
   vlib_worker_thread_barrier_sync (om->vlib_main);
@@ -790,10 +814,14 @@ ly_orch_disable (void)
       }
   old_config = om->active;
   old_workers = om->workers;
+  old_group_bypass = om->group_bypass;
   clib_memset (&om->active, 0, sizeof (om->active));
   om->active.wan_sw_if_index = LY_ORCH_INVALID_INDEX;
   om->active.lan_sw_if_index = LY_ORCH_INVALID_INDEX;
   om->workers = 0;
+  om->group_bypass = 0;
+  vec_free (om->probe_targets);
+  om->probe_targets = 0;
   /* Disabling orchestration removes the policy the bypass was shielding, so
    * the flag must not survive into a later, unrelated configuration. */
   om->bypass_active = 0;
@@ -805,6 +833,7 @@ ly_orch_disable (void)
 
   ly_orch_config_free (&old_config);
   ly_orch_workers_free (old_workers);
+  vec_free (old_group_bypass);
   ly_orch_candidate_clear ();
   return 0;
 }
@@ -840,14 +869,82 @@ ly_orch_set_bypass (vlib_main_t *vm, u8 active, u8 forced, const u8 *cause,
 static clib_error_t *
 ly_orch_bypass_command (unformat_input_t *input, vlib_main_t *vm)
 {
-  u8 *cause = 0, *reason = 0;
+  ly_orch_main_t *om = &ly_orch_main;
+  u8 *group = 0, *cause = 0, *reason = 0;
   u8 active, forced = 0;
+
+  /* Per-group form: bypass group <name> on|off [cause <token>] [reason <token>] */
+  if (unformat (input, "group %s", &group))
+    {
+      int position;
+      ly_orch_group_bypass_t *row;
+      if (unformat (input, "on"))
+        active = 1;
+      else if (unformat (input, "off"))
+        active = 0;
+      else
+        {
+          vec_free (group);
+          return clib_error_return (0, "expected group <name> bypass on|off");
+        }
+      while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+        {
+          if (unformat (input, "cause %s", &cause))
+            ;
+          else if (unformat (input, "reason %s", &reason))
+            ;
+          else
+            {
+              vec_free (group);
+              vec_free (cause);
+              vec_free (reason);
+              return clib_error_return (
+                0, "expected cause <token> or reason <token>");
+            }
+        }
+      if (!om->active.valid)
+        {
+          vec_free (group);
+          vec_free (cause);
+          vec_free (reason);
+          return clib_error_return (0, "orchestrator is not configured");
+        }
+      position = ly_orch_find_group (&om->active, group);
+      if (position < 0 || position >= vec_len (om->group_bypass))
+        {
+          clib_error_t *error = clib_error_return (
+            0, "unknown orchestration group %s", (char *) group);
+          vec_free (group);
+          vec_free (cause);
+          vec_free (reason);
+          return error;
+        }
+      if (active && !cause)
+        cause = format (cause, "%s", "manual");
+      if (!reason)
+        reason = format (reason, "%s",
+                         active ? "manual_force" : "manual_clear");
+      forced = active && cause && strcmp ((char *) cause, "manual") == 0;
+      vlib_worker_thread_barrier_sync (vm);
+      row = &om->group_bypass[position];
+      row->active = active;
+      row->forced = forced;
+      ly_orch_bypass_copy (row->cause, sizeof (row->cause), cause);
+      ly_orch_bypass_copy (row->reason, sizeof (row->reason), reason);
+      row->since = active ? vlib_time_now (vm) : 0;
+      vlib_worker_thread_barrier_release (vm);
+      vec_free (group);
+      vec_free (cause);
+      vec_free (reason);
+      return 0;
+    }
+
   if (unformat (input, "on"))
     active = 1;
   else if (unformat (input, "off"))
     active = 0;
   else
-    return clib_error_return (0, "expected bypass on|off");
+    return clib_error_return (0, "expected bypass on|off or bypass group <name> on|off");
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
       if (unformat (input, "cause %s", &cause))
@@ -877,6 +974,153 @@ ly_orch_bypass_command (unformat_input_t *input, vlib_main_t *vm)
   }
 }
 
+/* Install one passive request/response target:
+ *   probe group <name> dst <ip> port <n> proto tcp|udp [window <seconds>]
+ * The target belongs to the group whose ingress port sees the traffic. */
+static int
+ly_orch_probe_address_equal (const ip46_address_t *left,
+                             const ip46_address_t *right, u8 is_ip6)
+{
+  if (is_ip6)
+    return ip6_address_is_equal (&left->ip6, &right->ip6);
+  return ip4_address_is_equal (&left->ip4, &right->ip4);
+}
+
+static clib_error_t *
+ly_orch_probe_command (unformat_input_t *input)
+{
+  ly_orch_main_t *om = &ly_orch_main;
+  u8 *group = 0, *protocol = 0;
+  ip4_address_t address4 = { 0 };
+  ip6_address_t address6 = { 0 };
+  u8 is_ip6 = 0;
+  u32 port = 0, window = 10, index;
+  ly_orch_probe_target_t target = { 0 };
+
+  if (unformat (input, "clear"))
+    {
+      vec_free (om->probe_targets);
+      om->probe_targets = 0;
+      return 0;
+    }
+  if (!unformat (input, "group %s", &group))
+    return clib_error_return (0, "expected probe group <name> or probe clear");
+  if (!unformat (input, "dst %U", unformat_ip4_address, &address4))
+    {
+      if (unformat (input, "dst %U", unformat_ip6_address, &address6))
+        is_ip6 = 1;
+      else
+        {
+          vec_free (group);
+          return clib_error_return (0, "expected dst <ipv4|ipv6>");
+        }
+    }
+  if (!unformat (input, "port %u", &port) || !unformat (input, "proto %s", &protocol))
+    {
+      vec_free (group);
+      vec_free (protocol);
+      return clib_error_return (0, "expected port <n> proto tcp|udp");
+    }
+  if (unformat (input, "window %u", &window))
+    ;
+  if (!om->active.valid)
+    {
+      vec_free (group);
+      vec_free (protocol);
+      return clib_error_return (0, "orchestrator is not configured");
+    }
+  if (port < 1 || port > 65535 || window < 1 || window > 3600 ||
+      (strcmp ((char *) protocol, "tcp") != 0 &&
+       strcmp ((char *) protocol, "udp") != 0))
+    {
+      vec_free (group);
+      vec_free (protocol);
+      return clib_error_return (0, "invalid probe target");
+    }
+  {
+    int position = ly_orch_find_group (&om->active, group);
+    if (position < 0)
+      {
+        clib_error_t *error = clib_error_return (
+          0, "unknown orchestration group %s", (char *) group);
+        vec_free (group);
+        vec_free (protocol);
+        return error;
+      }
+    target.group_position = position;
+  }
+  ly_orch_copy_name (target.group, group);
+  if (is_ip6)
+    target.destination.ip6 = address6;
+  else
+    target.destination.ip4 = address4;
+  target.destination_port = (u16) port;
+  target.protocol = strcmp ((char *) protocol, "udp") == 0 ? IP_PROTOCOL_UDP
+                                                            : IP_PROTOCOL_TCP;
+  target.is_ip6 = is_ip6;
+  target.window = window;
+
+  /* Replace an identical tuple so its counters restart, otherwise append. */
+  vec_foreach_index (index, om->probe_targets)
+    {
+      ly_orch_probe_target_t *existing = &om->probe_targets[index];
+      if (existing->group_position == target.group_position &&
+          existing->destination_port == target.destination_port &&
+          existing->protocol == target.protocol &&
+          existing->is_ip6 == target.is_ip6 &&
+          ly_orch_probe_address_equal (&existing->destination,
+                                       &target.destination, is_ip6))
+        {
+          clib_memset (existing, 0, sizeof (*existing));
+          *existing = target;
+          vec_free (group);
+          vec_free (protocol);
+          return 0;
+        }
+    }
+  if (vec_len (om->probe_targets) >= LY_ORCH_MAX_PROBE_TARGETS)
+    {
+      vec_free (group);
+      vec_free (protocol);
+      return clib_error_return (0, "passive probe target limit exceeded");
+    }
+  vec_add1 (om->probe_targets, target);
+  vec_free (group);
+  vec_free (protocol);
+  return 0;
+}
+
+/* Rebuild the per-group bypass rows in active group order, carrying over the
+ * flag of a group with the same name across a commit. */
+static ly_orch_group_bypass_t *
+ly_orch_group_bypass_build (ly_orch_config_t *config)
+{
+  ly_orch_main_t *om = &ly_orch_main;
+  ly_orch_group_bypass_t *rows = 0;
+  u32 index;
+
+  if (!vec_len (config->groups))
+    return 0;
+  vec_validate (rows, vec_len (config->groups) - 1);
+  clib_memset (rows, 0, sizeof (ly_orch_group_bypass_t) * vec_len (config->groups));
+  vec_foreach_index (index, config->groups)
+    {
+      u8 *name = config->groups[index].name;
+      u32 old;
+      clib_strncpy ((char *) rows[index].name, (const char *) name,
+                    LY_ORCH_NAME_LEN - 1);
+      vec_foreach_index (old, om->group_bypass)
+        if (strcmp ((char *) om->group_bypass[old].name, (char *) name) == 0)
+          {
+            rows[index] = om->group_bypass[old];
+            clib_strncpy ((char *) rows[index].name, (const char *) name,
+                          LY_ORCH_NAME_LEN - 1);
+            break;
+          }
+    }
+  return rows;
+}
+
 static clib_error_t *
 ly_orch_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
                         vlib_cli_command_t *cmd)
@@ -901,6 +1145,14 @@ ly_orch_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
     }
   if (unformat (input, "bypass"))
     return ly_orch_bypass_command (input, vm);
+  if (unformat (input, "probe"))
+    {
+      clib_error_t *error;
+      vlib_worker_thread_barrier_sync (vm);
+      error = ly_orch_probe_command (input);
+      vlib_worker_thread_barrier_release (vm);
+      return error;
+    }
   if (unformat (input, "disable"))
     return ly_orch_disable ();
   if (unformat (input, "commit"))
@@ -914,7 +1166,10 @@ VLIB_CLI_COMMAND (ly_orch_set_command, static) = {
     "set ly-route orchestrator candidate clear|boundary|group|rule|default "
     "[wan-next-hop-mac <mac> lan-next-hop-mac <mac>]; "
     "set ly-route orchestrator commit generation <id>|disable|"
-    "bypass on|off [cause <token>] [reason <token>]",
+    "bypass on|off [cause <token>] [reason <token>]|"
+    "bypass group <name> on|off [cause <token>] [reason <token>]|"
+    "probe clear|probe group <name> dst <ip> port <n> proto tcp|udp "
+    "[window <seconds>]",
   .function = ly_orch_set_command_fn,
 };
 
@@ -1010,6 +1265,38 @@ ly_orch_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
                              config->groups[index].lan_sw_if_index) ?
                          "up" : "bypass",
                        bypass_packets);
+      if (index < vec_len (om->group_bypass))
+        {
+          ly_orch_group_bypass_t *row = &om->group_bypass[index];
+          vlib_cli_output (
+            vm, "group-bypass %s state %s forced %s cause %s packets %llu "
+                "reason %s",
+            config->groups[index].name, row->active ? "on" : "off",
+            row->forced ? "yes" : "no",
+            row->cause[0] ? (char *) row->cause : "none", bypass_packets,
+            row->reason[0] ? (char *) row->reason : "none");
+        }
+    }
+  vlib_cli_output (vm, "probe-targets %u", vec_len (om->probe_targets));
+  vec_foreach_index (index, om->probe_targets)
+    {
+      ly_orch_probe_target_t *target = &om->probe_targets[index];
+      u64 success = target->synack + target->responses;
+      u64 timeouts = target->attempts > success ? target->attempts - success : 0;
+      vlib_cli_output (
+        vm,
+        "group-probe %s dst %U port %u proto %s attempts %llu syn %llu "
+        "synack %llu rst %llu responses %llu icmp-unreachable %llu "
+        "window %.0f",
+        target->group,
+        target->is_ip6 ? format_ip6_address : format_ip4_address,
+        target->is_ip6 ? (void *) &target->destination.ip6 :
+                         (void *) &target->destination.ip4,
+        target->destination_port,
+        target->protocol == IP_PROTOCOL_UDP ? "udp" : "tcp", target->attempts,
+        target->syn, target->synack, target->rst, target->responses,
+        target->icmp_unreachable, target->window);
+      (void) timeouts;
     }
   vec_foreach_index (index, config->rules)
     {

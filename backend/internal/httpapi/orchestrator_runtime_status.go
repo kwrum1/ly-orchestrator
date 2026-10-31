@@ -110,6 +110,10 @@ func (server *Server) orchestratorRuntimeCapability(ctx context.Context) *contro
 		reason = fmt.Sprintf("fault bypass active (%s): %s", nonEmpty(evidence.BypassCause, "unknown"), nonEmpty(evidence.BypassReason, "unspecified"))
 		bypassReason = evidence.BypassReason
 	}
+	if len(evidence.BypassGroups) > 0 {
+		reason = fmt.Sprintf("policy group fault bypass active: %s (other groups keep policy enforcement)", strings.Join(evidence.BypassGroups, ","))
+		bypassReason = reason
+	}
 	return &controlapi.CapabilityState{Name: "orchestrator_runtime", Available: true, State: controlapi.CapabilityAvailable, Reason: serviceRuntime.Redact(reason), Bypass: evidence.Bypass, BypassReason: serviceRuntime.Redact(bypassReason)}
 }
 

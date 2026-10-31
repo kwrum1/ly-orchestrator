@@ -100,6 +100,9 @@ type TransparentRuntimeEvidence struct {
 	BypassReason  string    `json:"bypass_reason,omitempty"`
 	BypassSince   time.Time `json:"bypass_since,omitempty"`
 	BypassPackets uint64    `json:"bypass_packets,omitempty"`
+	// BypassGroups lists the groups currently bypassing policy.  A single
+	// bypassed group does not degrade the appliance.
+	BypassGroups []string `json:"bypass_groups,omitempty"`
 }
 
 type TransparentRuntimeEvidenceProvider interface {

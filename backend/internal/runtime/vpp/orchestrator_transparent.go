@@ -36,8 +36,51 @@ type TransparentOrchestratorReadback struct {
 	BypassReason  string `json:"bypass_reason,omitempty"`
 	BypassForced  bool   `json:"bypass_forced,omitempty"`
 	BypassPackets uint64 `json:"bypass_packets,omitempty"`
-	Output        string `json:"output"`
+	// GroupBypass and GroupProbes are the per-group view reported by newer
+	// plugin builds.  Older builds report neither and the slices stay empty.
+	GroupBypass  []GroupBypassReadback `json:"group_bypass,omitempty"`
+	GroupProbes  []GroupProbeReadback  `json:"group_probes,omitempty"`
+	ProbeTargets int                   `json:"probe_targets,omitempty"`
+	Output       string                `json:"output"`
 }
+
+// GroupBypassReadback is one `group-bypass` line from the plugin.
+type GroupBypassReadback struct {
+	Name    string
+	Enabled bool
+	Forced  bool
+	Cause   string
+	Reason  string
+	Packets uint64
+}
+
+// GroupProbeReadback is one `group-probe` line from the plugin.  The counters
+// are cumulative since the plugin loaded or since the passive target was
+// (re)configured; the control plane derives the window from deltas.
+type GroupProbeReadback struct {
+	Group           string
+	DstIP           string
+	DstPort         int
+	Protocol        string
+	Attempts        uint64
+	Syn             uint64
+	SynAck          uint64
+	RST             uint64
+	Responses       uint64
+	ICMPUnreachable uint64
+	WindowSeconds   float64
+}
+
+// GroupProbeTarget installs one passive request/response tuple inside the
+// plugin for a group.
+type GroupProbeTarget struct {
+	Group         string
+	DstIP         string
+	DstPort       int
+	Protocol      string
+	WindowSeconds float64
+}
+
 
 // ParseTransparentOrchestratorBypass extracts the fault-bypass state from
 // `show ly-route orchestrator` output.  Older plugin builds do not print these
@@ -78,6 +121,226 @@ func ParseTransparentOrchestratorBypass(output string) (enabled bool, cause, rea
 		reason = ""
 	}
 	return enabled, cause, reason, forced, packets
+}
+
+// ParseTransparentOrchestratorGroupBypass extracts the per-group bypass rows
+// from `show ly-route orchestrator` output:
+//
+//	group-bypass grp-b state on forced no cause auto packets 12 reason probe_failed
+func ParseTransparentOrchestratorGroupBypass(output string) []GroupBypassReadback {
+	result := []GroupBypassReadback{}
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 4 || fields[0] != "group-bypass" {
+			continue
+		}
+		row := GroupBypassReadback{Name: fields[1]}
+		for index := 2; index+1 < len(fields); index++ {
+			switch fields[index] {
+			case "state":
+				row.Enabled = fields[index+1] == "on"
+				index++
+			case "forced":
+				row.Forced = fields[index+1] == "yes"
+				index++
+			case "cause":
+				row.Cause = fields[index+1]
+				index++
+			case "packets":
+				row.Packets, _ = strconv.ParseUint(fields[index+1], 10, 64)
+				index++
+			case "reason":
+				row.Reason = strings.Join(fields[index+1:], " ")
+				index = len(fields)
+			}
+		}
+		if row.Cause == "none" {
+			row.Cause = ""
+		}
+		if row.Reason == "none" {
+			row.Reason = ""
+		}
+		result = append(result, row)
+	}
+	return result
+}
+
+// ParseTransparentOrchestratorGroupProbes extracts the passive-analysis rows:
+//
+//	group-probe grp-a dst 192.168.10.82 port 53 proto udp attempts 4 syn 0
+//	  synack 0 rst 0 responses 2 icmp-unreachable 0 window 10
+func ParseTransparentOrchestratorGroupProbes(output string) []GroupProbeReadback {
+	result := []GroupProbeReadback{}
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 4 || fields[0] != "group-probe" {
+			continue
+		}
+		row := GroupProbeReadback{Group: fields[1]}
+		for index := 2; index+1 < len(fields); index++ {
+			value := fields[index+1]
+			switch fields[index] {
+			case "dst":
+				row.DstIP = value
+			case "port":
+				row.DstPort, _ = strconv.Atoi(value)
+			case "proto":
+				row.Protocol = value
+			case "attempts":
+				row.Attempts, _ = strconv.ParseUint(value, 10, 64)
+			case "syn":
+				row.Syn, _ = strconv.ParseUint(value, 10, 64)
+			case "synack":
+				row.SynAck, _ = strconv.ParseUint(value, 10, 64)
+			case "rst":
+				row.RST, _ = strconv.ParseUint(value, 10, 64)
+			case "responses":
+				row.Responses, _ = strconv.ParseUint(value, 10, 64)
+			case "icmp-unreachable":
+				row.ICMPUnreachable, _ = strconv.ParseUint(value, 10, 64)
+			case "window":
+				row.WindowSeconds, _ = strconv.ParseFloat(value, 64)
+			}
+			index++
+		}
+		result = append(result, row)
+	}
+	return result
+}
+
+// ParseTransparentOrchestratorProbeTargets reads the installed passive-target
+// count so the supervisor can re-install them after a VPP restart.
+func ParseTransparentOrchestratorProbeTargets(output string) int {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 2 && fields[0] == "probe-targets" {
+			count, _ := strconv.Atoi(fields[1])
+			return count
+		}
+	}
+	return 0
+}
+
+// BuildTransparentOrchestratorGroupBypassCommands toggles one group's bypass
+// flag.  The committed generation and policy are untouched, exactly like the
+// global flag.
+func BuildTransparentOrchestratorGroupBypassCommands(group string, enabled bool, cause, reason string) []string {
+	group = transparentBypassToken(group, "unknown")
+	state := "off"
+	if enabled {
+		state = "on"
+	}
+	cause = transparentBypassToken(cause, "manual")
+	reason = transparentBypassToken(reason, "unspecified")
+	return []string{
+		fmt.Sprintf("set ly-route orchestrator bypass group %s %s cause %s reason %s", group, state, cause, reason),
+		"show ly-route orchestrator",
+	}
+}
+
+// SetTransparentOrchestratorGroupBypass applies one group's bypass and verifies
+// the group row in the readback.  Other groups keep their own state.
+func (adapter Adapter) SetTransparentOrchestratorGroupBypass(ctx context.Context, requestID, group string, enabled bool, cause, reason string) (TransparentOrchestratorReadback, error) {
+	if adapter.Client == nil {
+		return TransparentOrchestratorReadback{}, VPPError{Operation: "vpp.transparent-orchestrator.group-bypass", RequestID: requestID, Err: errors.New("vpp client is not configured")}
+	}
+	channel, err := adapter.Client.OpenChannel(ctx)
+	if err != nil {
+		return TransparentOrchestratorReadback{}, VPPError{Operation: "open_channel", RequestID: requestID, Err: err}
+	}
+	defer channel.Close()
+	commands := BuildTransparentOrchestratorGroupBypassCommands(group, enabled, cause, reason)
+	operation := Operation{Name: "vpp.transparent-orchestrator.group-bypass", RequestID: requestID, Resource: group, VPPCtlCommands: commands}
+	reply, err := channel.Do(ctx, operation)
+	if err != nil {
+		return TransparentOrchestratorReadback{}, VPPError{Operation: operation.Name, RequestID: requestID, Err: err}
+	}
+	payload, ok := reply.Payload.(VPPCTLReplyPayload)
+	if !ok || len(payload.CommandResults) == 0 {
+		return TransparentOrchestratorReadback{}, fmt.Errorf("%w: group bypass results are missing", ErrSnapshotIncomplete)
+	}
+	show := payload.CommandResults[len(payload.CommandResults)-1]
+	if show.Command != "show ly-route orchestrator" || show.Retval != 0 {
+		return TransparentOrchestratorReadback{}, fmt.Errorf("%w: group bypass readback is missing", ErrSnapshotIncomplete)
+	}
+	state, generation, defaultAction := ParseTransparentOrchestratorOutput(show.Stdout)
+	bypass, bypassCause, bypassReason, forced, packets := ParseTransparentOrchestratorBypass(show.Stdout)
+	groups := ParseTransparentOrchestratorGroupBypass(show.Stdout)
+	found := false
+	for _, row := range groups {
+		if row.Name != group {
+			continue
+		}
+		found = true
+		if row.Enabled != enabled {
+			return TransparentOrchestratorReadback{}, fmt.Errorf("%w: group %s bypass state is %t, want %t", ErrSnapshotIncomplete, group, row.Enabled, enabled)
+		}
+	}
+	if !found {
+		return TransparentOrchestratorReadback{}, fmt.Errorf("%w: group %s bypass row is missing", ErrSnapshotIncomplete, group)
+	}
+	return TransparentOrchestratorReadback{
+		Generation: generation, State: state, Default: defaultAction,
+		Bypass: bypass, BypassCause: bypassCause, BypassReason: bypassReason,
+		BypassForced: forced, BypassPackets: packets, Output: show.Stdout,
+		GroupBypass: groups,
+		GroupProbes: ParseTransparentOrchestratorGroupProbes(show.Stdout),
+		ProbeTargets: ParseTransparentOrchestratorProbeTargets(show.Stdout),
+	}, nil
+}
+
+// BuildTransparentOrchestratorProbeCommands replaces the passive probe target
+// set.  Targets are runtime state, not part of the committed generation, so a
+// restart is recovered by re-issuing them.
+func BuildTransparentOrchestratorProbeCommands(targets []GroupProbeTarget) []string {
+	commands := []string{"set ly-route orchestrator probe clear"}
+	for _, target := range targets {
+		protocol := strings.ToLower(strings.TrimSpace(target.Protocol))
+		if protocol != "udp" {
+			protocol = "tcp"
+		}
+		window := target.WindowSeconds
+		if window < 1 {
+			window = 10
+		}
+		commands = append(commands, fmt.Sprintf(
+			"set ly-route orchestrator probe group %s dst %s port %d proto %s window %.0f",
+			transparentBypassToken(target.Group, "unknown"),
+			strings.TrimSpace(target.DstIP), target.DstPort, protocol, window))
+	}
+	commands = append(commands, "show ly-route orchestrator")
+	return commands
+}
+
+// SetTransparentOrchestratorProbes installs the passive targets and verifies
+// the count the plugin reports.
+func (adapter Adapter) SetTransparentOrchestratorProbes(ctx context.Context, requestID string, targets []GroupProbeTarget) error {
+	if adapter.Client == nil {
+		return VPPError{Operation: "vpp.transparent-orchestrator.probes", RequestID: requestID, Err: errors.New("vpp client is not configured")}
+	}
+	channel, err := adapter.Client.OpenChannel(ctx)
+	if err != nil {
+		return VPPError{Operation: "open_channel", RequestID: requestID, Err: err}
+	}
+	defer channel.Close()
+	commands := BuildTransparentOrchestratorProbeCommands(targets)
+	operation := Operation{Name: "vpp.transparent-orchestrator.probes", RequestID: requestID, Resource: "probes", VPPCtlCommands: commands}
+	reply, err := channel.Do(ctx, operation)
+	if err != nil {
+		return VPPError{Operation: operation.Name, RequestID: requestID, Err: err}
+	}
+	payload, ok := reply.Payload.(VPPCTLReplyPayload)
+	if !ok || len(payload.CommandResults) == 0 {
+		return fmt.Errorf("%w: passive probe results are missing", ErrSnapshotIncomplete)
+	}
+	show := payload.CommandResults[len(payload.CommandResults)-1]
+	if show.Command != "show ly-route orchestrator" || show.Retval != 0 {
+		return fmt.Errorf("%w: passive probe readback is missing", ErrSnapshotIncomplete)
+	}
+	if observed := ParseTransparentOrchestratorProbeTargets(show.Stdout); observed != len(targets) {
+		return fmt.Errorf("%w: plugin reports %d passive targets, want %d", ErrSnapshotIncomplete, observed, len(targets))
+	}
+	return nil
 }
 
 func transparentBypassToken(value, fallback string) string {
@@ -153,6 +416,9 @@ func (adapter Adapter) SetTransparentOrchestratorBypass(ctx context.Context, req
 		Generation: generation, State: state, Default: defaultAction,
 		Bypass: bypass, BypassCause: bypassCause, BypassReason: bypassReason,
 		BypassForced: forced, BypassPackets: packets, Output: show.Stdout,
+		GroupBypass: ParseTransparentOrchestratorGroupBypass(show.Stdout),
+		GroupProbes: ParseTransparentOrchestratorGroupProbes(show.Stdout),
+		ProbeTargets: ParseTransparentOrchestratorProbeTargets(show.Stdout),
 	}, nil
 }
 
@@ -438,7 +704,7 @@ func (adapter Adapter) ApplyTransparentOrchestrator(ctx context.Context, request
 	if generation == "" {
 		generation = config.Generation
 	}
-	return TransparentOrchestratorReadback{Generation: generation, State: state, Default: defaultAction, Bypass: bypass, BypassCause: bypassCause, BypassReason: bypassReason, BypassForced: bypassForced, BypassPackets: bypassPackets, Output: show.Stdout}, nil
+	return TransparentOrchestratorReadback{Generation: generation, State: state, Default: defaultAction, Bypass: bypass, BypassCause: bypassCause, BypassReason: bypassReason, BypassForced: bypassForced, BypassPackets: bypassPackets, Output: show.Stdout, GroupBypass: ParseTransparentOrchestratorGroupBypass(show.Stdout), GroupProbes: ParseTransparentOrchestratorGroupProbes(show.Stdout), ProbeTargets: ParseTransparentOrchestratorProbeTargets(show.Stdout)}, nil
 }
 
 func (adapter Adapter) ObserveTransparentOrchestrator(ctx context.Context, requestID string) (TransparentOrchestratorReadback, error) {
@@ -462,7 +728,7 @@ func (adapter Adapter) ObserveTransparentOrchestrator(ctx context.Context, reque
 	output := payload.CommandResults[0].Stdout
 	state, generation, defaultAction := ParseTransparentOrchestratorOutput(output)
 	bypass, bypassCause, bypassReason, bypassForced, bypassPackets := ParseTransparentOrchestratorBypass(output)
-	readback := TransparentOrchestratorReadback{State: state, Generation: generation, Default: defaultAction, Bypass: bypass, BypassCause: bypassCause, BypassReason: bypassReason, BypassForced: bypassForced, BypassPackets: bypassPackets, Output: output}
+	readback := TransparentOrchestratorReadback{State: state, Generation: generation, Default: defaultAction, Bypass: bypass, BypassCause: bypassCause, BypassReason: bypassReason, BypassForced: bypassForced, BypassPackets: bypassPackets, Output: output, GroupBypass: ParseTransparentOrchestratorGroupBypass(output), GroupProbes: ParseTransparentOrchestratorGroupProbes(output), ProbeTargets: ParseTransparentOrchestratorProbeTargets(output)}
 	if readback.State == "" || (readback.State == "running" && readback.Generation == "") {
 		return TransparentOrchestratorReadback{}, fmt.Errorf("%w: transparent orchestrator state/generation is missing", ErrSnapshotIncomplete)
 	}
