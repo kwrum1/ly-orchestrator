@@ -188,6 +188,12 @@ async function openRole(page, port) {
   await gotoReady(page, "/interfaces");
   let row = page.locator("table tbody tr", { hasText: port }).first();
   if (!(await row.count().catch(() => 0))) {
+    // A lost/stale session shows the login screen instead of the table.
+    await loginUI(page);
+    await gotoReady(page, "/interfaces");
+    row = page.locator("table tbody tr", { hasText: port }).first();
+  }
+  if (!(await row.count().catch(() => 0))) {
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForTimeout(2500);
     row = page.locator("table tbody tr", { hasText: port }).first();
@@ -309,8 +315,11 @@ async function vppSpan() {
 }
 function spanHas(output, source, destination, direction) {
   const lines = output.split(/\r?\n/);
-  return lines.some((line) => line.includes(source) && line.includes(destination) &&
-    (!direction || line.includes(`(${direction})`)));
+  return lines.some((line) => {
+    if (!line.includes(source) || !line.includes(destination)) return false;
+    if (!direction) return true;
+    return new RegExp("\\(\\s*" + direction + "\\s*\\)").test(line);
+  });
 }
 function spanLine(output, source) {
   return output.split(/\r?\n/).find((line) => line.includes(source)) || "";
