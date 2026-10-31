@@ -201,12 +201,6 @@
       health.className = "badge " + healthTone(group.health);
       health.textContent = healthLabel(group.health);
       actions.appendChild(health);
-      if (group.enabled) {
-        var bypass = document.createElement("span");
-        bypass.className = "badge badge-danger";
-        bypass.textContent = "旁路中";
-        actions.appendChild(bypass);
-      }
       if (group.forced) {
         var forced = document.createElement("span");
         forced.className = "badge badge-warning";
