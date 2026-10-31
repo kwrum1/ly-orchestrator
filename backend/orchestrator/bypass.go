@@ -83,6 +83,7 @@ type bypassGroupRuntime struct {
 	windowSuccess  uint64
 	windowRST      uint64
 	windowTimeouts uint64
+	windowReady    bool
 	flowStats      []orchestratorapi.BypassFlowStats
 	bypassPackets  uint64
 	health         string
@@ -1007,7 +1008,7 @@ func (controller *bypassController) probeGroups(ctx context.Context, config orch
 		state.health = groupHealth(state, groupConfig, outcome.probeOK)
 
 		flowActive := len(groupConfig.FlowTargets) > 0
-		passiveFailed := flowActive && state.windowAttempts > 0 && state.windowSuccess == 0
+		passiveFailed := flowActive && state.windowReady && state.windowAttempts > 0 && state.windowSuccess == 0
 		activeProbes := len(outcome.probes) > 0
 		roundConfigured := activeProbes || flowActive
 		roundFailed := !outcome.probeOK
@@ -1107,6 +1108,10 @@ func (state *bypassGroupRuntime) observeFlow(now time.Time, stats []orchestrator
 		}
 	}
 	state.samples = append(state.samples, bypassFlowSample{at: now, attempts: attempts, success: success, rst: rst})
+	// The failure verdict only becomes conclusive after a full window of
+	// observation.  Before that a single unanswered first contact must not
+	// switch the business path.
+	state.windowReady = now.Sub(state.samples[0].at) >= window
 	for len(state.samples) > 1 && now.Sub(state.samples[1].at) >= window {
 		state.samples = state.samples[1:]
 	}

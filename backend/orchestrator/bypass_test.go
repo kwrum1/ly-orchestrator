@@ -79,11 +79,13 @@ func TestPassiveWindowAllRSTIsFaulty(t *testing.T) {
 	state := &bypassGroupRuntime{name: "grp-a"}
 	config := orchestratorapi.BypassGroupConfig{Name: "grp-a", FlowTargets: []orchestratorapi.BypassFlowTarget{{DstIP: "192.0.2.10", DstPort: 443, Protocol: "tcp"}}}
 	now := time.Now().UTC()
-	failing := []orchestratorapi.BypassFlowStats{{Group: "grp-a", DstIP: "192.0.2.10", DstPort: 443, Protocol: "tcp", Attempts: 5, Syn: 5, RST: 5}}
+	first := []orchestratorapi.BypassFlowStats{{Group: "grp-a", DstIP: "192.0.2.10", DstPort: 443, Protocol: "tcp", Attempts: 5, Syn: 5, RST: 5}}
+	second := []orchestratorapi.BypassFlowStats{{Group: "grp-a", DstIP: "192.0.2.10", DstPort: 443, Protocol: "tcp", Attempts: 10, Syn: 10, RST: 10}}
 	state.observeFlow(now, nil, 10*time.Second)
-	state.observeFlow(now.Add(2*time.Second), failing, 10*time.Second)
-	if state.windowAttempts != 5 || state.windowSuccess != 0 || state.windowRST != 5 {
-		t.Fatalf("window = attempts %d success %d rst %d", state.windowAttempts, state.windowSuccess, state.windowRST)
+	state.observeFlow(now.Add(2*time.Second), first, 10*time.Second)
+	state.observeFlow(now.Add(11*time.Second), second, 10*time.Second)
+	if state.windowAttempts != 10 || state.windowSuccess != 0 || state.windowRST != 10 || !state.windowReady {
+		t.Fatalf("window = attempts %d success %d rst %d ready %t", state.windowAttempts, state.windowSuccess, state.windowRST, state.windowReady)
 	}
 	if health := groupHealth(state, config, true); health != "faulty" {
 		t.Fatalf("health = %q, want faulty", health)
