@@ -825,6 +825,17 @@ VLIB_NODE_FN (ly_orch_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
             worker->bypass_packets++;
           bypassed++;
         }
+      else if (!drop && ingress.group_index != LY_ORCH_INVALID_INDEX &&
+               ly_orch_group_bypassed (ingress.group_index))
+        {
+          /* The traffic's own policy group is bypassed: this group forwards
+           * like a transparent port pair, every other group keeps enforcing
+           * its policy. */
+          path_count = 0;
+          if (worker)
+            worker->group_bypass_packets[ingress.group_index]++;
+          group_bypassed++;
+        }
       else if (!drop && tuple.valid)
         path_count = ly_orch_build_path (config, &tuple, path, worker,
                                          packet_bytes, &drop, &group_bypass);
