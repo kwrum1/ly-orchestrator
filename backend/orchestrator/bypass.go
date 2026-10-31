@@ -1,4 +1,4 @@
-package main
+package orchestrator
 
 import (
 	"context"
@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"ly-route/backend/internal/orchestrator"
+	orchdomain "ly-route/backend/internal/orchestrator"
 	"ly-route/backend/internal/orchestratorapi"
 )
 
@@ -48,7 +48,7 @@ type bypassPersistedState struct {
 type bypassController struct {
 	mu         sync.Mutex
 	runtime    *productionOrchestratorRuntime
-	repository *orchestrator.Repository
+	repository *orchdomain.Repository
 	statePath  string
 	sysfsRoot  string
 	now        func() time.Time
@@ -72,7 +72,7 @@ type bypassController struct {
 	started bool
 }
 
-func newBypassController(runtime *productionOrchestratorRuntime, repository *orchestrator.Repository, statePath, sysfsRoot, tcpTargets, icmpTargets, interfaces string) *bypassController {
+func newBypassController(runtime *productionOrchestratorRuntime, repository *orchdomain.Repository, statePath, sysfsRoot, tcpTargets, icmpTargets, interfaces string) *bypassController {
 	controller := &bypassController{
 		runtime:    runtime,
 		repository: repository,
@@ -505,7 +505,7 @@ func (controller *bypassController) collectProbes(ctx context.Context, config or
 	return probes
 }
 
-func topologyProbeInterfaces(view orchestrator.TopologyView) []string {
+func topologyProbeInterfaces(view orchdomain.TopologyView) []string {
 	result := []string{}
 	for _, item := range view.Interfaces {
 		if item.Bond != nil {
