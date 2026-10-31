@@ -939,9 +939,13 @@ func (controller *bypassController) probeGroups(ctx context.Context, config orch
 	}
 
 	for _, group := range config.Groups {
-		interfaces := append([]string(nil), group.Interfaces...)
-		if len(interfaces) == 0 && topologyInterfaces != nil {
-			interfaces = append(interfaces, topologyInterfaces[group.Name]...)
+		interfaceBypass := group.InterfaceBypass == nil || *group.InterfaceBypass
+		interfaces := []string(nil)
+		if interfaceBypass {
+			interfaces = append(interfaces, group.Interfaces...)
+			if len(interfaces) == 0 && topologyInterfaces != nil {
+				interfaces = append(interfaces, topologyInterfaces[group.Name]...)
+			}
 		}
 		probes := make([]orchestratorapi.BypassProbe, 0, len(interfaces)+len(group.TCPTargets))
 		interfaceFailed := false

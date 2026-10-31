@@ -118,6 +118,10 @@ The control plane reads the plugin's cumulative counters every
 ```
 
 * `interfaces` is optional; when empty the group's topology ports are used.
+* `interface_bypass` (optional, default `true`) keeps the link-down detector
+  for the group. Set it to `false` to run only the business (passive/active)
+  probes; the console exposes the two switches independently in the
+  orchestration-group dialog.
 * `tcp_targets` is optional and active. A host-side TCP connect needs a
   reachable source address/route. When `source` cannot be bound the probe is
   **inconclusive** (not a failure), because data-plane group ports are not host

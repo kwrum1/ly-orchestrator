@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"ly-route/backend/internal/product"
 	serviceRuntime "ly-route/backend/internal/runtime/service"
 )
 
@@ -17,8 +18,28 @@ func (server *Server) captureRunningServices(ctx context.Context) map[serviceRun
 	if !server.serviceRuntimeConfigured() {
 		return baseline
 	}
+	// Probe only the daemons this product ships: the orchestrator has no
+	// smartdns/dnsmasq/xray/pppoe units, and asking systemctl about them adds
+	// noise (and, on a TCG host, seconds) to every dataplane transition.
+	services := make([]serviceRuntime.ServiceName, 0, 4)
+	for _, service := range []struct {
+		productService product.Service
+		runtimeService serviceRuntime.ServiceName
+	}{
+		{product.ServiceSmartDNS, serviceRuntime.SmartDNS},
+		{product.ServiceDnsmasq, serviceRuntime.Dnsmasq},
+		{product.ServiceXray, serviceRuntime.Xray},
+		{product.ServicePPPoE, serviceRuntime.PPPoE},
+	} {
+		if server.profile.AllowsService(service.productService) {
+			services = append(services, service.runtimeService)
+		}
+	}
+	if len(services) == 0 {
+		return baseline
+	}
 	server.services.InvalidateHealth()
-	health, err := server.services.HealthCheck(ctx, serviceRuntime.SmartDNS, serviceRuntime.Dnsmasq, serviceRuntime.Xray, serviceRuntime.PPPoE)
+	health, err := server.services.HealthCheck(ctx, services...)
 	if err != nil {
 		return baseline
 	}

@@ -24,10 +24,20 @@ type orchestratorTelemetryRuntime struct {
 	source     orchestratortelemetry.Source
 	clock      orchestratortelemetry.Clock
 
-	mu        sync.Mutex
-	checksum  string
-	collector *orchestratortelemetry.Collector
+	mu             sync.Mutex
+	checksum       string
+	collector      *orchestratortelemetry.Collector
+	cachedSnapshot orchestratortelemetry.Snapshot
+	cachedAt       time.Time
+	cachedChecksum string
+	cached         bool
 }
+
+// orchestratorTelemetryCacheTTL collapses the dashboard/trend/online-users
+// polls that arrive together into one VPP observation. Each observation forks
+// three vppctl commands; without the cache a single page load could run a
+// dozen of them and a single transient failure painted every panel degraded.
+const orchestratorTelemetryCacheTTL = 2500 * time.Millisecond
 
 func newOrchestratorTelemetryRuntime(repository orchestratorTopologySnapshot, binary string, now func() time.Time) *orchestratorTelemetryRuntime {
 	if now == nil {
@@ -47,11 +57,23 @@ func (runtime *orchestratorTelemetryRuntime) Collect(ctx context.Context) orches
 	if err != nil {
 		return unavailableOrchestratorTelemetry(time.Now().UTC(), "orchestrator topology is unavailable")
 	}
+	now := time.Now().UTC()
+	if runtime.clock != nil {
+		now = runtime.clock.Now().UTC()
+	}
+	if runtime.cached && runtime.cachedChecksum == checksum && now.Sub(runtime.cachedAt) < orchestratorTelemetryCacheTTL {
+		return runtime.cachedSnapshot
+	}
 	if runtime.collector == nil || runtime.checksum != checksum {
 		runtime.collector = orchestratortelemetry.NewCollector(topology, runtime.source, runtime.clock)
 		runtime.checksum = checksum
 	}
-	return runtime.collector.Collect(ctx)
+	snapshot := runtime.collector.Collect(ctx)
+	runtime.cachedSnapshot = snapshot
+	runtime.cachedChecksum = checksum
+	runtime.cachedAt = now
+	runtime.cached = true
+	return snapshot
 }
 
 type vppctlTelemetryCommand func(context.Context, string, ...string) (string, error)

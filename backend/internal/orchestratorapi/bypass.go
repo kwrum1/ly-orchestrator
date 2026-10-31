@@ -44,6 +44,10 @@ type BypassGroupConfig struct {
 	Name string `json:"name"`
 	// Interfaces replaces the topology-derived group-port set when non-empty.
 	Interfaces []string `json:"interfaces,omitempty"`
+	// InterfaceBypass controls the link-down detector for this group.  It is
+	// optional and defaults to true so existing configurations keep their
+	// behaviour; false leaves only the passive/active business probes active.
+	InterfaceBypass *bool `json:"interface_bypass,omitempty"`
 	// TCPTargets are optional active TCP connect probes.
 	TCPTargets []BypassTCPTarget `json:"tcp_targets,omitempty"`
 	// FlowTargets are the passive request/response tuples observed in the

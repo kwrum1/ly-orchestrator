@@ -33,6 +33,9 @@ type Role string
 const (
 	RoleLAN Role = "lan"
 	RoleWAN Role = "wan"
+	// RoleMirror marks the single port that receives mirrored traffic. It is
+	// console metadata; the interface mirror document carries the SPAN state.
+	RoleMirror Role = "mirror"
 )
 
 type Direction string

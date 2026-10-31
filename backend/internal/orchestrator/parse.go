@@ -55,7 +55,7 @@ func parsePortRoles(input map[string]Role) (map[InterfaceName]Role, error) {
 		if err != nil {
 			return nil, fmt.Errorf("port role: %w", err)
 		}
-		if role != RoleLAN && role != RoleWAN {
+		if role != RoleLAN && role != RoleWAN && role != RoleMirror {
 			return nil, fmt.Errorf("%w: %q has %q", ErrInvalidPortRole, name, role)
 		}
 		roles[name] = role

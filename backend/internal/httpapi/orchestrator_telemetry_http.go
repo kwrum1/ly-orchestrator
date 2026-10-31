@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"math"
+	"strings"
 
 	controlapi "ly-route/backend/internal/api"
 	orchestratortelemetry "ly-route/backend/internal/orchestrator/telemetry"
@@ -49,9 +50,17 @@ func (server *Server) orchestratorTelemetryPayload(ctx context.Context, kind, ru
 			policyHits += item.Hits
 		}
 		throughput := snapshot.Totals.WAN.WANToLAN.BytesPerSecond + snapshot.Totals.WAN.LANToWAN.BytesPerSecond
+		// A runtime that is momentarily applying/recovering is normal after a
+		// save; it is reported through runtime_state, not as degraded
+		// telemetry. Only a real collection failure is degraded.
+		degraded := !available
+		reason := ""
+		if degraded {
+			reason = orchestratorTelemetryDegradedReason(snapshot.Components.Interfaces, snapshot.Status, runtimeState)
+		}
 		return map[string]any{
 			"device_mode": "orchestrator", "runtime_state": runtimeState, "active_path": "vpp",
-			"degraded": !available || runtimeState != "running", "degraded_reason": snapshot.Status.Reason,
+			"degraded": degraded, "degraded_reason": reason,
 			"components": components, "last_apply": lastApply, "telemetry_status": snapshot.Status,
 			"sessions": len(snapshot.TopConnections), "online_users": len(snapshot.OnlineUsers),
 			"throughput_bps": throughput * 8, "policy_hits": policyHits,
@@ -78,7 +87,12 @@ func (server *Server) orchestratorTrafficTrend(ctx context.Context, query Traffi
 	}
 	snapshot := server.orchestratorTelemetry.Collect(ctx)
 	interfaceStatus := snapshot.Components.Interfaces
-	result := TrafficTrendResult{Window: query.Window, Points: query.Points, SamplingIntervalSeconds: 300, State: string(interfaceStatus.State), Degraded: interfaceStatus.State != orchestratortelemetry.StateAvailable, DegradedReason: interfaceStatus.Reason}
+	degraded := interfaceStatus.State != orchestratortelemetry.StateAvailable
+	reason := ""
+	if degraded {
+		reason = orchestratorTelemetryDegradedReason(interfaceStatus, snapshot.Status, "")
+	}
+	result := TrafficTrendResult{Window: query.Window, Points: query.Points, SamplingIntervalSeconds: 300, State: string(interfaceStatus.State), Degraded: degraded, DegradedReason: reason}
 	seriesByName := make(map[string]*LogicalEgressSeries, len(snapshot.Groups))
 	result.Series.LogicalEgresses = make([]LogicalEgressSeries, 0, len(snapshot.Groups))
 	for _, group := range snapshot.Groups {
@@ -135,4 +149,23 @@ func boundedInt64(value uint64) int64 {
 		return math.MaxInt64
 	}
 	return int64(value)
+}
+
+// orchestratorTelemetryDegradedReason names the real cause instead of leaving
+// the console with its generic "部分流量数据暂不可用" sentence.
+func orchestratorTelemetryDegradedReason(interfaces orchestratortelemetry.ComponentStatus, status orchestratortelemetry.Status, runtimeState string) string {
+	if reason := strings.TrimSpace(interfaces.Reason); reason != "" {
+		return reason
+	}
+	state := strings.TrimSpace(runtimeState)
+	if state != "" && state != "running" {
+		return "运行时状态：" + state + "（配置下发中，采集稍后恢复）"
+	}
+	if reason := strings.TrimSpace(status.Reason); reason != "" {
+		return reason
+	}
+	if interfaces.State != "" && interfaces.State != orchestratortelemetry.StateAvailable {
+		return "VPP 接口采集暂不可用（" + string(interfaces.State) + "）"
+	}
+	return "VPP 接口采集暂不可用"
 }

@@ -3238,6 +3238,18 @@ func (server *Server) compileInterfaceBond(ctx context.Context, payload map[stri
 			return nil, http.StatusBadRequest, fmt.Errorf("interface bond members must have the same work_mode")
 		}
 	}
+	for _, item := range selected {
+		mode := stringField(item, "takeover_mode")
+		if mode == "" {
+			mode = stringField(item, "work_mode")
+		}
+		// Only a port that is already taken over in compatibility mode is a
+		// hard stop. An unclaimed port is validated by the takeover plan when
+		// it is attached, and unit/CLI callers may create the bond first.
+		if stringField(item, "takeover_state") == "taken_over" && (stringField(item, "takeover_class") == "compatibility" || mode == "af_packet") {
+			return nil, http.StatusConflict, fmt.Errorf("interface bond member %q 正在兼容模式（af_packet）下接管，聚合口无法证明数据面能力；请先把该网卡切到高性能接管，再创建聚合", stringField(item, "id"))
+		}
+	}
 	return map[string]any{"id": id, "name": nonEmpty(stringField(payload, "name"), id), "members": members, "mode": "xor", "load_balance": "l34", "speed": speed, "work_mode": workMode, "runtime_state": "desired_not_applied", "vpp_operation": map[string]any{"name": "vpp.interface-bond", "mode": "xor", "load_balance": "l34", "members": members}, "capabilities": server.degradedRuntimeCapabilities(ctx)}, http.StatusOK, nil
 }
 
@@ -4095,6 +4107,14 @@ func (server *Server) handleDesiredDelete(w http.ResponseWriter, r *http.Request
 		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "local store is not configured")
 		return
 	}
+	if resourceType == "interface_bond" {
+		if references := server.interfaceBondReferences(r.Context(), id); len(references) > 0 {
+			message := fmt.Sprintf("接口聚合 %s 仍被 %s 使用；请先更换入口/出口或清除端口角色，再删除聚合组", id, strings.Join(references, "、"))
+			server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "denied", message, r)
+			writeError(w, r, http.StatusConflict, "interface_bond_in_use", message)
+			return
+		}
+	}
 	if resourceType == "interface" {
 		if canonical := server.canonicalInterfaceReference(r.Context(), id); isProductInterfaceID(canonical) {
 			id = canonical
@@ -4183,9 +4203,76 @@ func (server *Server) handleDesiredDelete(w http.ResponseWriter, r *http.Request
 		writeError(w, r, http.StatusInternalServerError, "desired_state_delete_failed", "desired state could not be deleted")
 		return
 	}
+	if resourceType == "interface_bond" {
+		server.deleteBondInterfaceDocuments(r.Context(), id)
+	}
 	server.recordAudit(session.Username, session.Role, r.URL.Path, "delete", "success", "", r)
 	server.bumpConfigGraphGeneration(r.Context(), "delete", resourceType, id, "")
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id, "runtime_state": "desired_not_applied", "request_id": requestID(r)})
+}
+
+// interfaceBondReferences reports the console objects that still use a bond.
+// Deleting the bond underneath them would leave the topology pointing at an
+// interface that no longer exists.
+func (server *Server) interfaceBondReferences(ctx context.Context, id string) []string {
+	references := make([]string, 0, 2)
+	if server.orchestratorRepository == nil {
+		return references
+	}
+	topology, _, err := server.orchestratorRepository.Snapshot(ctx)
+	if err != nil {
+		return references
+	}
+	view := topology.View()
+	for _, item := range view.Interfaces {
+		if item.Bond != nil && strings.EqualFold(item.Bond.Name, id) {
+			references = append(references, fmt.Sprintf("%s 逻辑接口", item.Role))
+		}
+	}
+	for _, group := range view.Groups {
+		for _, port := range group.Ports {
+			if port.Bond != nil && strings.EqualFold(port.Bond.Name, id) {
+				references = append(references, fmt.Sprintf("编排组 %s", group.Name))
+			}
+		}
+	}
+	if _, ok := view.PortRoles[id]; ok {
+		references = append(references, "端口角色标记")
+	}
+	return references
+}
+
+// deleteBondInterfaceDocuments removes desired interface documents that point
+// at a bond which no longer exists. They are the residue that used to keep the
+// dataplane locked after a bond was deleted, with no console entry to clear it.
+func (server *Server) deleteBondInterfaceDocuments(ctx context.Context, id string) {
+	items, err := server.desiredItems(ctx, "interface")
+	if err != nil {
+		return
+	}
+	for _, item := range items {
+		if truthy(item["deleted"]) {
+			continue
+		}
+		docID := firstNonEmpty(stringField(item, "id"), stringField(item, "interface_id"), stringField(item, "name"))
+		if docID == "" {
+			continue
+		}
+		matches := strings.EqualFold(docID, id)
+		for _, field := range []string{"bond", "bond_id", "member_of", "lag"} {
+			value := strings.TrimSpace(stringField(item, field))
+			if value != "" && strings.EqualFold(value, id) {
+				matches = true
+			}
+		}
+		if !matches {
+			continue
+		}
+		for _, alias := range server.interfaceDocumentAliases(ctx, docID) {
+			_ = server.store.DeleteConfig(ctx, "interface", alias)
+		}
+		_ = server.store.DeleteConfig(ctx, "interface", docID)
+	}
 }
 
 func (server *Server) objectGroupReferences(ctx context.Context, id string) ([]map[string]any, error) {
@@ -6612,11 +6699,20 @@ func (server *Server) degradedRuntimeCapabilities(ctx context.Context) []control
 		name              string
 		unavailableReason string
 	}
-	entries := []capabilityService{
+	all := []capabilityService{
 		{serviceRuntime.VPP, "vpp_runtime_apply", "VPP apply runtime is not configured"},
 		{serviceRuntime.SmartDNS, "smartdns_runtime_apply", "SmartDNS service runtime is not configured"},
 		{serviceRuntime.Dnsmasq, "dnsmasq_runtime_apply", "Dnsmasq service runtime is not configured"},
 		{serviceRuntime.Xray, "xray_runtime_apply", "xray service runtime is not configured"},
+	}
+	// Never advertise (or probe) a daemon the active product does not ship.
+	// The orchestrator appliance has no smartdns/dnsmasq/xray units.
+	entries := make([]capabilityService, 0, len(all))
+	for _, entry := range all {
+		if productService, ok := productServiceForRuntime(entry.service); ok && !server.profile.AllowsService(productService) {
+			continue
+		}
+		entries = append(entries, entry)
 	}
 	results := make([]controlapi.CapabilityState, 0, len(entries))
 	if !server.serviceRuntimeConfigured() {
@@ -6628,6 +6724,9 @@ func (server *Server) degradedRuntimeCapabilities(ctx context.Context) []control
 	services := make([]serviceRuntime.ServiceName, 0, len(entries))
 	for _, entry := range entries {
 		services = append(services, entry.service)
+	}
+	if len(services) == 0 {
+		return results
 	}
 	health, err := server.services.HealthCheck(ctx, services...)
 	byService := make(map[serviceRuntime.ServiceName]serviceRuntime.Health, len(health))
@@ -6651,6 +6750,24 @@ func (server *Server) degradedRuntimeCapabilities(ctx context.Context) []control
 		results = append(results, controlapi.CapabilityState{Name: entry.name, Available: true, State: controlapi.CapabilityAvailable})
 	}
 	return results
+}
+
+// productServiceForRuntime maps a runtime service name to the product service
+// it belongs to, so profile gating can skip units a product does not ship.
+func productServiceForRuntime(name serviceRuntime.ServiceName) (product.Service, bool) {
+	switch name {
+	case serviceRuntime.VPP:
+		return product.ServiceVPP, true
+	case serviceRuntime.SmartDNS:
+		return product.ServiceSmartDNS, true
+	case serviceRuntime.Dnsmasq:
+		return product.ServiceDnsmasq, true
+	case serviceRuntime.Xray:
+		return product.ServiceXray, true
+	case serviceRuntime.PPPoE:
+		return product.ServicePPPoE, true
+	}
+	return "", false
 }
 
 func nonEmpty(value, fallback string) string {
@@ -10778,8 +10895,22 @@ func (server *Server) runtimeStatusComponentsForResult(ctx context.Context, arti
 	components := []RuntimeComponentState{}
 	healthByService := map[serviceRuntime.ServiceName]serviceRuntime.Health{}
 	var healthErr error
-	if server.serviceRuntimeConfigured() {
-		health, err := server.services.HealthCheck(ctx, serviceRuntime.SmartDNS, serviceRuntime.Dnsmasq, serviceRuntime.Xray, serviceRuntime.PPPoE)
+	services := make([]serviceRuntime.ServiceName, 0, 4)
+	for _, service := range []struct {
+		productService product.Service
+		runtimeService serviceRuntime.ServiceName
+	}{
+		{productService: product.ServiceSmartDNS, runtimeService: serviceRuntime.SmartDNS},
+		{productService: product.ServiceDnsmasq, runtimeService: serviceRuntime.Dnsmasq},
+		{productService: product.ServiceXray, runtimeService: serviceRuntime.Xray},
+		{productService: product.ServicePPPoE, runtimeService: serviceRuntime.PPPoE},
+	} {
+		if server.profile.AllowsService(service.productService) {
+			services = append(services, service.runtimeService)
+		}
+	}
+	if server.serviceRuntimeConfigured() && len(services) > 0 {
+		health, err := server.services.HealthCheck(ctx, services...)
 		healthErr = err
 		for _, item := range health {
 			healthByService[item.Service] = item

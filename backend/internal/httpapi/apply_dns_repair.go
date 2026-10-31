@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"ly-route/backend/internal/product"
 	"ly-route/backend/internal/runtime/vpp"
 )
 
@@ -18,9 +19,16 @@ import (
 // only prevents a burst of applies from forking it repeatedly.
 const dnsRepairInterval = 5 * time.Second
 
+const dnsRepairUnit = "ly-route-dns-vpp-datapath.service"
+
 var (
 	dnsRepairMu   sync.Mutex
 	dnsRepairLast time.Time
+
+	dnsRepairUnitMu      sync.Mutex
+	dnsRepairUnitChecked bool
+	dnsRepairUnitAt      time.Time
+	dnsRepairUnitLoaded  bool
 )
 
 func dnsRepairEnabled() bool {
@@ -34,12 +42,36 @@ func dnsRepairEnabled() bool {
 	return err == nil
 }
 
+// dnsRepairUnitPresent reports whether the heal unit is installed on this
+// appliance. The orchestrator product does not ship it, and blindly starting a
+// missing unit made every apply log "exit status 5" every few seconds. The
+// answer is cached: package installs are rare and a slow `systemctl show` must
+// not run on every apply.
+func dnsRepairUnitPresent() bool {
+	dnsRepairUnitMu.Lock()
+	defer dnsRepairUnitMu.Unlock()
+	now := time.Now()
+	if dnsRepairUnitChecked && now.Sub(dnsRepairUnitAt) < 5*time.Minute {
+		return dnsRepairUnitLoaded
+	}
+	out, err := exec.Command("systemctl", "show", "-p", "LoadState", "--value", dnsRepairUnit).Output()
+	dnsRepairUnitLoaded = err == nil && strings.TrimSpace(string(out)) == "loaded"
+	dnsRepairUnitChecked = true
+	dnsRepairUnitAt = now
+	return dnsRepairUnitLoaded
+}
+
 // requestDNSPostApplyRepair runs the DNS data-path heal after a committed
 // apply. The heal re-attaches interception, rebuilds the diagnostics probe TAP
 // and repoints the session rules at the live adapter index, which a fresh
 // apply can invalidate.
 func (server *Server) requestDNSPostApplyRepair() {
-	if !dnsRepairEnabled() {
+	// The heal is a gateway-only unit; the orchestrator has no interception
+	// adapters to re-register.
+	if server.profile.ID() != product.Gateway().ID() {
+		return
+	}
+	if !dnsRepairEnabled() || !dnsRepairUnitPresent() {
 		return
 	}
 	now := time.Now()
@@ -51,7 +83,7 @@ func (server *Server) requestDNSPostApplyRepair() {
 	dnsRepairLast = now
 	dnsRepairMu.Unlock()
 
-	cmd := exec.Command("systemctl", "start", "--no-block", "ly-route-dns-vpp-datapath.service")
+	cmd := exec.Command("systemctl", "start", "--no-block", dnsRepairUnit)
 	if err := cmd.Start(); err != nil {
 		log.Printf("runtime apply: could not start the DNS data-path heal: %v", err)
 		return

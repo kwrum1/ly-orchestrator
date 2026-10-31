@@ -115,7 +115,11 @@ restore_files() {
   fi
   timeout 30 systemctl daemon-reload || true
   timeout 30 systemctl restart ly-route-control-api.service || true
-  timeout 30 systemctl reload nginx.service || timeout 30 systemctl restart nginx.service || true
+  # nginx is the gateway edge; the orchestrator ships pingora. Only touch it
+  # when the unit actually exists on this appliance.
+  if systemctl cat nginx.service >/dev/null 2>&1; then
+    timeout 30 systemctl reload nginx.service || timeout 30 systemctl restart nginx.service || true
+  fi
 }
 
 health_check() {
@@ -225,7 +229,9 @@ if ! timeout 30 systemctl restart ly-route-control-api.service; then
   restore_files
   fail "control API restart failed"
 fi
-timeout 30 systemctl reload nginx.service || timeout 30 systemctl restart nginx.service || true
+if systemctl cat nginx.service >/dev/null 2>&1; then
+  timeout 30 systemctl reload nginx.service || timeout 30 systemctl restart nginx.service || true
+fi
 if ! health_check; then
   restore_files
   fail "health check failed after install"
