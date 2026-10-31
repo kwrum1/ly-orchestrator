@@ -48,7 +48,7 @@ func (server *Server) orchestratorTransparentRuntimeComponents(ctx context.Conte
 		ReconciliationReceipt: apply.ReconciliationReceipt{TransactionID: evidence.TransactionID, Capability: "runtime.reconciliation", Status: apply.ReceiptApplied, Cause: "live transparent VPP generation verified", Timestamp: evidence.ObservedAt},
 	}
 	components := []RuntimeComponentState{
-		{Name: "vpp", State: "running", Available: true, Reason: "transparent VPP generation " + evidence.Generation + " verified"},
+		{Name: "vpp", State: "running", Available: true, Reason: transparentRuntimeReason(evidence)},
 		{Name: "persistence", State: "running", Available: server.store != nil, Reason: persistenceRuntimeReason(server.store != nil)},
 	}
 	// Persist the inventory with the receipt so every consumer (status,
@@ -105,6 +105,25 @@ func (server *Server) orchestratorRuntimeCapability(ctx context.Context) *contro
 		return &controlapi.CapabilityState{Name: "orchestrator_runtime", Available: false, State: controlapi.CapabilityDegraded, Reason: serviceRuntime.Redact("transparent orchestrator state is " + evidence.State)}
 	}
 	return &controlapi.CapabilityState{Name: "orchestrator_runtime", Available: true, State: controlapi.CapabilityAvailable}
+}
+
+// transparentRuntimeReason names the committed generation, the default action
+// the plugin enforces and how often the reconciler had to repair a drift, so
+// /runtime/status shows configuration vs data-plane identity without a manual
+// vppctl session.
+func transparentRuntimeReason(evidence orchestratorapi.TransparentRuntimeEvidence) string {
+	policydigest := evidence.PolicyGeneration
+	if len(policydigest) > 12 {
+		policydigest = policydigest[:12]
+	}
+	reason := fmt.Sprintf("transparent VPP generation %s verified (default %s, policy %s, repairs %d)", evidence.Generation, nonEmpty(evidence.ObservedDefault, "unknown"), nonEmpty(policydigest, "unknown"), evidence.Repairs)
+	if evidence.ReconcileFailures > 0 {
+		reason += fmt.Sprintf(", reconcile failures %d", evidence.ReconcileFailures)
+	}
+	if strings.TrimSpace(evidence.LastDriftReason) != "" {
+		reason += "; last drift: " + evidence.LastDriftReason
+	}
+	return reason
 }
 
 func persistenceRuntimeReason(available bool) string {

@@ -218,14 +218,26 @@ type productionOrchestratorRuntime struct {
 	transparentAppliedAt      time.Time
 	journalPath               string
 	transparentJournalPending bool
-	dpdkMu                    sync.Mutex
-	dpdkActive                map[string]vpp.NativePath
-	tracker                   *orchestrator.HealthTracker
-	probe                     orchestrator.HealthProbe
-	capabilityReport          string
-	managementInterface       string
-	linuxInterface            func(context.Context, string) string
-	proofCommand              string
+	// Data-plane readback state used by health/status evidence and by the
+	// periodic reconcile.  It records what the plugin actually committed and
+	// what the persisted configuration asked for, so a mismatch can be named
+	// (config hash vs VPP generation/default) instead of only logged.
+	transparentObservedGeneration string
+	transparentObservedDefault    string
+	transparentConfiguredDefault  string
+	reconcileRepairs              int
+	reconcileFailures             int
+	lastDriftReason               string
+	lastReconcileAt               time.Time
+	driftDetected                 bool
+	dpdkMu                        sync.Mutex
+	dpdkActive                    map[string]vpp.NativePath
+	tracker                       *orchestrator.HealthTracker
+	probe                         orchestrator.HealthProbe
+	capabilityReport              string
+	managementInterface           string
+	linuxInterface                func(context.Context, string) string
+	proofCommand                  string
 }
 
 func (runtime *productionOrchestratorRuntime) ApplyTransparent(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) error {
@@ -255,15 +267,10 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 		view := policy.View()
 		policyView = &view
 	}
-	payload, err := json.Marshal(struct {
-		Topology orchestrator.TopologyView `json:"topology"`
-		Policy   *orchestrator.PolicyView  `json:"policy,omitempty"`
-	}{Topology: topologyView, Policy: policyView})
+	generation, err := transparentGeneration(topologyView, policyView)
 	if err != nil {
-		return fmt.Errorf("encode transparent orchestrator generation: %w", err)
+		return err
 	}
-	digest := sha256.Sum256(payload)
-	generation := hex.EncodeToString(digest[:])
 	if err := runtime.beginTransparentTransaction(requestID, "apply", generation, previousBonds, desiredBonds); err != nil {
 		runtime.releaseDPDK(ctx, requestID, err)
 		return err
@@ -274,7 +281,7 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 			return err
 		}
 	}
-	_, err = runtime.adapter.ApplyTransparentOrchestrator(ctx, requestID, vpp.TransparentOrchestratorConfig{Generation: generation, Topology: topologyView, Policy: policyView})
+	readback, err := runtime.adapter.ApplyTransparentOrchestrator(ctx, requestID, vpp.TransparentOrchestratorConfig{Generation: generation, Topology: topologyView, Policy: policyView})
 	if err != nil {
 		var rollbackErr error
 		if len(previousBonds) > 0 || len(desiredBonds) > 0 {
@@ -293,17 +300,43 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 	runtime.transparentRequest = requestID
 	runtime.transparentGeneration = generation
 	runtime.transparentAppliedAt = time.Now().UTC()
+	runtime.transparentConfiguredDefault = transparentDefaultAction(policyView)
+	runtime.transparentObservedGeneration = readback.Generation
+	runtime.transparentObservedDefault = readback.Default
+	runtime.lastReconcileAt = runtime.transparentAppliedAt
 	return nil
 }
 
+// transparentGeneration is the single source of truth for the VPP generation
+// of a topology/policy pair.  Apply and reconcile must compute it identically,
+// otherwise a readback comparison would report drift for an unchanged config.
+func transparentGeneration(topologyView orchestrator.TopologyView, policyView *orchestrator.PolicyView) (string, error) {
+	payload, err := json.Marshal(struct {
+		Topology orchestrator.TopologyView `json:"topology"`
+		Policy   *orchestrator.PolicyView  `json:"policy,omitempty"`
+	}{Topology: topologyView, Policy: policyView})
+	if err != nil {
+		return "", fmt.Errorf("encode transparent orchestrator generation: %w", err)
+	}
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func transparentDefaultAction(policyView *orchestrator.PolicyView) string {
+	if policyView == nil || strings.TrimSpace(string(policyView.Default.Kind)) == "" {
+		return string(orchestrator.ActionDirect)
+	}
+	return string(policyView.Default.Kind)
+}
+
 // RecoverTransparent restores the persisted topology/policy when VPP restarts
-// and reloads the plugin in the locked state.  It holds the transparent mutex
-// across the readback and replay so a user apply cannot interleave with the
-// recovery generation.  No topology means orchestration is intentionally
-// disabled, so recovery is a no-op.
+// and reloads the plugin in the locked state, or when the committed VPP
+// generation no longer matches the persisted configuration (for example after
+// two overlapping applies committed the older generation last).  It holds the
+// transparent mutex across the readback and replay so a user apply cannot
+// interleave with the recovery generation.  No topology means orchestration is
+// intentionally disabled, so recovery is a no-op.
 func (runtime *productionOrchestratorRuntime) RecoverTransparent(ctx context.Context, repository *orchestrator.Repository) error {
-	runtime.transparentMu.Lock()
-	defer runtime.transparentMu.Unlock()
 	topology, _, err := repository.Snapshot(ctx)
 	if errors.Is(err, orchestrator.ErrTopologyNotFound) {
 		return nil
@@ -320,24 +353,118 @@ func (runtime *productionOrchestratorRuntime) RecoverTransparent(ctx context.Con
 	default:
 		return fmt.Errorf("read orchestrator policy for recovery: %w", policyErr)
 	}
-	observed, observeErr := runtime.adapter.ObserveTransparentOrchestrator(ctx, "orchestrator-recovery")
-	if !transparentRecoveryRequired(observed, observeErr, runtime.transparentGeneration) {
+	return runtime.reconcileTransparent(ctx, "orchestrator-recovery", topology, policy, true)
+}
+
+// ReconcileTransparent compares the committed VPP generation and default
+// action with the configuration that was just persisted, and re-applies the
+// configuration when the readback disagrees.  Callers persist first and then
+// call this, so the data plane is verified against the durable desired state
+// rather than against whatever an earlier request happened to apply.
+func (runtime *productionOrchestratorRuntime) ReconcileTransparent(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) error {
+	return runtime.reconcileTransparent(ctx, requestID, topology, policy, false)
+}
+
+func (runtime *productionOrchestratorRuntime) reconcileTransparent(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy, skipWhileMutationPending bool) error {
+	runtime.transparentMu.Lock()
+	defer runtime.transparentMu.Unlock()
+	if skipWhileMutationPending && runtime.transparentJournalPending {
+		// A configuration mutation is between its VPP apply and its
+		// persistence. The periodic reconciler must not compare the durable
+		// (older) policy with that in-flight generation and undo it.
+		return nil
+	}
+	return runtime.reconcileTransparentLocked(ctx, requestID, topology, policy)
+}
+
+func (runtime *productionOrchestratorRuntime) reconcileTransparentLocked(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) error {
+	topologyView := runtime.resolveTopologyView(ctx, topology.View())
+	var policyView *orchestrator.PolicyView
+	if policy != nil {
+		view := policy.View()
+		policyView = &view
+	}
+	expected, err := transparentGeneration(topologyView, policyView)
+	if err != nil {
+		runtime.reconcileFailures++
+		return err
+	}
+	configuredDefault := transparentDefaultAction(policyView)
+	observed, observeErr := runtime.adapter.ObserveTransparentOrchestrator(ctx, requestID+"-observe")
+	runtime.lastReconcileAt = time.Now().UTC()
+	if observeErr == nil && transparentStateMatchesConfiguration(observed, expected, configuredDefault) {
+		runtime.markReconcileConsistent(requestID, expected, configuredDefault, observed)
 		if runtime.transparentJournalPending {
 			return runtime.clearTransparentTransactionLocked()
 		}
 		return nil
 	}
-	if err := runtime.applyTransparentLocked(ctx, "orchestrator-recovery", topology, policy); err != nil {
-		return err
+	reason := transparentDriftReason(expected, configuredDefault, observed, observeErr)
+	runtime.driftDetected = true
+	runtime.lastDriftReason = reason
+	runtime.reconcileRepairs++
+	log.Printf("transparent orchestrator policy drift detected: %s; re-applying configuration generation %s", reason, shortGeneration(expected))
+	if err := runtime.applyTransparentLocked(ctx, requestID, topology, policy); err != nil {
+		runtime.reconcileFailures++
+		if clearErr := runtime.clearTransparentTransactionLocked(); clearErr != nil {
+			log.Printf("clear failed reconcile transaction journal: %v", clearErr)
+		}
+		return fmt.Errorf("transparent orchestrator reconcile apply: %w", err)
 	}
+	verify, verifyErr := runtime.adapter.ObserveTransparentOrchestrator(ctx, requestID+"-verify")
+	if verifyErr != nil || !transparentStateMatchesConfiguration(verify, expected, configuredDefault) {
+		runtime.reconcileFailures++
+		reason = transparentDriftReason(expected, configuredDefault, verify, verifyErr)
+		runtime.lastDriftReason = reason
+		return fmt.Errorf("transparent orchestrator reconcile readback failed after re-apply: %s", reason)
+	}
+	runtime.markReconcileConsistent(requestID, expected, configuredDefault, verify)
 	return runtime.clearTransparentTransactionLocked()
 }
 
-func transparentRecoveryRequired(observed vpp.TransparentOrchestratorReadback, observeErr error, committedGeneration string) bool {
-	if observeErr != nil || strings.TrimSpace(committedGeneration) == "" {
-		return true
+func (runtime *productionOrchestratorRuntime) markReconcileConsistent(requestID, generation, configuredDefault string, observed vpp.TransparentOrchestratorReadback) {
+	repaired := runtime.driftDetected
+	runtime.transparentRequest = requestID
+	runtime.transparentGeneration = generation
+	runtime.transparentObservedGeneration = observed.Generation
+	runtime.transparentObservedDefault = observed.Default
+	runtime.transparentConfiguredDefault = configuredDefault
+	if runtime.transparentAppliedAt.IsZero() || repaired {
+		runtime.transparentAppliedAt = time.Now().UTC()
 	}
-	return observed.State != "running" || observed.Generation != committedGeneration
+	runtime.driftDetected = false
+}
+
+func transparentStateMatchesConfiguration(observed vpp.TransparentOrchestratorReadback, expectedGeneration, configuredDefault string) bool {
+	if observed.State != "running" || observed.Generation != expectedGeneration {
+		return false
+	}
+	if strings.TrimSpace(observed.Default) != "" && observed.Default != configuredDefault {
+		return false
+	}
+	return true
+}
+
+func transparentDriftReason(expectedGeneration, configuredDefault string, observed vpp.TransparentOrchestratorReadback, observeErr error) string {
+	observedDefault := strings.TrimSpace(observed.Default)
+	if observedDefault == "" {
+		observedDefault = "unknown"
+	}
+	if observeErr != nil {
+		return fmt.Sprintf("configured generation %s default %s, VPP readback failed: %v", shortGeneration(expectedGeneration), configuredDefault, observeErr)
+	}
+	return fmt.Sprintf("configured generation %s default %s, VPP state %s generation %s default %s", shortGeneration(expectedGeneration), configuredDefault, observed.State, shortGeneration(observed.Generation), observedDefault)
+}
+
+func shortGeneration(generation string) string {
+	generation = strings.TrimSpace(generation)
+	if len(generation) > 12 {
+		return generation[:12]
+	}
+	if generation == "" {
+		return "unknown"
+	}
+	return generation
 }
 
 func runTransparentRecovery(ctx context.Context, repository *orchestrator.Repository, runtime *productionOrchestratorRuntime, interval time.Duration) {
@@ -385,6 +512,9 @@ func (runtime *productionOrchestratorRuntime) DisableTransparent(ctx context.Con
 		runtime.transparentRequest = ""
 		runtime.transparentGeneration = ""
 		runtime.transparentAppliedAt = time.Time{}
+		runtime.transparentConfiguredDefault = ""
+		runtime.transparentObservedGeneration = ""
+		runtime.transparentObservedDefault = ""
 	}
 	runtime.releaseDPDK(ctx, requestID, err)
 	return err
@@ -512,13 +642,38 @@ func (runtime *productionOrchestratorRuntime) TransparentRuntimeEvidence(ctx con
 	if err != nil {
 		return orchestratorapi.TransparentRuntimeEvidence{}, err
 	}
+	evidence := orchestratorapi.TransparentRuntimeEvidence{
+		TransactionID:     runtime.transparentRequest,
+		Generation:        observed.Generation,
+		State:             observed.State,
+		AppliedAt:         runtime.transparentAppliedAt,
+		ObservedAt:        time.Now().UTC(),
+		PolicyGeneration:  runtime.transparentGeneration,
+		VPPGeneration:     observed.Generation,
+		ConfiguredDefault: runtime.transparentConfiguredDefault,
+		ObservedDefault:   observed.Default,
+		Repairs:           runtime.reconcileRepairs,
+		ReconcileFailures: runtime.reconcileFailures,
+		LastDriftReason:   runtime.lastDriftReason,
+		LastReconciledAt:  runtime.lastReconcileAt,
+	}
 	if observed.State != "running" {
-		return orchestratorapi.TransparentRuntimeEvidence{}, fmt.Errorf("transparent orchestrator state is %s", observed.State)
+		return orchestratorapi.TransparentRuntimeEvidence{}, fmt.Errorf("transparent orchestrator state is %s (configured generation %s default %s)", observed.State, shortGeneration(runtime.transparentGeneration), runtime.transparentConfiguredDefault)
 	}
 	if observed.Generation != runtime.transparentGeneration {
-		return orchestratorapi.TransparentRuntimeEvidence{}, fmt.Errorf("transparent orchestrator generation drift: observed %s, committed %s", observed.Generation, runtime.transparentGeneration)
+		return orchestratorapi.TransparentRuntimeEvidence{}, fmt.Errorf("transparent orchestrator policy drift: configured generation %s default %s, VPP generation %s default %s (repairs %d)", shortGeneration(runtime.transparentGeneration), runtime.transparentConfiguredDefault, shortGeneration(observed.Generation), nonEmpty(observed.Default, "unknown"), runtime.reconcileRepairs)
 	}
-	return orchestratorapi.TransparentRuntimeEvidence{TransactionID: runtime.transparentRequest, Generation: observed.Generation, State: observed.State, AppliedAt: runtime.transparentAppliedAt, ObservedAt: time.Now().UTC()}, nil
+	if strings.TrimSpace(observed.Default) != "" && observed.Default != runtime.transparentConfiguredDefault {
+		return orchestratorapi.TransparentRuntimeEvidence{}, fmt.Errorf("transparent orchestrator policy drift: configured default %s, VPP default %s generation %s (repairs %d)", runtime.transparentConfiguredDefault, observed.Default, shortGeneration(observed.Generation), runtime.reconcileRepairs)
+	}
+	return evidence, nil
+}
+
+func nonEmpty(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 type transparentStartupRuntime interface {
