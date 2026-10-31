@@ -9,8 +9,6 @@ import { OrchestratorGroupsPage } from "../../pages/orchestrator/GroupsPage";
 import { OrchestratorPolicyPage } from "../../pages/orchestrator/PolicyPage";
 import { OrchestratorTelemetryPage } from "../../pages/orchestrator/TelemetryPage";
 import { OrchestratorUpgradesPage } from "../../pages/orchestrator/UpgradesPage";
-import { OrchestratorConversionsPage } from "../../pages/orchestrator/ConversionsPage";
-import { RuntimePage } from "../../pages/RuntimePage";
 import { ConfigPage } from "../../pages/ConfigPage";
 import { UsersPage } from "../../pages/UsersPage";
 
@@ -35,10 +33,8 @@ export default function OrchestratorRoutes() {
         <Route path="groups" element={<OrchestratorGroupsPage />} />
         <Route path="policy" element={<OrchestratorPolicyPage />} />
         <Route path="telemetry" element={<OrchestratorTelemetryPage />} />
-        <Route path="runtime" element={<RuntimePage />} />
         <Route path="config" element={<ConfigPage />} />
         <Route path="upgrades" element={<OrchestratorUpgradesPage />} />
-        <Route path="conversions" element={<OrchestratorConversionsPage />} />
         <Route path="system/users" element={<UsersPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>

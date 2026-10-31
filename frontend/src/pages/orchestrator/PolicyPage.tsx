@@ -108,7 +108,7 @@ export function OrchestratorPolicyPage() {
   };
 
   const save = async () => {
-    if (!topology.data?.item) { toast("请先保存单机拓扑", "error"); return; }
+    if (!topology.data?.item) { toast("请先保存网卡设置", "error"); return; }
     if (draft.default.kind === "via" && !draft.default.group) { toast("默认动作 via 需要选择编排组", "error"); return; }
     for (const group of groups) {
       for (const rule of group.rules) {
@@ -233,7 +233,7 @@ export function OrchestratorPolicyPage() {
         actions={<><Button size="sm" variant="primary" icon={<Save size={14} />} loading={busy} onClick={save} disabled={readonly || !topology.data?.item}>保存策略</Button></>}
         meta={<><span className="meta-item">策略 checksum {text(policyQuery.data?.checksum, "未保存")}</span><span className="meta-item">拓扑 {topology.data?.item ? "已配置" : "未配置"}</span></>}
       />
-      {!topology.data?.item && <div className="inline-warning">策略保存依赖单机拓扑；请先在“单机拓扑”保存 LAN/WAN。</div>}
+      {!topology.data?.item && <div className="inline-warning">策略保存依赖网卡设置；请先在“网卡设置”保存 LAN/WAN。</div>}
 
       <Card title="默认动作" subtitle="未匹配任何策略组时的行为" actions={<Badge tone={actionTone(draft.default)}>{actionLabel(draft.default)}</Badge>}>
         <div className="form-grid">

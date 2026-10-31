@@ -106,7 +106,7 @@ export function OrchestratorTransparentPage() {
 
       {error && <div className="error-state"><strong>服务链操作失败</strong><p>{error}</p></div>}
       {result && <Card title="编译 / 应用结果" subtitle="后端返回的真实 path / chain"><pre className="json-preview">{JSON.stringify(result, null, 2)}</pre></Card>}
-      {!groups.length && <div className="inline-warning">当前没有编排组；服务链需要至少一个编排组。请先在“单机拓扑”配置。</div>}
+      {!groups.length && <div className="inline-warning">当前没有编排组；服务链需要至少一个编排组。请先在“网卡设置”配置。</div>}
 
       <div className="inline-warning"><Workflow size={14} /> 透明编排是单机本地 L3 服务链，不是多站点控制器；服务链 apply 依赖运行时，未配置时会返回明确错误，不会伪造成功。</div>
     </div>

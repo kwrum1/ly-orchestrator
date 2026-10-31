@@ -403,7 +403,7 @@ export function deviceStatusSummary(input: {
       tone: "warning",
       label: "部分成功",
       sidebarLabel: "部分应用",
-      reason: "配置已应用，但存在降级步骤，请到系统状态查看降级原因",
+      reason: "配置已应用，但存在降级步骤，请到系统配置查看降级原因",
     };
   }
   const committed = status === "committed" || status === "applied";

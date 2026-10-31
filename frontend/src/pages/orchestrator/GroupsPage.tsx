@@ -170,7 +170,7 @@ export function OrchestratorGroupsPage() {
         subtitle="每组两个方向端口；策略 via 动作按组进入服务链"
         actions={<><Button size="sm" variant="primary" icon={<Plus size={14} />} onClick={() => openEditor()} disabled={session?.role === "readonly" || !topology.data?.item}>新增编排组</Button></>}
       />
-      {!topology.data?.item && <div className="inline-warning">请先在“单机拓扑”中配置 LAN/WAN 并保存，再创建编排组。</div>}
+      {!topology.data?.item && <div className="inline-warning">请先在“网卡设置”中配置 LAN/WAN 并保存，再创建编排组。</div>}
       <DataTable data={groups} columns={columns} loading={topology.isLoading} error={topology.isError ? topology.error : null} onRetry={() => topology.refetch()} emptyTitle="暂无编排组" emptyDescription="没有编排组时，策略只能 direct/drop，无法经过服务链。" getRowId={(row) => row.name} />
 
       <Modal open={open} onClose={closeEditor} title={editing ? "编辑编排组" : "新增编排组"} size="md" busy={busy} footer={<><Button onClick={closeEditor} disabled={busy}>取消</Button><Button variant="primary" loading={busy} onClick={save}>保存</Button></>}>

@@ -198,7 +198,7 @@ export function ConfigPage() {
     <div className="page">
       <PageHeader
         title="配置管理"
-        subtitle="系统状态、管理口与配置备份"
+        subtitle="管理口、配置备份与快照"
       />
 
       <div className="config-page">
