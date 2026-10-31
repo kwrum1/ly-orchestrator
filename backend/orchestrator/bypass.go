@@ -317,6 +317,11 @@ func (controller *bypassController) statusLocked() orchestratorapi.BypassState {
 	if state.Since.IsZero() {
 		state.Since = runtime.Since
 	}
+	if !state.Enabled {
+		state.Cause = ""
+		state.Reason = ""
+		state.Since = time.Time{}
+	}
 	return state
 }
 

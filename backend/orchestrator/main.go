@@ -337,11 +337,14 @@ func (runtime *productionOrchestratorRuntime) observeBypassReadback(observed vpp
 	}
 	if !observed.Bypass {
 		runtime.bypassSince = time.Time{}
+		runtime.bypassCause = ""
+		runtime.bypassReason = ""
+	} else {
+		runtime.bypassCause = observed.BypassCause
+		runtime.bypassReason = observed.BypassReason
 	}
 	runtime.bypassActive = observed.Bypass
 	runtime.bypassForced = observed.BypassForced
-	runtime.bypassCause = observed.BypassCause
-	runtime.bypassReason = observed.BypassReason
 	runtime.bypassPackets = observed.BypassPackets
 }
 
