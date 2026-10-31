@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"ly-route/backend/internal/product"
 )
@@ -101,13 +103,34 @@ func OpenForProduct(ctx context.Context, dsn string, productID product.ID) (*Sto
 	// reads and an apply's receipt write at the same time; the default rollback
 	// journal mode turned one long write into HTTP 500 for every save. Applied
 	// after initialize() so a second instance still fails the migration lock.
-	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode = WAL`); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("configure sqlite wal: %w", err)
-	}
-	if _, err := db.ExecContext(ctx, `PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 15000`); err != nil {
+	// The busy timeout must be in place before the journal-mode switch: two
+	// processes opening the same database can collide on that write, and
+	// without a timeout the loser fails immediately with SQLITE_BUSY.
+	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 15000`); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("configure sqlite timeouts: %w", err)
+	}
+	// Switching the journal mode takes an exclusive lock and SQLite answers
+	// SQLITE_BUSY instead of waiting on the busy handler when another process
+	// is opening the same file at the same time. Retry briefly so two control
+	// processes starting together converge on WAL instead of failing boot.
+	var walErr error
+	for attempt := 0; attempt < 25; attempt++ {
+		if _, walErr = db.ExecContext(ctx, `PRAGMA journal_mode = WAL`); walErr == nil {
+			break
+		}
+		if !strings.Contains(strings.ToLower(walErr.Error()), "locked") && !strings.Contains(strings.ToLower(walErr.Error()), "busy") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if walErr != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("configure sqlite wal: %w", walErr)
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA synchronous = NORMAL`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("configure sqlite synchronous: %w", err)
 	}
 	return store, nil
 }
