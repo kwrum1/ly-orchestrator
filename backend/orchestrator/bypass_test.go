@@ -29,6 +29,92 @@ func TestNormalizeBypassConfigDefaultsAndValidation(t *testing.T) {
 	}
 }
 
+func TestNormalizeBypassGroupConfig(t *testing.T) {
+	config, err := normalizeBypassConfig(orchestratorapi.BypassConfig{Enabled: true, Groups: []orchestratorapi.BypassGroupConfig{
+		{Name: "grp-b", FlowTargets: []orchestratorapi.BypassFlowTarget{{DstIP: "192.168.20.82", DstPort: 53, Protocol: "UDP"}}},
+		{Name: "grp-a", FlowTargets: []orchestratorapi.BypassFlowTarget{{DstIP: "192.168.10.82", DstPort: 443}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Groups) != 2 || config.Groups[0].Name != "grp-a" || config.Groups[1].Name != "grp-b" {
+		t.Fatalf("group order = %#v", config.Groups)
+	}
+	if config.Groups[0].WindowSeconds != 10 || config.Groups[0].FailureThreshold != 3 || config.Groups[0].RecoveryThreshold != 3 {
+		t.Fatalf("group defaults = %#v", config.Groups[0])
+	}
+	if config.Groups[1].FlowTargets[0].Protocol != "udp" {
+		t.Fatalf("protocol normalization = %#v", config.Groups[1].FlowTargets[0])
+	}
+	if _, err := normalizeBypassConfig(orchestratorapi.BypassConfig{Enabled: true, Groups: []orchestratorapi.BypassGroupConfig{{Name: "grp-a"}, {Name: "grp-a"}}}); err == nil {
+		t.Fatal("duplicate group must be rejected")
+	}
+	if _, err := normalizeBypassConfig(orchestratorapi.BypassConfig{Enabled: true, Groups: []orchestratorapi.BypassGroupConfig{{Name: "grp-a", FlowTargets: []orchestratorapi.BypassFlowTarget{{DstIP: "bad", DstPort: 80}}}}}); err == nil {
+		t.Fatal("invalid flow destination must be rejected")
+	}
+	if _, err := normalizeBypassConfig(orchestratorapi.BypassConfig{Enabled: true, Groups: []orchestratorapi.BypassGroupConfig{{Name: "grp-a", FlowTargets: []orchestratorapi.BypassFlowTarget{{DstIP: "192.0.2.1", DstPort: 80, Protocol: "icmp"}}}}}); err == nil {
+		t.Fatal("unsupported flow protocol must be rejected")
+	}
+}
+
+// A window without business traffic is not a fault: the group stays unknown
+// and must never be bypassed for lack of traffic.
+func TestPassiveWindowWithoutTrafficDoesNotBypass(t *testing.T) {
+	state := &bypassGroupRuntime{name: "grp-a"}
+	config := orchestratorapi.BypassGroupConfig{Name: "grp-a", FlowTargets: []orchestratorapi.BypassFlowTarget{{DstIP: "192.0.2.10", DstPort: 443, Protocol: "tcp"}}}
+	now := time.Now().UTC()
+	state.observeFlow(now, nil, 10*time.Second)
+	state.observeFlow(now.Add(12*time.Second), nil, 10*time.Second)
+	if state.windowAttempts != 0 || state.windowSuccess != 0 {
+		t.Fatalf("counters = %#v", state)
+	}
+	if health := groupHealth(state, config, true); health != "unknown" {
+		t.Fatalf("health = %q, want unknown", health)
+	}
+}
+
+// Requests with only RST (or no response at all) inside the window are the
+// only passive failure evidence.
+func TestPassiveWindowAllRSTIsFaulty(t *testing.T) {
+	state := &bypassGroupRuntime{name: "grp-a"}
+	config := orchestratorapi.BypassGroupConfig{Name: "grp-a", FlowTargets: []orchestratorapi.BypassFlowTarget{{DstIP: "192.0.2.10", DstPort: 443, Protocol: "tcp"}}}
+	now := time.Now().UTC()
+	failing := []orchestratorapi.BypassFlowStats{{Group: "grp-a", DstIP: "192.0.2.10", DstPort: 443, Protocol: "tcp", Attempts: 5, Syn: 5, RST: 5}}
+	state.observeFlow(now, failing, 10*time.Second)
+	state.observeFlow(now.Add(11*time.Second), failing, 10*time.Second)
+	if state.windowAttempts != 5 || state.windowSuccess != 0 || state.windowRST != 5 {
+		t.Fatalf("window = attempts %d success %d rst %d", state.windowAttempts, state.windowSuccess, state.windowRST)
+	}
+	if health := groupHealth(state, config, true); health != "faulty" {
+		t.Fatalf("health = %q, want faulty", health)
+	}
+}
+
+// Any reverse packet is a success for UDP request/response services; a DNS
+// error answer (NXDOMAIN/SERVFAIL) is still a response and must not bypass.
+func TestPassiveWindowUDPResponseRecovers(t *testing.T) {
+	state := &bypassGroupRuntime{name: "grp-a", enabled: true}
+	config := orchestratorapi.BypassGroupConfig{Name: "grp-a", FlowTargets: []orchestratorapi.BypassFlowTarget{{DstIP: "192.0.2.53", DstPort: 53, Protocol: "udp"}}}
+	now := time.Now().UTC()
+	stats := []orchestratorapi.BypassFlowStats{{Group: "grp-a", DstIP: "192.0.2.53", DstPort: 53, Protocol: "udp", Attempts: 4, Responses: 4, Success: 4}}
+	state.observeFlow(now, stats, 10*time.Second)
+	state.observeFlow(now.Add(2*time.Second), stats, 10*time.Second)
+	if state.windowSuccess != 4 {
+		t.Fatalf("window success = %d", state.windowSuccess)
+	}
+	state.enabled = false
+	if health := groupHealth(state, config, true); health != "healthy" {
+		t.Fatalf("health = %q, want healthy", health)
+	}
+}
+
+func TestTopologyGroupInterfacesMapsNames(t *testing.T) {
+	groups := topologyGroupInterfaces(orchestratorViewForTest())
+	if len(groups["grp-a"]) != 2 || groups["grp-a"][0] != "ens160" || groups["grp-b"][1] != "ens161" {
+		t.Fatalf("group interfaces = %#v", groups)
+	}
+}
+
 func TestProbeInterfaceReadsOperstateAndCarrier(t *testing.T) {
 	root := t.TempDir()
 	interfaceDir := filepath.Join(root, "class", "net", "ens224")

@@ -18,6 +18,7 @@
 #define LY_ORCH_MAC_TTL_SECONDS 300.0
 #define LY_ORCH_BYPASS_CAUSE_LEN 32
 #define LY_ORCH_BYPASS_REASON_LEN 160
+#define LY_ORCH_MAX_PROBE_TARGETS 64
 #define LY_ORCH_INVALID_INDEX ((u32) ~0)
 
 typedef enum
@@ -148,6 +149,40 @@ typedef struct
   ly_orch_flow_t *flows;
 } ly_orch_worker_t;
 
+/* One policy group's independent bypass flag.  The row is rebuilt on commit in
+ * the same order as the active group vector so the packet path can index it by
+ * group position; the name is kept for the CLI and readback. */
+typedef struct
+{
+  u8 name[LY_ORCH_NAME_LEN];
+  u8 active;
+  u8 forced;
+  u8 cause[LY_ORCH_BYPASS_CAUSE_LEN];
+  u8 reason[LY_ORCH_BYPASS_REASON_LEN];
+  f64 since;
+} ly_orch_group_bypass_t;
+
+/* Passive request/response analysis target.  A forward packet addressed to
+ * destination:port is an attempt; the reverse packet (same five-tuple swapped)
+ * is a response.  RST and ICMP unreachable are failure evidence. */
+typedef struct
+{
+  u8 group[LY_ORCH_NAME_LEN];
+  u32 group_position;
+  ip46_address_t destination;
+  u16 destination_port;
+  u8 protocol;
+  u8 is_ip6;
+  u8 reserved[2];
+  f64 window;
+  u64 attempts;
+  u64 syn;
+  u64 synack;
+  u64 rst;
+  u64 responses;
+  u64 icmp_unreachable;
+} ly_orch_probe_target_t;
+
 typedef struct
 {
   vlib_main_t *vlib_main;
@@ -170,6 +205,10 @@ typedef struct
   u8 bypass_cause[LY_ORCH_BYPASS_CAUSE_LEN];
   u8 bypass_reason[LY_ORCH_BYPASS_REASON_LEN];
   f64 bypass_since;
+  /* Per-group bypass rows, aligned with active.groups after commit. */
+  ly_orch_group_bypass_t *group_bypass;
+  /* Passive flow targets installed at runtime by the supervisor. */
+  ly_orch_probe_target_t *probe_targets;
 } ly_orch_main_t;
 
 extern ly_orch_main_t ly_orch_main;

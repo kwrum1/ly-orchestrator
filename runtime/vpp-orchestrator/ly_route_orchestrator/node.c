@@ -2,6 +2,7 @@
 #include <vnet/bonding/node.h>
 #include <vnet/tcp/tcp_packet.h>
 #include <vnet/udp/udp_packet.h>
+#include <vnet/ip/icmp46_packet.h>
 #include <ly_route_orchestrator/orchestrator.h>
 
 typedef enum
@@ -14,6 +15,7 @@ typedef enum
   LY_ORCH_ERROR_FLOODED,
   LY_ORCH_ERROR_LOOPED,
   LY_ORCH_ERROR_BYPASS,
+  LY_ORCH_ERROR_GROUP_BYPASS,
   LY_ORCH_N_ERROR,
 } ly_orch_error_t;
 
@@ -26,6 +28,7 @@ static char *ly_orch_error_strings[] = {
   "unicast packets flooded to learn the next-hop MAC",
   "own transmitted frames ignored (loop breaker)",
   "packets forwarded by fault bypass",
+  "packets forwarded by policy-group fault bypass",
 };
 
 typedef struct
@@ -38,6 +41,8 @@ typedef struct
   u8 is_ip6;
   u8 ports_valid;
   u8 valid;
+  u8 tcp_flags;
+  u8 tcp_valid;
 } ly_orch_tuple_t;
 
 typedef enum
@@ -94,6 +99,13 @@ ly_orch_parse_tuple (vlib_buffer_t *buffer)
           tuple.source_port = clib_net_to_host_u16 (transport->src_port);
           tuple.destination_port = clib_net_to_host_u16 (transport->dst_port);
           tuple.ports_valid = 1;
+          if (ip->protocol == IP_PROTOCOL_TCP &&
+              length >= offset + header_length + sizeof (tcp_header_t))
+            {
+              tcp_header_t *tcp = (tcp_header_t *) transport;
+              tuple.tcp_flags = tcp->flags;
+              tuple.tcp_valid = 1;
+            }
         }
       tuple.valid = 1;
       return tuple;
@@ -153,6 +165,13 @@ ly_orch_parse_tuple (vlib_buffer_t *buffer)
           tuple.source_port = clib_net_to_host_u16 (transport->src_port);
           tuple.destination_port = clib_net_to_host_u16 (transport->dst_port);
           tuple.ports_valid = 1;
+          if (protocol == IP_PROTOCOL_TCP &&
+              length >= transport_offset + sizeof (tcp_header_t))
+            {
+              tcp_header_t *tcp = (tcp_header_t *) transport;
+              tuple.tcp_flags = tcp->flags;
+              tuple.tcp_valid = 1;
+            }
         }
       tuple.valid = 1;
     }
@@ -214,14 +233,141 @@ ly_orch_group_available (ly_orch_config_t *config, u32 group_index)
          vnet_sw_interface_is_up (vnm, group->lan_sw_if_index);
 }
 
+/* Is this policy group in an automatic/operator group bypass?  The row is
+ * aligned with the active group vector at commit time. */
+static_always_inline int
+ly_orch_group_bypassed (u32 group_index)
+{
+  ly_orch_main_t *om = &ly_orch_main;
+  return om->group_bypass && group_index < vec_len (om->group_bypass) &&
+         om->group_bypass[group_index].active;
+}
+
+static_always_inline int
+ly_orch_address_equal (const ip46_address_t *left,
+                       const ip46_address_t *right, u8 is_ip6)
+{
+  if (is_ip6)
+    return ip6_address_is_equal (&left->ip6, &right->ip6);
+  return ip4_address_is_equal (&left->ip4, &right->ip4);
+}
+
+/* Passive request/response analysis.
+ *
+ * A client-side packet addressed to the configured destination:port is an
+ * attempt.  A server-side packet with the swapped five-tuple is a response;
+ * TCP SYN-ACK and any non-RST return packet count as success, RST is recorded
+ * as failure evidence.  A group with no attempts in the window stays
+ * "unknown" and is NEVER bypassed: absence of traffic is not a fault. */
+static_always_inline void
+ly_orch_probe_observe (const ly_orch_tuple_t *tuple, u32 group_index,
+                       u8 client_side)
+{
+  ly_orch_main_t *om = &ly_orch_main;
+  u32 index;
+  if (!om->probe_targets || !tuple->valid || !tuple->ports_valid)
+    return;
+  vec_foreach_index (index, om->probe_targets)
+    {
+      ly_orch_probe_target_t *target = &om->probe_targets[index];
+      if (target->group_position != group_index ||
+          target->is_ip6 != tuple->is_ip6 ||
+          target->protocol != tuple->protocol)
+        continue;
+      if (client_side &&
+          tuple->destination_port == target->destination_port &&
+          ly_orch_address_equal (&tuple->destination, &target->destination,
+                                 tuple->is_ip6))
+        {
+          if (tuple->protocol == IP_PROTOCOL_TCP)
+            {
+              if (!tuple->tcp_valid || (tuple->tcp_flags & TCP_FLAG_SYN) == 0 ||
+                  (tuple->tcp_flags & TCP_FLAG_ACK))
+                continue;
+              __atomic_fetch_add (&target->syn, 1, __ATOMIC_RELAXED);
+            }
+          __atomic_fetch_add (&target->attempts, 1, __ATOMIC_RELAXED);
+          continue;
+        }
+      if (!client_side && tuple->source_port == target->destination_port &&
+          ly_orch_address_equal (&tuple->source, &target->destination,
+                                 tuple->is_ip6))
+        {
+          if (tuple->protocol == IP_PROTOCOL_TCP && tuple->tcp_valid)
+            {
+              if (tuple->tcp_flags & TCP_FLAG_RST)
+                {
+                  __atomic_fetch_add (&target->rst, 1, __ATOMIC_RELAXED);
+                  continue;
+                }
+              if ((tuple->tcp_flags & TCP_FLAG_SYN) &&
+                  (tuple->tcp_flags & TCP_FLAG_ACK))
+                __atomic_fetch_add (&target->synack, 1, __ATOMIC_RELAXED);
+            }
+          __atomic_fetch_add (&target->responses, 1, __ATOMIC_RELAXED);
+        }
+    }
+}
+
+/* ICMP destination-unreachable quoting a request for a probe target is a
+ * definitive failure signal (no response will ever arrive).  Only IPv4 is
+ * inspected; the quoted header lives directly after the 8-byte ICMP header. */
+static_always_inline void
+ly_orch_probe_observe_icmp (vlib_buffer_t *buffer, u32 group_index)
+{
+  ly_orch_main_t *om = &ly_orch_main;
+  u8 *data = vlib_buffer_get_current (buffer);
+  u32 length = buffer->current_length;
+  u32 offset = sizeof (ethernet_header_t);
+  u16 type;
+  ip4_header_t *outer, *inner;
+  icmp46_header_t *icmp;
+  udp_header_t *transport;
+  u32 inner_length, header_length;
+  u32 index;
+
+  if (!om->probe_targets || length < offset + sizeof (ip4_header_t) + 8)
+    return;
+  type = clib_net_to_host_u16 (*(u16 *) (data + 12));
+  if (type != ETHERNET_TYPE_IP4)
+    return;
+  outer = (ip4_header_t *) (data + offset);
+  header_length = ip4_header_bytes (outer);
+  if (outer->protocol != IP_PROTOCOL_ICMP ||
+      length < offset + header_length + 8 + sizeof (ip4_header_t))
+    return;
+  icmp = (icmp46_header_t *) (data + offset + header_length);
+  if (icmp->type != 3)
+    return;
+  inner = (ip4_header_t *) (data + offset + header_length + 8);
+  inner_length = offset + header_length + 8 + sizeof (ip4_header_t);
+  if (inner->protocol != IP_PROTOCOL_TCP && inner->protocol != IP_PROTOCOL_UDP)
+    return;
+  if (length < inner_length + 4)
+    return;
+  transport = (udp_header_t *) (data + inner_length);
+  vec_foreach_index (index, om->probe_targets)
+    {
+      ly_orch_probe_target_t *target = &om->probe_targets[index];
+      if (target->group_position != group_index || target->is_ip6 ||
+          target->protocol != inner->protocol ||
+          target->destination_port !=
+            clib_net_to_host_u16 (transport->dst_port))
+        continue;
+      if (ip4_address_is_equal (&inner->dst_address, &target->destination.ip4))
+        __atomic_fetch_add (&target->icmp_unreachable, 1, __ATOMIC_RELAXED);
+    }
+}
+
 static_always_inline u8
 ly_orch_build_path (ly_orch_config_t *config, const ly_orch_tuple_t *tuple,
                     u32 path[LY_ORCH_MAX_HOPS], ly_orch_worker_t *worker,
-                    u32 packet_bytes, u8 *drop)
+                    u32 packet_bytes, u8 *drop, u8 *group_bypass)
 {
   u32 index = 0;
   u8 path_count = 0;
   *drop = 0;
+  *group_bypass = 0;
   while (index < vec_len (config->rules))
     {
       u32 group_position = config->rules[index].group_position;
@@ -249,11 +395,15 @@ ly_orch_build_path (ly_orch_config_t *config, const ly_orch_tuple_t *tuple,
             }
           if (rule->action == LY_ORCH_ACTION_VIA)
             {
-              if (!ly_orch_group_available (config, rule->target_group))
+              if (!ly_orch_group_available (config, rule->target_group) ||
+                  ly_orch_group_bypassed (rule->target_group))
                 {
                   if (worker)
                     worker->group_bypass_packets[rule->target_group]++;
-                  /* First matching group is terminal even when bypassed. */
+                  *group_bypass = 1;
+                  /* First matching group is terminal even when bypassed.
+                   * A bypassed group forwards like a plain transparent port
+                   * pair; every other group keeps its own policy. */
                   return path_count;
                 }
               if (path_count >= LY_ORCH_MAX_HOPS)
@@ -434,7 +584,10 @@ ly_orch_rewrite_ethernet (vlib_main_t *vm, vlib_buffer_t *buffer, u32 egress,
 static_always_inline u64
 ly_orch_flow_hash (const ly_orch_tuple_t *tuple)
 {
-  return hash_memory ((void *) tuple, sizeof (*tuple), 0x6c796f72);
+  ly_orch_tuple_t key = *tuple;
+  key.tcp_flags = 0;
+  key.tcp_valid = 0;
+  return hash_memory ((void *) &key, sizeof (key), 0x6c796f72);
 }
 
 static_always_inline int
@@ -591,7 +744,8 @@ VLIB_NODE_FN (ly_orch_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 buffers[VLIB_FRAME_SIZE];
   u16 nexts[VLIB_FRAME_SIZE];
   u32 forwarded = 0, dropped = 0, non_ip = 0, no_next_hop_mac = 0;
-  u32 not_ours = 0, flooded = 0, looped = 0, bypassed = 0, index;
+  u32 not_ours = 0, flooded = 0, looped = 0, bypassed = 0, group_bypassed = 0;
+  u32 index;
 
   for (index = 0; index < frame->n_vectors; index++)
     {
@@ -610,8 +764,20 @@ VLIB_NODE_FN (ly_orch_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
       ly_orch_ingress_t ingress = ly_orch_classify_ingress (config, rx);
       u16 next = 0;
       u8 path_count;
+      u8 group_bypass = 0;
       u32 packet_bytes = vlib_buffer_length_in_chain (vm, buffer);
       f64 now = vlib_time_now (vm);
+
+      /* Passive analysis runs before policy evaluation (and also while the
+       * group bypass is active, so recovery can be detected). */
+      if (ingress.group_index != LY_ORCH_INVALID_INDEX)
+        {
+          if (wire_tuple.valid && wire_tuple.protocol == IP_PROTOCOL_ICMP)
+            ly_orch_probe_observe_icmp (buffer, ingress.group_index);
+          else if (wire_tuple.valid)
+            ly_orch_probe_observe (&wire_tuple, ingress.group_index,
+                                   ingress.client_side);
+        }
 
       if (buffer->current_length >= sizeof (ethernet_header_t))
         {
@@ -661,7 +827,7 @@ VLIB_NODE_FN (ly_orch_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
         }
       else if (!drop && tuple.valid)
         path_count = ly_orch_build_path (config, &tuple, path, worker,
-                                         packet_bytes, &drop);
+                                         packet_bytes, &drop, &group_bypass);
       else
         path_count = 0;
       if (!drop)
@@ -669,6 +835,8 @@ VLIB_NODE_FN (ly_orch_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
                                     &wire_tuple, now, &target);
       if (!next || target == LY_ORCH_INVALID_INDEX)
         drop = 1;
+      if (group_bypass)
+        group_bypassed++;
 
       if (tuple.valid)
         ly_orch_record_flow (vm, worker, &tuple, path, path_count,
@@ -737,6 +905,8 @@ VLIB_NODE_FN (ly_orch_node) (vlib_main_t *vm, vlib_node_runtime_t *node,
                                looped);
   vlib_node_increment_counter (vm, node->node_index, LY_ORCH_ERROR_BYPASS,
                                bypassed);
+  vlib_node_increment_counter (vm, node->node_index,
+                               LY_ORCH_ERROR_GROUP_BYPASS, group_bypassed);
   return frame->n_vectors;
 }
 

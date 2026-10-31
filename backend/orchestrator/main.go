@@ -251,6 +251,9 @@ type productionOrchestratorRuntime struct {
 	bypassReason                  string
 	bypassSince                   time.Time
 	bypassPackets                 uint64
+	bypassGroups                  map[string]orchestratorapi.BypassGroupRuntimeState
+	bypassFlow                    []orchestratorapi.BypassFlowStats
+	bypassProbeTargets            int
 	dpdkMu                        sync.Mutex
 	dpdkActive                    map[string]vpp.NativePath
 	tracker                       *orchestrator.HealthTracker
@@ -346,6 +349,39 @@ func (runtime *productionOrchestratorRuntime) observeBypassReadback(observed vpp
 	runtime.bypassActive = observed.Bypass
 	runtime.bypassForced = observed.BypassForced
 	runtime.bypassPackets = observed.BypassPackets
+	runtime.bypassGroups = bypassGroupsFromReadback(observed)
+	runtime.bypassFlow = bypassFlowFromReadback(observed)
+	runtime.bypassProbeTargets = observed.ProbeTargets
+}
+
+func bypassGroupsFromReadback(observed vpp.TransparentOrchestratorReadback) map[string]orchestratorapi.BypassGroupRuntimeState {
+	groups := make(map[string]orchestratorapi.BypassGroupRuntimeState, len(observed.GroupBypass))
+	for _, row := range observed.GroupBypass {
+		groups[row.Name] = orchestratorapi.BypassGroupRuntimeState{
+			Enabled: row.Enabled, Forced: row.Forced, Cause: row.Cause,
+			Reason: row.Reason, Packets: row.Packets,
+		}
+	}
+	return groups
+}
+
+func bypassFlowFromReadback(observed vpp.TransparentOrchestratorReadback) []orchestratorapi.BypassFlowStats {
+	stats := make([]orchestratorapi.BypassFlowStats, 0, len(observed.GroupProbes))
+	for _, row := range observed.GroupProbes {
+		success := row.SynAck + row.Responses
+		timeouts := uint64(0)
+		if row.Attempts > success+row.RST {
+			timeouts = row.Attempts - success - row.RST
+		}
+		stats = append(stats, orchestratorapi.BypassFlowStats{
+			Group: row.Group, DstIP: row.DstIP, DstPort: row.DstPort,
+			Protocol: row.Protocol, Attempts: row.Attempts, Syn: row.Syn,
+			SynAck: row.SynAck, RST: row.RST, Responses: row.Responses,
+			Success: success, Timeouts: timeouts,
+			ICMPUnreachable: row.ICMPUnreachable,
+		})
+	}
+	return stats
 }
 
 // transparentGeneration is the single source of truth for the VPP generation
@@ -617,15 +653,80 @@ func (runtime *productionOrchestratorRuntime) setBypassLockedStateOnly(enabled b
 func (runtime *productionOrchestratorRuntime) BypassSnapshot() orchestratorapi.BypassRuntimeState {
 	runtime.bypassMu.RLock()
 	defer runtime.bypassMu.RUnlock()
-	return orchestratorapi.BypassRuntimeState{
-		Enabled:    runtime.bypassActive,
-		Forced:     runtime.bypassForced,
-		Cause:      runtime.bypassCause,
-		Reason:     runtime.bypassReason,
-		Since:      runtime.bypassSince,
-		Packets:    runtime.bypassPackets,
-		Generation: runtime.transparentGeneration,
+	groups := make(map[string]orchestratorapi.BypassGroupRuntimeState, len(runtime.bypassGroups))
+	for name, state := range runtime.bypassGroups {
+		groups[name] = state
 	}
+	return orchestratorapi.BypassRuntimeState{
+		Enabled:      runtime.bypassActive,
+		Forced:       runtime.bypassForced,
+		Cause:        runtime.bypassCause,
+		Reason:       runtime.bypassReason,
+		Since:        runtime.bypassSince,
+		Packets:      runtime.bypassPackets,
+		Generation:   runtime.transparentGeneration,
+		Groups:       groups,
+		Flow:         append([]orchestratorapi.BypassFlowStats(nil), runtime.bypassFlow...),
+		ProbeTargets: runtime.bypassProbeTargets,
+	}
+}
+
+// SetGroupBypass toggles one policy group's bypass flag.  It uses the same
+// serialisation as apply/reconcile and leaves the committed generation and all
+// other groups untouched.
+func (runtime *productionOrchestratorRuntime) SetGroupBypass(ctx context.Context, group string, enabled bool, cause, reason string) error {
+	runtime.transparentMu.Lock()
+	defer runtime.transparentMu.Unlock()
+	requestID := fmt.Sprintf("orchestrator-group-bypass-%d", time.Now().UnixNano())
+	readback, err := runtime.adapter.SetTransparentOrchestratorGroupBypass(ctx, requestID, group, enabled, cause, reason)
+	if err != nil {
+		return err
+	}
+	runtime.observeBypassReadback(readback)
+	action := "cleared"
+	if enabled {
+		action = "enabled"
+	}
+	log.Printf("orchestrator group fault bypass %s for %s: cause=%s reason=%s generation=%s", action, group, cause, reason, shortGeneration(runtime.transparentGeneration))
+	return nil
+}
+
+// SetGroupProbes installs the passive request/response targets.  They are
+// runtime state, not part of the committed policy generation.
+func (runtime *productionOrchestratorRuntime) SetGroupProbes(ctx context.Context, targets []groupProbeTarget) error {
+	runtime.transparentMu.Lock()
+	defer runtime.transparentMu.Unlock()
+	converted := make([]vpp.GroupProbeTarget, 0, len(targets))
+	for _, target := range targets {
+		converted = append(converted, vpp.GroupProbeTarget{
+			Group: target.Group, DstIP: target.DstIP, DstPort: target.DstPort,
+			Protocol: target.Protocol, WindowSeconds: target.WindowSeconds,
+		})
+	}
+	requestID := fmt.Sprintf("orchestrator-group-probes-%d", time.Now().UnixNano())
+	if err := runtime.adapter.SetTransparentOrchestratorProbes(ctx, requestID, converted); err != nil {
+		return err
+	}
+	runtime.bypassMu.Lock()
+	runtime.bypassProbeTargets = len(converted)
+	runtime.bypassMu.Unlock()
+	return nil
+}
+
+// ObserveBypassRuntime reads the plugin telemetry (group flags and passive
+// counters) without holding the apply serialisation while the probe runs.
+func (runtime *productionOrchestratorRuntime) ObserveBypassRuntime(ctx context.Context) (orchestratorapi.BypassRuntimeState, error) {
+	if !runtime.transparentMu.TryLock() {
+		return runtime.BypassSnapshot(), errors.New("transparent orchestrator runtime is applying or recovering")
+	}
+	defer runtime.transparentMu.Unlock()
+	requestID := fmt.Sprintf("orchestrator-bypass-telemetry-%d", time.Now().UnixNano())
+	observed, err := runtime.adapter.ObserveTransparentOrchestrator(ctx, requestID)
+	if err != nil {
+		return runtime.BypassSnapshot(), err
+	}
+	runtime.observeBypassReadback(observed)
+	return runtime.BypassSnapshot(), nil
 }
 
 type transparentTransactionJournal struct {
@@ -773,6 +874,23 @@ func (runtime *productionOrchestratorRuntime) TransparentRuntimeEvidence(ctx con
 	evidence.BypassReason = bypass.Reason
 	evidence.BypassSince = bypass.Since
 	evidence.BypassPackets = bypass.Packets
+	if len(bypass.Groups) > 0 {
+		for name, group := range bypass.Groups {
+			if group.Enabled {
+				evidence.BypassGroups = append(evidence.BypassGroups, name)
+			}
+		}
+		sort.Strings(evidence.BypassGroups)
+		if len(evidence.BypassGroups) > 0 {
+			evidence.Bypass = true
+			if evidence.BypassCause == "" {
+				evidence.BypassCause = "auto"
+			}
+			if evidence.BypassReason == "" {
+				evidence.BypassReason = "groups:" + strings.Join(evidence.BypassGroups, ",")
+			}
+		}
+	}
 	if observed.State != "running" {
 		return orchestratorapi.TransparentRuntimeEvidence{}, fmt.Errorf("transparent orchestrator state is %s (configured generation %s default %s)", observed.State, shortGeneration(runtime.transparentGeneration), runtime.transparentConfiguredDefault)
 	}
