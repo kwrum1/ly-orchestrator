@@ -136,6 +136,11 @@ type BypassGroupState struct {
 
 	// WindowSeconds and the window counters come from the passive analyzer.
 	WindowSeconds float64 `json:"window_seconds,omitempty"`
+	// Interfaces, TCPTargets and FlowTargets echo the active group config so a
+	// GET /bypass explains what is watched.
+	Interfaces  []string              `json:"interfaces,omitempty"`
+	TCPTargets  []BypassTCPTarget     `json:"tcp_targets,omitempty"`
+	FlowTargets []BypassFlowTarget    `json:"flow_targets,omitempty"`
 	FlowAttempts  uint64  `json:"flow_attempts"`
 	FlowSuccess   uint64  `json:"flow_success"`
 	FlowRST       uint64  `json:"flow_rst"`
