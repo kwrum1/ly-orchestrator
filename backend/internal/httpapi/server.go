@@ -206,6 +206,7 @@ type Server struct {
 	gatewayTransaction            apply.GatewayTransactionRunner
 	orchestratorRepository        orchestrator.Orchestrator
 	orchestratorRuntime           orchestratorapi.ServiceChainRuntime
+	orchestratorBypass            orchestratorapi.BypassController
 	orchestratorReconcileInterval time.Duration
 	orchestratorTelemetry         OrchestratorTelemetryCollector
 	interfaceTelemetry            InterfaceTelemetryCollector
@@ -622,6 +623,12 @@ func WithOrchestratorRuntime(runtime orchestratorapi.ServiceChainRuntime) Option
 	return func(server *Server) { server.orchestratorRuntime = runtime }
 }
 
+// WithOrchestratorBypass installs the fault-detection controller exposed at
+// /api/v1/orchestrator/bypass.
+func WithOrchestratorBypass(controller orchestratorapi.BypassController) Option {
+	return func(server *Server) { server.orchestratorBypass = controller }
+}
+
 func WithOrchestratorReconcileInterval(interval time.Duration) Option {
 	return func(server *Server) { server.orchestratorReconcileInterval = interval }
 }
@@ -789,6 +796,7 @@ func (server *Server) Handler() http.Handler {
 		})
 		handler.SetUpdateService(newOrchestratorUpdateService(server))
 		handler.SetOperationTracker(server)
+		handler.SetBypassController(server.orchestratorBypass)
 		handler.RegisterRoutes(mux)
 		if _, transparent := server.orchestratorRuntime.(orchestratorapi.TransparentRuntime); !transparent {
 			handler.StartServiceChainReconciler(context.Background(), server.orchestratorReconcileInterval)

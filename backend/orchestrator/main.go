@@ -112,6 +112,7 @@ func run() error {
 	}
 	var recoveryRepository *orchestrator.Repository
 	var recoveryRuntime *productionOrchestratorRuntime
+	var bypass *bypassController
 	var reconcileInterval time.Duration
 	if profile.ID() == product.Orchestrator().ID() {
 		repository, repositoryErr := orchestrator.NewRepository(store, orchestrator.RepositoryOptions{Now: time.Now})
@@ -155,11 +156,21 @@ func run() error {
 			return fmt.Errorf("commit recovered orchestrator transaction: %w", err)
 		}
 		reconcileInterval = envDuration("LY_ROUTE_ORCHESTRATOR_RECONCILE_INTERVAL", 2*time.Second)
+		bypass = newBypassController(
+			orchestratorRuntime,
+			repository,
+			env("LY_ROUTE_ORCHESTRATOR_BYPASS_STATE", "/var/lib/ly-route/orchestrator/bypass.json"),
+			env("LY_ROUTE_SYSFS_ROOT", "/sys"),
+			env("LY_ROUTE_ORCHESTRATOR_BYPASS_TCP_TARGETS", ""),
+			env("LY_ROUTE_ORCHESTRATOR_BYPASS_ICMP_TARGETS", ""),
+			env("LY_ROUTE_ORCHESTRATOR_BYPASS_INTERFACES", ""),
+		)
 		options = append(options,
 			httpapi.WithOrchestratorRepository(repository),
 			httpapi.WithOrchestratorTelemetry(newOrchestratorTelemetryRuntime(repository, env("LY_ROUTE_VPPCTL", "vppctl"), time.Now)),
 			httpapi.WithOrchestratorReconcileInterval(reconcileInterval),
 			httpapi.WithOrchestratorRuntime(orchestratorRuntime),
+			httpapi.WithOrchestratorBypass(bypass),
 		)
 		recoveryRepository = repository
 		recoveryRuntime = orchestratorRuntime
@@ -181,6 +192,9 @@ func run() error {
 	defer stopRecovery()
 	if recoveryRepository != nil && recoveryRuntime != nil {
 		go runTransparentRecovery(recoveryCtx, recoveryRepository, recoveryRuntime, reconcileInterval)
+	}
+	if bypass != nil {
+		bypass.Start(recoveryCtx)
 	}
 	server.StartDataplaneWatcher(context.Background(), envDuration("LY_ROUTE_DATAPLANE_WATCH_INTERVAL", 3*time.Second))
 	log.Printf("ly-route %s control API listening on %s database=%s config=%s", profile.ID(), addr, databasePath, configPath)
@@ -230,6 +244,13 @@ type productionOrchestratorRuntime struct {
 	lastDriftReason               string
 	lastReconcileAt               time.Time
 	driftDetected                 bool
+	bypassMu                      sync.RWMutex
+	bypassActive                  bool
+	bypassForced                  bool
+	bypassCause                   string
+	bypassReason                  string
+	bypassSince                   time.Time
+	bypassPackets                 uint64
 	dpdkMu                        sync.Mutex
 	dpdkActive                    map[string]vpp.NativePath
 	tracker                       *orchestrator.HealthTracker
@@ -303,8 +324,25 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 	runtime.transparentConfiguredDefault = transparentDefaultAction(policyView)
 	runtime.transparentObservedGeneration = readback.Generation
 	runtime.transparentObservedDefault = readback.Default
+	runtime.observeBypassReadback(readback)
 	runtime.lastReconcileAt = runtime.transparentAppliedAt
 	return nil
+}
+
+func (runtime *productionOrchestratorRuntime) observeBypassReadback(observed vpp.TransparentOrchestratorReadback) {
+	runtime.bypassMu.Lock()
+	defer runtime.bypassMu.Unlock()
+	if observed.Bypass && !runtime.bypassActive {
+		runtime.bypassSince = time.Now().UTC()
+	}
+	if !observed.Bypass {
+		runtime.bypassSince = time.Time{}
+	}
+	runtime.bypassActive = observed.Bypass
+	runtime.bypassForced = observed.BypassForced
+	runtime.bypassCause = observed.BypassCause
+	runtime.bypassReason = observed.BypassReason
+	runtime.bypassPackets = observed.BypassPackets
 }
 
 // transparentGeneration is the single source of truth for the VPP generation
@@ -429,6 +467,7 @@ func (runtime *productionOrchestratorRuntime) markReconcileConsistent(requestID,
 	runtime.transparentObservedGeneration = observed.Generation
 	runtime.transparentObservedDefault = observed.Default
 	runtime.transparentConfiguredDefault = configuredDefault
+	runtime.observeBypassReadback(observed)
 	if runtime.transparentAppliedAt.IsZero() || repaired {
 		runtime.transparentAppliedAt = time.Now().UTC()
 	}
@@ -515,9 +554,75 @@ func (runtime *productionOrchestratorRuntime) DisableTransparent(ctx context.Con
 		runtime.transparentConfiguredDefault = ""
 		runtime.transparentObservedGeneration = ""
 		runtime.transparentObservedDefault = ""
+		runtime.setBypassLockedStateOnly(false, false, "", "")
 	}
 	runtime.releaseDPDK(ctx, requestID, err)
 	return err
+}
+
+// SetBypass toggles the plugin fault-bypass flag.  It serialises with apply and
+// reconcile, but deliberately leaves the committed generation untouched: the
+// configured policy is still in the data plane and applies again the moment
+// the bypass is cleared.
+func (runtime *productionOrchestratorRuntime) SetBypass(ctx context.Context, enabled bool, cause, reason string) error {
+	runtime.transparentMu.Lock()
+	defer runtime.transparentMu.Unlock()
+	return runtime.setBypassLocked(ctx, enabled, cause, reason)
+}
+
+func (runtime *productionOrchestratorRuntime) setBypassLocked(ctx context.Context, enabled bool, cause, reason string) error {
+	requestID := fmt.Sprintf("orchestrator-bypass-%d", time.Now().UnixNano())
+	readback, err := runtime.adapter.SetTransparentOrchestratorBypass(ctx, requestID, enabled, cause, reason)
+	if err != nil {
+		return err
+	}
+	runtime.bypassMu.Lock()
+	if enabled && !runtime.bypassActive {
+		runtime.bypassSince = time.Now().UTC()
+	}
+	if !enabled {
+		runtime.bypassSince = time.Time{}
+	}
+	runtime.bypassActive = readback.Bypass
+	runtime.bypassForced = enabled && strings.EqualFold(strings.TrimSpace(cause), "manual")
+	runtime.bypassCause = readback.BypassCause
+	runtime.bypassReason = readback.BypassReason
+	runtime.bypassPackets = readback.BypassPackets
+	runtime.bypassMu.Unlock()
+	action := "cleared"
+	if enabled {
+		action = "enabled"
+	}
+	log.Printf("orchestrator fault bypass %s: cause=%s reason=%s generation=%s", action, cause, reason, shortGeneration(runtime.transparentGeneration))
+	return nil
+}
+
+// setBypassLocked clears the cached bypass state without issuing a VPP
+// command (used when the orchestrator is disabled).
+func (runtime *productionOrchestratorRuntime) setBypassLockedStateOnly(enabled bool, forced bool, cause, reason string) {
+	runtime.bypassMu.Lock()
+	defer runtime.bypassMu.Unlock()
+	runtime.bypassActive = enabled
+	runtime.bypassForced = forced
+	runtime.bypassCause = cause
+	runtime.bypassReason = reason
+	if !enabled {
+		runtime.bypassSince = time.Time{}
+	}
+}
+
+func (runtime *productionOrchestratorRuntime) BypassSnapshot() orchestratorapi.BypassRuntimeState {
+	runtime.bypassMu.RLock()
+	defer runtime.bypassMu.RUnlock()
+	return orchestratorapi.BypassRuntimeState{
+		Enabled: runtime.bypassActive,
+		Forced:  runtime.bypassForced,
+		Cause:   runtime.bypassCause,
+		Reason:  runtime.bypassReason,
+		Since:   runtime.bypassSince,
+		Packets: runtime.bypassPackets,
+		Generation: runtime.transparentGeneration,
+	}
 }
 
 type transparentTransactionJournal struct {
@@ -657,6 +762,14 @@ func (runtime *productionOrchestratorRuntime) TransparentRuntimeEvidence(ctx con
 		LastDriftReason:   runtime.lastDriftReason,
 		LastReconciledAt:  runtime.lastReconcileAt,
 	}
+	runtime.observeBypassReadback(observed)
+	bypass := runtime.BypassSnapshot()
+	evidence.Bypass = bypass.Enabled
+	evidence.BypassForced = bypass.Forced
+	evidence.BypassCause = bypass.Cause
+	evidence.BypassReason = bypass.Reason
+	evidence.BypassSince = bypass.Since
+	evidence.BypassPackets = bypass.Packets
 	if observed.State != "running" {
 		return orchestratorapi.TransparentRuntimeEvidence{}, fmt.Errorf("transparent orchestrator state is %s (configured generation %s default %s)", observed.State, shortGeneration(runtime.transparentGeneration), runtime.transparentConfiguredDefault)
 	}

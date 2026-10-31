@@ -37,6 +37,7 @@ type Handler struct {
 	managementShared func(context.Context, string) bool
 	ports            PortResolver
 	reconcile        reconcileState
+	bypass           BypassController
 	// mutationMu serialises every configuration mutation from decoding to
 	// persistence.  Apply used to hold only the runtime mutex and released it
 	// before the record was persisted, so an overlapping topology/policy save
@@ -90,6 +91,15 @@ type TransparentRuntimeEvidence struct {
 	ReconcileFailures int       `json:"reconcile_failures"`
 	LastDriftReason   string    `json:"last_drift_reason,omitempty"`
 	LastReconciledAt  time.Time `json:"last_reconciled_at"`
+	// Fault bypass is independent of the policy generation: when active the
+	// plugin skips policy evaluation while still reporting the committed
+	// generation, so the control plane can state both facts.
+	Bypass        bool      `json:"bypass"`
+	BypassForced  bool      `json:"bypass_forced,omitempty"`
+	BypassCause   string    `json:"bypass_cause,omitempty"`
+	BypassReason  string    `json:"bypass_reason,omitempty"`
+	BypassSince   time.Time `json:"bypass_since,omitempty"`
+	BypassPackets uint64    `json:"bypass_packets,omitempty"`
 }
 
 type TransparentRuntimeEvidenceProvider interface {
@@ -232,6 +242,7 @@ func (handler *Handler) RegisterRoutes(mux *http.ServeMux) {
 	if handler.operations != nil {
 		mux.HandleFunc(OperationsPath, handler.handleCurrentOperation)
 	}
+	handler.registerBypassRoutes(mux)
 }
 
 func (handler *Handler) handleTopology(writer http.ResponseWriter, request *http.Request) {

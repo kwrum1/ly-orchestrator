@@ -793,12 +793,84 @@ ly_orch_disable (void)
   om->active.wan_sw_if_index = LY_ORCH_INVALID_INDEX;
   om->active.lan_sw_if_index = LY_ORCH_INVALID_INDEX;
   om->workers = 0;
+  /* Disabling orchestration removes the policy the bypass was shielding, so
+   * the flag must not survive into a later, unrelated configuration. */
+  om->bypass_active = 0;
+  om->bypass_forced = 0;
+  clib_memset (om->bypass_cause, 0, sizeof (om->bypass_cause));
+  clib_memset (om->bypass_reason, 0, sizeof (om->bypass_reason));
+  om->bypass_since = 0;
   vlib_worker_thread_barrier_release (om->vlib_main);
 
   ly_orch_config_free (&old_config);
   ly_orch_workers_free (old_workers);
   ly_orch_candidate_clear ();
   return 0;
+}
+
+static void
+ly_orch_bypass_copy (u8 destination[], u32 length, const u8 *source)
+{
+  clib_memset (destination, 0, length);
+  if (source)
+    clib_strncpy ((char *) destination, (const char *) source, length - 1);
+}
+
+/* Apply a bypass transition.  This deliberately does not touch the candidate
+ * or the committed generation: the policy stays configured and is re-armed
+ * the moment the bypass is cleared. */
+static clib_error_t *
+ly_orch_set_bypass (vlib_main_t *vm, u8 active, u8 forced, const u8 *cause,
+                    const u8 *reason)
+{
+  ly_orch_main_t *om = &ly_orch_main;
+  vlib_worker_thread_barrier_sync (vm);
+  om->bypass_active = active;
+  om->bypass_forced = forced;
+  ly_orch_bypass_copy (om->bypass_cause, sizeof (om->bypass_cause),
+                       cause ? cause : (u8 *) (active ? "auto" : "none"));
+  ly_orch_bypass_copy (om->bypass_reason, sizeof (om->bypass_reason),
+                       reason ? reason : (u8 *) "none");
+  om->bypass_since = active ? vlib_time_now (vm) : 0;
+  vlib_worker_thread_barrier_release (vm);
+  return 0;
+}
+
+static clib_error_t *
+ly_orch_bypass_command (unformat_input_t *input, vlib_main_t *vm)
+{
+  u8 *cause = 0, *reason = 0;
+  u8 active;
+  if (unformat (input, "on"))
+    active = 1;
+  else if (unformat (input, "off"))
+    active = 0;
+  else
+    return clib_error_return (0, "expected bypass on|off");
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "cause %s", &cause))
+        ;
+      else if (unformat (input, "reason %s", &reason))
+        ;
+      else
+        {
+          vec_free (cause);
+          vec_free (reason);
+          return clib_error_return (0, "expected cause <token> or reason <token>");
+        }
+    }
+  if (active && !cause)
+    cause = format (cause, "%s", "manual");
+  if (!reason)
+    reason = format (reason, "%s", active ? "manual_force" : "manual_clear");
+  {
+    clib_error_t *error =
+      ly_orch_set_bypass (vm, active, active, cause, reason);
+    vec_free (cause);
+    vec_free (reason);
+    return error;
+  }
 }
 
 static clib_error_t *
@@ -823,6 +895,8 @@ ly_orch_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
       ly_orch_main.candidate.default_action = LY_ORCH_ACTION_DROP;
       return 0;
     }
+  if (unformat (input, "bypass"))
+    return ly_orch_bypass_command (input, vm);
   if (unformat (input, "disable"))
     return ly_orch_disable ();
   if (unformat (input, "commit"))
@@ -835,7 +909,8 @@ VLIB_CLI_COMMAND (ly_orch_set_command, static) = {
   .short_help =
     "set ly-route orchestrator candidate clear|boundary|group|rule|default "
     "[wan-next-hop-mac <mac> lan-next-hop-mac <mac>]; "
-    "set ly-route orchestrator commit generation <id>|disable",
+    "set ly-route orchestrator commit generation <id>|disable|"
+    "bypass on|off [cause <token>] [reason <token>]",
   .function = ly_orch_set_command_fn,
 };
 
@@ -884,6 +959,21 @@ ly_orch_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
   }
   vlib_cli_output (vm, "default %s",
                    ly_orch_action_name (config->default_action));
+  {
+    u64 bypass_packets = 0;
+    vec_foreach_index (thread, workers)
+      bypass_packets += workers[thread].bypass_packets;
+    vlib_cli_output (vm, "bypass state %s",
+                     om->bypass_active ? "on" : "off");
+    vlib_cli_output (vm, "bypass cause %s",
+                     om->bypass_cause[0] ? (char *) om->bypass_cause : "none");
+    vlib_cli_output (vm, "bypass reason %s",
+                     om->bypass_reason[0] ? (char *) om->bypass_reason
+                                          : "none");
+    vlib_cli_output (vm, "bypass forced %s",
+                     om->bypass_forced ? "yes" : "no");
+    vlib_cli_output (vm, "bypass packets %llu", bypass_packets);
+  }
   vec_foreach_index (index, config->groups)
     {
       u64 bypass_packets = 0;
