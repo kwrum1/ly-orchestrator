@@ -192,26 +192,29 @@ async function interfacesReady(page) {
 async function openRole(page, port) {
   await waitRuntimeConverged(60000);
   let row = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
     await gotoReady(page, "/interfaces");
     if (await interfacesReady(page)) {
       row = page.locator("table tbody tr", { hasText: port }).first();
-      if (await row.count().catch(() => 0)) break;
+      if (await row.count().catch(() => 0)) {
+        const button = row.locator('button:has-text("角色配置")').first();
+        if (await button.count().catch(() => 0)) {
+          await button.click({ timeout: 25000 });
+          await page.waitForTimeout(500);
+          return page.locator(".modal").last();
+        }
+      }
     }
     await loginUI(page);
+    await page.waitForTimeout(800);
   }
-  if (!row || !(await row.count().catch(() => 0))) {
-    const info = {
-      url: page.url(),
-      heading: await page.locator(".main-inner h1").innerText().catch(() => ""),
-      rows: await page.locator("table tbody tr").count().catch(() => 0),
-      body: (await page.locator("body").innerText().catch(() => "")).slice(0, 300)
-    };
-    throw new Error("role row not found: " + JSON.stringify(info));
-  }
-  await row.locator('button:has-text("角色配置")').first().click({ timeout: 25000 });
-  await page.waitForTimeout(500);
-  return page.locator(".modal").last();
+  const info = {
+    url: page.url(),
+    heading: await page.locator(".main-inner h1").innerText().catch(() => ""),
+    rows: await page.locator("table tbody tr").count().catch(() => 0),
+    body: (await page.locator("body").innerText().catch(() => "")).slice(0, 300)
+  };
+  throw new Error("role row not found: " + JSON.stringify(info));
 }
 async function saveRoleDialog(page) {
   const modal = page.locator(".modal").last();
