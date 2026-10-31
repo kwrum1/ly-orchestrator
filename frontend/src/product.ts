@@ -15,7 +15,7 @@ export const PRODUCT_CONFIG = {
     loginTitle: "登录编排控制台",
     loginSubtitle: "单机流量编排：本地拓扑、策略与服务链",
     loginFooter: "Ly Route Orchestrator",
-    documentTitle: "Ly Route 流量编排器",
+    documentTitle: "ly Orchestrator",
   },
 };
 
