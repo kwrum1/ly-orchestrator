@@ -183,20 +183,31 @@ async function loginUI(page) {
     await page.waitForTimeout(3000);
   }
 }
+async function interfacesReady(page) {
+  const heading = await page.locator(".main-inner h1").innerText().catch(() => "");
+  if (!/网卡设置/.test(heading)) return false;
+  return (await page.locator("table thead th").allInnerTexts().catch(() => [])).some((text) => text.trim() === "方向");
+}
+
 async function openRole(page, port) {
   await waitRuntimeConverged(60000);
-  await gotoReady(page, "/interfaces");
-  let row = page.locator("table tbody tr", { hasText: port }).first();
-  if (!(await row.count().catch(() => 0))) {
-    // A lost/stale session shows the login screen instead of the table.
-    await loginUI(page);
+  let row = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     await gotoReady(page, "/interfaces");
-    row = page.locator("table tbody tr", { hasText: port }).first();
+    if (await interfacesReady(page)) {
+      row = page.locator("table tbody tr", { hasText: port }).first();
+      if (await row.count().catch(() => 0)) break;
+    }
+    await loginUI(page);
   }
-  if (!(await row.count().catch(() => 0))) {
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(2500);
-    row = page.locator("table tbody tr", { hasText: port }).first();
+  if (!row || !(await row.count().catch(() => 0))) {
+    const info = {
+      url: page.url(),
+      heading: await page.locator(".main-inner h1").innerText().catch(() => ""),
+      rows: await page.locator("table tbody tr").count().catch(() => 0),
+      body: (await page.locator("body").innerText().catch(() => "")).slice(0, 300)
+    };
+    throw new Error("role row not found: " + JSON.stringify(info));
   }
   await row.locator('button:has-text("角色配置")').first().click({ timeout: 25000 });
   await page.waitForTimeout(500);
