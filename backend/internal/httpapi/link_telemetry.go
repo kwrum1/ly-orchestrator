@@ -18,6 +18,7 @@ type vppLinkSnapshot struct {
 	PCI       string
 	Carrier   string
 	SpeedMbps int64
+	Duplex    string
 	MAC       string
 }
 
@@ -110,6 +111,7 @@ func parseVPPHardwareLinks(output string) (map[string]vppLinkSnapshot, map[strin
 			Interface: current,
 			Carrier:   "unknown",
 			SpeedMbps: vppLinkSpeedMbps(text),
+			Duplex:    vppHardwareDuplex(text),
 		}
 		if carrier := vppHardwareCarrier(text); carrier == "up" || carrier == "down" {
 			snapshot.Carrier = carrier
@@ -158,6 +160,17 @@ func parseVPPHardwareLinks(output string) (map[string]vppLinkSnapshot, map[strin
 // vppHardwareMACAddress reads the MAC VPP reports for a DPDK port. A port bound
 // to uio has no kernel netdev, so this is the only place the address still
 // exists after ownership/inventory records lose it.
+func vppHardwareDuplex(text string) string {
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "half duplex") {
+		return "half"
+	}
+	if strings.Contains(lower, "full duplex") {
+		return "full"
+	}
+	return ""
+}
+
 func vppHardwareMACAddress(line string) string {
 	trimmed := strings.TrimSpace(line)
 	if !strings.HasPrefix(trimmed, "Ethernet address") {

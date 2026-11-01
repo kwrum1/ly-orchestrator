@@ -11,7 +11,7 @@ func gatewayDiffHasDelete(name string, diff vpp.GatewayDiff) bool {
 	case "interfaces":
 		return len(diff.Interfaces.DeleteInterfaces) > 0
 	case "bonds":
-		return len(diff.Bonds.DeleteBonds) > 0
+		return len(diff.Bonds.DeleteBonds) > 0 || len(diff.Bonds.DeleteInterfaces) > 0
 	case "wan-groups":
 		return len(diff.WANGroups.DeleteWANGroups) > 0
 	case "routes":
@@ -34,7 +34,7 @@ func gatewayDiffHasApply(name string, diff vpp.GatewayDiff) bool {
 	case "interfaces":
 		return len(diff.Interfaces.Interfaces) > 0
 	case "bonds":
-		return len(diff.Bonds.Bonds) > 0
+		return len(diff.Bonds.Bonds) > 0 || len(diff.Bonds.Interfaces) > 0
 	case "wan-groups":
 		return len(diff.WANGroups.WANGroups) > 0
 	case "routes":

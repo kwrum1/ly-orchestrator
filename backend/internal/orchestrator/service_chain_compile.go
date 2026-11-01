@@ -47,6 +47,30 @@ func CompileServiceChain(topology Topology, flow PolicyFlow, path CompiledPath, 
 	if len(path.Traversal) > MaxServiceChainHops {
 		return ServiceChain{}, ErrServiceChainHopLimit
 	}
+	// VPP 26.06 segfaults in abf_plugin when an ABF/LCP pair is created on a
+	// synthetic bond. Bond LAN is static L3 in this release; service chains must
+	// use physical ports.
+	bonds := topologyBondNames(topology)
+	for _, name := range []string{logicalInterfaceName(topology.wan), logicalInterfaceName(topology.lan)} {
+		if bonds[name] {
+			return ServiceChain{}, fmt.Errorf("%w: %q", ErrServiceChainBond, name)
+		}
+	}
+	groups := make(map[string]Group, len(topology.groups))
+	for _, group := range topology.groups {
+		groups[group.Name()] = group
+	}
+	for _, name := range path.Traversal {
+		group, ok := groups[name]
+		if !ok {
+			continue
+		}
+		for _, port := range group.ports {
+			if port.hasBond {
+				return ServiceChain{}, fmt.Errorf("%w: group %q", ErrServiceChainBond, name)
+			}
+		}
+	}
 	forwardMatch := flowTuple(flow)
 	reverseMatch := reverseFlowTuple(forwardMatch)
 	chain := ServiceChain{
@@ -59,10 +83,6 @@ func CompileServiceChain(topology Topology, flow PolicyFlow, path CompiledPath, 
 	}
 	if chain.Direct {
 		return chain, nil
-	}
-	groups := make(map[string]Group, len(topology.groups))
-	for _, group := range topology.groups {
-		groups[group.Name()] = group
 	}
 	bindings, err := parseServiceChainBindings(inputs, groups, flow.sourceIP.Is6())
 	if err != nil {
@@ -139,6 +159,25 @@ func logicalInterfaceName(item LogicalInterface) string {
 		return item.bond.name.String()
 	}
 	return item.port.String()
+}
+
+// topologyBondNames lists every synthetic bond in the topology. Service chains
+// reject these endpoints because VPP 26.06's abf_plugin crashes on a bond ABF.
+func topologyBondNames(topology Topology) map[string]bool {
+	names := map[string]bool{}
+	for _, item := range []LogicalInterface{topology.lan, topology.wan} {
+		if item.hasBond {
+			names[item.bond.name.String()] = true
+		}
+	}
+	for _, group := range topology.groups {
+		for _, port := range group.ports {
+			if port.hasBond {
+				names[port.bond.name.String()] = true
+			}
+		}
+	}
+	return names
 }
 
 func flowTuple(flow PolicyFlow) FlowTuple {

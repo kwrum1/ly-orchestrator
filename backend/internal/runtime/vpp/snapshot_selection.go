@@ -81,10 +81,10 @@ func selectBonds(states []BondState, request SnapshotRequest) ([]BondState, erro
 		available[state.Name] = struct{}{}
 		selected = append(selected, state)
 	}
-	if len(selected) == 0 && len(request.Bonds) > 0 {
+	if len(selected) == 0 && len(request.Bonds) > 0 && !request.AllowMissing {
 		return nil, fmt.Errorf("%w: no bond state returned", ErrSnapshotIncomplete)
 	}
-	if err := requireNames(request.Bonds, available, "bond"); err != nil {
+	if err := requireNamesAllowMissing(request.Bonds, available, "bond", request.AllowMissing); err != nil {
 		return nil, err
 	}
 	sort.Slice(selected, func(left, right int) bool { return selected[left].Name < selected[right].Name })

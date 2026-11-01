@@ -343,8 +343,14 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 		return nil, &DataplaneLockedError{Prerequisites: prerequisites, Candidates: nativePath.Candidates}
 	}
 	attachments := make(map[string]NativeAttachment, len(nativePath.Attachments))
+	attachmentsByVPP := make(map[string]NativeAttachment, len(nativePath.Attachments))
 	for _, attachment := range nativePath.Attachments {
 		attachments[strings.TrimSpace(attachment.LinuxInterface)] = attachment
+		attachmentsByVPP[strings.TrimSpace(attachment.VPPInterface)] = attachment
+	}
+	bondMembers := make(map[string][]string, len(plan.Bonds))
+	for _, bond := range plan.Bonds {
+		bondMembers[strings.TrimSpace(bond.Name)] = bond.Members
 	}
 	prerequisites := append([]PrerequisiteResult(nil), nativePath.Prerequisites...)
 	management := strings.TrimSpace(plan.NativePath.ManagementInterface)
@@ -352,10 +358,29 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 		linuxInterface := strings.TrimSpace(assignment.LinuxInterface)
 		vppInterface := strings.TrimSpace(assignment.VPPInterface)
 		attachment, proven := attachments[linuxInterface]
+		isBond := false
+		if members, ok := bondMembers[linuxInterface]; ok {
+			// A bond is a synthetic interface: it has no PCI/native proof of its
+			// own. It inherits the proof of every member; a member without a
+			// selected native attachment keeps the assignment locked with that
+			// member's name in the evidence.
+			isBond = true
+			proven = len(members) > 0
+			for _, member := range members {
+				if _, ok := attachmentsByVPP[strings.TrimSpace(member)]; !ok {
+					proven = false
+					break
+				}
+			}
+		}
+		vppMatches := proven && vppInterface == attachment.VPPInterface
+		if isBond {
+			vppMatches = proven && vppInterface == linuxInterface
+		}
 		prerequisites = append(prerequisites,
 			prerequisite("address_assignment_management_excluded", linuxInterface, management != "" && (plan.NativePath.ManagementShared || linuxInterface != management), "address assignment references the management interface"),
-			prerequisite("address_assignment_proven", linuxInterface, proven, "address assignment has no selected runtime-proven native attachment"),
-			prerequisite("address_assignment_vpp_interface_matches", linuxInterface, proven && vppInterface == attachment.VPPInterface, "address assignment VPP interface does not match the selected native attachment"),
+			prerequisite("address_assignment_proven", linuxInterface, proven, "address assignment has no selected runtime-proven native attachment (bond inherits its members)"),
+			prerequisite("address_assignment_vpp_interface_matches", linuxInterface, vppMatches, "address assignment VPP interface does not match the selected native attachment"),
 		)
 	}
 	for _, result := range prerequisites {
@@ -381,8 +406,18 @@ func BuildOperations(plan Plan) ([]Operation, error) {
 	broadcastRouteEmitted := false
 	bypassPoliciesEmitted := 0
 	nat44RolePlanEmitted := false
+	// A bond has no Linux host interface, and creating an LCP/ABF pair for it
+	// segfaults VPP 26.06's abf_plugin. Bond L3 is applied by the bond lifecycle;
+	// LAN services that require an LCP stay unavailable on a bond.
+	bondNames := make(map[string]bool, len(plan.Bonds))
+	for _, bond := range plan.Bonds {
+		bondNames[strings.TrimSpace(bond.Name)] = true
+	}
 	for _, assignment := range plan.AddressAssignments {
 		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		if bondNames[strings.TrimSpace(assignment.LinuxInterface)] {
 			continue
 		}
 		vppInterface := strings.TrimSpace(assignment.VPPInterface)

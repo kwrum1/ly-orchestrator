@@ -511,8 +511,15 @@ func supplementalReconciliationOperations(plan Plan, owner SupplementalOwner) ([
 func interfaceLCPReconciliationOperations(plan Plan) []Operation {
 	operations := make([]Operation, 0, len(plan.AddressAssignments)+1)
 	seen := make(map[string]bool, len(plan.AddressAssignments))
+	bondNames := make(map[string]bool, len(plan.Bonds))
+	for _, bond := range plan.Bonds {
+		bondNames[strings.TrimSpace(bond.Name)] = true
+	}
 	for _, assignment := range plan.AddressAssignments {
 		if !strings.EqualFold(strings.TrimSpace(assignment.Role), "lan") {
+			continue
+		}
+		if bondNames[strings.TrimSpace(assignment.LinuxInterface)] {
 			continue
 		}
 		vppInterface := strings.TrimSpace(assignment.VPPInterface)

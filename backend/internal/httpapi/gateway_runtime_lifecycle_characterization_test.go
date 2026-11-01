@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"ly-route/backend/internal/persistence"
 	"ly-route/backend/internal/runtime/apply"
@@ -223,16 +224,42 @@ func gatewayLifecycleBondServer(t *testing.T) (*Server, *http.Cookie) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
+	// A fake sysfs tree makes eth1/eth2 physical ixgbe ports. Without it the
+	// rule library sees unknown hardware and drops the fresh AF_XDP proofs,
+	// which is not what this bond lifecycle characterization is about.
+	sysfs := t.TempDir()
+	for index, name := range []string{"eth1", "eth2"} {
+		pci := []string{"0000:03:00.0", "0000:04:00.0"}[index]
+		device := filepath.Join(sysfs, "bus", "pci", "devices", pci)
+		if err := os.MkdirAll(device, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		driver := filepath.Join(sysfs, "bus", "pci", "drivers", "ixgbe")
+		if err := os.MkdirAll(driver, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(driver, filepath.Join(device, "driver")); err != nil {
+			t.Fatal(err)
+		}
+		netdev := filepath.Join(sysfs, "class", "net", name)
+		if err := os.MkdirAll(netdev, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(device, filepath.Join(netdev, "device")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("LY_ROUTE_SYSFS_ROOT", sysfs)
 	saveExplicitDataInterface(t, store, "eth1")
 	useVPPProof(t, "eth0")
 	server := New(
 		WithStore(store),
 		WithAuthConfig(AuthConfig{AdminUsername: "admin", AdminPassword: "secret"}),
 		WithInterfaceTelemetry(fakeInterfaceTelemetry{items: []map[string]any{
-			{"id": "eth1", "name": "eth1", "work_mode": "vpp", "speed": "10G"},
-			{"id": "eth2", "name": "eth2", "work_mode": "vpp", "speed": "10G"},
+			{"id": "eth1", "name": "eth1", "work_mode": "vpp", "speed": "10G", "link_state": "up", "link_speed_mbps": 10000},
+			{"id": "eth2", "name": "eth2", "work_mode": "vpp", "speed": "10G", "link_state": "up", "link_speed_mbps": 10000},
 		}}),
-		WithClock(fixedClock()),
+		WithClock(func() time.Time { return time.Date(2026, 6, 6, 11, 59, 30, 0, time.UTC) }),
 	)
 	login := requestBody(t, server, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"secret"}`)
 	if login.Code != http.StatusOK {

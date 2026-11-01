@@ -3225,21 +3225,91 @@ func (server *Server) compileInterfaceBond(ctx context.Context, payload map[stri
 		}
 		selected = append(selected, item)
 	}
-	speed := stringField(selected[0], "speed")
+	// The persisted interface item often has no speed (a DPDK-bound port has no
+	// Linux netdev). Read the live link state and VPP/hardware speed instead of
+	// comparing two empty strings, and name the failing member in the error.
+	vppNames := server.vppInterfaceNames(ctx)
+	// Use the same enriched inventory the interface API serves so a DPDK-bound
+	// member (no Linux netdev) reports its live VPP speed instead of "unknown".
+	enriched := map[string]map[string]any{}
+	for _, item := range interfaces {
+		for _, key := range []string{stringField(item, "id"), stringField(item, "interface_id"), stringField(item, "system_name")} {
+			if key = strings.TrimSpace(key); key != "" {
+				enriched[key] = item
+			}
+		}
+	}
+	type bondMemberLink struct {
+		member  string
+		display string
+		speed   int
+		duplex  string
+	}
+	links := make([]bondMemberLink, 0, len(selected))
+	for index, item := range selected {
+		name := server.resolveInterfaceID(ctx, members[index])
+		statusItem := item
+		if candidate, ok := enriched[members[index]]; ok {
+			statusItem = candidate
+		} else if candidate, ok := enriched[name]; ok {
+			statusItem = candidate
+		}
+		status := server.interfaceTakeoverStatus(ctx, name, statusItem, vppNames)
+		display := nonEmpty(stringField(statusItem, "system_name"), name)
+		// A DPDK port has no Linux netdev; the live carrier/speed is only in
+		// VPP. Read it directly instead of depending on the status function's
+		// takeover-mode heuristics (the raw desired item has no pci proof).
+		link := stringField(status, "link_state")
+		speedMbps := intField(status, "link_speed_mbps")
+		duplex := ""
+		if snapshot, ok := server.vppLinkSnapshotFor(ctx, name, stringField(statusItem, "pci")); ok {
+			if snapshot.Carrier == "up" || snapshot.Carrier == "down" {
+				link = snapshot.Carrier
+			}
+			if snapshot.SpeedMbps > 0 {
+				speedMbps = int(snapshot.SpeedMbps)
+			}
+			duplex = snapshot.Duplex
+		}
+		if link != "up" {
+			return nil, http.StatusBadRequest, fmt.Errorf("interface bond member %q (%s) link is %s; all members must be link up", members[index], display, nonEmpty(link, "unknown"))
+		}
+		if speedMbps <= 0 {
+			speedMbps = parseLinkSpeedMbps(stringField(item, "speed"))
+		}
+		if speedMbps <= 0 {
+			return nil, http.StatusBadRequest, fmt.Errorf("interface bond member %q (%s) has unknown link speed; connect it and retry", members[index], display)
+		}
+		links = append(links, bondMemberLink{member: members[index], display: display, speed: speedMbps, duplex: duplex})
+	}
+	for _, link := range links[1:] {
+		if link.speed != links[0].speed {
+			parts := make([]string, 0, len(links))
+			for _, item := range links {
+				parts = append(parts, fmt.Sprintf("%s=%dMb/s", item.display, item.speed))
+			}
+			return nil, http.StatusBadRequest, fmt.Errorf("interface bond members must have the same speed: %s", strings.Join(parts, ", "))
+		}
+		if link.duplex != "" && links[0].duplex != "" && link.duplex != links[0].duplex {
+			parts := make([]string, 0, len(links))
+			for _, item := range links {
+				parts = append(parts, fmt.Sprintf("%s=%s", item.display, nonEmpty(item.duplex, "unknown")))
+			}
+			return nil, http.StatusBadRequest, fmt.Errorf("interface bond members must have the same duplex: %s", strings.Join(parts, ", "))
+		}
+	}
+	speed := fmt.Sprintf("%dMb/s", links[0].speed)
 	workMode := stringField(selected[0], "work_mode")
 	if workMode == "" {
 		workMode = stringField(selected[0], "active_path")
 	}
-	for _, item := range selected[1:] {
-		if stringField(item, "speed") != speed {
-			return nil, http.StatusBadRequest, fmt.Errorf("interface bond members must have the same speed")
-		}
+	for index, item := range selected[1:] {
 		itemWorkMode := stringField(item, "work_mode")
 		if itemWorkMode == "" {
 			itemWorkMode = stringField(item, "active_path")
 		}
 		if itemWorkMode != workMode {
-			return nil, http.StatusBadRequest, fmt.Errorf("interface bond members must have the same work_mode")
+			return nil, http.StatusBadRequest, fmt.Errorf("interface bond member %q (%s) work_mode %q differs from %q", members[index+1], nonEmpty(stringField(item, "system_name"), members[index+1]), itemWorkMode, workMode)
 		}
 	}
 	for _, item := range selected {
@@ -5266,10 +5336,22 @@ func (server *Server) managementNetworkState(ctx context.Context, includeCurrent
 func (server *Server) runtimeDataInterfaces(ctx context.Context) []string {
 	managementInterface := server.managementInterfaceID(ctx)
 	managementShared := server.managementNetworkShared(ctx)
+	bonds := server.desiredBondMemberMap(ctx)
+	bondIDs := make(map[string]bool, len(bonds))
+	for id := range bonds {
+		bondIDs[id] = true
+	}
 	dataInterfaces := []string{}
 	seen := map[string]bool{}
 	appendInterface := func(name string) {
 		name = strings.TrimSpace(name)
+		// A bond is a synthetic VPP interface. It has no PCI address or native
+		// capability proof of its own; its members are the dataplane ports that
+		// must be proven. Probing the bond id produced a spurious
+		// dataplane_locked/runtime_capability_proof failure.
+		if bondIDs[name] {
+			return
+		}
 		if name == "" || (!managementShared && name == managementInterface) || seen[name] || !vppInterfaceNameSafe(name) {
 			return
 		}
@@ -5307,12 +5389,78 @@ func (server *Server) runtimeDataInterfaces(ctx context.Context) []string {
 			}
 			for _, group := range view.Groups {
 				for _, port := range group.Ports {
+					if port.Bond != nil {
+						for _, member := range port.Bond.Members {
+							appendInterface(member)
+						}
+						continue
+					}
 					appendInterface(port.Interface)
 				}
 			}
 		}
 	}
+	// Bond members are data ports even before the bond has a role/address, so
+	// their native proofs must be selected and verified before the bond add.
+	for _, members := range bonds {
+		for _, member := range members {
+			appendInterface(member)
+		}
+	}
 	return dataInterfaces
+}
+
+// desiredBondMemberMap returns every desired bond id/name and its resolved
+// member ports. The bond itself is synthetic; only the members are physical
+// dataplane candidates.
+func (server *Server) desiredBondMemberMap(ctx context.Context) map[string][]string {
+	result := map[string][]string{}
+	add := func(id string, members []string, resolve bool) {
+		resolved := make([]string, 0, len(members))
+		for _, member := range members {
+			name := strings.TrimSpace(member)
+			if resolve {
+				name = server.resolveInterfaceID(ctx, member)
+			}
+			if name != "" {
+				resolved = append(resolved, name)
+			}
+		}
+		id = strings.TrimSpace(id)
+		if id != "" && len(resolved) > 0 {
+			result[id] = resolved
+		}
+	}
+	items, err := server.desiredItems(ctx, "interface_bond")
+	if err == nil {
+		for _, item := range items {
+			if truthy(item["deleted"]) {
+				continue
+			}
+			members := stringSliceField(item, "members")
+			for _, key := range []string{stringField(item, "id"), stringField(item, "name")} {
+				add(key, members, true)
+			}
+		}
+	}
+	if server.orchestratorRepository != nil {
+		if topology, _, err := server.orchestratorRepository.Snapshot(ctx); err == nil {
+			view := topology.View()
+			for _, logical := range view.Interfaces {
+				if logical.Bond != nil {
+					add(logical.Bond.Name, logical.Bond.Members, false)
+				}
+			}
+			for _, group := range view.Groups {
+				for _, port := range group.Ports {
+					if port.Bond != nil {
+						add(port.Bond.Name, port.Bond.Members, false)
+					}
+				}
+			}
+		}
+	}
+	return result
 }
 
 // runtimeDataplaneInterfaces is the single interface set the capability probe,
@@ -5330,20 +5478,33 @@ func (server *Server) runtimeDataplaneInterfaces(ctx context.Context) []string {
 	}
 	managementInterface := server.managementInterfaceID(ctx)
 	managementShared := server.managementNetworkShared(ctx)
+	bonds := server.desiredBondMemberMap(ctx)
+	bondIDs := make(map[string]bool, len(bonds))
+	for id := range bonds {
+		bondIDs[id] = true
+	}
 	seen := make(map[string]bool, len(interfaces)+len(assignments))
 	for _, name := range interfaces {
 		seen[strings.TrimSpace(name)] = true
 	}
-	for _, assignment := range assignments {
-		name := strings.TrimSpace(assignment.LinuxInterface)
-		if name == "" || seen[name] || !vppInterfaceNameSafe(name) {
-			continue
+	appendName := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || bondIDs[name] || seen[name] || !vppInterfaceNameSafe(name) {
+			return
 		}
 		if !managementShared && name == managementInterface {
-			continue
+			return
 		}
 		seen[name] = true
 		interfaces = append(interfaces, name)
+	}
+	for _, assignment := range assignments {
+		appendName(assignment.LinuxInterface)
+	}
+	for _, members := range bonds {
+		for _, member := range members {
+			appendName(member)
+		}
 	}
 	return interfaces
 }
@@ -5584,6 +5745,13 @@ func vppInterfaceName(linuxInterface string) string {
 	linuxInterface = strings.TrimSpace(linuxInterface)
 	if linuxInterface == "" {
 		return ""
+	}
+	// Bonds are created with their product id as the VPP interface name
+	// (create bond ... then set interface name BondEthernetN <id>). Adding the
+	// lyroute- prefix addressed a non-existent interface and left the bond
+	// address unapplied.
+	if strings.HasPrefix(linuxInterface, "bond-") || strings.HasPrefix(linuxInterface, "BondEthernet") {
+		return linuxInterface
 	}
 	return "lyroute-" + linuxInterface
 }
@@ -6681,6 +6849,44 @@ func round2(value float64) float64 {
 func stringField(item map[string]any, key string) string {
 	value, _ := item[key].(string)
 	return strings.TrimSpace(value)
+}
+
+// parseLinkSpeedMbps accepts the UI's "1000Mb/s", "1Gb/s", "10G" or bare
+// numeric form. Live VPP/hardware speed is preferred; this is only a fallback
+// for a persisted item that still carries a speed string.
+func parseLinkSpeedMbps(value string) int {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return 0
+	}
+	multiplier := 1
+	switch {
+	case strings.HasSuffix(value, "gb/s"):
+		multiplier = 1000
+		value = strings.TrimSuffix(value, "gb/s")
+	case strings.HasSuffix(value, "gbps"):
+		multiplier = 1000
+		value = strings.TrimSuffix(value, "gbps")
+	case strings.HasSuffix(value, "gb"):
+		multiplier = 1000
+		value = strings.TrimSuffix(value, "gb")
+	case strings.HasSuffix(value, "g"):
+		multiplier = 1000
+		value = strings.TrimSuffix(value, "g")
+	case strings.HasSuffix(value, "mb/s"):
+		value = strings.TrimSuffix(value, "mb/s")
+	case strings.HasSuffix(value, "mbps"):
+		value = strings.TrimSuffix(value, "mbps")
+	case strings.HasSuffix(value, "mb"):
+		value = strings.TrimSuffix(value, "mb")
+	case strings.HasSuffix(value, "m"):
+		value = strings.TrimSuffix(value, "m")
+	}
+	number, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil || number <= 0 {
+		return 0
+	}
+	return int(number * float64(multiplier))
 }
 
 func intField(item map[string]any, key string) int {
@@ -8056,7 +8262,8 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 	if err := vpp.ResolveFlowShapingInterfaces(&gatewayFlow, addressAssignments); err != nil {
 		return RuntimePlan{}, err
 	}
-	canonicalGatewayPlan := vpp.Plan{RequestID: requestID, NativePath: nativePath, DataplanePrepared: dataplanePrepared, AddressAssignments: addressAssignments, Proxy: compiledProxy, Flow: gatewayFlow, NAT: compiledNAT, Policy: gatewayPolicy, RetiredRoutePolicyIDs: retiredRoutePolicyIDs, Security: securityGeneration, DNSInterception: dnsInterceptionEnabled, DNSABFSteering: dnsABFSteering, LANVPPInterfaces: lanVPPInterfaces(addressAssignments), DNSServiceNetworks: dnsServiceNetworks, Mirror: mirrorConfig, SkipQoS: qosSkipAll}
+	gatewayBonds := server.desiredBondStates(ctx)
+	canonicalGatewayPlan := vpp.Plan{RequestID: requestID, NativePath: nativePath, DataplanePrepared: dataplanePrepared, AddressAssignments: addressAssignments, Proxy: compiledProxy, Flow: gatewayFlow, NAT: compiledNAT, Policy: gatewayPolicy, RetiredRoutePolicyIDs: retiredRoutePolicyIDs, Security: securityGeneration, DNSInterception: dnsInterceptionEnabled, DNSABFSteering: dnsABFSteering, LANVPPInterfaces: lanVPPInterfaces(addressAssignments), DNSServiceNetworks: dnsServiceNetworks, Mirror: mirrorConfig, Bonds: gatewayBonds, SkipQoS: qosSkipAll}
 	operations, err := vpp.BuildOperations(canonicalGatewayPlan)
 	mark("build-operations")
 	dataplaneState := "native_ready"
@@ -8079,7 +8286,6 @@ func (server *Server) buildRuntimePlanFromConfig(ctx context.Context, requestID 
 		})
 	}
 	warnings := append([]string(nil), planningWarnings...)
-	gatewayBonds := []vpp.BondState{}
 	if err != nil {
 		var afRequired *vpp.AFFallbackRequiredError
 		var locked *vpp.DataplaneLockedError
@@ -9342,13 +9548,46 @@ func (server *Server) currentInterfaceBondOperations(ctx context.Context, reques
 			if resolved == management && !server.managementNetworkShared(ctx) {
 				return nil, managementOperationLock(management, "vpp.interface-bond")
 			}
-			actualMembers = append(actualMembers, resolved)
+			// VPP's `bond add` and `show bond` use the VPP interface name, not
+			// the Linux netdev name. Persisting the Linux name made every bond
+			// readback mismatch and the member add fail.
+			actualMembers = append(actualMembers, vppInterfaceName(resolved))
 		}
 		payload := cloneObject(item)
 		payload["members"] = actualMembers
 		operations = append(operations, vpp.Operation{Name: "vpp.interface-bond", RequestID: requestID, Resource: stringField(item, "id"), Payload: payload})
 	}
 	return operations, nil
+}
+
+// desiredBondStates is the declarative bond inventory used by BuildOperations
+// before the bond operations are appended. Without it the address-proof gate
+// saw an empty plan.Bonds and treated the synthetic bond as an unproven port.
+func (server *Server) desiredBondStates(ctx context.Context) []vpp.BondState {
+	items, err := server.desiredItems(ctx, "interface_bond")
+	if err != nil {
+		return nil
+	}
+	bonds := make([]vpp.BondState, 0, len(items))
+	for _, item := range items {
+		if truthy(item["deleted"]) {
+			continue
+		}
+		id := strings.TrimSpace(stringField(item, "id"))
+		members := stringSliceField(item, "members")
+		if id == "" || len(members) == 0 {
+			continue
+		}
+		resolved := make([]string, 0, len(members))
+		for _, member := range members {
+			name := server.resolveInterfaceID(ctx, member)
+			if name != "" {
+				resolved = append(resolved, vppInterfaceName(name))
+			}
+		}
+		bonds = append(bonds, vpp.BondState{Name: id, Mode: nonEmpty(stringField(item, "mode"), "xor"), Members: resolved})
+	}
+	return bonds
 }
 
 func bondStatesFromOperations(operations []vpp.Operation) []vpp.BondState {

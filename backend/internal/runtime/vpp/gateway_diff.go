@@ -152,9 +152,15 @@ func ReconcileGatewayPlan(input GatewayReconciliationInput) (GatewayDiff, error)
 		previousPoolAddresses = nat44PoolAddresses(prior.AddressAssignments)
 	}
 	staleNATRoles := staleNAT44RoleInterfaces(prior, desired)
+	interfacesPlan, bondsPlan := splitBondInterfaceStates(
+		InterfaceBondPlan{TransactionID: transactionID, ManagementInterface: desired.NativePath.ManagementInterface, Interfaces: interfaces.apply, DeleteInterfaces: interfaces.delete},
+		InterfaceBondPlan{TransactionID: transactionID, ManagementInterface: desired.NativePath.ManagementInterface, Bonds: bonds.apply, DeleteBonds: bonds.delete},
+		desired,
+		prior,
+	)
 	return GatewayDiff{
-		Interfaces: InterfaceBondPlan{TransactionID: transactionID, ManagementInterface: desired.NativePath.ManagementInterface, Interfaces: interfaces.apply, DeleteInterfaces: interfaces.delete},
-		Bonds:      InterfaceBondPlan{TransactionID: transactionID, ManagementInterface: desired.NativePath.ManagementInterface, Bonds: bonds.apply, DeleteBonds: bonds.delete},
+		Interfaces: interfacesPlan,
+		Bonds:      bondsPlan,
 		WANGroups:  RouteWANGroupPlan{TransactionID: transactionID, WANGroups: wanGroups.apply, DeleteWANGroups: wanGroups.delete},
 		Routes: RouteWANGroupPlan{
 			TransactionID:       transactionID,
@@ -197,6 +203,44 @@ func ReconcileGatewayPlan(input GatewayReconciliationInput) (GatewayDiff, error)
 			DeletePortMappings:    portMappings.delete,
 		},
 	}, nil
+}
+
+// splitBondInterfaceStates moves synthetic bond interface states (the bond's
+// admin state/address) out of the physical-interface plan and into the bond
+// plan. The interfaces adapter runs before the bonds adapter and cannot
+// address an interface that does not exist yet; the bond adapter creates the
+// bond first and then applies its address, with the bond interface included in
+// the readback request.
+func splitBondInterfaceStates(interfaces, bonds InterfaceBondPlan, desired, prior Plan) (InterfaceBondPlan, InterfaceBondPlan) {
+	names := map[string]bool{}
+	for _, bond := range desired.Bonds {
+		names[strings.TrimSpace(bond.Name)] = true
+	}
+	for _, bond := range prior.Bonds {
+		names[strings.TrimSpace(bond.Name)] = true
+	}
+	if len(names) == 0 {
+		return interfaces, bonds
+	}
+	physical := make([]InterfaceState, 0, len(interfaces.Interfaces))
+	for _, state := range interfaces.Interfaces {
+		if names[strings.TrimSpace(state.Name)] {
+			bonds.Interfaces = append(bonds.Interfaces, state)
+			continue
+		}
+		physical = append(physical, state)
+	}
+	interfaces.Interfaces = physical
+	physicalDelete := make([]string, 0, len(interfaces.DeleteInterfaces))
+	for _, name := range interfaces.DeleteInterfaces {
+		if names[strings.TrimSpace(name)] {
+			bonds.DeleteInterfaces = append(bonds.DeleteInterfaces, name)
+			continue
+		}
+		physicalDelete = append(physicalDelete, name)
+	}
+	interfaces.DeleteInterfaces = physicalDelete
+	return interfaces, bonds
 }
 
 // staleNAT44RoleInterfaces returns data ports that owned an address in the

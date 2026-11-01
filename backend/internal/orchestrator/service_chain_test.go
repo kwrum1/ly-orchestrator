@@ -183,6 +183,42 @@ func TestCompileServiceChainWithHealth_allGroupsFailedDefaultsToDirect(t *testin
 	}
 }
 
+func TestCompileServiceChainRejectsBondEndpoints(t *testing.T) {
+	flow := mustParseFlow(t, FlowInput{SourceIP: "198.18.0.2", DestinationIP: "198.18.5.2", Protocol: ProtocolICMP})
+
+	t.Run("logical bond", func(t *testing.T) {
+		input := TopologyInput{SchemaVersion: SchemaVersion, ManagementInterface: "mgmt0", Interfaces: []InterfaceInput{
+			{Name: "lan", Role: RoleLAN, Bond: &BondInput{Name: "bond-lan", Members: []string{"lan1", "lan2"}}},
+			{Name: "wan", Role: RoleWAN, Port: "wan0"},
+		}}
+		topology, err := ParseTopology(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := CompileServiceChain(topology, flow, CompiledPath{Exit: PathExitLAN}, nil); !errors.Is(err, ErrServiceChainBond) {
+			t.Fatalf("CompileServiceChain = %v, want ErrServiceChainBond", err)
+		}
+	})
+
+	t.Run("group bond", func(t *testing.T) {
+		input := TopologyInput{SchemaVersion: SchemaVersion, ManagementInterface: "mgmt0", Interfaces: []InterfaceInput{
+			{Name: "lan", Role: RoleLAN, Port: "lan0"},
+			{Name: "wan", Role: RoleWAN, Port: "wan0"},
+		}, Groups: []GroupInput{{Name: "group-a", Ports: []DirectedPortInput{
+			{Bond: &BondInput{Name: "bond-group", Members: []string{"a-lan1", "a-lan2"}}, Direction: DirectionLANFacing},
+			{Interface: "a-wan", Direction: DirectionWANFacing},
+		}}}}
+		topology, err := ParseTopology(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = CompileServiceChain(topology, flow, CompiledPath{Traversal: []string{"group-a"}, Exit: PathExitLAN}, []ServiceChainBindingInput{{Group: "group-a", WANFacingNextHop: "198.18.1.2", LANFacingNextHop: "198.18.2.2"}})
+		if !errors.Is(err, ErrServiceChainBond) {
+			t.Fatalf("CompileServiceChain = %v, want ErrServiceChainBond", err)
+		}
+	})
+}
+
 func serviceChainTopology(t *testing.T, groups ...string) Topology {
 	t.Helper()
 	input := TopologyInput{SchemaVersion: SchemaVersion, ManagementInterface: "mgmt0", Interfaces: []InterfaceInput{{Name: "lan", Role: RoleLAN, Port: "lan0"}, {Name: "wan", Role: RoleWAN, Port: "wan0"}}}

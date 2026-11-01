@@ -47,6 +47,10 @@ func TestRuntimeDataInterfacesIncludeConfirmedOrchestratorTopology(t *testing.T)
 		Groups: []orchestrator.GroupInput{
 			{Name: "inspection-a", Ports: []orchestrator.DirectedPortInput{{Interface: "eth4", Direction: orchestrator.DirectionLANFacing}, {Interface: "eth5", Direction: orchestrator.DirectionWANFacing}}},
 			{Name: "inspection-b", Ports: []orchestrator.DirectedPortInput{{Interface: "eth6", Direction: orchestrator.DirectionLANFacing}, {Interface: "eth7", Direction: orchestrator.DirectionWANFacing}}},
+			{Name: "inspection-bond", Ports: []orchestrator.DirectedPortInput{
+				{Bond: &orchestrator.BondInput{Name: "bond-group", Members: []string{"eth8", "eth9"}}, Direction: orchestrator.DirectionLANFacing},
+				{Interface: "eth10", Direction: orchestrator.DirectionWANFacing},
+			}},
 		},
 	}
 	topology, err := orchestrator.ParseTopology(input)
@@ -58,7 +62,7 @@ func TestRuntimeDataInterfacesIncludeConfirmedOrchestratorTopology(t *testing.T)
 	}
 
 	got := server.runtimeDataInterfaces(context.Background())
-	want := []string{"eth1", "eth2", "eth3", "eth4", "eth5", "eth6", "eth7"}
+	want := []string{"eth1", "eth2", "eth3", "eth4", "eth5", "eth6", "eth7", "eth8", "eth9", "eth10"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("runtime data interfaces = %v, want %v", got, want)
 	}

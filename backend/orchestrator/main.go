@@ -970,12 +970,18 @@ func reconcileTransparentStartup(ctx context.Context, repository *orchestrator.R
 func transparentTopologyInterfaces(topology orchestrator.TopologyView) []string {
 	seen := map[string]bool{}
 	result := []string{}
+	bonds := transparentBondMemberMap(topology)
+	bondIDs := make(map[string]bool, len(bonds))
+	for id := range bonds {
+		bondIDs[id] = true
+	}
 	appendName := func(name string) {
 		name = strings.TrimSpace(name)
-		if name != "" && !seen[name] {
-			seen[name] = true
-			result = append(result, name)
+		if name == "" || bondIDs[name] || seen[name] {
+			return
 		}
+		seen[name] = true
+		result = append(result, name)
 	}
 	for _, item := range topology.Interfaces {
 		if item.Bond == nil {
@@ -988,10 +994,57 @@ func transparentTopologyInterfaces(topology orchestrator.TopologyView) []string 
 	}
 	for _, group := range topology.Groups {
 		for _, port := range group.Ports {
+			if port.Bond != nil {
+				for _, member := range port.Bond.Members {
+					appendName(member)
+				}
+				continue
+			}
 			appendName(port.Interface)
 		}
 	}
+	for _, members := range bonds {
+		for _, member := range members {
+			appendName(member)
+		}
+	}
 	sort.Strings(result)
+	return result
+}
+
+// transparentBondMemberMap returns every bond in the topology and its members.
+// A bond is a synthetic VPP interface; probing it produces a spurious
+// runtime_capability_proof failure because it has no PCI/native proof of its
+// own. Its members are the dataplane ports that must be proven.
+func transparentBondMemberMap(topology orchestrator.TopologyView) map[string][]string {
+	result := map[string][]string{}
+	add := func(name string, members []string) {
+		name = strings.TrimSpace(name)
+		if name == "" || len(members) == 0 {
+			return
+		}
+		resolved := make([]string, 0, len(members))
+		for _, member := range members {
+			if member = strings.TrimSpace(member); member != "" {
+				resolved = append(resolved, member)
+			}
+		}
+		if len(resolved) > 0 {
+			result[name] = resolved
+		}
+	}
+	for _, item := range topology.Interfaces {
+		if item.Bond != nil {
+			add(item.Bond.Name, item.Bond.Members)
+		}
+	}
+	for _, group := range topology.Groups {
+		for _, port := range group.Ports {
+			if port.Bond != nil {
+				add(port.Bond.Name, port.Bond.Members)
+			}
+		}
+	}
 	return result
 }
 

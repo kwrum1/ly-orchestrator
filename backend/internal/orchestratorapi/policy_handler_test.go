@@ -14,7 +14,7 @@ import (
 
 func TestPolicyPersistenceCompileAndServiceChainRoutes(t *testing.T) {
 	_, server := newTestHTTPServer(t)
-	topology, err := os.ReadFile("testdata/topology-v1.json")
+	topology, err := os.ReadFile("testdata/topology-service-chain.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func (runtime *healthTestRuntime) ApplyServiceChain(_ context.Context, requestID
 func TestServiceChainApplyBypassesUnavailableGroup(t *testing.T) {
 	runtime := &healthTestRuntime{unavailable: map[string]bool{"inline-east": true}, health: []orchestrator.GroupHealth{{Group: "inline-east", WANReachable: true, LANReachable: false, Unavailable: true, RequiredSuccesses: 3}}}
 	repository, handler, server := newTestHTTPServerWithHandler(t, runtime)
-	topology, err := os.ReadFile("testdata/topology-v1.json")
+	topology, err := os.ReadFile("testdata/topology-service-chain.json")
 	if err != nil {
 		t.Fatal(err)
 	}

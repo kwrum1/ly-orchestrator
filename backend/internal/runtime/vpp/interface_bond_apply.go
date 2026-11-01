@@ -55,6 +55,21 @@ func BuildInterfaceBondOperations(plan InterfaceBondPlan) ([]Operation, error) {
 	}
 	management := strings.TrimSpace(plan.ManagementInterface)
 	operations := make([]Operation, 0, len(plan.Interfaces)+len(plan.Bonds)+len(plan.DeleteInterfaces)+len(plan.DeleteBonds))
+	bondIDs := make(map[int]string, len(plan.Bonds))
+	for _, bond := range plan.Bonds {
+		for _, member := range bond.Members {
+			if strings.TrimSpace(member) == management && management != "" {
+				return nil, interfaceBondManagementLock(management, "vpp.interface-bond")
+			}
+		}
+		bondID, _ := vppBondIdentity(bond.Name)
+		if existing, collision := bondIDs[bondID]; collision && existing != bond.Name {
+			return nil, fmt.Errorf("bond names %q and %q resolve to the same VPP interface id %d", existing, bond.Name, bondID)
+		}
+		bondIDs[bondID] = bond.Name
+		commands := createBondCommands(bond)
+		operations = append(operations, Operation{Name: "vpp.interface-bond", RequestID: transactionID, Resource: bond.Name, Payload: bond, VPPCtlCommands: commands})
+	}
 	applied := make(map[string]InterfaceState, len(plan.Interfaces))
 	for _, state := range plan.Interfaces {
 		name := strings.TrimSpace(state.Name)
@@ -107,21 +122,6 @@ func BuildInterfaceBondOperations(plan InterfaceBondPlan) ([]Operation, error) {
 			continue
 		}
 		operations = append(operations, Operation{Name: "vpp.interface.address", RequestID: transactionID, Resource: name, VPPCtlCommands: deleteInterfaceCommands(state)})
-	}
-	bondIDs := make(map[int]string, len(plan.Bonds))
-	for _, bond := range plan.Bonds {
-		for _, member := range bond.Members {
-			if strings.TrimSpace(member) == management && management != "" {
-				return nil, interfaceBondManagementLock(management, "vpp.interface-bond")
-			}
-		}
-		bondID, _ := vppBondIdentity(bond.Name)
-		if existing, collision := bondIDs[bondID]; collision && existing != bond.Name {
-			return nil, fmt.Errorf("bond names %q and %q resolve to the same VPP interface id %d", existing, bond.Name, bondID)
-		}
-		bondIDs[bondID] = bond.Name
-		commands := createBondCommands(bond)
-		operations = append(operations, Operation{Name: "vpp.interface-bond", RequestID: transactionID, Resource: bond.Name, Payload: bond, VPPCtlCommands: commands})
 	}
 	for _, name := range plan.DeleteBonds {
 		operations = append(operations, Operation{Name: "vpp.interface-bond", RequestID: transactionID, Resource: name, VPPCtlCommands: []string{fmt.Sprintf("delete bond %s", name)}})

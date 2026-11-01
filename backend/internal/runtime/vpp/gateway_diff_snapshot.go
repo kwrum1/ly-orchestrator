@@ -111,6 +111,13 @@ func GatewayResourceSnapshotRequest(transactionID, resource string, desired Plan
 		return SnapshotRequest{}, fmt.Errorf("%w: unsupported gateway resource %q", ErrSnapshotIncomplete, resource)
 	}
 	request.Capabilities = []SnapshotCapability{capability}
+	if resource == "interfaces" {
+		// The interfaces resource only owns physical ports. Bond admin/address
+		// is reconciled by the bond lifecycle; including it made the interfaces
+		// readback fail before/after the bond node ran.
+		request.Interfaces = physicalInterfaceNames(request.Interfaces)
+		request.Candidates.Interfaces = physicalInterfaceStates(request.Candidates.Interfaces)
+	}
 	if resource == "nat44" {
 		request.NATPortMappings = nil
 	}

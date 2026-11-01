@@ -18,7 +18,7 @@ import (
 func GatewaySnapshotMatchesResource(resource string, snapshot Snapshot, desired Plan) bool {
 	switch resource {
 	case "interfaces":
-		return InterfaceStatesMatchDesired(snapshot.Interfaces, desired.Interfaces)
+		return InterfaceStatesMatchDesired(physicalInterfaceStates(snapshot.Interfaces), physicalInterfaceStates(desired.Interfaces))
 	case "bonds":
 		return gatewayItemsEqualUnordered(snapshot.Bonds, desired.Bonds)
 	case "wan-groups":
@@ -49,12 +49,14 @@ func GatewaySnapshotMatchesResource(resource string, snapshot Snapshot, desired 
 // only reporting a generic evidence error.
 func DescribeGatewaySnapshotMismatch(resource string, snapshot Snapshot, desired Plan) string {
 	if resource == "interfaces" {
-		observed := make(map[string]InterfaceState, len(snapshot.Interfaces))
-		for _, state := range snapshot.Interfaces {
+		liveInterfaces := physicalInterfaceStates(snapshot.Interfaces)
+		observed := make(map[string]InterfaceState, len(liveInterfaces))
+		for _, state := range liveInterfaces {
 			observed[strings.TrimSpace(state.Name)] = state
 		}
-		wanted := make(map[string]struct{}, len(desired.Interfaces))
-		for _, state := range desired.Interfaces {
+		physical := physicalInterfaceStates(desired.Interfaces)
+		wanted := make(map[string]struct{}, len(physical))
+		for _, state := range physical {
 			name := strings.TrimSpace(state.Name)
 			wanted[name] = struct{}{}
 			live, found := observed[name]
@@ -85,6 +87,34 @@ func DescribeGatewaySnapshotMismatch(resource string, snapshot Snapshot, desired
 		return fmt.Sprintf("wan-groups live=%#v desired=%#v", snapshot.WANGroups, desired.Policy.WANGroups)
 	}
 	return fmt.Sprintf("%s live readback differs from the desired generation", resource)
+}
+
+// physicalInterfaceStates drops synthetic bond interfaces. The interfaces
+// adapter owns physical ports; the bond lifecycle owns bond admin/address and
+// its readback. Leaving a bond in the physical comparison made the interfaces
+// node fail after the bond adapter had already applied it.
+func physicalInterfaceNames(names []string) []string {
+	physical := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" || strings.HasPrefix(name, "bond-") || strings.HasPrefix(name, "BondEthernet") {
+			continue
+		}
+		physical = append(physical, name)
+	}
+	return physical
+}
+
+func physicalInterfaceStates(states []InterfaceState) []InterfaceState {
+	physical := make([]InterfaceState, 0, len(states))
+	for _, state := range states {
+		name := strings.TrimSpace(state.Name)
+		if strings.HasPrefix(name, "bond-") || strings.HasPrefix(name, "BondEthernet") {
+			continue
+		}
+		physical = append(physical, state)
+	}
+	return physical
 }
 
 func gatewayItemsEqualUnordered[T any](observed, desired []T) bool {

@@ -53,6 +53,10 @@ func decodeVPPCTLInterfaces(request SnapshotRequest, results []VPPCTLCommandResu
 	if len(states) == 0 {
 		return InterfaceReadback{}, snapshotDecodeError("interface output contained no rows")
 	}
+	absent := make(map[string]bool, len(request.AbsentInterfaces))
+	for _, name := range request.AbsentInterfaces {
+		absent[strings.TrimSpace(name)] = true
+	}
 	requested := append(append([]string(nil), request.Interfaces...), request.AbsentInterfaces...)
 	selected := make([]InterfaceState, 0, len(requested))
 	for _, name := range requested {
@@ -67,7 +71,11 @@ func decodeVPPCTLInterfaces(request SnapshotRequest, results []VPPCTLCommandResu
 			}
 		}
 		if !found {
-			if request.AllowMissing {
+			// A deletion target is expected to disappear; a missing row is the
+			// successful outcome, not a truncated readback. This is what made
+			// `delete bond` fail with `interface "bond-test" was not returned`
+			// after the bond lifecycle removed the interface.
+			if request.AllowMissing || absent[strings.TrimSpace(name)] {
 				continue
 			}
 			return InterfaceReadback{}, snapshotDecodeError("interface %q was not returned", name)
@@ -124,7 +132,9 @@ func decodeVPPCTLBonds(request SnapshotRequest, results []VPPCTLCommandResult) (
 		return BondReadback{}, err
 	}
 	if strings.TrimSpace(output) == "" {
-		if len(request.Bonds) > 0 {
+		// A VPP restart can drop a persisted bond. A diff snapshot must be able
+		// to observe the drift and recreate it instead of failing the prepare.
+		if len(request.Bonds) > 0 && !request.AllowMissing {
 			return BondReadback{}, snapshotDecodeError("bond output contained no requested rows")
 		}
 		return BondReadback{}, nil
@@ -212,6 +222,9 @@ func decodeVPPCTLBonds(request SnapshotRequest, results []VPPCTLCommandResult) (
 	for _, name := range request.Bonds {
 		bond, found := bondByName(bonds, strings.TrimSpace(name))
 		if !found {
+			if request.AllowMissing {
+				continue
+			}
 			return BondReadback{}, snapshotDecodeError("bond %q was not returned", name)
 		}
 		if strings.TrimSpace(candidates[bond.Name].Mode) != bond.Mode {

@@ -2131,8 +2131,8 @@ func TestInterfaceBondDeleteRemovesDesiredBond(t *testing.T) {
 	}
 	t.Cleanup(func() { store.Close() })
 	server := New(WithStore(store), WithAuthConfig(AuthConfig{AdminUsername: "admin", AdminPassword: "secret"}), WithInterfaceTelemetry(fakeInterfaceTelemetry{items: []map[string]any{
-		{"id": "eth1", "name": "eth1", "active_path": "vpp", "work_mode": "vpp", "speed": "10G"},
-		{"id": "eth2", "name": "eth2", "active_path": "vpp", "work_mode": "vpp", "speed": "10G"},
+		{"id": "eth1", "name": "eth1", "active_path": "vpp", "work_mode": "vpp", "speed": "10G", "link_state": "up", "link_speed_mbps": 10000},
+		{"id": "eth2", "name": "eth2", "active_path": "vpp", "work_mode": "vpp", "speed": "10G", "link_state": "up", "link_speed_mbps": 10000},
 	}}), WithClock(fixedClock()))
 	login := requestBody(t, server, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"secret"}`)
 	if login.Code != http.StatusOK {
@@ -2164,8 +2164,8 @@ func TestInterfaceBondPatchRolePreservesMembers(t *testing.T) {
 	}
 	t.Cleanup(func() { store.Close() })
 	server := New(WithStore(store), WithAuthConfig(AuthConfig{AdminUsername: "admin", AdminPassword: "secret"}), WithInterfaceTelemetry(fakeInterfaceTelemetry{items: []map[string]any{
-		{"id": "eth1", "name": "eth1", "active_path": "vpp", "work_mode": "vpp", "speed": "10G"},
-		{"id": "eth2", "name": "eth2", "active_path": "vpp", "work_mode": "vpp", "speed": "10G"},
+		{"id": "eth1", "name": "eth1", "active_path": "vpp", "work_mode": "vpp", "speed": "10G", "link_state": "up", "link_speed_mbps": 10000},
+		{"id": "eth2", "name": "eth2", "active_path": "vpp", "work_mode": "vpp", "speed": "10G", "link_state": "up", "link_speed_mbps": 10000},
 	}}), WithClock(fixedClock()))
 	login := requestBody(t, server, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"secret"}`)
 	if login.Code != http.StatusOK {
@@ -2200,10 +2200,10 @@ func TestInterfaceBondCreateValidatesMembersAndAudits(t *testing.T) {
 	}
 	t.Cleanup(func() { store.Close() })
 	server := New(WithStore(store), WithAuthConfig(AuthConfig{AdminUsername: "admin", AdminPassword: "secret"}), WithInterfaceTelemetry(fakeInterfaceTelemetry{items: []map[string]any{
-		{"id": "eth1", "name": "eth1", "active_path": "vpp", "work_mode": "vpp", "speed": "10G"},
-		{"id": "eth2", "name": "eth2", "active_path": "vpp", "work_mode": "vpp", "speed": "10G"},
-		{"id": "eth3", "name": "eth3", "active_path": "vpp", "work_mode": "vpp", "speed": "1G"},
-		{"id": "eth4", "name": "eth4", "active_path": "vpp", "work_mode": "vpp", "speed": "10G", "bond": "bond-old"},
+		{"id": "eth1", "name": "eth1", "active_path": "vpp", "work_mode": "vpp", "speed": "10G", "link_state": "up", "link_speed_mbps": 10000},
+		{"id": "eth2", "name": "eth2", "active_path": "vpp", "work_mode": "vpp", "speed": "10G", "link_state": "up", "link_speed_mbps": 10000},
+		{"id": "eth3", "name": "eth3", "active_path": "vpp", "work_mode": "vpp", "speed": "1G", "link_state": "up", "link_speed_mbps": 1000},
+		{"id": "eth4", "name": "eth4", "active_path": "vpp", "work_mode": "vpp", "speed": "10G", "link_state": "up", "link_speed_mbps": 10000, "bond": "bond-old"},
 	}}), WithClock(fixedClock()))
 	login := requestBody(t, server, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"secret"}`)
 	if login.Code != http.StatusOK {

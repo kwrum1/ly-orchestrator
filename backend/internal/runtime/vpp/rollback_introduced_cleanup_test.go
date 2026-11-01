@@ -143,11 +143,9 @@ func TestRollbackPriorSnapshotContinuesAfterEarlyDependentCleanupError(t *testin
 		}
 	}
 	// Rollback replays the previous generation first and only then removes
-	// what the failed plan introduced, so the interface always keeps an
-	// address (build-then-delete).
+	// what the failed plan introduced. Bonds are created before their
+	// addresses, so the failed plan stops at the first bond operation.
 	wantOperations := []string{
-		"vpp.interface.address:if-1",
-		"vpp.interface.address:if-2",
 		"vpp.interface-bond:bond-1",
 		"vpp.interface.address.rollback:if-prior",
 		"vpp.interface-bond.rollback:bond-prior",
