@@ -30,7 +30,6 @@ var DefaultServiceUnits = []string{
 	"ly-route-vpp-apply.service",
 	"ly-route-runtime-check.service",
 	"ly-route-recovery.service",
-	"ly-route-firstboot.service",
 	"vpp.service",
 	"nginx.service",
 }

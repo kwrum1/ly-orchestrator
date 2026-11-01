@@ -975,6 +975,31 @@
     return false;
   }
 
+  // The IP-group page writes /api/v1/objects/ip-groups, while the policy
+  // editor only offers the policy document's inline ip_objects. Merge the
+  // stored groups into the policy payload the editor reads so a group created
+  // on that page is selectable in a rule (inline CIDRs stay untouched).
+  function mergeIPGroups(doc) {
+    return api("/api/v1/objects/ip-groups").then(function (data) {
+      var item = doc && doc.item;
+      if (!item) return doc;
+      var merged = {};
+      (item.ip_objects || []).forEach(function (object) {
+        if (object && object.id) merged[object.id] = object;
+      });
+      ((data && data.items) || []).forEach(function (group) {
+        var kind = group.kind || group.group_type || group.type;
+        if (kind && kind !== "ip") return;
+        var id = group.name || group.id;
+        if (!id) return;
+        var prefixes = group.entries || group.members || [];
+        merged[id] = { id: id, prefixes: prefixes };
+      });
+      item.ip_objects = Object.keys(merged).sort().map(function (key) { return merged[key]; });
+      return doc;
+    }).catch(function () { return doc; });
+  }
+
   // ---------- fetch interception ----------
 
   var rawFetch = window.fetch.bind(window);
@@ -992,6 +1017,21 @@
           sources: roleModal.sources || []
         }
       : null;
+
+    if (method === "GET" && /\/api\/v1\/orchestrator\/policy$/.test(url)) {
+      return rawFetch(input, opts).then(function (response) {
+        if (!response.ok) return response;
+        return response.clone().json().then(function (doc) {
+          return mergeIPGroups(doc).then(function (merged) {
+            return new Response(JSON.stringify(merged), {
+              status: response.status,
+              statusText: response.statusText,
+              headers: { "Content-Type": "application/json" }
+            });
+          });
+        }).catch(function () { return response; });
+      });
+    }
 
     if (roleSnapshot && bodyText) {
       try {
@@ -1072,8 +1112,7 @@
 
   // ---------- DOM observation ----------
 
-  function relabelConfirmTitle() {
-    if (!roleModal) return;
+  function relabelConfirmTitle() {    if (!roleModal) return;
     document.querySelectorAll(".modal").forEach(function (modal) {
       var heading = modal.querySelector(".modal-head h2");
       if (!heading) return;
@@ -1089,6 +1128,19 @@
     });
   }
 
+  // Routing-consistent feedback: routine apply success ("顺序已生效（3.3s）")
+  // stays out of the toast stack, but explicit save/upgrade/rollback messages
+  // remain visible.
+  function keepSuccessToasts() {
+    document.querySelectorAll(".toast-stack .toast-success").forEach(function (node) {
+      if (node.classList.contains("extras-keep")) return;
+      var text = node.textContent || "";
+      if (/保存成功|已保存|升级完成|回滚完成|导入成功|导出成功|已创建|已删除|已更新|已恢复/.test(text)) {
+        node.classList.add("extras-keep");
+      }
+    });
+  }
+
   function scan() {
     document.querySelectorAll(".modal").forEach(function (modal) {
       var heading = modal.querySelector(".modal-head h2");
@@ -1099,6 +1151,7 @@
     if (!document.querySelector(".modal[data-role-enhanced='1']")) roleModal = null;
     if (!document.querySelector(".modal[data-bypass-enhanced='1']")) groupModal = null;
     relabelConfirmTitle();
+    keepSuccessToasts();
     inject();
     scheduleRelabel();
   }
@@ -1147,6 +1200,7 @@
         ".takeover-facts{flex-wrap:wrap;gap:6px 16px}" +
         ".takeover-facts>span{font-size:12px}" +
         ".toast-stack .toast-success{display:none!important}" +
+        ".toast-stack .toast-success.extras-keep{display:flex!important}" +
         ".metric-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}" +
         ".extras-auto-table{table-layout:auto}" +
         ".metric{min-height:112px;padding:14px 16px}" +
@@ -1166,6 +1220,16 @@
       var observer = new MutationObserver(function () { inject(); });
       observer.observe(nav, { childList: true, subtree: false });
     }
+    // Sorting and the column picker rebuild the table cells; re-apply the
+    // synthetic 网卡状态 column after those interactions.
+    document.addEventListener("click", function (event) {
+      var target = event.target && event.target.closest
+        ? event.target.closest(".th-button, .column-menu label, .column-picker button")
+        : null;
+      if (!target) return;
+      window.setTimeout(decorateInterfacesPage, 350);
+      window.setTimeout(decorateInterfacesPage, 1200);
+    }, true);
     if (window.MutationObserver) {
       var bodyObserver = new MutationObserver(scheduleScan);
       bodyObserver.observe(document.body, { childList: true, subtree: true });

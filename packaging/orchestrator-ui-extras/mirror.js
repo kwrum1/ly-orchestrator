@@ -109,6 +109,7 @@ window.LyExtrasMirrorView = function (root) {
         : "源接口为物理数据口（不含管理口），输出口固定为镜像口";
     }
 
+    var applying = state.busy || Boolean(state.component && /applying|recovering|pending/.test(String(state.component.state)));
     list.forEach(function (source) {
       var item = portByReference(source.interface) || { id: source.interface, name: source.interface };
       var tr = document.createElement("tr");
@@ -126,8 +127,8 @@ window.LyExtrasMirrorView = function (root) {
 
       var status = document.createElement("td");
       var badge = document.createElement("span");
-      badge.className = "badge " + (running() ? "badge-success" : "badge-warning");
-      badge.textContent = running() ? "已生效" : "未生效";
+      badge.className = "badge " + (applying ? "badge-info" : running() ? "badge-success" : "badge-warning");
+      badge.textContent = applying ? "下发中" : running() ? "已生效" : "未生效";
       status.appendChild(badge);
 
       var actions = document.createElement("td");
@@ -136,12 +137,12 @@ window.LyExtrasMirrorView = function (root) {
       var edit = document.createElement("button");
       edit.className = "btn btn-sm btn-text";
       edit.textContent = "编辑";
-      edit.disabled = state.busy;
+      edit.disabled = state.busy || applying;
       edit.addEventListener("click", function () { openDialog(source.interface); });
       var remove = document.createElement("button");
       remove.className = "btn btn-sm btn-text";
       remove.textContent = "删除";
-      remove.disabled = state.busy;
+      remove.disabled = state.busy || applying;
       remove.addEventListener("click", function () { removeSource(source.interface); });
       wrap.appendChild(edit);
       wrap.appendChild(remove);

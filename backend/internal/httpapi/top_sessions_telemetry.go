@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	controlapi "ly-route/backend/internal/api"
+	"ly-route/backend/internal/product"
 )
 
 func (server *Server) handleTopSessionsTelemetry(w http.ResponseWriter, r *http.Request) {
@@ -27,6 +28,15 @@ func (server *Server) handleActiveSessionsTelemetry(w http.ResponseWriter, r *ht
 	}
 	if _, ok := server.sessionFromRequest(r); !ok {
 		writeError(w, r, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	// The orchestrator has no gateway active-session table; its sessions are the
+	// VPP top-connection view. Map the endpoint instead of reporting the
+	// gateway detector as degraded on a healthy appliance.
+	if server.profile.ID() == product.Orchestrator().ID() {
+		payload, capabilities := server.telemetryPayload(r.Context(), "top_sessions")
+		normalizeTopSessionConnectionCounts(payload)
+		writeJSON(w, http.StatusOK, map[string]any{"data": payload, "capabilities": capabilities, "request_id": requestID(r)})
 		return
 	}
 	items, state, reason := server.gatewayActiveSessions(r.Context())
