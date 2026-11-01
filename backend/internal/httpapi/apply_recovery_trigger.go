@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -47,8 +48,12 @@ func (server *Server) requestRecoveryAfterFailure(result RuntimeApplyResult) {
 	recoveryTriggerLast = now
 	recoveryTriggerMu.Unlock()
 
-	log.Printf("runtime apply: %s failed (%s); asking ly-route-recovery.service to replay the last committed generation",
-		result.Status, result.TransactionID)
+	failureReason := strings.TrimSpace(result.Reason)
+	if failureReason == "" {
+		failureReason = "no reason reported"
+	}
+	log.Printf("runtime apply: %s failed (%s): %s; asking ly-route-recovery.service to replay the last committed generation",
+		result.Status, result.TransactionID, failureReason)
 	cmd := exec.Command("systemctl", "start", "--no-block", "ly-route-recovery.service")
 	if err := cmd.Start(); err != nil {
 		log.Printf("runtime apply: could not start ly-route-recovery.service: %v", err)
