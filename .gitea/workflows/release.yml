@@ -22,6 +22,7 @@ env:
   #  - the vpp-apply helper carried by the appliance package
   LY_ROUTE_ORCH_BASE_IMAGE: /root/work/orch-base/ly-route-orchestrator-base-4g.img.zst
   LY_ROUTE_VPP_APPLY: /tmp/vpp-apply
+  LY_ROUTE_MIRROR: https://mirrors.aliyun.com/debian
 
 jobs:
   release:
