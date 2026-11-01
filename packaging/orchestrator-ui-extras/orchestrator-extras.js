@@ -1141,6 +1141,54 @@
     });
   }
 
+  var STATUS_COPY = {
+    "运行正常": { label: "运行正常", tone: "success" },
+    "设备正常": { label: "运行正常", tone: "success" },
+    "配置下发中": { label: "配置下发中", tone: "info" },
+    "配置应用中": { label: "配置下发中", tone: "info" },
+    "读取中": { label: "配置下发中", tone: "info" },
+    "状态读取中": { label: "配置下发中", tone: "info" },
+    "配置异常": { label: "配置异常", tone: "danger" },
+    "需要处理": { label: "配置异常", tone: "danger" },
+    "配置未生效": { label: "配置异常", tone: "danger" },
+    "状态未知": { label: "配置异常", tone: "danger" }
+  };
+
+  // The frozen shell still uses neutral labels (需要处理 / 配置未生效 /
+  // 设备正常). The product exposes three states only: 运行正常 / 配置下发中 /
+  // 配置异常. Rewrite the copy and the tone without touching React's nodes.
+  function normalizeStatusCopy() {
+    document.querySelectorAll(".health-pill").forEach(function (pill) {
+      var span = pill.querySelector("span:not(.health-reason)");
+      if (!span) return;
+      var mapped = STATUS_COPY[(span.textContent || "").trim()];
+      if (!mapped) return;
+      if (span.textContent !== mapped.label) span.textContent = mapped.label;
+      pill.classList.remove("health-success", "health-warning", "health-danger", "health-info");
+      pill.classList.add("health-" + mapped.tone);
+      var dot = pill.querySelector(".status-dot");
+      if (dot) dot.className = "status-dot status-dot-" + mapped.tone;
+    });
+    document.querySelectorAll(".sidebar-foot").forEach(function (foot) {
+      var spans = foot.querySelectorAll("span");
+      var label = spans[spans.length - 1];
+      if (!label) return;
+      var mapped = STATUS_COPY[(label.textContent || "").trim()];
+      if (!mapped) return;
+      if (label.textContent !== mapped.label) label.textContent = mapped.label;
+      var dot = foot.querySelector(".status-dot");
+      if (dot) dot.className = "status-dot status-dot-" + mapped.tone;
+    });
+    document.querySelectorAll(".metric-bottom, .metric").forEach(function (box) {
+      var walker = document.createTreeWalker(box, NodeFilter.SHOW_TEXT, null);
+      var node = walker.nextNode();
+      while (node) {
+        if ((node.nodeValue || "").trim() === "available") node.nodeValue = "可用";
+        node = walker.nextNode();
+      }
+    });
+  }
+
   function scan() {
     document.querySelectorAll(".modal").forEach(function (modal) {
       var heading = modal.querySelector(".modal-head h2");
@@ -1153,6 +1201,7 @@
     relabelConfirmTitle();
     keepSuccessToasts();
     inject();
+    normalizeStatusCopy();
     scheduleRelabel();
   }
 
@@ -1211,7 +1260,8 @@
         "@media(min-width:1181px){.overview-main-grid .span-8{grid-column:span 8}.overview-main-grid .span-4{grid-column:span 4}.overview-secondary-grid .span-7,.overview-bottom-grid .span-7{grid-column:span 7}.overview-secondary-grid .span-5,.overview-bottom-grid .span-5{grid-column:span 5}}" +
         "@media(max-width:1180px){.overview-main-grid .span-8,.overview-main-grid .span-4,.overview-secondary-grid .span-7,.overview-secondary-grid .span-5,.overview-bottom-grid .span-7,.overview-bottom-grid .span-5{grid-column:span 12}}" +
         "@media(max-width:1500px){.metric{padding:14px 16px}.metric strong{font-size:24px}.metric-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}}" +
-        "@media(max-width:1280px){.metric-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}}";
+        "@media(max-width:1280px){.metric-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}}" +
+        ".health-pill.health-info{border-color:#c4e9f7;background:var(--info-soft);color:#0369a1}";
       document.head.appendChild(style);
     }
     inject();
