@@ -372,21 +372,13 @@ func diffResources[T any](states resourceStates[T], contract resourceContract[T]
 // live snapshot for rollback.
 func diffVerifiedLiveResources[T any](states resourceStates[T], desired, live map[string]T, contract resourceContract[T]) (resourceDiff[T], error) {
 	diff := resourceDiff[T]{}
-	// A fully empty verified live snapshot is a clean rollback/restart state and
-	// may be rebuilt. A partially missing snapshot is ambiguous with a truncated
-	// readback and still fails closed before mutation.
-	if len(states.live) > 0 {
-		for _, planned := range states.prior {
-			id := contract.identity(planned)
-			if _, stillDesired := desired[id]; !stillDesired {
-				continue
-			}
-			if _, observed := live[id]; observed {
-				continue
-			}
-			return resourceDiff[T]{}, fmt.Errorf("%w: %s %q is absent from the verified live snapshot", ErrGatewayLiveMismatch, contract.kind, id)
-		}
-	}
+	// A verified readback is authoritative. A still-desired resource that is
+	// absent from it is observed drift - a VPP restart that lost one object, a
+	// repair helper that removed an orphan, or a partial rollback - and the
+	// final loop below queues it for re-apply. Failing closed here wedged the
+	// appliance: the missing object blocked every later apply, so nothing could
+	// ever recreate it. A truncated readback never reaches this function; the
+	// snapshot adapter rejects it with ErrSnapshotIncomplete first.
 	for _, observed := range states.live {
 		id := contract.identity(observed)
 		wanted, found := desired[id]

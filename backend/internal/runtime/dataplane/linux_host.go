@@ -70,7 +70,11 @@ func (host *LinuxHost) Snapshot(_ context.Context, request Request) (Snapshot, e
 				continue
 			}
 			seenPCI[state.PCIAddress] = true
-			state.PreviousDPDK = previous
+			// PreviousDPDK means "the port was already on a DPDK driver when
+			// this transaction took its snapshot". It is not limited to ports
+			// in the superseded generation: a boot-bound port that is part of
+			// the new generation must still be restored to DPDK on rollback.
+			state.PreviousDPDK = previous || isDPDKDriverName(state.BoundDriver)
 			snapshot.Devices = append(snapshot.Devices, state)
 		}
 		return nil
@@ -88,8 +92,31 @@ func (host *LinuxHost) Snapshot(_ context.Context, request Request) (Snapshot, e
 }
 
 func (host *LinuxHost) StopVPP(ctx context.Context) error {
-	_, err := host.run(ctx, "systemctl", "stop", "vpp.service")
-	return err
+	if _, err := host.run(ctx, "systemctl", "stop", "vpp.service"); err != nil {
+		// vpp.service runs with Restart=always, so systemd can merge or cancel a
+		// stop job against a pending auto-restart and answer "Job for
+		// vpp.service canceled." even though the stop took effect. Ask the unit
+		// instead of failing the whole dataplane transaction, and retry once
+		// when VPP is still running.
+		if state, _ := host.run(ctx, "systemctl", "is-active", "vpp.service"); stoppedVPPState(strings.TrimSpace(string(state))) {
+			return nil
+		}
+		if _, retryErr := host.run(ctx, "systemctl", "stop", "vpp.service"); retryErr == nil {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// stoppedVPPState reports whether a systemctl is-active answer proves VPP is no
+// longer running.
+func stoppedVPPState(state string) bool {
+	switch state {
+	case "inactive", "failed":
+		return true
+	}
+	return false
 }
 
 func (host *LinuxHost) ConfigureDPDK(ctx context.Context, path vpp.NativePath, snapshot Snapshot) error {
@@ -702,6 +729,14 @@ func (host *LinuxHost) deviceState(attachment vpp.NativeAttachment) (DeviceState
 		OwnedByProduct: ownedByProduct,
 		LinkUp:         linkUp,
 	}, nil
+}
+
+func isDPDKDriverName(driver string) bool {
+	switch strings.TrimSpace(driver) {
+	case "uio_pci_generic", "vfio-pci":
+		return true
+	}
+	return false
 }
 
 func (host *LinuxHost) currentDriver(pci string) string {

@@ -297,6 +297,19 @@ func activeDataplaneModeFor(name, pci string) (string, bool) {
 	return "", false
 }
 
+// afXDPPluginLoaded reports whether the running VPP build actually ships the
+// AF_XDP plugin. `show af_xdp` is a parse error in builds without it, and VPP
+// logs every such probe as "unknown input"; the queue-fd fact is optional, so
+// skip the probe instead of polluting the VPP log on DPDK-only appliances.
+func afXDPPluginLoaded(ctx context.Context, vppctl string) bool {
+	output, err := execCommandOutput(ctx, vppctl, "show", "plugins")
+	if err != nil {
+		return false
+	}
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "af_xdp") || strings.Contains(lower, "af-xdp")
+}
+
 // fillTakeoverRuntimeFacts records the runtime handles that make a transition
 // auditable: sw_if_index, AF_XDP queue fds and the attached XDP program. Every
 // read is best effort; an unavailable fact stays empty rather than guessed.
@@ -310,8 +323,10 @@ func (server *Server) fillTakeoverRuntimeFacts(ctx context.Context, snapshot *ta
 	if output, err := execCommandOutput(readCtx, vppctl, "show", "interface", snapshot.VPPInterface); err == nil {
 		snapshot.SWIfIndex = parseVPPInterfaceIndex(output, snapshot.VPPInterface)
 	}
-	if output, err := execCommandOutput(readCtx, vppctl, "show", "af_xdp"); err == nil {
-		snapshot.QueueFDs = parseAFXDPQueueFDs(output)
+	if afXDPPluginLoaded(readCtx, vppctl) {
+		if output, err := execCommandOutput(readCtx, vppctl, "show", "af_xdp"); err == nil {
+			snapshot.QueueFDs = parseAFXDPQueueFDs(output)
+		}
 	}
 	if snapshot.Netdev != "" {
 		ip := envOrDefault("LY_ROUTE_IP_COMMAND", "ip")
@@ -772,9 +787,11 @@ func (executor systemTakeoverExecutor) verify(ctx context.Context, transition *t
 			result.Output = "verified " + takeoverModeLabel(transition.ToMode) + " carrier=" + firstNonEmptyTrimmed(vppHardwareCarrier(carrierOutput), "unknown")
 		}
 		// Queue fds are an audit hint, never the proof: `show af_xdp` does not
-		// exist in every build, so a failure here must not fail the switch.
-		if afxdp, afxdpErr := execCommandOutput(readCtx, vppctl, "show", "af_xdp"); afxdpErr == nil {
-			result.QueueFDs = parseAFXDPQueueFDs(afxdp)
+		// exist in every build, so probe it only when the plugin is loaded.
+		if afXDPPluginLoaded(readCtx, vppctl) {
+			if afxdp, afxdpErr := execCommandOutput(readCtx, vppctl, "show", "af_xdp"); afxdpErr == nil {
+				result.QueueFDs = parseAFXDPQueueFDs(afxdp)
+			}
 		}
 		if netdev := strings.TrimSpace(transition.Netdev); netdev != "" {
 			result.XDPProgram = netdevXDPProgram(readCtx, netdev)
@@ -820,8 +837,10 @@ func (executor systemTakeoverExecutor) verify(ctx context.Context, transition *t
 	}
 	result.SWIfIndex = live.SWIfIndex
 	result.XDPProgram = live.XDPProgram
-	if afxdp, afxdpErr := execCommandOutput(readCtx, vppctl, "show", "af_xdp"); afxdpErr == nil {
-		result.QueueFDs = parseAFXDPQueueFDs(afxdp)
+	if afXDPPluginLoaded(readCtx, vppctl) {
+		if afxdp, afxdpErr := execCommandOutput(readCtx, vppctl, "show", "af_xdp"); afxdpErr == nil {
+			result.QueueFDs = parseAFXDPQueueFDs(afxdp)
+		}
 	}
 	result.Output = "verified " + takeoverModeLabel(transition.ToMode) + " (" + live.summary() + ")"
 	return result, nil

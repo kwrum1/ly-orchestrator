@@ -53,6 +53,7 @@ func mergeApplyStateFields(response map[string]any, state applystate.State) {
 	response["partial"] = state.Partial
 	response["degraded_reasons"] = state.DegradedReasons
 	response["apply_state_status"] = state.Status
+	response["receipt_status"] = state.ReceiptStatusView(time.Now().UTC(), apply.ReadbackFreshnessWindow)
 	if state.LastError != nil {
 		response["last_error"] = state.LastError
 	}
@@ -175,6 +176,12 @@ func runtimeConcreteDegradedReasons(components []RuntimeComponentState, steps []
 		if reason == "" || seen[reason] || legacyGenericDegradedReasons[reason] {
 			return
 		}
+		// A receipt-partial reason describes the *previous* transaction's
+		// helper receipt, which this transaction is about to rewrite. Copying
+		// it forward kept every later receipt partial.
+		if strings.Contains(reason, "VPP apply receipt is partial") {
+			return
+		}
 		seen[reason] = true
 		reasons = append(reasons, reason)
 	}
@@ -244,7 +251,7 @@ func (server *Server) commitRuntimeApplyStateWithReceipt(transactionID, sourceHa
 			return applystate.State{}, err
 		}
 	}
-	state, err := server.applyGenerationState.Commit(transactionID, receipt)
+	state, err := server.applyGenerationState.CommitWithReadback(transactionID, receipt, execution.Readback.Timestamp)
 	if err != nil {
 		return applystate.State{}, err
 	}
@@ -341,7 +348,7 @@ func (server *Server) handleRuntimeApplyState(w http.ResponseWriter, r *http.Req
 		writeError(w, r, http.StatusInternalServerError, "apply_state_unavailable", err.Error())
 		return
 	}
-	response := applyStateResponse(state, requestID(r))
+	response := applyStateResponse(state, requestID(r), server.now().UTC())
 	response["vpp_receipt"] = server.vppReceiptState(state)
 	writeJSON(w, http.StatusOK, response)
 }
@@ -379,23 +386,32 @@ func (server *Server) vppReceiptState(state applystate.State) map[string]any {
 	}
 }
 
-func applyStateResponse(state applystate.State, requestIDValue string) map[string]any {
+func applyStateResponse(state applystate.State, requestIDValue string, now time.Time) map[string]any {
+	verdict := state.ReceiptStatusView(now, apply.ReadbackFreshnessWindow)
+	readbackAgeSeconds := int64(0)
+	if !state.ReadbackAt.IsZero() {
+		readbackAgeSeconds = int64(now.Sub(state.ReadbackAt).Seconds())
+	}
 	response := map[string]any{
-		"enabled":            true,
-		"schema_version":     state.SchemaVersion,
-		"desired_generation": state.DesiredGeneration,
-		"desired_hash":       state.DesiredHash,
-		"applied_generation": state.AppliedGeneration,
-		"applied_hash":       state.AppliedDesiredHash,
-		"current_generation": state.CurrentGeneration,
-		"current_hash":       state.CurrentHash,
-		"transaction_id":     state.TransactionID,
-		"status":             state.Status,
-		"receipt_status":     state.ReceiptStatus,
-		"partial":            state.Partial,
-		"degraded_reasons":   state.DegradedReasons,
-		"updated_at":         state.UpdatedAt,
-		"request_id":         requestIDValue,
+		"enabled":                           true,
+		"schema_version":                    state.SchemaVersion,
+		"desired_generation":                state.DesiredGeneration,
+		"desired_hash":                      state.DesiredHash,
+		"applied_generation":                state.AppliedGeneration,
+		"applied_hash":                      state.AppliedDesiredHash,
+		"current_generation":                state.CurrentGeneration,
+		"current_hash":                      state.CurrentHash,
+		"transaction_id":                    state.TransactionID,
+		"status":                            state.Status,
+		"receipt_status":                    verdict,
+		"receipt_status_raw":                state.ReceiptStatus,
+		"partial":                           state.Partial,
+		"degraded_reasons":                  state.DegradedReasons,
+		"readback_at":                       state.ReadbackAt,
+		"readback_age_seconds":              readbackAgeSeconds,
+		"readback_freshness_window_seconds": int64(apply.ReadbackFreshnessWindow.Seconds()),
+		"updated_at":                        state.UpdatedAt,
+		"request_id":                        requestIDValue,
 	}
 	response["desired"] = map[string]any{"generation": state.DesiredGeneration, "hash": state.DesiredHash}
 	response["applied"] = map[string]any{
@@ -407,8 +423,8 @@ func applyStateResponse(state applystate.State, requestIDValue string) map[strin
 		"status": state.Status,
 	}
 	response["transaction"] = map[string]any{
-		"id": state.TransactionID, "status": state.ReceiptStatus, "partial": state.Partial,
-		"degraded_reasons": state.DegradedReasons,
+		"id": state.TransactionID, "status": state.ReceiptStatus, "receipt_status": verdict,
+		"partial": state.Partial, "degraded_reasons": state.DegradedReasons,
 	}
 	if state.LastError != nil {
 		response["last_error"] = state.LastError

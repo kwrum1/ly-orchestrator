@@ -449,6 +449,7 @@ func TestApplyTakeoverSwitchRunsThePrivilegedStepsAndJournalsHandles(t *testing.
 	vppctlScript := `#!/bin/sh
 case "$*" in
   "show version") exit 0 ;;
+  "show plugins") printf '%s\n' 'af_xdp_plugin.so' ;;
   "show hardware-interfaces") printf '%s\n' 'GigabitEthernet1/0/0 5 up GigabitEthernet1/0/0' '  pci: device 8086:125c subsystem 8086:0000 address 0000:03:00.0 numa 0' ;;
   "show interface")
     if [ -f "$DELETED_FLAG" ]; then

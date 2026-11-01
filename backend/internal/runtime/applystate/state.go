@@ -38,6 +38,14 @@ const (
 	ReceiptStatusApplied   = "applied"
 	ReceiptStatusPartial   = "partial"
 	ReceiptStatusUnchanged = "unchanged"
+
+	// Operator-facing receipt verdicts. The durable status above records what
+	// the executor reported; the view adds the only time-dependent distinction:
+	// a committed generation stays committed forever and its readback merely
+	// ages out of the freshness window.
+	ReceiptStatusCommitted     = "committed"
+	ReceiptStatusReadbackStale = "readback_stale"
+	ReceiptStatusIncomplete    = "incomplete"
 )
 
 var (
@@ -63,19 +71,22 @@ type ErrorRecord struct {
 // dataplane converged for that generation. CurrentGeneration mirrors the last
 // applied generation; a failed apply never advances it.
 type State struct {
-	SchemaVersion      int          `json:"schema_version"`
-	DesiredGeneration  int64        `json:"desired_generation"`
-	DesiredHash        string       `json:"desired_hash,omitempty"`
-	AppliedGeneration  int64        `json:"applied_generation"`
-	AppliedDesiredHash string       `json:"applied_desired_hash,omitempty"`
-	CurrentGeneration  int64        `json:"current_generation"`
-	CurrentHash        string       `json:"current_hash,omitempty"`
-	TransactionID      string       `json:"transaction_id,omitempty"`
-	Status             string       `json:"status"`
-	Partial            bool         `json:"partial"`
-	DegradedReasons    []string     `json:"degraded_reasons,omitempty"`
-	ReceiptStatus      string       `json:"receipt_status,omitempty"`
-	LastError          *ErrorRecord `json:"last_error,omitempty"`
+	SchemaVersion      int      `json:"schema_version"`
+	DesiredGeneration  int64    `json:"desired_generation"`
+	DesiredHash        string   `json:"desired_hash,omitempty"`
+	AppliedGeneration  int64    `json:"applied_generation"`
+	AppliedDesiredHash string   `json:"applied_desired_hash,omitempty"`
+	CurrentGeneration  int64    `json:"current_generation"`
+	CurrentHash        string   `json:"current_hash,omitempty"`
+	TransactionID      string   `json:"transaction_id,omitempty"`
+	Status             string   `json:"status"`
+	Partial            bool     `json:"partial"`
+	DegradedReasons    []string `json:"degraded_reasons,omitempty"`
+	ReceiptStatus      string   `json:"receipt_status,omitempty"`
+	// ReadbackAt is when the typed readback behind the committed receipt was
+	// taken. The receipt never expires; only this timestamp's freshness decays.
+	ReadbackAt time.Time    `json:"readback_at,omitempty"`
+	LastError  *ErrorRecord `json:"last_error,omitempty"`
 	// SelfHealed records the bounded, product-owned dataplane scopes this
 	// generation had to rebuild before it converged (for example "nftables" or
 	// "abf"). It is cleared for a new desired generation and for a failed one.
@@ -271,6 +282,13 @@ func (store *Store) Begin(desiredHash string) (BeginResult, error) {
 // not match the current desired generation is rejected: a stale transaction
 // can never advance the applied generation.
 func (store *Store) Commit(transactionID string, receipt Receipt) (State, error) {
+	return store.CommitWithReadback(transactionID, receipt, time.Time{})
+}
+
+// CommitWithReadback additionally records when the typed readback behind the
+// receipt was taken, so the operator-facing view can distinguish a fresh commit
+// from a committed generation whose readback has simply aged out.
+func (store *Store) CommitWithReadback(transactionID string, receipt Receipt, readbackAt time.Time) (State, error) {
 	if !store.Enabled() {
 		return State{}, ErrStateDisabled
 	}
@@ -304,6 +322,9 @@ func (store *Store) Commit(transactionID string, receipt Receipt) (State, error)
 	state.Partial = receipt.Partial
 	state.DegradedReasons = append([]string(nil), receipt.DegradedReasons...)
 	state.SelfHealed = uniqueStrings(receipt.SelfHealed)
+	if !readbackAt.IsZero() {
+		state.ReadbackAt = readbackAt.UTC()
+	}
 	state.Status = StatusApplied
 	state.ReceiptStatus = ReceiptStatusApplied
 	if receipt.Partial {
@@ -357,7 +378,40 @@ func (store *Store) MarkUnchangedEvaluated(transactionID string, partial bool, d
 	state.Partial = partial
 	state.DegradedReasons = reasons
 	state.LastError = nil
+	// A no-op re-read the live configuration, so its readback is fresh even
+	// though the receipt (and therefore the generation) is old.
+	state.ReadbackAt = store.timestamp()
 	return store.saveLocked(state)
+}
+
+// ReceiptStatusView maps the durable receipt status plus the age of the
+// committed readback onto the operator-facing vocabulary:
+//
+//	committed      the transaction applied and its readback agreed
+//	readback_stale the transaction applied; the readback is older than window
+//	incomplete     the receipt is missing, failed or inconsistent
+//
+// Only "incomplete" is a failure. Age alone is never a failure.
+func (state State) ReceiptStatusView(now time.Time, window time.Duration) string {
+	switch state.ReceiptStatus {
+	case ReceiptStatusApplied, ReceiptStatusUnchanged:
+	case ReceiptStatusPartial, ReceiptStatusMissing, ReceiptStatusInvalid, ReceiptStatusFailed, "":
+		return ReceiptStatusIncomplete
+	default:
+		return ReceiptStatusIncomplete
+	}
+	if state.Partial {
+		return ReceiptStatusIncomplete
+	}
+	if state.ReadbackAt.IsZero() {
+		// Written before readback timestamps were persisted. It was validated
+		// when it committed, so it is committed, not incomplete.
+		return ReceiptStatusCommitted
+	}
+	if window > 0 && now.Sub(state.ReadbackAt) > window {
+		return ReceiptStatusReadbackStale
+	}
+	return ReceiptStatusCommitted
 }
 
 // Failure is the audit record of a rejected or failed apply.
