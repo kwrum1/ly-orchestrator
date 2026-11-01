@@ -109,11 +109,14 @@ echo "== overlay release package =="
 base_raw="$work/base.img"
 if [ -f "${base_image%.zst}" ]; then
   base_raw=${base_image%.zst}
+  echo "using uncompressed base image: $base_raw"
 else
-  zstd -dc "$base_image" > "$base_raw"
+  echo "decompressing base image: $base_image"
+  zstd -dc --sparse "$base_image" > "$base_raw"
 fi
+echo "copying base image to the release image"
 work_img="$work/ly-route-orchestrator-${version}-amd64.img"
-cp --sparse=always "$base_raw" "$work_img"
+cp --reflink=auto --sparse=always "$base_raw" "$work_img"
 [ "$base_raw" = "${base_image%.zst}" ] || rm -f "$base_raw"
 
 pkg="$work/pkg"
@@ -121,9 +124,11 @@ mkdir -p "$pkg"
 tar --zstd -xf "$package" -C "$pkg"
 mnt="$work/mnt"
 mkdir -p "$mnt"
+echo "mounting release image"
 loop=$(losetup -Pf --show "$work_img")
 sleep 1
 mount "${loop}p3" "$mnt"
+echo "installing release payload into the image"
 install -m 0755 "$pkg/usr/lib/ly-route/ly-route-control" "$mnt/usr/lib/ly-route/ly-route-control"
 install -m 0755 "$pkg/usr/lib/ly-route/vpp-apply" "$mnt/usr/lib/ly-route/vpp-apply"
 rm -rf "$mnt/opt/ly-route/admin"
@@ -136,7 +141,8 @@ losetup -d "$loop"
 mnt=
 loop=
 
-zstd -T0 -19 --sparse -f "$work_img" -o "$work_img.zst"
+echo "compressing release image"
+zstd -T0 -3 --sparse -f "$work_img" -o "$work_img.zst"
 image_size=$(stat -c %s "$work_img")
 image_hash=$(sha256sum "$work_img" | awk '{print $1}')
 payload_hash=$(sha256sum "$work_img.zst" | awk '{print $1}')

@@ -87,6 +87,7 @@ jobs:
           ls -l dist/release
 
       - name: build installer ISO (amd64)
+        timeout-minutes: 30
         run: |
           set -euo pipefail
           [ -f "${LY_ROUTE_ORCH_BASE_IMAGE}" ] || { echo "base disk image build input is missing: ${LY_ROUTE_ORCH_BASE_IMAGE}" >&2; exit 1; }
