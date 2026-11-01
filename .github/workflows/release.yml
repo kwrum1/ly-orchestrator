@@ -127,7 +127,9 @@ jobs:
           test -s "$iso"
           xorriso -osirrox on -indev "$iso" \
             -extract /live/filesystem.squashfs work/verify-filesystem.squashfs >/dev/null
-          unsquashfs -d work/verify-root work/verify-filesystem.squashfs >/dev/null
+          # The live root contains device nodes; ignore those extraction errors
+          # and xattrs, we only verify the installer payload files below.
+          unsquashfs -no-exit-code -no-xattrs -d work/verify-root work/verify-filesystem.squashfs >/dev/null
           install_dir=work/verify-root/opt/ly-route/install
           test -s "$install_dir/ly-route-orchestrator-x86_64.img.zst"
           test -s "$install_dir/image.sha256"
