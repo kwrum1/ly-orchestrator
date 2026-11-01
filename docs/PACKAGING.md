@@ -47,8 +47,8 @@ dist/ly-route-orchestrator-<version>-amd64.iso.sha256
 
 触发方式：
 
-- push tag `v*`；
-- 手动 `workflow_dispatch`。
+- 手动 `workflow_dispatch`：私有流水线上传升级包后触发；
+- 不使用 tag push 自动触发，避免 Release 资产尚未上传时误跑。
 
 手动参数：
 
