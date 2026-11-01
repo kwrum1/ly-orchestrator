@@ -220,6 +220,10 @@ type Server struct {
 	gatewayState                  *gatewayTelemetryState
 	securityGuardObserver         SecurityGuardRuntimeObserver
 	capabilityProber              *vpp.CapabilityProber
+	// afXDPProbe caches the optional `show af_xdp` audit hint. Some VPP builds
+	// ship the AF_XDP plugin but removed the CLI, so status polling must not
+	// probe it every few seconds.
+	afXDPProbe afXDPProbeCache
 	// dnsProbeMu guards the cached data-plane DNS verdict. The probe is a real
 	// DNS exchange through VPP, so it must not run once per health poll and a
 	// single timeout must not be seen as a flap by concurrent callers.
