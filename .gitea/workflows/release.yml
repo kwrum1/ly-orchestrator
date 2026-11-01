@@ -20,7 +20,9 @@ env:
   # Build inputs on the x86_64 runner:
   #  - a base orchestrator disk image (the installer ISO overlays this release)
   #  - the vpp-apply helper carried by the appliance package
-  LY_ROUTE_ORCH_BASE_IMAGE: /root/work/orch-base/ly-route-orchestrator-base-4g.img.zst
+  LY_ROUTE_ORCH_BASE_IMAGE: /root/work/orch-base/ly-route-orchestrator-base-1.0.0.img.zst
+  LY_ROUTE_ORCH_BASE_ISO: /root/work/orch-base/ly-route-orchestrator-base.iso
+  LY_ROUTE_ORCH_SQUASHFS_CACHE: /root/work/orch-iso/sq/squashfs-root
   LY_ROUTE_VPP_APPLY: /tmp/vpp-apply
   LY_ROUTE_MIRROR: https://mirrors.aliyun.com/debian
 
@@ -88,10 +90,13 @@ jobs:
         run: |
           set -euo pipefail
           [ -f "${LY_ROUTE_ORCH_BASE_IMAGE}" ] || { echo "base disk image build input is missing: ${LY_ROUTE_ORCH_BASE_IMAGE}" >&2; exit 1; }
-          bash scripts/build-orchestrator-installer-iso.sh \
+          [ -f "${LY_ROUTE_ORCH_BASE_ISO}" ] || { echo "base installer ISO build input is missing: ${LY_ROUTE_ORCH_BASE_ISO}" >&2; exit 1; }
+          bash scripts/build-orchestrator-installer-iso-from-base.sh \
             --version "${VERSION}" \
             --image "${LY_ROUTE_ORCH_BASE_IMAGE}" \
             --package "dist/release/ly-route-orchestrator-${VERSION}-amd64.tar.zst" \
+            --base-iso "${LY_ROUTE_ORCH_BASE_ISO}" \
+            --squashfs-root "${LY_ROUTE_ORCH_SQUASHFS_CACHE}" \
             --out dist/release
           ls -l dist/release
 
