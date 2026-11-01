@@ -1,108 +1,104 @@
-# Ly Route Orchestrator
+# ly Orchestrator 流量编排器
 
-LY Route 编排器（Orchestrator）独立仓库：控制面二进制 `orchestrator-control`、编排策略 API、
-以及编排器的 product/build profile。编排器 UI 是 React/Vite 应用，源码暂在 `ly-route`，
-本仓库不再包含任何 UI 源码或 UI 构建产物（见下节）。
+**透明串接的流量编排平台。** 把安全设备、审计设备或任意服务节点以「编排组」的形式
+透明接入网络，按策略引流、按组旁路、按需镜像，全程不改变现有 IP 与路由。
 
-本仓库从 `kurumi/ly-route` 拆分而来，用于让编排器拥有独立的构建、测试与发布节奏，
-不再阻塞也不再被网关的发布流程牵连。
+当前版本：**1.0.0**（x86_64）
 
-- 编排器产品仓库：`http://10.1.18.100:10000/kurumi/ly-orchestrator`（本仓库）
-- 网关产品仓库：`http://10.1.18.100:10000/kurumi/ly-route`
+![流量监控总览](docs/images/overview.png)
 
-## 当前状态：backend 仍与网关共享
+## 产品定位
 
-拆分的第一阶段，`backend/` 是**全量拷贝**，不是精简后的编排器后端。原因是控制面与网关
-在同一个 Go module 里共享 `internal/httpapi`、`internal/product`、`internal/persistence`、
-`internal/runtime/vpp` 等包，直接切开会让两侧同时构建失败。
+ly Orchestrator 部署在网关与业务网络之间，以两个物理口组成一条透明通道。流量进入
+编排组后按策略直通、丢弃或经过服务链，业务侧无需修改地址、网关或客户端配置。
 
-具体哪些内容已分离、哪些仍共享、后续怎么抽公共库，见 [`docs/REPO-BOUNDARY.md`](docs/REPO-BOUNDARY.md)。
-在公共库抽出之前，**修改 `backend/internal/httpapi` 等共享包必须同时在两个仓库对齐**。
+- **透明串接**：不改变现有网络拓扑与 IP 规划。
+- **按组编排**：每组两个方向端口，策略以组为单位进入服务链。
+- **故障不中断**：接口故障或业务请求持续无响应时，只旁路受影响的组。
+- **可视化运维**：实时流量、在线用户、会话与趋势一屏可见。
 
-## 编排器 UI：冻结基线 + 增量页面（唯一 UI）
+## 核心功能
 
-唯一有效的编排器 UI 是 `packaging/orchestrator-ui-baseline/` 的冻结外观，加上
-`packaging/orchestrator-ui-extras/` 的镜像口/故障旁路/编排组页内页面。
-`scripts/build-orchestrator-ui.sh` 负责组合这两部分（不改基线 app.js，只注入一行
-`orchestrator-extras.js`），升级包从组合结果构建。`frontend/` 重建 shell 不再参与
-部署或打包。
+### 拓扑与网卡角色
 
-已淘汰的 controller-shell 静态 UI 已彻底删除：`frontend/orchestrator/`（13 个源码文件）、
-仓库内固定的 `packaging/orchestrator-frontend/`（旧 11 页 bundle + manifest）、
-`scripts/build-controller-shell.sh`、`scripts/lib/product-build-profile.sh`，以及只服务
-它的 `test-orchestrator-ui-bundle-contract.sh`、`test-controller-shell-orchestrator-ui.mjs`、
-`test-orchestrator-demo-ui.mjs`。它曾被误部署到 VM，覆盖了新 UI。
+按端口分配 **LAN / WAN / 镜像口 / 未配置** 四种角色；管理口保留在管理面，不参与
+数据面转发。角色变更即时校验并下发，方向列直接显示端口用途。
 
-`scripts/check-retired-ui-boundary.sh` 在 CI 与发布流水线中把关：旧路径、controller-shell
-源码（`nic-settings.js` / `group-settings.js` / `forms.css` / `responsive.css`）、
-约 185 KB 的 shell bundle 重新出现即失败。历史 baseline 不再参与部署或 hash 门禁。
+![网卡设置](docs/images/nic-settings.png)
 
-## 构建
+![角色配置](docs/images/nic-role-dialog.png)
 
-需要 Go 1.22+（编译器实测 1.26）。
+### 链路聚合
 
-```bash
-cd backend
-go build ./...
-go build -trimpath -ldflags "-s -w" -o ../dist/orchestrator-control ./cmd/orchestrator-control
-```
+支持将两张同速率物理口组成聚合组，提升带宽与链路冗余；兼容模式端口会在创建前被
+明确拦截并说明原因，避免把整笔下发拖入失败。
 
-`backend/go.mod` 的 module path 仍是 `ly-route/backend`，因此 `backend/` 目录布局必须保持
-原样，跨包 import 才不会断。
+### 流量镜像
 
-## 测试
+单一镜像目的口、多个源口并行复制；每条策略独立选择源接口、方向（双向/仅接收/
+仅发送）与输出口。策略保存即下发，`vppctl show interface span` 可实时核对会话。
 
-CI 中运行的契约（见 `.gitea/workflows/ci.yml`）：
+![流量镜像](docs/images/mirror-policies.png)
 
-```bash
-# 编排器领域单测
-cd backend && go test ./internal/orchestrator/... ./internal/orchestratorapi/... -count=1
+![添加镜像策略](docs/images/mirror-add-dialog.png)
 
-# 编排器 HTTP / 产品边界契约
-cd backend && go test ./internal/httpapi \
-  -run 'TestOrchestrator|TestGatewayConversion|TestFirmwareUpgradeInstaller' -count=1
+### 编排组
 
-# 策略 / 反例 / 数据面契约
-sh scripts/test-orchestrator-policy-contract.sh
-sh scripts/test-orchestrator-negative-contract.sh
-sh scripts/test-orchestrator-dataplane-contract.sh
+每组由一对方向端口组成（LAN-facing / WAN-facing），是策略、服务链与故障旁路的
+最小单元。支持新增、编辑、删除；组端口与入口/出口、管理口、聚合口互斥校验。
 
-# 已淘汰 UI 的边界门禁（旧 shell 源码/bundle 重新出现即失败）
-sh scripts/check-retired-ui-boundary.sh
-```
+![编排组](docs/images/groups.png)
 
-需要在真实数据面主机上运行的完整验收脚本仍保留在 `scripts/`，但**不在 CI 中执行**：
+### 故障旁路
 
-- `test-orchestrator-product-contract.sh`（跑整个 `internal/httpapi`，依赖 vppctl /
-  `/usr/lib/ly-route/runtime-check.sh`）
-- `test-orchestrator-container-api.sh`、`test-orchestrator-vpp-*.sh`、
-  `test-vpp-orchestrator-transparent.sh`（需要 Docker + VPP）
+每个编排组可独立开启两类旁路：
 
-旧 controller-shell 的 Playwright 用例（`test-orchestrator-demo-ui.mjs`、
-`test-controller-shell-orchestrator-ui.mjs`）已随 UI 一起删除；编排器 UI 的浏览器验收
-放在 `ly-route` 的 React/Vite 工程里。
+- **接口故障旁路**：组内网口 down 即旁路该组，其它组不受影响。
+- **业务故障旁路**：按目的地址、目的端口、协议与阈值（秒）被动探测；规定时间内
+  所有请求都没有收到答复才旁路。拒绝、重置（RST）、丢包都不算答复。
 
-## 发布
+故障恢复后自动回到策略路径；旁路配置随组保存、随组删除。
 
-打 `v*` tag 触发 `.gitea/workflows/release.yml`，产出并上传：
+![故障旁路](docs/images/group-bypass-dialog.png)
 
-- `orchestrator-control-linux-amd64`
-- `orchestrator-control-linux-arm64`
-- `SHA256SUMS`
+### 流量编排与 IP 群组
 
-发布只产出控制面二进制，不再构建或上传 UI bundle（UI 由 `ly-route` 的
-`frontend/gateway` 工程构建）。上传走 `scripts/ci-upload-release.sh`（Gitea Release API）。
+策略组内规则按顺序首条命中生效，支持源/目的地址、端口、协议以及直通、丢弃、
+经过编排组三类动作。IP 群组可直接在规则编辑器中引用，也可直接填写 CIDR。
 
-## 目录
+![流量编排](docs/images/policy.png)
 
-| 路径 | 内容 |
-|---|---|
-| `backend/` | Go module `ly-route/backend`（当前全量共享） |
-| `backend/cmd/orchestrator-control` | 编排器控制面入口 |
-| `backend/orchestrator` | 控制面启动入口 (`orchestrator.Run()`) |
-| `packaging/build-profiles`, `packaging/product-profiles` | 编排器 build / product profile |
-| `packaging/orchestrator-ui-baseline` | 已发布 React UI 固定产物（部署用，CI 不重建） |
-| `scripts/` | 编排器构建、契约测试、发布脚本、旧 UI 边界门禁 |
-| `docs/` | 编排器文档与仓库边界说明 |
+### 可观测
 
-本仓库没有 `frontend/`：UI 源码与 React 构建都在 `ly-route`。
+流量监控提供 WAN→LAN / LAN→WAN 实时速率、边界流量趋势、在线用户、Top 连接与
+策略命中。采集带短周期缓存，下发窗口内不会误报「数据暂不可用」；真实采集失败会
+给出具体原因。
+
+### 升级与配置管理
+
+支持在线升级、配置快照、配置导出/导入（预检 + 确认 + 回滚快照）、产品转换与
+固件升级。导入包默认排除密钥材料，含密钥字段的包会被拒绝。
+
+![系统配置](docs/images/system-config.png)
+
+## 部署形态
+
+| 形态 | 产物 |
+| --- | --- |
+| 在线升级 | `ly-route-orchestrator-1.0.0-amd64.tar.zst` |
+| 裸机安装 | `ly-route-orchestrator-1.0.0-amd64.iso` |
+
+安装 ISO 支持 BIOS/UEFI 启动，安装时选择目标磁盘与管理口，写入管理地址后首次启动
+即进入编排器控制台。系统要求：x86_64、至少 2 张数据网卡、4 GB 以上系统盘。
+
+## 版本
+
+- 当前正式版本：`1.0.0`
+- 仅发布 x86_64（amd64）产物。
+
+## 文档
+
+- 产品与界面截图：`docs/images/`
+- 维护者边界说明：`docs/REPO-BOUNDARY.md`
+- 编排组故障旁路语义：`docs/orchestrator-per-group-bypass.md`
+- 服务集与运行边界：`docs/orchestrator-service-units.md`
