@@ -12485,7 +12485,7 @@ func (server *Server) exportDesiredConfig(ctx context.Context) (ConfigPackagePay
 		if !resourceAllowed(server.profile, resourceType) {
 			continue
 		}
-		items, err := server.desiredItems(ctx, resourceType)
+		items, err := server.storedDesiredItems(ctx, resourceType)
 		if err != nil {
 			return ConfigPackagePayload{}, err
 		}
@@ -12518,6 +12518,35 @@ func (server *Server) exportDesiredConfig(ctx context.Context) (ConfigPackagePay
 		excluded = append(excluded, "orchestrator_service_chain_intents")
 	}
 	return ConfigPackagePayload{SchemaVersion: ConfigPackageSchemaVersion, ContentType: configContentType, Product: server.profile.ID(), DeviceMode: server.profile.ID().String(), Resources: resources, Excluded: excluded}, nil
+}
+
+// storedDesiredItems returns only documents the operator actually saved. The
+// export must not carry product defaults (management network, default ACLs,
+// built-in IP objects): importing those defaults as desired state changes the
+// meaning of the package and can lock the dataplane on a fresh appliance.
+func (server *Server) storedDesiredItems(ctx context.Context, resourceType string) ([]map[string]any, error) {
+	if server.store == nil {
+		return nil, nil
+	}
+	documents, err := server.store.Configs(ctx, resourceType)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]map[string]any, 0, len(documents))
+	for _, document := range documents {
+		var item map[string]any
+		if err := json.Unmarshal(document.Payload, &item); err != nil {
+			return nil, err
+		}
+		if truthy(item["deleted"]) {
+			continue
+		}
+		if stringField(item, "id") == "" {
+			item["id"] = document.ResourceID
+		}
+		items = append(items, item)
+	}
+	return items, nil
 }
 
 func (server *Server) createConfigSnapshot(ctx context.Context, id, source string) (persistence.RuntimeSnapshot, error) {
