@@ -1,0 +1,172 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "目标版本，例如 1.0.4"
+        required: true
+        type: string
+      base_version:
+        description: "基础 ISO 的 Release 标签，例如 v1.0.3"
+        required: true
+        default: "v1.0.3"
+        type: string
+      package_url:
+        description: "升级包直链；留空则从目标版本 Release 下载"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  orchestrator-iso:
+    name: assemble x86_64 installer ISO
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve inputs
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BASE_VERSION: ${{ inputs.base_version }}
+          INPUT_PACKAGE_URL: ${{ inputs.package_url }}
+          TAG_NAME: ${{ github.ref_name }}
+          DEFAULT_BASE_VERSION: ${{ vars.LY_ORCHESTRATOR_BASE_VERSION || 'v1.0.3' }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+            base_version="$INPUT_BASE_VERSION"
+            package_url="$INPUT_PACKAGE_URL"
+          else
+            version="${TAG_NAME#v}"
+            base_version="$DEFAULT_BASE_VERSION"
+            package_url=""
+          fi
+          case "$version" in
+            ""|*[!0-9A-Za-z.+~-]*) echo "invalid version: $version" >&2; exit 1 ;;
+          esac
+          {
+            echo "version=$version"
+            echo "base_version=$base_version"
+            echo "package_url=$package_url"
+          } >> "$GITHUB_OUTPUT"
+          echo "target=$version base=$base_version package_url=${package_url:-<release asset>}"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xorriso zstd squashfs-tools
+
+      - name: Download base ISO
+        env:
+          BASE_VERSION: ${{ steps.meta.outputs.base_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          asset="ly-route-orchestrator-${BASE_VERSION#v}-amd64.iso"
+          gh release download "$BASE_VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$asset" \
+            --dir work --clobber
+          mv "work/$asset" work/base.iso
+          test -s work/base.iso
+
+      - name: Download upgrade package
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          PACKAGE_URL: ${{ steps.meta.outputs.package_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          if [ -n "$PACKAGE_URL" ]; then
+            curl -fL --retry 3 --retry-delay 5 -o work/package.tar.zst "$PACKAGE_URL"
+          else
+            asset="ly-route-orchestrator-${VERSION}-amd64.tar.zst"
+            gh release download "v$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset" \
+              --dir work --clobber
+            mv "work/$asset" work/package.tar.zst
+          fi
+          test -s work/package.tar.zst
+
+      - name: Assemble ISO
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          sudo --preserve-env=PATH,LY_ROUTE_ISO_WORK_ROOT \
+            bash packaging/build-orchestrator-iso-from-base.sh \
+              --version "$VERSION" \
+              --package work/package.tar.zst \
+              --base-iso work/base.iso \
+              --out dist
+          sudo chown -R "$(id -u):$(id -g)" dist
+
+      - name: Verify ISO payload
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          iso="dist/ly-route-orchestrator-${VERSION}-amd64.iso"
+          test -s "$iso"
+          xorriso -osirrox on -indev "$iso" \
+            -extract /live/filesystem.squashfs work/verify-filesystem.squashfs >/dev/null
+          unsquashfs -d work/verify-root work/verify-filesystem.squashfs >/dev/null
+          install_dir=work/verify-root/opt/ly-route/install
+          test -s "$install_dir/ly-route-orchestrator-x86_64.img.zst"
+          test -s "$install_dir/image.sha256"
+          test -s "$install_dir/image.size"
+          echo "image payload and sidecars verified for $VERSION"
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.iso > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "ly Orchestrator $VERSION" \
+              --generate-notes
+          fi
+          gh release upload "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            dist/*.iso dist/*.iso.sha256 dist/SHA256SUMS \
+            --clobber
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestrator-iso-${{ steps.meta.outputs.version }}
+          path: |
+            dist/*.iso
+            dist/*.iso.sha256
+            dist/SHA256SUMS
+          retention-days: 14
