@@ -3,7 +3,7 @@
 **透明串接的流量编排平台。** 把安全设备、审计设备或任意服务节点以「编排组」的形式
 透明接入网络，按策略引流、按组旁路、按需镜像，全程不改变现有 IP 与路由。
 
-当前版本：**1.0.3**（x86_64）
+当前版本：**1.0.4**（x86_64）
 
 ![流量监控总览](docs/images/overview.png)
 
@@ -12,14 +12,14 @@
 
 ## 下载
 
-最新正式版：**[v1.0.3](https://github.com/kwrum1/ly-orchestrator/releases/tag/v1.0.3)**
+最新正式版：**[v1.0.4](https://github.com/kwrum1/ly-orchestrator/releases/tag/v1.0.4)**
 
 | 形态 | 产物 | 用途 |
 | --- | --- | --- |
-| 裸机安装 | [`ly-route-orchestrator-1.0.3-amd64.iso`](https://github.com/kwrum1/ly-orchestrator/releases/download/v1.0.3/ly-route-orchestrator-1.0.3-amd64.iso) | BIOS/UEFI 安装 |
-| 在线升级 | [`ly-route-orchestrator-1.0.3-amd64.tar.zst`](https://github.com/kwrum1/ly-orchestrator/releases/download/v1.0.3/ly-route-orchestrator-1.0.3-amd64.tar.zst) | 1.0.x 原地升级 |
+| 裸机安装 | [`ly-route-orchestrator-1.0.4-amd64.iso`](https://github.com/kwrum1/ly-orchestrator/releases/download/v1.0.4/ly-route-orchestrator-1.0.4-amd64.iso) | BIOS/UEFI 安装 |
+| 在线升级 | [`ly-route-orchestrator-1.0.4-amd64.tar.zst`](https://github.com/kwrum1/ly-orchestrator/releases/download/v1.0.4/ly-route-orchestrator-1.0.4-amd64.tar.zst) | 1.0.x 原地升级 |
 
-校验文件：[`SHA256SUMS`](https://github.com/kwrum1/ly-orchestrator/releases/download/v1.0.3/SHA256SUMS)
+校验文件：[`SHA256SUMS`](https://github.com/kwrum1/ly-orchestrator/releases/download/v1.0.4/SHA256SUMS)
 
 ## 产品定位
 
@@ -124,11 +124,11 @@ ly Orchestrator 部署在网关与业务网络之间，以两个物理口组成�
 sha256sum -c SHA256SUMS
 ```
 
-v1.0.3 的 SHA256：
+v1.0.4 的 SHA256：
 
 ```text
-0651e9ed8dc679fbd9e7899506e9b2a4a2a0c25329322cf7aede0fa71c9597b5  ly-route-orchestrator-1.0.3-amd64.tar.zst
-064ffce23181a0a477731b0791264a98bfe0de0d483e542d21ab3d8bf2131973  ly-route-orchestrator-1.0.3-amd64.iso
+7657dec3e0c1467eb393f1fdab01bf25227410f0095cb6da1a6cbccb17c2048d  ly-route-orchestrator-1.0.4-amd64.tar.zst
+e87c508eae55987a1973fe74720f563f776c9b78bb3849d534bbe67b7e5fadca  ly-route-orchestrator-1.0.4-amd64.iso
 ```
 
 ## 仓库结构
@@ -157,7 +157,7 @@ ISO，并上传到 Release。见 [docs/PACKAGING.md](docs/PACKAGING.md)。
 
 ## 版本与平台
 
-- 当前正式版本：`1.0.3`
+- 当前正式版本：`1.0.4`
 - 仅发布 x86_64（amd64）产物。
 
 ## 许可证与第三方组件
