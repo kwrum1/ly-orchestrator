@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"ly-route/backend/internal/persistence"
 	"ly-route/backend/internal/runtime/apply"
@@ -31,6 +34,7 @@ type runtimeDesiredSourceDocument struct {
 type runtimeDesiredSource struct {
 	Schema    string                         `json:"schema"`
 	Product   string                         `json:"product"`
+	Build     string                         `json:"build"`
 	Documents []runtimeDesiredSourceDocument `json:"documents"`
 }
 
@@ -43,6 +47,7 @@ func (server *Server) runtimeDesiredSourceHash(ctx context.Context) (string, err
 	source := runtimeDesiredSource{
 		Schema:    runtimeDesiredSourceSchema,
 		Product:   server.profile.ID().String(),
+		Build:     server.version,
 		Documents: []runtimeDesiredSourceDocument{},
 	}
 	if server.store != nil {
@@ -257,6 +262,16 @@ func (server *Server) tryNoopRuntimeApply(ctx context.Context, sourceHash string
 			log.Printf("runtime apply: live state drifted from the committed generation (%v); rebuilding the plan", err)
 			return nil, false
 		}
+		// A VPP restart discards its runtime state even though the receipt and
+		// every artifact still match. The committed generation would then
+		// answer "unchanged" while service-chain/nftables programming is gone
+		// (observed on the router after a daemon restart). Compare the live VPP
+		// uptime with the commit time and force a full replay when VPP is
+		// younger than the commit.
+		if vppUptime, ok := liveVPPUptimeSeconds(ctx); ok && vppRestartedAfterCommit(vppUptime, result.AppliedAt, server.now().UTC()) {
+			log.Printf("runtime apply: VPP restarted after the committed generation (vpp up %.0fs); rebuilding the plan", vppUptime)
+			return nil, false
+		}
 		return &result, true
 	}
 	return nil, false
@@ -335,4 +350,55 @@ func shortRuntimeHash(hash string) string {
 		return hash[:12]
 	}
 	return hash
+}
+
+// liveVPPUptimeSeconds reports how long the current vpp process has been up.
+// It reads /proc so it does not depend on systemd timestamp formatting or the
+// host timezone. Ported from the gateway control plane after a real-appliance
+// restart made an otherwise valid committed generation report "unchanged".
+func liveVPPUptimeSeconds(ctx context.Context) (float64, bool) {
+	return unitUptimeSeconds(ctx, "vpp.service")
+}
+
+func unitUptimeSeconds(ctx context.Context, unit string) (float64, bool) {
+	pidOutput, err := exec.CommandContext(ctx, "systemctl", "show", unit, "--property=MainPID", "--value").Output()
+	if err != nil {
+		return 0, false
+	}
+	pid := strings.TrimSpace(string(pidOutput))
+	if pid == "" || pid == "0" {
+		return 0, false
+	}
+	stat, err := os.ReadFile("/proc/" + pid + "/stat")
+	if err != nil {
+		return 0, false
+	}
+	fields := strings.Fields(string(stat))
+	if len(fields) < 22 {
+		return 0, false
+	}
+	startTicks, err := strconv.ParseFloat(fields[21], 64)
+	if err != nil {
+		return 0, false
+	}
+	uptimeContent, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0, false
+	}
+	uptimeFields := strings.Fields(string(uptimeContent))
+	if len(uptimeFields) == 0 {
+		return 0, false
+	}
+	uptime, err := strconv.ParseFloat(uptimeFields[0], 64)
+	if err != nil {
+		return 0, false
+	}
+	return uptime - startTicks/100.0, true
+}
+
+func vppRestartedAfterCommit(vppUptimeSeconds float64, committedAt, now time.Time) bool {
+	if committedAt.IsZero() || now.Before(committedAt) {
+		return false
+	}
+	return vppUptimeSeconds+5 < now.Sub(committedAt).Seconds()
 }

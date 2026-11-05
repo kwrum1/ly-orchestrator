@@ -11389,6 +11389,13 @@ func (server *Server) vppRuntimeComponent(ctx context.Context, rendered bool) Ru
 	// successful apply. Live availability is proved by the VPP service health
 	// probe above and by the command results recorded in the receipt.
 	if len(receipt.Operations) == 0 {
+		// A route-only or policy-only generation can legitimately have no VPP
+		// operations. The live VPP health probe above already passed; an empty
+		// operations[] must not turn a committed generation into a partial
+		// apply. Ported from the gateway control plane.
+		if strings.EqualFold(strings.TrimSpace(receipt.Status), "applied") {
+			return RuntimeComponentState{Name: "vpp", State: "running", Available: true, Reason: "VPP service is healthy; this generation recorded no VPP operations"}
+		}
 		return RuntimeComponentState{Name: "vpp", State: "degraded", Reason: "VPP apply receipt has no operations"}
 	}
 	for _, operation := range receipt.Operations {
@@ -11416,6 +11423,21 @@ func (server *Server) readVPPApplyReceipt() (vppApplyReceipt, error) {
 	var receipt vppApplyReceipt
 	if err := json.Unmarshal(content, &receipt); err != nil {
 		return vppApplyReceipt{}, fmt.Errorf("VPP apply receipt is invalid: %v", err)
+	}
+	// vpp-apply publishes the transaction contract without applied_at /
+	// readback_at. Older readers required them and degraded a perfectly
+	// applied generation forever. The receipt is written atomically at commit
+	// time, so its mtime is a truthful fallback. Ported from the gateway.
+	if receipt.AppliedAt.IsZero() || receipt.ReadbackAt.IsZero() {
+		if info, statErr := os.Stat(path); statErr == nil {
+			committed := info.ModTime().UTC()
+			if receipt.AppliedAt.IsZero() {
+				receipt.AppliedAt = committed
+			}
+			if receipt.ReadbackAt.IsZero() {
+				receipt.ReadbackAt = committed
+			}
+		}
 	}
 	return receipt, nil
 }
