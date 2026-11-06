@@ -7,6 +7,39 @@
 (function () {
   "use strict";
 
+  /* --- gateway-parity interaction rules ---------------------------------
+   * 1. The shell's toolbar dispatches `lyroute:refresh`, but the frozen
+   *    baseline never listens. Reload the active route so the operator sees
+   *    the committed generation instead of a toast with stale data.
+   * 2. The shell has an in-flight guard for the main ApplyProvider; the
+   *    policy page and these extras also issue async policy PUTs. Serialize
+   *    those mutations so a second save cannot race the first VPP
+   *    transaction (the gateway's useApply queue behaviour).
+   * 3. Policy/topology applies are committed through `set ly-route
+   *    orchestrator candidate/commit` inside VPP: no vpp.service restart and
+   *    no control-plane restart. The UI must show "配置应用中", never a
+   *    generic "system restarting" state for a policy delete.
+   */
+  window.addEventListener("lyroute:refresh", function () {
+    window.setTimeout(function () { window.location.reload(); }, 80);
+  });
+
+  var applyQueue = Promise.resolve();
+  var nativeFetch = window.fetch;
+  if (nativeFetch) {
+    window.fetch = function (input, init) {
+      var url = typeof input === "string" ? input : (input && input.url) || "";
+      var method = ((init && init.method) || (input && input.method) || "GET").toUpperCase();
+      var isApply = /\/api\/v1\/(runtime\/apply|orchestrator\/policy|orchestrator\/service-chains\/apply)(\?|$)/.test(url) &&
+                    (method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE");
+      if (!isApply) return nativeFetch.call(window, input, init);
+      var run = function () { return nativeFetch.call(window, input, init); };
+      var next = applyQueue.then(run, run);
+      applyQueue = next.catch(function () {});
+      return next;
+    };
+  }
+
   var ITEMS = [
     {
       kind: "mirror",
