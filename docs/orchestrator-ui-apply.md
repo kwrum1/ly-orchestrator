@@ -71,3 +71,26 @@ systemctl show -p NRestarts --value vpp.service
 Expected: `policy/status=applied`, `vpp.service` `NRestarts` unchanged, and
 the console shows `顺序已生效`/`配置应用中`, never a dataplane restart for a
 policy-only delete.
+
+## Create/delete concurrency contract
+
+The gateway once crashed when a policy delete raced a policy create that was
+still applying. The orchestrator closes that class of race in three layers:
+
+1. `orchestratorapi.Handler.mutationMu` wraps every write handler
+   (`PUT/DELETE /topology`, groups, policy) from decode through the VPP apply,
+   the repository write and the journal commit. A delete that arrives during a
+   create waits for the whole create transaction before it starts.
+2. `productionOrchestratorRuntime.transparentMu` serialises every VPP
+   `candidate clear/add/commit` sequence, including the explicit
+   `/api/v1/runtime/apply` path and the periodic reconciler. Two apply paths
+   cannot interleave VPP candidate state.
+3. `transparentJournalPending` stops the periodic reconciler from comparing the
+   durable (older) policy against a mutation that is between its VPP apply and
+   its persistence.
+
+Regression test:
+`backend/internal/orchestratorapi/concurrency_test.go` starts a policy create,
+waits until its `ApplyTransparent` is in flight, then sends the delete and
+asserts the two transparent applies never overlap and the final repository has
+no policy.
