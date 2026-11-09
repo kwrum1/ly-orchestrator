@@ -278,8 +278,14 @@ type Server struct {
 	operationMu              sync.Mutex
 	operation                orchestratorapi.OperationState
 	dnsSyncToken             string
-	proxyFailurePage         proxyFailureActuator
-	proxyFailure             *proxyFailureTracker
+	// desiredDisplayHashMu caches the desired source hash for list decoration.
+	// The interface/policy lists poll every few seconds; recomputing a canonical
+	// hash over every desired document on each poll starved the dataplane CPU.
+	desiredDisplayHashMu    sync.Mutex
+	desiredDisplayHashValue string
+	desiredDisplayHashAt    time.Time
+	proxyFailurePage        proxyFailureActuator
+	proxyFailure            *proxyFailureTracker
 }
 
 type InterfaceTelemetryCollector interface {
@@ -818,7 +824,10 @@ func (server *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/", server.handleNotFound)
 	// requestIDMiddleware runs first so the body-limit rejection still carries
 	// a request id; the edge enforces the same limit in front of this process.
-	return requestIDMiddleware(requestBodyLimitMiddleware(mux))
+	// interfaceIdentityMiddleware memoizes the netlink/sysfs interface scan for
+	// the whole request: health, topology and list handlers resolve the same
+	// identities several times per call.
+	return requestIDMiddleware(interfaceIdentityMiddleware(requestBodyLimitMiddleware(mux)))
 }
 
 // maxRequestBodyBytes bounds every control-plane request body. It matches the
@@ -4163,6 +4172,7 @@ func (server *Server) handleDesiredItem(resourceType string) http.HandlerFunc {
 }
 
 func (server *Server) handleDesiredDelete(w http.ResponseWriter, r *http.Request, resourceType, id string) {
+	server.invalidateDesiredDisplayHash()
 	session, ok := server.sessionFromRequest(r)
 	if !ok {
 		server.recordAudit("anonymous", "system", r.URL.Path, "delete", "denied", "authentication required", r)
@@ -4955,6 +4965,7 @@ func (server *Server) desiredItem(ctx context.Context, resourceType, id string) 
 }
 
 func (server *Server) handleDesiredMutation(w http.ResponseWriter, r *http.Request, resourceType, action, explicitID string) {
+	server.invalidateDesiredDisplayHash()
 	session, ok := server.sessionFromRequest(r)
 	if !ok {
 		server.recordAudit("anonymous", "system", r.URL.Path, action, "denied", "authentication required", r)
@@ -13882,6 +13893,16 @@ func (server *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeError(w, r, http.StatusNotFound, "not_found", "unknown API route")
+}
+
+// interfaceIdentityMiddleware installs the per-request interface identity
+// cache. Without it a single topology/status response re-enumerated every
+// netdev (and its sysfs PCI/MAC files) once per resolution, which dominated
+// the allocation profile of the polling endpoints.
+func interfaceIdentityMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(withInterfaceIdentities(r.Context())))
+	})
 }
 
 func requestIDMiddleware(next http.Handler) http.Handler {

@@ -1,6 +1,7 @@
 package trafficpolicy
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -503,5 +504,31 @@ func TestCompileConfigRejectsObjectGroupCommandCharacters(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("expected command characters in object group entry to fail")
+	}
+}
+
+func TestCompileConfigCacheKeysOnContent(t *testing.T) {
+	routes := []map[string]any{{
+		"id": "route-cache", "enabled": true, "priority": 10, "action": "deny",
+		"match": map[string]any{"src_ip": "192.0.2.0/24"},
+	}}
+	first, err := CompileConfig(routes, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := CompileConfig(routes, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("cached compile changed result: %#v vs %#v", first, second)
+	}
+	routes[0]["priority"] = 20
+	third, err := CompileConfig(routes, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reflect.DeepEqual(first, third) {
+		t.Fatalf("content change reused the cached compile: %#v", third)
 	}
 }

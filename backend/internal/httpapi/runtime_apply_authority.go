@@ -84,6 +84,37 @@ func (server *Server) runtimeDesiredSourceHash(ctx context.Context) (string, err
 	return hash, nil
 }
 
+// runtimeDesiredSourceHashForDisplay reuses a recently computed desired hash.
+// The list pages poll every few seconds and each poll only needs to know
+// whether the saved configuration still matches the applied one. Recomputing a
+// canonical hash over the multi-megabyte object groups on every poll starved
+// the dataplane CPU. Apply authority never uses this cached value.
+func (server *Server) runtimeDesiredSourceHashForDisplay(ctx context.Context) (string, error) {
+	server.desiredDisplayHashMu.Lock()
+	if server.desiredDisplayHashValue != "" && time.Since(server.desiredDisplayHashAt) < 60*time.Second {
+		value := server.desiredDisplayHashValue
+		server.desiredDisplayHashMu.Unlock()
+		return value, nil
+	}
+	server.desiredDisplayHashMu.Unlock()
+	value, err := server.runtimeDesiredSourceHash(ctx)
+	if err != nil {
+		return "", err
+	}
+	server.desiredDisplayHashMu.Lock()
+	server.desiredDisplayHashValue = value
+	server.desiredDisplayHashAt = time.Now()
+	server.desiredDisplayHashMu.Unlock()
+	return value, nil
+}
+
+func (server *Server) invalidateDesiredDisplayHash() {
+	server.desiredDisplayHashMu.Lock()
+	server.desiredDisplayHashValue = ""
+	server.desiredDisplayHashAt = time.Time{}
+	server.desiredDisplayHashMu.Unlock()
+}
+
 // runtimeDesiredSourceExcluded drops resource types that are runtime
 // observations rather than desired state. Including a live DHCP lease would
 // change the source hash every time a client renewed and defeat the no-op

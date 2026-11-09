@@ -47,6 +47,19 @@ func (server *Server) appliedWANGroupIDs(ctx context.Context) map[string]struct{
 	}
 	for _, evidence := range result.GatewayEvidence {
 		if evidence.Resource == "wan-groups" && evidence.TransactionID == result.TransactionID && evidence.ApplyReceipt.Status == apply.ReceiptApplied && evidence.ApplyReceipt.TransactionID == result.TransactionID && equalGatewaySlice(evidence.After.WANGroups, result.GatewayPlan.Policy.WANGroups) {
+			// Steady state: the committed generation was built from exactly
+			// these desired documents, so the typed evidence is authoritative.
+			// The list polls every few seconds; it must not recompile the
+			// traffic policy just to decorate a badge.
+			if result.SourceHash != "" {
+				if currentHash, err := server.runtimeDesiredSourceHashForDisplay(ctx); err == nil && currentHash == result.SourceHash {
+					applied := make(map[string]struct{}, len(result.GatewayPlan.Policy.WANGroups))
+					for _, group := range result.GatewayPlan.Policy.WANGroups {
+						applied[group.ID] = struct{}{}
+					}
+					return applied
+				}
+			}
 			current, err := server.currentTrafficPolicyConfig(ctx)
 			if err != nil || !equalGatewaySliceUnordered(current.WANGroups, result.GatewayPlan.Policy.WANGroups) {
 				return nil
@@ -80,6 +93,18 @@ func (server *Server) appliedRoutePolicyIDs(ctx context.Context) map[string]stru
 	}
 	if appliedSnapshot == nil {
 		return nil
+	}
+
+	// Steady state: the committed generation was built from exactly these
+	// desired documents, so the typed route snapshot is authoritative.
+	if result.SourceHash != "" {
+		if currentHash, err := server.runtimeDesiredSourceHashForDisplay(ctx); err == nil && currentHash == result.SourceHash {
+			applied := make(map[string]struct{}, len(appliedSnapshot))
+			for _, policy := range appliedSnapshot {
+				applied[policy.ID] = struct{}{}
+			}
+			return applied
+		}
 	}
 
 	current, err := server.currentTrafficPolicyConfig(ctx)

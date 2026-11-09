@@ -1,12 +1,16 @@
 package trafficpolicy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -119,6 +123,47 @@ func CompileConfigWithDomainIPSet(routeItems, securityItems, objectGroupItems []
 }
 
 func CompileConfigWithDomainIPSetAt(routeItems, securityItems, objectGroupItems []map[string]any, domainIPSet []DomainIPSetEntry, now time.Time) (Config, error) {
+	key := compileCacheKey(routeItems, securityItems, objectGroupItems, domainIPSet, now)
+	compiledCache.mu.Lock()
+	if compiledCache.ok && compiledCache.key == key {
+		config := compiledCache.config
+		compiledCache.mu.Unlock()
+		return config, nil
+	}
+	compiledCache.mu.Unlock()
+	config, err := compileConfigWithDomainIPSetAtUncached(routeItems, securityItems, objectGroupItems, domainIPSet, now)
+	if err == nil {
+		compiledCache.mu.Lock()
+		compiledCache.key = key
+		compiledCache.config = config
+		compiledCache.ok = true
+		compiledCache.mu.Unlock()
+	}
+	return config, err
+}
+
+var (
+	compiledCache struct {
+		mu     sync.Mutex
+		key    string
+		config Config
+		ok     bool
+	}
+)
+
+func compileCacheKey(routeItems, securityItems, objectGroupItems []map[string]any, domainIPSet []DomainIPSetEntry, now time.Time) string {
+	payload, err := json.Marshal([]any{routeItems, securityItems, objectGroupItems, domainIPSet})
+	if err != nil {
+		return ""
+	}
+	// Expiry depends on the observation timestamp, not the absolute clock: a
+	// cached compile is valid for the same domain set generation.
+	_ = now
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
+}
+
+func compileConfigWithDomainIPSetAtUncached(routeItems, securityItems, objectGroupItems []map[string]any, domainIPSet []DomainIPSetEntry, now time.Time) (Config, error) {
 	groups := compileObjectGroups(objectGroupItems)
 	domains := compileDomainIPSet(domainIPSet, groups, now)
 	routes := make([]RoutePolicy, 0, len(routeItems))

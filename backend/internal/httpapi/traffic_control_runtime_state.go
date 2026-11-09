@@ -83,6 +83,20 @@ func (server *Server) appliedTrafficControlIDs(ctx context.Context) map[string]s
 		return nil
 	}
 
+	// Steady state: the committed generation was built from exactly these
+	// desired documents. Reading the one traffic-control document is enough;
+	// expanding object groups and recompiling the flow on every list poll made
+	// the policy page expensive.
+	if result.SourceHash != "" {
+		if currentHash, err := server.runtimeDesiredSourceHashForDisplay(ctx); err == nil && currentHash == result.SourceHash {
+			current, err := server.currentFlowIntent(ctx)
+			if err != nil || strings.TrimSpace(current.ID) == "" {
+				return nil
+			}
+			return map[string]struct{}{current.ID: {}}
+		}
+	}
+
 	current, err := server.currentFlowIntent(ctx)
 	if err != nil {
 		return nil

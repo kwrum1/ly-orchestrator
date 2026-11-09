@@ -46,8 +46,18 @@ func (server *Server) setRuntimeEvidence(result RuntimeApplyResult) {
 	}
 	server.clearReconciliationNotice()
 	server.runtimeMu.Lock()
+	previousTransactionID := ""
+	if server.lastRuntime != nil {
+		previousTransactionID = server.lastRuntime.TransactionID
+	}
 	server.lastRuntime = &result
 	server.runtimeMu.Unlock()
+	// Only a new generation invalidates the cached desired hash. Status
+	// polling republishes the same committed evidence and must not defeat the
+	// 60s cache that keeps the list endpoints cheap.
+	if previousTransactionID != result.TransactionID {
+		server.invalidateDesiredDisplayHash()
+	}
 	// A committed generation may have rebuilt the VPP DNS adapters, which
 	// invalidates the app index inside the session rules until the heal
 	// re-registers them. Ask for that repair immediately instead of leaving

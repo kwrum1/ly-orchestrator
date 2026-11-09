@@ -211,3 +211,57 @@ func TestRoutePolicyRuntimeStateKeepsUserPoliciesAppliedAcrossGeneratedDNSRouteC
 		t.Fatalf("route list after generated DNS change = %d %s", list.Code, list.Body.String())
 	}
 }
+
+func TestRoutePolicyRuntimeStateUsesCommittedSnapshotWhenSourceHashMatches(t *testing.T) {
+	ctx := context.Background()
+	store, err := persistence.Open(ctx, "file:httpapi-route-runtime-sourcehash-test?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	server := New(WithStore(store), WithAuthConfig(AuthConfig{AdminUsername: "admin", AdminPassword: "secret"}), WithClock(fixedClock()))
+	login := requestBody(t, server, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"secret"}`)
+	cookie := login.Result().Cookies()[0]
+	created := authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/gateway/policies/routes", `{"id":"route-sourcehash","enabled":true,"priority":10,"action":"deny","match":{"src_ip":"192.0.2.0/24"}}`, cookie)
+	if created.Code != http.StatusOK {
+		t.Fatalf("create route = %d %s", created.Code, created.Body.String())
+	}
+	compiled, err := server.currentTrafficPolicyConfig(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceHash, err := server.runtimeDesiredSourceHash(ctx)
+	if err != nil || sourceHash == "" {
+		t.Fatalf("desired source hash = %q err=%v", sourceHash, err)
+	}
+	transactionID := "txn-route-sourcehash"
+	plan := vpp.Plan{Policy: compiled}
+	server.runtimeMu.Lock()
+	server.lastRuntime = &RuntimeApplyResult{
+		Status: RuntimeStatusCommitted, RuntimeState: RuntimeStateRunning, TransactionID: transactionID,
+		SourceHash:  sourceHash,
+		Receipt:     apply.ApplyReceipt{TransactionID: transactionID, Capability: "runtime", Status: apply.ReceiptApplied, AppliedAt: fixedClock()()},
+		GatewayPlan: &plan,
+		GatewayEvidence: []apply.GatewayResourceEvidence{{
+			Resource: "routes", TransactionID: transactionID,
+			ApplyReceipt: apply.ApplyReceipt{TransactionID: transactionID, Capability: "routes", Status: apply.ReceiptApplied, AppliedAt: fixedClock()()},
+			After:        vpp.Snapshot{RoutePolicies: compiled.RoutePolicies},
+		}},
+	}
+	server.runtimeMu.Unlock()
+
+	list := authenticatedJSONRequest(t, server, http.MethodGet, "/api/v1/gateway/policies/routes", "", cookie)
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"runtime_state":"applied"`) {
+		t.Fatalf("steady-state route list = %d %s", list.Code, list.Body.String())
+	}
+
+	changed := authenticatedJSONRequest(t, server, http.MethodPatch, "/api/v1/gateway/policies/routes/route-sourcehash", `{"id":"route-sourcehash","enabled":true,"priority":20,"action":"deny","match":{"src_ip":"192.0.2.0/24"}}`, cookie)
+	if changed.Code != http.StatusOK {
+		t.Fatalf("change route = %d %s", changed.Code, changed.Body.String())
+	}
+	server.invalidateDesiredDisplayHash()
+	list = authenticatedJSONRequest(t, server, http.MethodGet, "/api/v1/gateway/policies/routes", "", cookie)
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"runtime_state":"desired_not_applied"`) {
+		t.Fatalf("pending route list = %d %s", list.Code, list.Body.String())
+	}
+}
