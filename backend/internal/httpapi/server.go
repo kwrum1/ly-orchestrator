@@ -3396,9 +3396,12 @@ func (server *Server) compileInterfaceBond(ctx context.Context, payload map[stri
 	return map[string]any{"id": id, "name": nonEmpty(stringField(payload, "name"), id), "members": members, "mode": "xor", "load_balance": "l34", "speed": speed, "work_mode": workMode, "runtime_state": "desired_not_applied", "vpp_operation": map[string]any{"name": "vpp.interface-bond", "mode": "xor", "load_balance": "l34", "members": members}, "capabilities": server.degradedRuntimeCapabilities(ctx)}, http.StatusOK, nil
 }
 
-// orchestratorBoundaryPorts maps every port that currently owns the LAN or WAN
-// boundary to its role. Both the resolved Linux name and the product id are
-// included so callers can test whichever identity they hold.
+// orchestratorBoundaryPorts maps the two logical LAN/WAN interfaces (and their
+// bond members) to their role. PortRoles is deliberately excluded: it is
+// console metadata that also tags orchestration-group members, so treating
+// every lan/wan tag as a boundary would reject a freed group port that an
+// operator legitimately reuses for mirroring or a bond. Both the resolved Linux
+// name and the product id are included so callers can test either identity.
 func (server *Server) orchestratorBoundaryPorts(ctx context.Context) map[string]string {
 	ports := map[string]string{}
 	if server.store == nil {
@@ -3431,16 +3434,6 @@ func (server *Server) orchestratorBoundaryPorts(ctx context.Context) map[string]
 						}
 					}
 				}
-			}
-		}
-		for id, role := range pack.PortRoles {
-			id = strings.TrimSpace(id)
-			if id == "" || (role != "lan" && role != "wan") {
-				continue
-			}
-			ports[id] = role
-			if linux := strings.TrimSpace(server.resolveInterfaceID(ctx, id)); linux != "" {
-				ports[linux] = role
 			}
 		}
 	}
