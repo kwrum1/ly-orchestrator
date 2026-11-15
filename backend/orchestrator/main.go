@@ -1301,6 +1301,11 @@ func (runtime *productionOrchestratorRuntime) refreshRuntimeProof(ctx context.Co
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	command := exec.CommandContext(probeCtx, commandPath)
+	// The probe is a shell script that starts vppctl. Killing the script on
+	// timeout does not close a pipe inherited by a surviving child, and
+	// CombinedOutput would then wait forever even though the context expired.
+	// WaitDelay force-closes the I/O shortly after the deadline.
+	command.WaitDelay = 5 * time.Second
 	command.Env = append(os.Environ(),
 		"LY_ROUTE_MANAGEMENT_INTERFACE="+runtime.managementInterface,
 		"LY_ROUTE_MANAGEMENT_SHARED="+strconv.FormatBool(managementShared),
