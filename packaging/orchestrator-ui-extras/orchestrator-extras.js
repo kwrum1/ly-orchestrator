@@ -61,7 +61,17 @@
       "/* The shell prints its own wording first (设备正常 / 需要处理); keep it",
       "   hidden until normalised so the operator never sees two sentences. */",
       ".health-pill>span:not(.health-reason),.sidebar-foot>span:last-child{visibility:hidden}",
-      "html.extras-status-ready .health-pill>span:not(.health-reason),html.extras-status-ready .sidebar-foot>span:last-child{visibility:visible}"
+      "html.extras-status-ready .health-pill>span:not(.health-reason),html.extras-status-ready .sidebar-foot>span:last-child{visibility:visible}",
+      "/* A page that ends after one short card left a bare block under it. The",
+      "   shell's table board fills the viewport on 编排组; give the same shape to",
+      "   every single-card page, and let an empty state centre inside the card. */",
+      "@media (min-width:900px){",
+      "  .main-inner .page:not(:has(.card ~ .card))>.card:last-child{min-height:calc(100vh - 196px);display:flex;flex-direction:column}",
+      "  .main-inner .page:not(:has(.card ~ .card))>.card:last-child>.card-body{flex:1 1 auto;display:flex;flex-direction:column}",
+      "  .main-inner .page:not(:has(.card ~ .card))>.card:last-child>.card-body>.table-wrap{flex:1 1 auto}",
+      "  .main-inner .page:not(:has(.card ~ .card))>.card:last-child>.card-body>.empty-state{flex:1 1 auto;justify-content:center}",
+      "  .extras-embedded #no-target{margin:auto 0}",
+      "}"
     ].join("\n");
     document.head.appendChild(style);
   })();
