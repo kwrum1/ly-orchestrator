@@ -484,6 +484,14 @@ func (channel *vppctlChannel) runReadOnlyCommand(ctx context.Context, args ...st
 }
 
 func (channel *vppctlChannel) doCommands(ctx context.Context, operation Operation) (Reply, error) {
+	// A policy apply is dominated by process launches, not VPP work: one
+	// vppctl process per rule costs ~35ms on this class of appliance. Build the
+	// whole candidate in one `vppctl exec` file instead, then run the one or two
+	// readback commands normally. The readback verification compares the policy
+	// row count with the rule commands, so a silently dropped rule still fails.
+	if reply, handled, err := channel.doTransparentOrchestratorBatch(ctx, operation); handled {
+		return reply, err
+	}
 	results := make([]VPPCTLCommandResult, 0, len(operation.VPPCtlCommands))
 	for index := 0; index < len(operation.VPPCtlCommands); index++ {
 		command := strings.TrimSpace(operation.VPPCtlCommands[index])
@@ -597,6 +605,79 @@ func (channel *vppctlChannel) doCommands(ctx context.Context, operation Operatio
 	}
 	payload.Readback = readback
 	return Reply{Operation: operation.Name, Payload: payload}, nil
+}
+
+// doTransparentOrchestratorBatch runs the candidate-building commands of one
+// orchestrator apply through a single `vppctl exec`. It only takes over when the
+// operation is the plain apply (not an observation/disable), every command is a
+// candidate/commit/SPAN mutation or a show, and there is enough work to pay for
+// the file round trip. Anything unusual falls back to the per-command path.
+func (channel *vppctlChannel) doTransparentOrchestratorBatch(ctx context.Context, operation Operation) (Reply, bool, error) {
+	if operation.Name != "vpp.transparent-orchestrator" || len(operation.VPPCtlCommands) < 8 {
+		return Reply{}, false, nil
+	}
+	results := make([]VPPCTLCommandResult, len(operation.VPPCtlCommands))
+	mutating := make([]string, 0, len(operation.VPPCtlCommands))
+	mutatingSlots := make([]int, 0, len(operation.VPPCtlCommands))
+	shows := make([]int, 0, 2)
+	for index, raw := range operation.VPPCtlCommands {
+		command := strings.TrimSpace(raw)
+		results[index].Command = command
+		// The batch file cannot express the `?` ignore-failure marker; mirror
+		// cleanup uses it, so those applies keep the per-command path.
+		if command == "" || strings.HasPrefix(command, "?") {
+			return Reply{}, false, nil
+		}
+		if err := forbiddenVPPCTLCommand(command); err != nil {
+			return Reply{}, false, nil
+		}
+		switch {
+		case strings.HasPrefix(command, "show "):
+			shows = append(shows, index)
+		case strings.HasPrefix(command, "set ly-route orchestrator "),
+			strings.HasPrefix(command, "set interface span "),
+			strings.HasPrefix(command, "interface span "):
+			mutating = append(mutating, command)
+			mutatingSlots = append(mutatingSlots, index)
+		default:
+			return Reply{}, false, nil
+		}
+	}
+	if len(mutating) < 8 {
+		return Reply{}, false, nil
+	}
+	for begin := 0; begin < len(mutating); begin += vppRouteBatchChunkSize {
+		end := begin + vppRouteBatchChunkSize
+		if end > len(mutating) {
+			end = len(mutating)
+		}
+		label := fmt.Sprintf("vpp orchestrator batch %d-%d/%d", begin+1, end, len(mutating))
+		batchResult, err := channel.executeVPPBatchFile(ctx, mutating[begin:end], label)
+		if err != nil {
+			return Reply{Operation: operation.Name, Retval: 1, Payload: VPPCTLReplyPayload{CommandResults: results}}, true, err
+		}
+		// Attribute the combined output to the first command of the chunk for
+		// diagnostics; the caller only reads the trailing show results.
+		results[mutatingSlots[begin]].Stdout = batchResult.Stdout
+		results[mutatingSlots[begin]].Stderr = batchResult.Stderr
+	}
+	for _, index := range shows {
+		reply, err := channel.doCommands(ctx, Operation{
+			Name:           operation.Name,
+			RequestID:      operation.RequestID,
+			Resource:       operation.Resource,
+			VPPCtlCommands: []string{results[index].Command},
+		})
+		if err != nil {
+			return reply, true, err
+		}
+		payload, ok := reply.Payload.(VPPCTLReplyPayload)
+		if !ok || len(payload.CommandResults) != 1 {
+			return reply, true, fmt.Errorf("%w: %s readback is incomplete", ErrSnapshotIncomplete, operation.Name)
+		}
+		results[index] = payload.CommandResults[0]
+	}
+	return Reply{Operation: operation.Name, Payload: VPPCTLReplyPayload{CommandResults: results}}, true, nil
 }
 
 func collectVPPRouteBatch(commands []string, begin int) ([]string, int, error) {
@@ -809,6 +890,12 @@ func (channel *vppctlChannel) doVPPRouteBatch(ctx context.Context, commands []st
 
 func (channel *vppctlChannel) doVPPRouteBatchChunk(ctx context.Context, commands []string, begin, end, total int) (VPPCTLCommandResult, error) {
 	label := fmt.Sprintf("vpp route command batch %d-%d/%d", begin+1, end, total)
+	return channel.executeVPPBatchFile(ctx, commands, label)
+}
+
+// executeVPPBatchFile writes the commands to a CLI file and runs one
+// `vppctl exec`, which executes them in a single process.
+func (channel *vppctlChannel) executeVPPBatchFile(ctx context.Context, commands []string, label string) (VPPCTLCommandResult, error) {
 	file, err := os.CreateTemp("", "ly-route-vpp-batch-*.conf")
 	if err != nil {
 		return VPPCTLCommandResult{Command: label}, fmt.Errorf("create %s: %w", label, err)
