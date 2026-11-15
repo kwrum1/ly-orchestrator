@@ -69,6 +69,20 @@
       "/* One empty-state shape everywhere: same box, same centring, whichever",
       "   component rendered it. */",
       ".card-body .empty-state{flex:1 1 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:240px}",
+      "/* Every list page must put its empty state in the same place. Positioning it",
+      "   against the card (not against whatever wrapper happens to hold it) is the",
+      "   only way the three pages line up. */",
+      "/* Three pages use three different hosts: .card (mirror, policy) and",
+      "   .data-table-wrap (编排组). Anchor the empty state to whichever one holds it. */",
+      ".card:has(.empty-state),.data-table-wrap:has(.empty-state){position:relative}",
+      "/* 编排组's board is 24px taller than the card used by the other two pages,",
+      "   so even a centred empty state sat 12px lower. Match the board height while",
+      "   it is empty; rows never render in this state. */",
+      ".main-inner .page:not(:has(.card ~ .card))>.data-table-wrap:has(.empty-state){height:calc(100vh - 196px);flex:0 0 auto}",
+      ".card>.empty-state,.card .empty-state,.data-table-wrap>.empty-state,.data-table-wrap .empty-state{",
+      "  position:absolute;inset:0;z-index:1;display:flex;flex-direction:column;",
+      "  align-items:center;justify-content:center;gap:6px;min-height:0;padding:24px;",
+      "  pointer-events:none;text-align:center}",
       "}"
     ].join("\n");
     document.head.appendChild(style);
