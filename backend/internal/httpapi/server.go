@@ -837,7 +837,7 @@ func (server *Server) Handler() http.Handler {
 	// interfaceIdentityMiddleware memoizes the netlink/sysfs interface scan for
 	// the whole request: health, topology and list handlers resolve the same
 	// identities several times per call.
-	return requestIDMiddleware(interfaceIdentityMiddleware(requestBodyLimitMiddleware(mux)))
+	return requestIDMiddleware(interfaceIdentityMiddleware(requestBodyLimitMiddleware(invalidateMutationMiddleware(mux))))
 }
 
 // maxRequestBodyBytes bounds every control-plane request body. It matches the
@@ -4021,7 +4021,7 @@ func (server *Server) handleDesiredCollection(resourceType string) http.HandlerF
 		switch r.Method {
 		case http.MethodGet:
 			if resourceType == "interface" {
-				items, capabilities, err := server.interfaceRuntimeSnapshot(r.Context())
+				items, capabilities, err := server.cachedInterfaceRuntimeSnapshot(r.Context())
 				if err != nil {
 					writeError(w, r, http.StatusInternalServerError, "interface_snapshot_failed", err.Error())
 					return

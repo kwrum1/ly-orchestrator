@@ -274,7 +274,7 @@
       container.style.visibility = "hidden";
       window.setTimeout(function () {
         if (container.style.visibility === "hidden") container.style.visibility = "";
-      }, 2500);
+      }, 1200);
     }
     mainInner.appendChild(container);
     active = { kind: kind, container: container, hidden: hidden, cleanup: null };
@@ -770,10 +770,11 @@
   }
 
   function scheduleRelabel() {
-    refreshMirrorIds(false).then(function () {
-      relabelMirrorRoles();
-      decorateInterfacesPage();
-    });
+    // Decorate immediately: chaining it behind refreshMirrorIds() added a second
+    // /api/v1/interfaces round-trip before the page could be revealed, which is
+    // what made 网卡设置 feel slow.
+    decorateInterfacesPage();
+    refreshMirrorIds(false).then(relabelMirrorRoles);
     refreshPortNameMap().then(rewriteSystemNames);
   }
 
