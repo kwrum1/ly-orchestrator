@@ -133,6 +133,8 @@ func (handler *Handler) handlePolicy(writer http.ResponseWriter, request *http.R
 // asynchronous worker reuses it verbatim and reports its outcome through
 // policy/status.
 func (handler *Handler) servePolicyPut(writer http.ResponseWriter, request *http.Request) {
+	trace := policyTraceFrom(request.Context())
+	trace.mark("decode")
 	repository, ok := handler.policyRepository()
 	if !ok {
 		writeAPIError(writer, http.StatusServiceUnavailable, orchestrator.ErrRepositoryUnavailable)
@@ -148,20 +150,25 @@ func (handler *Handler) servePolicyPut(writer http.ResponseWriter, request *http
 		writeRepositoryError(writer, err)
 		return
 	}
+	trace.mark("snapshot")
 	policy, err := orchestrator.ParsePolicy(topology, input)
 	if err != nil {
 		writeAPIError(writer, http.StatusUnprocessableEntity, err)
 		return
 	}
+	trace.mark("parse")
 	previous, _, previousErr := repository.PolicySnapshot(request.Context())
 	if previousErr != nil && !errors.Is(previousErr, orchestrator.ErrPolicyNotFound) {
 		writePolicyRepositoryError(writer, previousErr)
 		return
 	}
+	trace.mark("previous")
 	if err := handler.applyTransparent(request.Context(), topology, &policy); err != nil {
 		writeAPIError(writer, http.StatusUnprocessableEntity, err)
 		return
 	}
+	trace.mark("apply")
+	trace.mark("persist-start")
 	if err := repository.ReplacePolicy(request.Context(), policy); err != nil {
 		var rollbackErr error
 		if previousErr == nil {
@@ -176,19 +183,24 @@ func (handler *Handler) servePolicyPut(writer http.ResponseWriter, request *http
 		writePolicyRepositoryError(writer, err)
 		return
 	}
+	trace.mark("persist")
 	if err := handler.commitTransparentTransaction(request.Context()); err != nil {
 		writeAPIError(writer, http.StatusInternalServerError, err)
 		return
 	}
+	trace.mark("commit")
 	stored, checksum, err := repository.PolicySnapshot(request.Context())
 	if err != nil {
 		writePolicyRepositoryError(writer, err)
 		return
 	}
+	trace.mark("readback")
 	if !handler.requireConverged(writer, request.Context(), topology, &stored) {
 		return
 	}
+	trace.mark("verify")
 	handler.recordAudit(request, PolicyPath, "update", "success", checksum)
+	trace.mark("audit")
 	writeJSON(writer, http.StatusOK, map[string]any{"item": stored.View(), "checksum": checksum})
 }
 

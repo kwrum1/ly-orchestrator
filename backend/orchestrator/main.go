@@ -492,11 +492,31 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 		}
 		return err
 	}
+	configuredDefault := transparentDefaultAction(policyView)
+	if !transparentStateMatchesConfiguration(readback, generation, configuredDefault) {
+		// The apply itself returned a readback. Verifying it here means a
+		// divergent plugin state fails the write immediately instead of hiding
+		// behind a second observation, and the caller does not need another
+		// round trip to a device this slow.
+		reason := transparentDriftReason(generation, configuredDefault, readback, nil)
+		var rollbackErr error
+		if len(previousBonds) > 0 || len(desiredBonds) > 0 {
+			_, rollbackErr = runtime.adapter.ApplyTransparentBondTransition(ctx, requestID+"-bond-rollback", desiredBonds, previousBonds)
+		}
+		runtime.releaseDPDK(ctx, requestID, errors.New(reason))
+		if clearErr := runtime.clearTransparentTransactionLocked(); clearErr != nil {
+			log.Printf("clear divergent transparent transaction journal: %v", clearErr)
+		}
+		if rollbackErr != nil {
+			return errors.Join(fmt.Errorf("transparent orchestrator readback disagrees with the applied configuration: %s", reason), rollbackErr)
+		}
+		return fmt.Errorf("transparent orchestrator readback disagrees with the applied configuration: %s", reason)
+	}
 	runtime.transparentBonds = append([]vpp.BondState(nil), desiredBonds...)
 	runtime.transparentRequest = requestID
 	runtime.transparentGeneration = generation
 	runtime.transparentAppliedAt = time.Now().UTC()
-	runtime.transparentConfiguredDefault = transparentDefaultAction(policyView)
+	runtime.transparentConfiguredDefault = configuredDefault
 	runtime.transparentObservedGeneration = readback.Generation
 	runtime.transparentObservedDefault = readback.Default
 	runtime.transparentMirrorSignature = mirrorSignature(mirror)

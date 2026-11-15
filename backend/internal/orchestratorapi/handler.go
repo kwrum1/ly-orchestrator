@@ -558,11 +558,60 @@ func (handler *Handler) recordAudit(request *http.Request, resource, action, sta
 // policyTransaction is the observable state of one asynchronous policy write.
 // Status values match the console contract: applying, applied, apply_failed.
 type policyTransaction struct {
-	ID         string    `json:"transaction_id"`
-	Status     string    `json:"status"`
-	Reason     string    `json:"reason,omitempty"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at,omitempty"`
+	ID         string     `json:"transaction_id"`
+	Status     string     `json:"status"`
+	Reason     string     `json:"reason,omitempty"`
+	StartedAt  time.Time  `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	// Phases breaks a completed write down by control-plane step. It is
+	// diagnostics for the acceptance run, not part of the UI contract.
+	Phases []policyPhase `json:"phases,omitempty"`
+}
+
+type policyPhase struct {
+	Phase      string `json:"phase"`
+	DurationMS int64  `json:"duration_ms"`
+}
+
+type policyTraceKey struct{}
+
+// policyTrace records step durations for one policy write. A nil trace (the
+// synchronous path outside an asynchronous transaction) makes mark a no-op.
+type policyTrace struct {
+	mu      sync.Mutex
+	started time.Time
+	last    time.Time
+	phases  []policyPhase
+}
+
+func newPolicyTrace() *policyTrace {
+	now := time.Now()
+	return &policyTrace{started: now, last: now}
+}
+
+func (trace *policyTrace) mark(phase string) {
+	if trace == nil {
+		return
+	}
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	now := time.Now()
+	trace.phases = append(trace.phases, policyPhase{Phase: phase, DurationMS: now.Sub(trace.last).Milliseconds()})
+	trace.last = now
+}
+
+func (trace *policyTrace) snapshot() []policyPhase {
+	if trace == nil {
+		return nil
+	}
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	return append([]policyPhase(nil), trace.phases...)
+}
+
+func policyTraceFrom(ctx context.Context) *policyTrace {
+	trace, _ := ctx.Value(policyTraceKey{}).(*policyTrace)
+	return trace
 }
 
 func wantsAsyncPolicy(request *http.Request) bool {
@@ -615,7 +664,7 @@ func (handler *Handler) beginPolicyTransaction() (policyTransaction, error) {
 	return transaction, nil
 }
 
-func (handler *Handler) finishPolicyTransaction(id, status, reason string) {
+func (handler *Handler) finishPolicyTransaction(id, status, reason string, phases []policyPhase) {
 	handler.policyTxMu.Lock()
 	defer handler.policyTxMu.Unlock()
 	transaction, ok := handler.policyTransactions[id]
@@ -624,7 +673,9 @@ func (handler *Handler) finishPolicyTransaction(id, status, reason string) {
 	}
 	transaction.Status = status
 	transaction.Reason = reason
-	transaction.FinishedAt = time.Now().UTC()
+	finished := time.Now().UTC()
+	transaction.FinishedAt = &finished
+	transaction.Phases = phases
 	handler.policyTransactions[id] = transaction
 }
 
@@ -642,6 +693,8 @@ func (handler *Handler) policyTransactionByID(id string) (policyTransaction, boo
 func (handler *Handler) runAsyncPolicyPut(transactionID string, request *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
+	trace := newPolicyTrace()
+	ctx = context.WithValue(ctx, policyTraceKey{}, trace)
 	request = request.WithContext(ctx)
 	recorder := &policyResponseRecorder{header: http.Header{}}
 	handler.mutationMu.Lock()
@@ -652,10 +705,10 @@ func (handler *Handler) runAsyncPolicyPut(transactionID string, request *http.Re
 		status = http.StatusOK
 	}
 	if status >= 200 && status < 300 {
-		handler.finishPolicyTransaction(transactionID, "applied", "")
+		handler.finishPolicyTransaction(transactionID, "applied", "", trace.snapshot())
 		return
 	}
-	handler.finishPolicyTransaction(transactionID, "apply_failed", recorder.reason())
+	handler.finishPolicyTransaction(transactionID, "apply_failed", recorder.reason(), trace.snapshot())
 }
 
 // policyResponseRecorder captures the synchronous handler's status and error
