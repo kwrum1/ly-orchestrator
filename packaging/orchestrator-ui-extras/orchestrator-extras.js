@@ -1167,6 +1167,12 @@
         var id = group.name || group.id;
         if (!id) return;
         var prefixes = group.entries || group.members || [];
+        // A source-backed group (GeoIP/GeoSite) starts with no entries until
+        // its data is downloaded. Injecting an empty object made the backend
+        // reject the whole policy save ("invalid policy IP object"): a rule
+        // referencing an empty set is also ambiguous (any vs none). Keep it out
+        // of the editor until it actually has prefixes.
+        if (!Array.isArray(prefixes) || prefixes.length === 0) return;
         merged[id] = { id: id, prefixes: prefixes };
       });
       item.ip_objects = Object.keys(merged).sort().map(function (key) { return merged[key]; });
