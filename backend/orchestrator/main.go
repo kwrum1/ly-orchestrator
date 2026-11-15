@@ -452,6 +452,7 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 			failed = false
 		} else {
 			runtime.clearResolvedNames()
+			runtime.clearProof()
 		}
 	}()
 	// The persisted topology is the operator's intent and may still carry
@@ -1550,16 +1551,13 @@ func (runtime *productionOrchestratorRuntime) runtimeProofKey(interfaces []strin
 	return strings.Join(interfaces, ",") + "|" + runtime.proofStateKeyFor(managementShared)
 }
 
-// proofStateKeyFor fingerprints everything about a proof except the interface
-// list: the management sharing mode and the takeover state files.
+// proofStateKeyFor fingerprints the non-interface input of a proof. The
+// takeover state files are deliberately excluded: the probe itself rewrites
+// them, so including their mtimes made every apply look like a hardware change
+// and re-ran the 5-10s probe. A takeover transition that invalidates the proof
+// fails the apply, which clears the cached proof.
 func (runtime *productionOrchestratorRuntime) proofStateKeyFor(managementShared bool) string {
-	key := strconv.FormatBool(managementShared)
-	for _, path := range []string{dataplaneOwnershipPathForProof(), dataplaneVerificationPathForProof()} {
-		if info, err := os.Stat(path); err == nil {
-			key += "|" + path + ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + ":" + strconv.FormatInt(info.Size(), 10)
-		}
-	}
-	return key
+	return strconv.FormatBool(managementShared)
 }
 
 // proofCovers reports whether the last successful probe still describes every
@@ -1571,11 +1569,14 @@ func (runtime *productionOrchestratorRuntime) proofCovers(interfaces []string, m
 	if runtime.proofKey == "" || runtime.proofStateKey != stateKey {
 		return false
 	}
+	// Hardware capability changes far less often than a topology edit. Keep the
+	// coverage window wider than the exact-key TTL so the device-wide probe runs
+	// once per session instead of on the first save after ten idle minutes.
 	ttl := runtime.proofTTL
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
-	if time.Since(runtime.proofAt) >= ttl {
+	if time.Since(runtime.proofAt) >= 6*ttl {
 		return false
 	}
 	covered := make(map[string]struct{}, len(runtime.proofInterfaces))
@@ -1601,6 +1602,17 @@ func (runtime *productionOrchestratorRuntime) proofFresh(key string) bool {
 		ttl = 10 * time.Minute
 	}
 	return time.Since(runtime.proofAt) < ttl
+}
+
+// clearProof drops the capability proof so the next attempt re-probes the
+// hardware instead of retrying a stale mode.
+func (runtime *productionOrchestratorRuntime) clearProof() {
+	runtime.proofMu.Lock()
+	runtime.proofKey = ""
+	runtime.proofInterfaces = nil
+	runtime.proofStateKey = ""
+	runtime.proofAt = time.Time{}
+	runtime.proofMu.Unlock()
 }
 
 func (runtime *productionOrchestratorRuntime) rememberProof(key string, interfaces []string, managementShared bool) {
