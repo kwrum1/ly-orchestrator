@@ -39,10 +39,17 @@ func (server *Server) OrchestratorDataInterfaces(ctx context.Context) []string {
 		seen[name] = struct{}{}
 		names = append(names, name)
 	}
-	if inventory, ok := server.operatorInterfaceInventory(ctx); ok {
-		add(inventory.Management.LinuxInterface)
-		for _, item := range inventory.DataInterfaces {
-			add(item.LinuxInterface)
+	// VPP-owned ports have no /sys/class/net entry, so the persisted identity
+	// service (netdevs + ownership records) is the source that still names them.
+	for _, identity := range server.interfaceIdentities(ctx) {
+		add(identity.LinuxInterface)
+	}
+	if len(names) == 0 {
+		if inventory, ok := server.operatorInterfaceInventory(ctx); ok {
+			add(inventory.Management.LinuxInterface)
+			for _, item := range inventory.DataInterfaces {
+				add(item.LinuxInterface)
+			}
 		}
 	}
 	if len(names) == 0 {
