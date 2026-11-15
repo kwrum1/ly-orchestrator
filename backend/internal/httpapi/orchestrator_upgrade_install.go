@@ -30,11 +30,25 @@ mkdir -p "$result_dir"
 plugin_path=
 plugin_payload=
 
+result_written=0
 write_result() {
   state=$1
   reason=${2:-}
   printf '{"state":"%s","reason":"%s"}\n' "$state" "$reason" >"$result_path"
+  result_written=1
 }
+
+# Every exit path must leave a result file. A command that failed under set -e,
+# or a unit that was terminated while the payload was already installed, used to
+# abort without one; the control plane then waited 15 minutes and reported
+# "installer did not report a result" for an upgrade that had actually worked.
+on_abort() {
+  if [ "$result_written" = 0 ]; then
+    write_result failed "installer aborted before reporting a result"
+  fi
+}
+trap on_abort EXIT
+trap 'on_abort; exit 143' TERM INT
 
 fail() {
   reason=$1

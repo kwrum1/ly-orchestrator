@@ -364,6 +364,35 @@ func (service *productUpdateService) reconcileUpgradeTasks(ctx context.Context) 
 				continue
 			}
 			if age > 15*time.Minute {
+				// The installer may have finished without writing its result file.
+				// Ask systemd what the transient unit actually did before calling a
+				// completed upgrade a failure.
+				if state, reason, ok := upgradeUnitResult(orchestratorUpgradeUnitName(payload.Task.ID)); ok {
+					switch {
+					case state == "success":
+						if originalState == orchestratorapi.UpgradeStateRollingBack {
+							payload.Task.State = orchestratorapi.UpgradeStateRolledBack
+						} else {
+							payload.Task.State = orchestratorapi.UpgradeStateInstalled
+						}
+						payload.Task.Reason = "installer completed; the result file was not written"
+					case state == "failed" || state == "exit-code" || state == "signal" || state == "timeout":
+						payload.Task.State = orchestratorapi.UpgradeStateFailed
+						if originalState == orchestratorapi.UpgradeStateRollingBack {
+							payload.Task.State = orchestratorapi.UpgradeStateRollbackFailed
+						}
+						payload.Task.Reason = reason
+					default:
+						payload.Task.State = orchestratorapi.UpgradeStateFailed
+						if originalState == orchestratorapi.UpgradeStateRollingBack {
+							payload.Task.State = orchestratorapi.UpgradeStateRollbackFailed
+						}
+						payload.Task.Reason = "installer did not report a result"
+					}
+					payload.Task.UpdatedAt = service.server.now().UTC()
+					_ = service.saveUpgradeTask(ctx, payload)
+					continue
+				}
 				payload.Task.State = orchestratorapi.UpgradeStateFailed
 				if originalState == orchestratorapi.UpgradeStateRollingBack {
 					payload.Task.State = orchestratorapi.UpgradeStateRollbackFailed
