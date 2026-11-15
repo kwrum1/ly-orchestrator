@@ -70,6 +70,9 @@
       "  .main-inner .page:not(:has(.card ~ .card))>.card:last-child>.card-body{flex:1 1 auto;display:flex;flex-direction:column}",
       "  .main-inner .page:not(:has(.card ~ .card))>.card:last-child>.card-body>.table-wrap{flex:1 1 auto}",
       "  .main-inner .page:not(:has(.card ~ .card))>.card:last-child>.card-body>.empty-state{flex:1 1 auto;justify-content:center}",
+      "/* One empty-state shape everywhere: same box, same centring, whichever",
+      "   component rendered it. */",
+      ".card-body .empty-state{flex:1 1 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:240px}",
       "  .extras-embedded #no-target{margin:auto 0}",
       "}"
     ].join("\n");
@@ -1325,6 +1328,28 @@
     document.documentElement.classList.add("extras-status-ready");
   }, 3000);
 
+  // 模式 字段整体下线：管理口只支持独立模式，一个只有单一选项的下拉只会让人
+  // 以为「与 LAN 共享」还在。MutationObserver 的回调是微任务，先于浏览器绘制执行，
+  // 所以新渲染出来的字段也会在绘制前被隐藏，不会出现闪烁。
+  function hideManagementModeField() {
+    document.querySelectorAll("label.field").forEach(function (field) {
+      var label = field.querySelector(".field-label");
+      if (!label) return;
+      if (label.textContent.replace(/\*/g, "").trim() !== "模式") return;
+      if (!field.querySelector("select")) return;
+      if (field.style.display === "none") return;
+      field.style.display = "none";
+    });
+  }
+
+  var managementModeObserver = new MutationObserver(function () {
+    hideManagementModeField();
+  });
+  if (document.body) {
+    managementModeObserver.observe(document.body, { childList: true, subtree: true });
+  }
+  hideManagementModeField();
+
   // 模式 下拉里的「与 LAN 共享」已经下线：管理口只支持独立模式。
   function dropSharedManagement() {
     document.querySelectorAll('select option[value="shared_lan"]').forEach(function (option) {
@@ -1372,6 +1397,7 @@
     relabelConfirmTitle();
     keepSuccessToasts();
     inject();
+    hideManagementModeField();
     dropSharedManagement();
     stretchPolicyTable();
     normalizeStatusCopy();
