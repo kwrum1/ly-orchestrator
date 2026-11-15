@@ -57,7 +57,11 @@
       ".extras-stretch-table{table-layout:auto !important;width:100% !important}",
       ".extras-stretch-table th[style*='width']{width:auto !important}",
       ".mirror-summary{display:flex;flex-wrap:wrap;gap:6px 18px;margin:0 0 10px;color:var(--text-tertiary);font-size:11px}",
-      ".mirror-summary b{color:var(--text-secondary);font-weight:600}"
+      ".mirror-summary b{color:var(--text-secondary);font-weight:600}",
+      "/* The shell prints its own wording first (设备正常 / 需要处理); keep it",
+      "   hidden until normalised so the operator never sees two sentences. */",
+      ".health-pill>span:not(.health-reason),.sidebar-foot>span:last-child{visibility:hidden}",
+      "html.extras-status-ready .health-pill>span:not(.health-reason),html.extras-status-ready .sidebar-foot>span:last-child{visibility:visible}"
     ].join("\n");
     document.head.appendChild(style);
   })();
@@ -804,25 +808,6 @@
     return main.querySelector(".page");
   }
 
-  function takeoverLabel(item) {
-    if (!item) return "—";
-    if (isManagement(item)) return "管理口";
-    if (item.takeover_class === "compatibility" || item.takeover_mode === "af_packet") return "兼容模式";
-    if (item.takeover_state === "taken_over") return "高性能";
-    if (item.takeover_capability === "supported") return "可接管";
-    return "不支持";
-  }
-
-  function takeoverSummary(ports) {
-    var taken = ports.filter(function (item) { return item.takeover_state === "taken_over"; }).length;
-    var compat = ports.filter(function (item) {
-      return item.takeover_class === "compatibility" || item.takeover_mode === "af_packet";
-    }).length;
-    var parts = ["已接管 " + taken + " 张"];
-    if (compat) parts.push("兼容模式 " + compat + " 张");
-    return parts.join(" · ");
-  }
-
   function overviewSummary(facts) {
     var ports = facts.ports || [];
     var topology = facts.topology || {};
@@ -866,11 +851,6 @@
     });
     if (!card) return;
     var factsBox = card.querySelector(".takeover-facts");
-    if (factsBox && factsBox.dataset.extrasSummary !== "1") {
-      factsBox.dataset.extrasSummary = "1";
-      factsBox.innerHTML = '<span><i class="status-dot status-dot-success"></i>' +
-        takeoverSummary(facts.ports || []) + "</span>";
-    }
     var note = card.querySelector(".takeover-panel p, .card-body > p.muted");
     if (note) note.style.display = "none";
     var headActions = card.querySelector(".card-actions");
@@ -881,24 +861,6 @@
     }
     var oldBadge = headActions ? headActions.querySelector(".badge") : null;
     if (oldBadge) oldBadge.style.display = "none";
-  }
-
-  // The overview card used to render a wide port grid first and collapse to a
-  // one-line summary once the API answered. Keep the summary node from the very
-  // first paint so the card never changes height.
-  function ensureOverviewPlaceholder(page) {
-    var cards = Array.prototype.slice.call(page.querySelectorAll("section.card"));
-    var card = cards.find(function (node) {
-      var h2 = node.querySelector(".card-head h2");
-      return h2 && h2.textContent.trim() === "接口总览";
-    });
-    if (!card) return;
-    var body = card.querySelector(".card-body");
-    if (!body || body.querySelector(".nic-summary")) return;
-    var summary = document.createElement("div");
-    summary.className = "nic-summary";
-    summary.textContent = "正在读取网卡信息…";
-    body.appendChild(summary);
   }
 
   function ensureOverviewCard(page, facts) {
@@ -930,9 +892,9 @@
     var takeoverTh = headers.find(function (th) { return th.textContent.trim() === "接管能力"; });
     if (takeoverTh && takeoverTh.dataset.extrasMode !== "1") {
       takeoverTh.dataset.extrasMode = "1";
-      var button = takeoverTh.querySelector(".th-button");
-      if (button) button.textContent = "接管模式";
-      else takeoverTh.textContent = "接管模式";
+      // Keep the shell's own header text: renaming it after paint is exactly
+      // the "first wording, then a different wording" flicker operators see.
+
     }
     if (takeoverTh && !takeoverTh.dataset.extrasStatus) {
       var statusTh = document.createElement("th");
@@ -949,14 +911,6 @@
       if (!first) return;
       var key = first.innerText.trim().split("\n")[0];
       var item = portLookup(facts.ports || [], key);
-      var modeCell = row.cells[index];
-      if (modeCell) {
-        var badge = modeCell.querySelector(".badge");
-        if (badge) {
-          var label = takeoverLabel(item);
-          if (badge.textContent !== label) badge.textContent = label;
-        }
-      }
       if (index < 0) return;
       var existing = row.querySelector("td[data-extras-status]");
       if (!existing) {
@@ -1024,7 +978,6 @@
     if (!page) return;
     refreshNicFacts().then(function (facts) {
       if (!document.body.contains(page)) return;
-      ensureOverviewPlaceholder(page);
       ensureTakeoverCard(page, facts);
       ensureOverviewCard(page, facts);
       ensureInterfaceTable(page, facts);
@@ -1357,7 +1310,14 @@
         node = walker.nextNode();
       }
     });
+    document.documentElement.classList.add("extras-status-ready");
   }
+
+  // Safety net: if this script never gets to run its pass, the status wording
+  // must still be visible.
+  window.setTimeout(function () {
+    document.documentElement.classList.add("extras-status-ready");
+  }, 3000);
 
   // 模式 下拉里的「与 LAN 共享」已经下线：管理口只支持独立模式。
   function dropSharedManagement() {
