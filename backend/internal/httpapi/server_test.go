@@ -3863,13 +3863,19 @@ func TestManagementNetworkSharedLANContract(t *testing.T) {
 	if before.Code != http.StatusOK || !strings.Contains(before.Body.String(), `"mode":"exclusive"`) {
 		t.Fatalf("default management mode = %d: %s", before.Code, before.Body.String())
 	}
+	// shared_lan is retired: the console must refuse it instead of silently
+	// moving the management address onto a LAN port.
 	shared := authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/management/network", `{"confirm_change":true,"mode":"shared_lan","interface_id":"eth0","cidr":"10.10.10.254/24","gateway":"10.10.10.254"}`, cookie)
-	if shared.Code != http.StatusOK || !strings.Contains(shared.Body.String(), `"mode":"shared_lan"`) {
+	if shared.Code != http.StatusUnprocessableEntity || !strings.Contains(shared.Body.String(), "shared_lan") {
 		t.Fatalf("shared management response = %d: %s", shared.Code, shared.Body.String())
 	}
+	// A rejected change must leave the appliance exactly where it was.
 	after := authenticatedJSONRequest(t, server, http.MethodGet, "/api/v1/management/network", "", cookie)
-	if after.Code != http.StatusOK || !strings.Contains(after.Body.String(), `"interface_id":"eth0"`) || !strings.Contains(after.Body.String(), `"management_ip":"10.10.10.254"`) {
-		t.Fatalf("shared management readback = %d: %s", after.Code, after.Body.String())
+	if after.Code != http.StatusOK ||
+		!strings.Contains(after.Body.String(), `"interface_id":"eth0"`) ||
+		!strings.Contains(after.Body.String(), `"mode":"exclusive"`) ||
+		!strings.Contains(after.Body.String(), `"management_ip":"192.168.88.254"`) {
+		t.Fatalf("management readback after the rejected change = %d: %s", after.Code, after.Body.String())
 	}
 	invalid := authenticatedJSONRequest(t, server, http.MethodPost, "/api/v1/management/network", `{"confirm_change":true,"mode":"shared"}`, cookie)
 	if invalid.Code != http.StatusUnprocessableEntity {

@@ -5816,10 +5816,17 @@ func (server *Server) saveManagementNetwork(ctx context.Context, payload map[str
 	item := server.managementNetworkState(ctx, false)
 	mode := normalizeManagementMode(stringField(item, "mode"))
 	if value := strings.TrimSpace(stringField(payload, "mode")); value != "" {
-		if value != "exclusive" && value != "shared_lan" {
-			return nil, fmt.Errorf("mode must be exclusive or shared_lan")
+		switch value {
+		case "exclusive":
+			mode = value
+		case "shared_lan":
+			// Retired: offering it again silently would let an appliance move the
+			// management address onto the LAN port, which is the kind of change
+			// that costs the operator the session editing it.
+			return nil, fmt.Errorf("管理口共享（shared_lan）已下线：管理口只支持独立模式（exclusive）")
+		default:
+			return nil, fmt.Errorf("mode must be exclusive")
 		}
-		mode = value
 	}
 	item["mode"] = mode
 	if value := strings.TrimSpace(stringField(payload, "interface_id")); value != "" {
