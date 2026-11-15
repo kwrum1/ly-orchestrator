@@ -424,10 +424,11 @@ func (server *Server) interfaceStoredItem(ctx context.Context, id, linuxName str
 // retired by "取消镜像" (whose document no longer lists the old sources).
 func (server *Server) mirrorCleanupInterfaces(ctx context.Context) ([]string, error) {
 	// This list is the union of every host port and every stored interface. It
-	// only changes when a port appears, disappears or is renamed, so a short
-	// cache saves a full sysfs walk on every policy apply.
+	// only changes when a port appears, disappears or is renamed, so a minute
+	// long cache saves a 0.7-1.8s sysfs walk on every policy apply. A brand new
+	// port cannot own a stale SPAN session, so a slightly stale list is safe.
 	server.mirrorCleanupMu.Lock()
-	if len(server.mirrorCleanupNames) > 0 && time.Since(server.mirrorCleanupAt) < 5*time.Second {
+	if len(server.mirrorCleanupNames) > 0 && time.Since(server.mirrorCleanupAt) < 60*time.Second {
 		cached := append([]string(nil), server.mirrorCleanupNames...)
 		server.mirrorCleanupMu.Unlock()
 		return cached, nil
