@@ -42,6 +42,7 @@ vpp_apply="${LY_ROUTE_VPP_APPLY:-/usr/lib/ly-route/vpp-apply}"
 skip_build=false
 commit=""
 services="ly-route-control-api.service"
+plugin_file=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -52,6 +53,7 @@ while [ "$#" -gt 0 ]; do
     --ui) ui_dir=${2:-}; shift 2 ;;
     --control) control_file=${2:-}; shift 2 ;;
     --vpp-apply) vpp_apply=${2:-}; shift 2 ;;
+    --plugin) plugin_file=${2:-}; shift 2 ;;
     --skip-build) skip_build=true; shift ;;
     --commit) commit=${2:-}; shift 2 ;;
     --services) services=${2:-}; shift 2 ;;
@@ -111,6 +113,14 @@ fi
 [ -f "$control_file" ] || { echo "control binary is missing: $control_file" >&2; exit 1; }
 install -m 0755 "$control_file" "$stage/usr/lib/ly-route/ly-route-control"
 rm -rf "$stage/.control-build"
+
+# 2b. Optional dataplane plugin. The installer replaces an existing plugin and
+# restarts VPP when the payload carries a different build.
+if [ -n "$plugin_file" ]; then
+  [ -f "$plugin_file" ] || { echo "plugin binary is missing: $plugin_file" >&2; exit 1; }
+  install -D -m 0644 "$plugin_file" \
+    "$stage/usr/lib/x86_64-linux-gnu/vpp_plugins/ly_route_orchestrator_plugin.so"
+fi
 
 # 3. vpp-apply. The installer refuses a package without it; the appliance
 # package owns the helper, so this build only carries the current file
