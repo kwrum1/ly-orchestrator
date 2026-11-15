@@ -971,6 +971,19 @@ func (runtime *productionOrchestratorRuntime) loadTransparentTransactionJournal(
 	if journal.Version != 1 || strings.TrimSpace(journal.TransactionID) == "" || (journal.Operation != "apply" && journal.Operation != "disable") {
 		return errors.New("transparent transaction journal is invalid")
 	}
+	// A journal left by a previous process (or by an apply that never cleared
+	// it) must not pin the reconciler in "mutation pending" forever: the
+	// recovery deliberately skips while a mutation is pending, so a stale
+	// journal made every status read report "applying" even though the
+	// dataplane was already on the last committed generation. A real apply
+	// finishes in seconds; ten minutes is far beyond that.
+	if !journal.StartedAt.IsZero() && time.Since(journal.StartedAt) > 10*time.Minute {
+		log.Printf("discarding stale transparent transaction journal %s (started %s)", journal.TransactionID, journal.StartedAt.Format(time.RFC3339))
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("discard stale transparent transaction journal: %w", err)
+		}
+		return nil
+	}
 	runtime.transparentBonds = append([]vpp.BondState(nil), journal.DesiredBonds...)
 	runtime.transparentJournalPending = true
 	return nil
