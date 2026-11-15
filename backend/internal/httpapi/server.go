@@ -218,6 +218,9 @@ type Server struct {
 	orchestratorRuntime           orchestratorapi.ServiceChainRuntime
 	orchestratorBypass            orchestratorapi.BypassController
 	orchestratorReconcileInterval time.Duration
+	mirrorCleanupMu               sync.Mutex
+	mirrorCleanupNames            []string
+	mirrorCleanupAt               time.Time
 	orchestratorTelemetry         OrchestratorTelemetryCollector
 	interfaceTelemetry            InterfaceTelemetryCollector
 	dhcpLeases                    DHCPLeaseCollector

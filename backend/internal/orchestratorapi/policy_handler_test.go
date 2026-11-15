@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	"ly-route/backend/internal/orchestrator"
 	"ly-route/backend/internal/runtime/vpp"
@@ -136,5 +138,91 @@ func TestPolicyPutPersistsCollectionOrderWithoutNumericFields(t *testing.T) {
 	if payload.Item.Groups[0].ID != "beta" || payload.Item.Groups[1].ID != "alpha" ||
 		payload.Item.Groups[1].Rules[0].ID != "alpha-2" || payload.Item.Groups[1].Rules[1].ID != "alpha-1" {
 		t.Fatalf("reversed readback order = %#v", payload.Item.Groups)
+	}
+}
+
+// A large policy save must not hold the console for the whole dataplane apply:
+// the write answers 202 with a transaction id and the console polls the status
+// endpoint until the persisted policy is applied.
+func TestAsyncPolicyWriteReturnsTransactionAndPollableStatus(t *testing.T) {
+	_, server := newTestHTTPServer(t)
+	topology, err := os.ReadFile("testdata/topology-service-chain.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response := sendRequest(t, server, http.MethodPut, TopologyPath, topology); response.StatusCode != http.StatusOK {
+		t.Fatalf("topology: %d %s", response.StatusCode, response.Body)
+	}
+	policy := []byte(`{"schema_version":1,"policy_groups":[{"id":"allow","position":10,"rules":[{"id":"allow-web","sequence":10,"match":{"sources":["any"],"destinations":["any"],"protocol":"tcp","destination_ports":[{"start":443,"end":443}]},"action":{"kind":"direct"}}]}],"default":{"kind":"drop"}}`)
+
+	request, err := http.NewRequest(http.MethodPut, server.URL+PolicyPath+"?async=1", bytes.NewReader(policy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Prefer", "respond-async")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("async PUT status = %d, want 202", response.StatusCode)
+	}
+	var accepted struct {
+		TransactionID string `json:"transaction_id"`
+		Status        string `json:"status"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
+		t.Fatal(err)
+	}
+	if accepted.TransactionID == "" || accepted.Status != "applying" {
+		t.Fatalf("accepted transaction = %#v", accepted)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	status := ""
+	for time.Now().Before(deadline) {
+		poll := sendRequest(t, server, http.MethodGet, PolicyStatusPath+"?transaction_id="+url.QueryEscape(accepted.TransactionID), nil)
+		if poll.StatusCode != http.StatusOK {
+			t.Fatalf("status: %d %s", poll.StatusCode, poll.Body)
+		}
+		var payload struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal(poll.Body, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Status == "apply_failed" {
+			t.Fatalf("async apply failed: %s", payload.Reason)
+		}
+		if payload.Status == "applied" {
+			status = payload.Status
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if status != "applied" {
+		t.Fatalf("async policy transaction did not reach applied, last status %q", status)
+	}
+	readback := sendRequest(t, server, http.MethodGet, PolicyPath, nil)
+	if readback.StatusCode != http.StatusOK || !bytes.Contains(readback.Body, []byte(`"allow-web"`)) {
+		t.Fatalf("persisted policy = %d %s", readback.StatusCode, readback.Body)
+	}
+
+	// A malformed document is still a 400 even when the caller asks for async.
+	bad, err := http.NewRequest(http.MethodPut, server.URL+PolicyPath+"?async=1", bytes.NewReader([]byte(`{"schema_version":1,`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad.Header.Set("Content-Type", "application/json")
+	badResponse, err := server.Client().Do(bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer badResponse.Body.Close()
+	if badResponse.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed async PUT status = %d, want 400", badResponse.StatusCode)
 	}
 }

@@ -191,7 +191,7 @@ func run() error {
 		if err := orchestratorRuntime.CommitTransparentTransaction(context.Background()); err != nil {
 			return fmt.Errorf("commit recovered orchestrator transaction: %w", err)
 		}
-		reconcileInterval = envDuration("LY_ROUTE_ORCHESTRATOR_RECONCILE_INTERVAL", 2*time.Second)
+		reconcileInterval = envDuration("LY_ROUTE_ORCHESTRATOR_RECONCILE_INTERVAL", 10*time.Second)
 		bypass = newBypassController(
 			orchestratorRuntime,
 			repository,
@@ -272,15 +272,24 @@ type productionOrchestratorRuntime struct {
 	// truthful indicator: the reconciler holds it every two seconds.
 	transparentApplyActive    atomic.Bool
 	transparentApplyStartedAt atomic.Int64
-	evidenceMu                sync.Mutex
-	cachedEvidence            orchestratorapi.TransparentRuntimeEvidence
-	cachedEvidenceSet         bool
-	transparentBonds          []vpp.BondState
-	transparentRequest        string
-	transparentGeneration     string
-	transparentAppliedAt      time.Time
-	journalPath               string
-	transparentJournalPending bool
+	// transparentVerified* keeps the readback of the most recently applied
+	// generation. A write verifies convergence right after the apply; asking
+	// the plugin to show its state again adds ~2s to every save on this device,
+	// so the immediate reconcile reuses this observation once. The periodic
+	// reconciler always performs a real observation.
+	transparentVerifiedGeneration string
+	transparentVerifiedDefault    string
+	transparentVerifiedReadback   vpp.TransparentOrchestratorReadback
+	transparentVerifiedAt         time.Time
+	evidenceMu                    sync.Mutex
+	cachedEvidence                orchestratorapi.TransparentRuntimeEvidence
+	cachedEvidenceSet             bool
+	transparentBonds              []vpp.BondState
+	transparentRequest            string
+	transparentGeneration         string
+	transparentAppliedAt          time.Time
+	journalPath                   string
+	transparentJournalPending     bool
 	// Data-plane readback state used by health/status evidence and by the
 	// periodic reconcile.  It records what the plugin actually committed and
 	// what the persisted configuration asked for, so a mismatch can be named
@@ -520,6 +529,10 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 	runtime.transparentObservedGeneration = readback.Generation
 	runtime.transparentObservedDefault = readback.Default
 	runtime.transparentMirrorSignature = mirrorSignature(mirror)
+	runtime.transparentVerifiedGeneration = generation
+	runtime.transparentVerifiedDefault = configuredDefault
+	runtime.transparentVerifiedReadback = readback
+	runtime.transparentVerifiedAt = runtime.transparentAppliedAt
 	runtime.observeBypassReadback(readback)
 	runtime.lastReconcileAt = runtime.transparentAppliedAt
 	return nil
@@ -691,7 +704,22 @@ func (runtime *productionOrchestratorRuntime) reconcileTransparentLocked(ctx con
 	}
 	mirrorDrift := mirrorSignature(mirror) != runtime.transparentMirrorSignature
 	configuredDefault := transparentDefaultAction(policyView)
-	observed, observeErr := runtime.adapter.ObserveTransparentOrchestrator(ctx, requestID+"-observe")
+	var observed vpp.TransparentOrchestratorReadback
+	var observeErr error
+	reusedReadback := !mirrorDrift &&
+		runtime.transparentVerifiedGeneration == expected &&
+		runtime.transparentVerifiedDefault == configuredDefault &&
+		!runtime.transparentVerifiedAt.IsZero() &&
+		time.Since(runtime.transparentVerifiedAt) < 30*time.Second
+	if reusedReadback {
+		observed = runtime.transparentVerifiedReadback
+		// Consume it: the next reconciliation must observe the plugin again.
+		runtime.transparentVerifiedGeneration = ""
+		runtime.transparentVerifiedDefault = ""
+		runtime.transparentVerifiedAt = time.Time{}
+	} else {
+		observed, observeErr = runtime.adapter.ObserveTransparentOrchestrator(ctx, requestID+"-observe")
+	}
 	runtime.lastReconcileAt = time.Now().UTC()
 	if observeErr == nil && !mirrorDrift && transparentStateMatchesConfiguration(observed, expected, configuredDefault) {
 		runtime.markReconcileConsistent(requestID, expected, configuredDefault, observed)

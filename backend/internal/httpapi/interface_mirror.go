@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"ly-route/backend/internal/runtime/vpp"
 )
@@ -422,6 +423,16 @@ func (server *Server) interfaceStoredItem(ctx context.Context, id, linuxName str
 // the inventory is small, so this also covers a destination/source that was
 // retired by "取消镜像" (whose document no longer lists the old sources).
 func (server *Server) mirrorCleanupInterfaces(ctx context.Context) ([]string, error) {
+	// This list is the union of every host port and every stored interface. It
+	// only changes when a port appears, disappears or is renamed, so a short
+	// cache saves a full sysfs walk on every policy apply.
+	server.mirrorCleanupMu.Lock()
+	if len(server.mirrorCleanupNames) > 0 && time.Since(server.mirrorCleanupAt) < 5*time.Second {
+		cached := append([]string(nil), server.mirrorCleanupNames...)
+		server.mirrorCleanupMu.Unlock()
+		return cached, nil
+	}
+	server.mirrorCleanupMu.Unlock()
 	names := map[string]struct{}{}
 	addLinux := func(linux string) {
 		linux = strings.TrimSpace(linux)
@@ -458,6 +469,10 @@ func (server *Server) mirrorCleanupInterfaces(ctx context.Context) ([]string, er
 		result = append(result, name)
 	}
 	sort.Strings(result)
+	server.mirrorCleanupMu.Lock()
+	server.mirrorCleanupNames = append([]string(nil), result...)
+	server.mirrorCleanupAt = time.Now()
+	server.mirrorCleanupMu.Unlock()
 	return result, nil
 }
 
