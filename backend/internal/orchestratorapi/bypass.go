@@ -325,6 +325,27 @@ func (handler *Handler) handleBypassConfig(writer http.ResponseWriter, request *
 			writeAPIError(writer, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
 			return
 		}
+		// A per-group detector for a group that no longer exists would probe
+		// nothing and silently never bypass. Validate the names against the
+		// persisted topology, exactly like the manual group toggle above.
+		if len(config.Groups) > 0 {
+			topology, _, err := handler.repository.Snapshot(request.Context())
+			if err != nil {
+				writeAPIError(writer, http.StatusNotFound, err)
+				return
+			}
+			known := map[string]bool{}
+			for _, item := range topology.View().Groups {
+				known[item.Name] = true
+			}
+			for _, group := range config.Groups {
+				name := strings.TrimSpace(group.Name)
+				if name != "" && !known[name] {
+					writeAPIError(writer, http.StatusNotFound, fmt.Errorf("%w: %q", orchestrator.ErrGroupNotFound, name))
+					return
+				}
+			}
+		}
 		state, err := handler.bypass.UpdateBypassConfig(request.Context(), config)
 		if err != nil {
 			writeAPIError(writer, http.StatusUnprocessableEntity, err)
