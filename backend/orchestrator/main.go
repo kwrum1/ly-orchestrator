@@ -1737,8 +1737,19 @@ func (runtime *productionOrchestratorRuntime) attachNativePath(ctx context.Conte
 		return nil
 	}
 	operations := make([]vpp.Operation, 0, len(path.Attachments))
-	for _, attachment := range path.Attachments {
-		operations = append(operations, vpp.DataplaneAttachOperation(requestID+"-attach", attachment))
+	if len(path.Attachments) > 1 {
+		// One command list for the whole apply: the client batches it into a
+		// couple of vppctl processes instead of one per port per command.
+		merged := vpp.Operation{Name: "vpp.dataplane.attach", RequestID: requestID + "-attach", Resource: "attachments"}
+		for _, attachment := range path.Attachments {
+			operation := vpp.DataplaneAttachOperation(requestID+"-attach", attachment)
+			merged.VPPCtlCommands = append(merged.VPPCtlCommands, operation.VPPCtlCommands...)
+		}
+		operations = append(operations, merged)
+	} else {
+		for _, attachment := range path.Attachments {
+			operations = append(operations, vpp.DataplaneAttachOperation(requestID+"-attach", attachment))
+		}
 	}
 	if len(operations) == 0 {
 		return nil

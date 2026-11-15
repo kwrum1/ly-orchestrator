@@ -381,6 +381,9 @@ func (server *Server) orchestratorGroupPorts(ctx context.Context) map[string]boo
 // operation as the plugin generation.
 func (server *Server) OrchestratorMirrorProvider() func(context.Context) (*vpp.MirrorConfig, []string, error) {
 	return func(ctx context.Context) (*vpp.MirrorConfig, []string, error) {
+		// Every mirror port is resolved through the identity service, and each
+		// lookup otherwise rebuilds the device inventory from sysfs (~300ms).
+		ctx = withInterfaceIdentities(ctx)
 		mirror, err := server.runtimeMirrorConfig(ctx)
 		if err != nil {
 			return nil, nil, err

@@ -492,6 +492,9 @@ func (channel *vppctlChannel) doCommands(ctx context.Context, operation Operatio
 	if reply, handled, err := channel.doTransparentOrchestratorBatch(ctx, operation); handled {
 		return reply, err
 	}
+	if reply, handled, err := channel.doDataplaneAttachBatch(ctx, operation); handled {
+		return reply, err
+	}
 	results := make([]VPPCTLCommandResult, 0, len(operation.VPPCtlCommands))
 	for index := 0; index < len(operation.VPPCtlCommands); index++ {
 		command := strings.TrimSpace(operation.VPPCtlCommands[index])
@@ -731,6 +734,96 @@ func batchCommandKind(command string) int {
 	default:
 		return -1
 	}
+}
+
+// doDataplaneAttachBatch merges the per-port attach commands of one apply into
+// a few vppctl processes. The order is global rather than per port, which is
+// safe here: every host-interface create/rename runs before any state-up, and
+// the readbacks run last.
+func (channel *vppctlChannel) doDataplaneAttachBatch(ctx context.Context, operation Operation) (Reply, bool, error) {
+	if operation.Name != "vpp.dataplane.attach" || len(operation.VPPCtlCommands) < 8 {
+		return Reply{}, false, nil
+	}
+	results := make([]VPPCTLCommandResult, len(operation.VPPCtlCommands))
+	cleanup := make([]int, 0, len(operation.VPPCtlCommands))
+	state := make([]int, 0, len(operation.VPPCtlCommands))
+	shows := make([]int, 0, len(operation.VPPCtlCommands))
+	for index, raw := range operation.VPPCtlCommands {
+		command := strings.TrimSpace(raw)
+		results[index].Command = command
+		if command == "" {
+			return Reply{}, false, nil
+		}
+		if err := forbiddenVPPCTLCommand(command); err != nil {
+			return Reply{}, false, nil
+		}
+		switch {
+		case strings.HasPrefix(command, "?"):
+			cleanup = append(cleanup, index)
+		case strings.HasPrefix(command, "set "):
+			state = append(state, index)
+		case strings.HasPrefix(command, "show "):
+			shows = append(shows, index)
+		default:
+			return Reply{}, false, nil
+		}
+	}
+	if len(state) < 4 {
+		return Reply{}, false, nil
+	}
+	if len(cleanup) > 0 {
+		commands := make([]string, 0, len(cleanup))
+		for _, index := range cleanup {
+			commands = append(commands, strings.TrimSpace(strings.TrimPrefix(results[index].Command, "?")))
+		}
+		for begin := 0; begin < len(commands); begin += vppRouteBatchChunkSize {
+			end := begin + vppRouteBatchChunkSize
+			if end > len(commands) {
+				end = len(commands)
+			}
+			batchResult, err := channel.executeVPPBatchFile(ctx, commands[begin:end], fmt.Sprintf("vpp attach setup %d-%d/%d", begin+1, end, len(commands)), false)
+			if err != nil {
+				return Reply{Operation: operation.Name, Retval: 1, Payload: VPPCTLReplyPayload{CommandResults: results}}, true, err
+			}
+			results[cleanup[begin]].Stdout = batchResult.Stdout
+			results[cleanup[begin]].Stderr = batchResult.Stderr
+		}
+	}
+	if len(state) > 0 {
+		commands := make([]string, 0, len(state))
+		for _, index := range state {
+			commands = append(commands, results[index].Command)
+		}
+		for begin := 0; begin < len(commands); begin += vppRouteBatchChunkSize {
+			end := begin + vppRouteBatchChunkSize
+			if end > len(commands) {
+				end = len(commands)
+			}
+			batchResult, err := channel.executeVPPBatchFile(ctx, commands[begin:end], fmt.Sprintf("vpp attach state %d-%d/%d", begin+1, end, len(commands)), true)
+			if err != nil {
+				return Reply{Operation: operation.Name, Retval: 1, Payload: VPPCTLReplyPayload{CommandResults: results}}, true, err
+			}
+			results[state[begin]].Stdout = batchResult.Stdout
+			results[state[begin]].Stderr = batchResult.Stderr
+		}
+	}
+	for _, index := range shows {
+		reply, err := channel.doCommands(ctx, Operation{
+			Name:           operation.Name,
+			RequestID:      operation.RequestID,
+			Resource:       operation.Resource,
+			VPPCtlCommands: []string{results[index].Command},
+		})
+		if err != nil {
+			return reply, true, err
+		}
+		payload, ok := reply.Payload.(VPPCTLReplyPayload)
+		if !ok || len(payload.CommandResults) != 1 {
+			return reply, true, fmt.Errorf("%w: %s readback is incomplete", ErrSnapshotIncomplete, operation.Name)
+		}
+		results[index] = payload.CommandResults[0]
+	}
+	return Reply{Operation: operation.Name, Payload: VPPCTLReplyPayload{CommandResults: results}}, true, nil
 }
 
 func collectVPPRouteBatch(commands []string, begin int) ([]string, int, error) {
