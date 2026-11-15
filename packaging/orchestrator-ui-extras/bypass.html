@@ -11,7 +11,7 @@
       [hidden] { display: none !important; }
       .extras-topbar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 14px; height: 56px; padding: 0 22px; border-bottom: 1px solid var(--border); background: #fff; }
       .extras-topbar .brand { display: flex; align-items: center; gap: 9px; font-weight: 700; }
-      .extras-topbar .brand-mark { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 8px; background: linear-gradient(135deg, #2563eb, #4f8df7); color: #fff; font-size: 13px; }
+      .extras-topbar .brand-mark { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 8px; background: linear-gradient(135deg, #2563eb, #4f46e5 55%, #7c3aed); color: #fff; box-shadow: inset 0 0 0 1px #ffffff30, 0 3px 8px #2563eb47; }
       .extras-topbar .spacer { flex: 1; }
       .extras-wrap { display: flex; flex-direction: column; gap: 16px; max-width: 1280px; margin: 0 auto; padding: 20px 24px 40px; }
       .extras-topbar a.back { color: var(--text-secondary); text-decoration: none; font-size: 12px; }
@@ -27,7 +27,7 @@
   <body data-extras-page="bypass">
     <header class="extras-topbar">
       <a class="back" href="/">← 返回控制台</a>
-      <div class="brand"><span class="brand-mark">LR</span>ly Orchestrator</div>
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" style="width:100%;height:100%"><path d="M15 34V26c0-1.66 1.34-3 3-3h2.4" stroke-width="3.6"/><path d="M24 19.4L27.6 23L24 26.6L20.4 23Z" stroke-width="2.6"/><path d="M27.6 23h2.4c1.66 0 3-1.34 3-3v-4.5" stroke-width="3.6"/><circle cx="15" cy="34" r="3.6" fill="currentColor" stroke="none"/><circle cx="33" cy="15.5" r="3.2" stroke-width="2.7"/></svg></span>ly Orchestrator</div>
       <div class="spacer"></div>
       <button class="btn btn-sm" id="refresh">刷新</button>
       <button class="btn btn-sm btn-primary" id="save-config">保存探测配置</button>
