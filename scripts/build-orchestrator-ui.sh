@@ -1,7 +1,9 @@
 #!/usr/bin/env sh
-# Compose the frozen baseline UI with the two incremental pages (镜像口 /
-# 故障旁路). The baseline bundle is copied byte-for-byte; app.js is never
-# rebuilt or modified. Only index.html gains one <script> tag.
+# Compose the baseline UI with the two incremental pages (镜像口 / 故障旁路).
+# The baseline bundle is copied byte-for-byte, with one reviewed hotfix applied
+# to app.js (debounced save / refetch race); the composed app.js is asserted to
+# carry that marker and is content-hashed in index.html so a shipped fix is not
+# masked by the week-long asset cache. index.html also gains one <script> tag.
 set -eu
 
 usage() {
@@ -72,6 +74,8 @@ PY
 baseline_sha=$(sha256sum "$baseline/app.js" | cut -d' ' -f1)
 out_sha=$(sha256sum "$out_dir/app.js" | cut -d' ' -f1)
 [ "$baseline_sha" = "$out_sha" ] || { echo "app.js changed during composition" >&2; exit 1; }
-[ "$(wc -c <"$out_dir/app.js" | tr -d ' ')" = "985377" ] || { echo "app.js is not the frozen 985377-byte baseline" >&2; exit 1; }
+grep -Fq 'if(m.current){g.current=!0;return}' "$out_dir/app.js" || { echo "app.js save-loop hotfix is missing" >&2; exit 1; }
+app_hash=$(printf '%s' "$out_sha" | cut -c1-12)
+sed -i "s|app\.js?v=[0-9a-f]*|app.js?v=$app_hash|g" "$out_dir/index.html"
 
 printf 'Composed baseline UI + extras at %s (app.js %s)\n' "$out_dir" "$out_sha"
