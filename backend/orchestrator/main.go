@@ -344,13 +344,41 @@ func (runtime *productionOrchestratorRuntime) desiredMirror(ctx context.Context)
 	return runtime.mirrorProvider(ctx)
 }
 
-func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) error {
+func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) (err error) {
+	// Phase timing: the appliance is slow enough that "the apply is slow" needs
+	// a breakdown before anything can be optimized or explained.
+	started := time.Now()
+	lastMark := started
+	phases := make([]orchestratorapi.ApplyPhaseTiming, 0, 8)
+	failed := true
+	mark := func(phase string) {
+		now := time.Now()
+		phases = append(phases, orchestratorapi.ApplyPhaseTiming{Phase: phase, DurationMS: now.Sub(lastMark).Milliseconds()})
+		lastMark = now
+	}
+	defer func() {
+		mark("finalize")
+		orchestratorapi.PublishApplyTiming(orchestratorapi.ApplyTiming{
+			RequestID:   requestID,
+			Transaction: requestID,
+			TotalMS:     time.Since(started).Milliseconds(),
+			Phases:      phases,
+			Failed:      failed,
+		})
+	}()
+	defer func() {
+		if err == nil {
+			failed = false
+		}
+	}()
 	// The persisted topology is the operator's intent and may still carry
 	// product ids from an older build. Resolve every port once and use the same
 	// kernel-name view for the probe, the bonds, the generation and VPP.
 	topologyView := runtime.resolveTopologyView(ctx, topology.View())
+	mark("resolve-topology")
 	interfaces := transparentTopologyInterfaces(topologyView)
 	mirror, mirrorCleanup, mirrorErr := runtime.desiredMirror(ctx)
+	mark("resolve-mirror")
 	if mirrorErr != nil {
 		return mirrorErr
 	}
@@ -364,13 +392,16 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 		}
 	}
 	path, err := runtime.selectAndPrepare(ctx, requestID, interfaces, topologyView.ManagementShared)
+	mark("select-and-prepare")
 	if err != nil {
 		return err
 	}
-	if err := runtime.attachNativePath(ctx, requestID, path); err != nil {
-		runtime.releaseDPDK(ctx, requestID, err)
-		return err
+	if attachErr := runtime.attachNativePath(ctx, requestID, path); attachErr != nil {
+		mark("attach-native-path")
+		runtime.releaseDPDK(ctx, requestID, attachErr)
+		return attachErr
 	}
+	mark("attach-native-path")
 	previousBonds := append([]vpp.BondState(nil), runtime.transparentBonds...)
 	desiredBonds := vpp.TransparentOrchestratorBonds(topologyView)
 	var policyView *orchestrator.PolicyView
@@ -388,11 +419,14 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 	}
 	if len(previousBonds) > 0 || len(desiredBonds) > 0 {
 		if _, err := runtime.adapter.ApplyTransparentBondTransition(ctx, requestID+"-bonds", previousBonds, desiredBonds); err != nil {
+			mark("bond-transition")
 			runtime.releaseDPDK(ctx, requestID, err)
 			return err
 		}
 	}
+	mark("bond-transition")
 	readback, err := runtime.adapter.ApplyTransparentOrchestrator(ctx, requestID, vpp.TransparentOrchestratorConfig{Generation: generation, Topology: topologyView, Policy: policyView, Mirror: mirror, MirrorCleanup: mirrorCleanup})
+	mark("apply-transparent-orchestrator")
 	if err != nil {
 		var rollbackErr error
 		if len(previousBonds) > 0 || len(desiredBonds) > 0 {

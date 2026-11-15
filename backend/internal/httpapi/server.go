@@ -821,6 +821,7 @@ func (server *Server) Handler() http.Handler {
 		// Read-only plugin diagnostics: support has no shell on the appliance and
 		// most dataplane questions are answered by the plugin's own CLI output.
 		mux.HandleFunc("/api/v1/orchestrator/plugin-snapshot", server.handleOrchestratorPluginSnapshot)
+		mux.HandleFunc("/api/v1/orchestrator/apply-timings", server.handleOrchestratorApplyTimings)
 		if _, transparent := server.orchestratorRuntime.(orchestratorapi.TransparentRuntime); !transparent {
 			handler.StartServiceChainReconciler(context.Background(), server.orchestratorReconcileInterval)
 		}

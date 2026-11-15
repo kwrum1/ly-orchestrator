@@ -8,6 +8,8 @@ import (
 	"context"
 	"net/http"
 	"time"
+
+	"ly-route/backend/internal/orchestratorapi"
 )
 
 func (server *Server) handleOrchestratorPluginSnapshot(writer http.ResponseWriter, request *http.Request) {
@@ -40,4 +42,27 @@ func (server *Server) handleOrchestratorPluginSnapshot(writer http.ResponseWrite
 // contextWithTimeout keeps the helper independent of the caller's imports.
 func contextWithTimeout(request *http.Request, seconds int) (ctx context.Context, cancel context.CancelFunc) {
 	return context.WithTimeout(request.Context(), time.Duration(seconds)*time.Second)
+}
+
+// handleOrchestratorApplyTimings reports where the last apply spent its time.
+func (server *Server) handleOrchestratorApplyTimings(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		writeError(writer, request, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+		return
+	}
+	session, ok := server.sessionFromRequest(request)
+	if !ok {
+		writeError(writer, request, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	if session.Role != "admin" {
+		writeError(writer, request, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	timing := orchestratorapi.LastApplyTiming()
+	if timing == nil {
+		writeJSON(writer, http.StatusOK, map[string]any{"available": false})
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"available": true, "timing": timing})
 }
