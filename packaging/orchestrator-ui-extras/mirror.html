@@ -10,8 +10,6 @@
          mirror specific bits live here so the page matches 编排组 spacing. */
       [hidden] { display: none !important; }
       .extras-wrap { display: flex; flex-direction: column; gap: 14px; }
-      .mirror-summary { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 10px; color: var(--text-tertiary); font-size: 11px; }
-      .mirror-summary b { color: var(--text-secondary); font-weight: 600; }
       .row-actions { display: flex; gap: 2px; justify-content: flex-end; }
     </style>
   </head>
@@ -28,13 +26,9 @@
 
       <section class="card">
         <div class="card-head">
-          <div class="card-title"><h2>镜像策略</h2><p id="policy-subtitle"></p></div>
+          <div class="card-title"><h2>镜像策略</h2></div>
         </div>
         <div class="card-body">
-          <div id="no-target" class="inline-warning" hidden>
-            还没有镜像口。请到「网卡设置」把目标端口的角色配置为「镜像口」，再回来添加策略。
-          </div>
-          <div id="mirror-summary" class="mirror-summary"></div>
           <div class="table-wrap">
             <table class="data-table">
               <thead>

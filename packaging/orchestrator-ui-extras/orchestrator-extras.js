@@ -48,16 +48,12 @@
     var style = document.createElement("style");
     style.id = "extras-base-style";
     style.textContent = [
-      "/* 网卡设置：直接按紧凑口径绘制，避免先铺开再收起的抖动 */",
-      ".card .port-grid{display:none !important}",
+      "/* 网卡设置 keeps the shell's own port grid: it is painted with the page. */",
       ".card .takeover-panel p{display:none !important}",
       ".card .card-actions .badge{display:none !important}",
-      ".nic-summary{color:var(--text-tertiary);font-size:12px;line-height:1.6}",
       "/* 固定列宽会在宽卡片里留下大片空白，统一交给表格自适应 */",
       ".extras-stretch-table{table-layout:auto !important;width:100% !important}",
       ".extras-stretch-table th[style*='width']{width:auto !important}",
-      ".mirror-summary{display:flex;flex-wrap:wrap;gap:6px 18px;margin:0 0 10px;color:var(--text-tertiary);font-size:11px}",
-      ".mirror-summary b{color:var(--text-secondary);font-weight:600}",
       "/* The shell prints its own wording first (设备正常 / 需要处理); keep it",
       "   hidden until normalised so the operator never sees two sentences. */",
       ".health-pill>span:not(.health-reason),.sidebar-foot>span:last-child{visibility:hidden}",
@@ -73,7 +69,6 @@
       "/* One empty-state shape everywhere: same box, same centring, whichever",
       "   component rendered it. */",
       ".card-body .empty-state{flex:1 1 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:240px}",
-      "  .extras-embedded #no-target{margin:auto 0}",
       "}"
     ].join("\n");
     document.head.appendChild(style);
@@ -901,28 +896,6 @@
     });
   }
 
-  function ensureOverviewCard(page, facts) {
-    var cards = Array.prototype.slice.call(page.querySelectorAll("section.card"));
-    var card = cards.find(function (node) {
-      var h2 = node.querySelector(".card-head h2");
-      return h2 && h2.textContent.trim() === "接口总览";
-    });
-    if (!card) return;
-    // The stylesheet hides .port-grid from the first paint; nothing to remove.
-
-    var body = card.querySelector(".card-body");
-    if (!body) return;
-    var summary = body.querySelector(".nic-summary");
-    if (!summary) {
-      summary = document.createElement("div");
-      summary.className = "nic-summary";
-      body.appendChild(summary);
-    }
-    var text = overviewSummary(facts);
-    if (summary.textContent !== text) summary.textContent = text;
-    card.style.marginBottom = "10px";
-  }
-
   function ensureInterfaceTable(page, facts) {
     var table = page.querySelector("table");
     if (!table) return;
@@ -1022,7 +995,6 @@
       // enhancement, which is why the summary sometimes never appeared).
       var current = interfacePage();
       if (!current) return;
-      ensureOverviewCard(current, facts);
       ensureInterfaceTable(current, facts);
       enhanceBondModal(current, facts);
       revealInterfacePage();
@@ -1483,7 +1455,6 @@
         ".bypass-error{margin-top:8px}" +
         ".extras-toast{position:fixed;right:24px;bottom:24px;z-index:1000;max-width:420px;padding:11px 14px;border-radius:var(--radius-md);border:1px solid var(--border);background:#fff;box-shadow:0 12px 30px rgba(15,23,42,.16);font-size:12px;line-height:1.5;color:var(--text-secondary)}" +
         ".extras-toast[data-tone=error]{border-color:#fecaca;background:#fff7f7;color:#b42318}" +
-        ".nic-summary{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:var(--text-secondary)}" +
         ".takeover-facts{flex-wrap:wrap;gap:6px 16px}" +
         ".takeover-facts>span{font-size:12px}" +
         ".toast-stack .toast-success{display:none!important}" +
