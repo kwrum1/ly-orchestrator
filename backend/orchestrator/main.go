@@ -325,6 +325,8 @@ type productionOrchestratorRuntime struct {
 	proofMu                       sync.Mutex
 	proofKey                      string
 	proofAt                       time.Time
+	proofStateKey                 string
+	proofInterfaces               []string
 	proofTTL                      time.Duration
 	// proofSkipUntil suppresses a probe that just timed out or failed. The
 	// appliance probe is a host script; on a test image it can wait for a
@@ -1446,6 +1448,12 @@ func (runtime *productionOrchestratorRuntime) refreshRuntimeProof(ctx context.Co
 	if runtime.proofFresh(proofKey) {
 		return nil
 	}
+	if runtime.proofCovers(interfaces, managementShared) {
+		// Adding a port that an earlier probe already described (with the same
+		// takeover state) must not re-walk the hardware: the probe costs 5-10
+		// seconds and every group/topology edit would otherwise pay it.
+		return nil
+	}
 	runtime.proofMu.Lock()
 	skip := !runtime.proofSkipUntil.IsZero() && time.Now().Before(runtime.proofSkipUntil)
 	runtime.proofMu.Unlock()
@@ -1477,7 +1485,7 @@ func (runtime *productionOrchestratorRuntime) refreshRuntimeProof(ctx context.Co
 	runtime.proofMu.Lock()
 	runtime.proofSkipUntil = time.Time{}
 	runtime.proofMu.Unlock()
-	runtime.rememberProof(proofKey)
+	runtime.rememberProof(proofKey, interfaces, managementShared)
 	return nil
 }
 
@@ -1485,13 +1493,47 @@ func (runtime *productionOrchestratorRuntime) refreshRuntimeProof(ctx context.Co
 // interface set, the management sharing mode, and the state files the takeover
 // machine rewrites when a port changes owner.
 func (runtime *productionOrchestratorRuntime) runtimeProofKey(interfaces []string, managementShared bool) string {
-	key := strings.Join(interfaces, ",") + "|" + strconv.FormatBool(managementShared)
+	return strings.Join(interfaces, ",") + "|" + runtime.proofStateKeyFor(managementShared)
+}
+
+// proofStateKeyFor fingerprints everything about a proof except the interface
+// list: the management sharing mode and the takeover state files.
+func (runtime *productionOrchestratorRuntime) proofStateKeyFor(managementShared bool) string {
+	key := strconv.FormatBool(managementShared)
 	for _, path := range []string{dataplaneOwnershipPathForProof(), dataplaneVerificationPathForProof()} {
 		if info, err := os.Stat(path); err == nil {
 			key += "|" + path + ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + ":" + strconv.FormatInt(info.Size(), 10)
 		}
 	}
 	return key
+}
+
+// proofCovers reports whether the last successful probe still describes every
+// requested interface under the current takeover state.
+func (runtime *productionOrchestratorRuntime) proofCovers(interfaces []string, managementShared bool) bool {
+	stateKey := runtime.proofStateKeyFor(managementShared)
+	runtime.proofMu.Lock()
+	defer runtime.proofMu.Unlock()
+	if runtime.proofKey == "" || runtime.proofStateKey != stateKey {
+		return false
+	}
+	ttl := runtime.proofTTL
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	if time.Since(runtime.proofAt) >= ttl {
+		return false
+	}
+	covered := make(map[string]struct{}, len(runtime.proofInterfaces))
+	for _, name := range runtime.proofInterfaces {
+		covered[name] = struct{}{}
+	}
+	for _, name := range interfaces {
+		if _, ok := covered[name]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (runtime *productionOrchestratorRuntime) proofFresh(key string) bool {
@@ -1507,10 +1549,12 @@ func (runtime *productionOrchestratorRuntime) proofFresh(key string) bool {
 	return time.Since(runtime.proofAt) < ttl
 }
 
-func (runtime *productionOrchestratorRuntime) rememberProof(key string) {
+func (runtime *productionOrchestratorRuntime) rememberProof(key string, interfaces []string, managementShared bool) {
 	runtime.proofMu.Lock()
 	runtime.proofKey = key
 	runtime.proofAt = time.Now()
+	runtime.proofStateKey = runtime.proofStateKeyFor(managementShared)
+	runtime.proofInterfaces = append([]string(nil), interfaces...)
 	runtime.proofMu.Unlock()
 }
 
