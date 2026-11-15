@@ -880,6 +880,38 @@
   // The operator asked for the overview card to go: it only repeated what the
   // table already shows. The whole card is hidden synchronously from the
   // observer callback, so it never paints and then disappears.
+  // 流量编排 renders its empty state as a muted table row (no icon, not
+  // centred). Replace it with the same block every other page uses, from the
+  // observer callback so the swap happens before paint.
+  function unifyPolicyEmptyState() {
+    var main = document.querySelector(".main-inner");
+    if (!main) return;
+    var heading = main.querySelector("h1");
+    if (!heading || heading.textContent.trim() !== "流量编排") return;
+    var row = null;
+    main.querySelectorAll("td.muted").forEach(function (cell) {
+      if (row) return;
+      if (String(cell.textContent || "").indexOf("组内暂无策略") !== -1) row = cell.parentElement;
+    });
+    var existing = main.querySelector(".extras-policy-empty");
+    if (!row) {
+      if (existing) existing.remove();
+      return;
+    }
+    row.style.display = "none";
+    if (existing) return;
+    var block = document.createElement("div");
+    block.className = "empty-state extras-policy-empty";
+    block.innerHTML =
+      '<div class="empty-icon"><svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" ' +
+      'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+      '<path d="M17 21v-2a1 1 0 0 1-1-1v-1a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v1a1 1 0 0 1-1 1"></path>' +
+      '<path d="M19 15V6.5a1 1 0 0 0-7 0v11a1 1 0 0 1-7 0V9"></path></svg></div>' +
+      '<strong>暂无策略</strong><p>点右上角「添加」，为这个策略组添加第一条策略。</p>';
+    var host = row.closest("div") ? row.closest("div").parentElement : main;
+    host.appendChild(block);
+  }
+
   function dropOverviewCard() {
     var cards = document.querySelectorAll(".main-inner section.card");
     for (var index = 0; index < cards.length; index++) {
@@ -1368,6 +1400,7 @@
   var managementModeObserver = new MutationObserver(function () {
     hideManagementModeField();
     dropOverviewCard();
+    unifyPolicyEmptyState();
     holdInterfacePageUntilReady();
   });
   if (document.body) {
@@ -1375,6 +1408,7 @@
   }
   hideManagementModeField();
   dropOverviewCard();
+  unifyPolicyEmptyState();
 
   // 模式 下拉里的「与 LAN 共享」已经下线：管理口只支持独立模式。
   function dropSharedManagement() {
@@ -1425,6 +1459,7 @@
     inject();
     hideManagementModeField();
     dropOverviewCard();
+    unifyPolicyEmptyState();
     dropSharedManagement();
     stretchPolicyTable();
     normalizeStatusCopy();
