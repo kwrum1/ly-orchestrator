@@ -693,7 +693,12 @@ func (runtime *productionOrchestratorRuntime) ReconcileTransparent(ctx context.C
 }
 
 func (runtime *productionOrchestratorRuntime) reconcileTransparent(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy, skipWhileMutationPending bool) error {
-	runtime.transparentMu.Lock()
+	// Never queue behind another dataplane operation. A write has already
+	// verified its own readback, and the periodic loop retries in ten seconds,
+	// so waiting here only made a save look slow for no additional safety.
+	if !runtime.transparentMu.TryLock() {
+		return nil
+	}
 	defer runtime.transparentMu.Unlock()
 	if skipWhileMutationPending && runtime.transparentApplyPending.Load() > 0 {
 		// A configuration write is queued or running. It verifies its own
