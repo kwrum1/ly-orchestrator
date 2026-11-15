@@ -877,6 +877,19 @@
   // The page is revealed once, after its data is written. Filling a visible page
   // in place made the summary and the extra column appear under the operator's
   // eyes; a single reveal is the only way to keep the compact layout without it.
+  // The operator asked for the overview card to go: it only repeated what the
+  // table already shows. The whole card is hidden synchronously from the
+  // observer callback, so it never paints and then disappears.
+  function dropOverviewCard() {
+    var cards = document.querySelectorAll(".main-inner section.card");
+    for (var index = 0; index < cards.length; index++) {
+      var heading = cards[index].querySelector(".card-head h2");
+      if (!heading || heading.textContent.trim() !== "接口总览") continue;
+      if (cards[index].style.display === "none") continue;
+      cards[index].style.display = "none";
+    }
+  }
+
   function holdInterfacePageUntilReady() {
     var page = interfacePage();
     if (!page || page.dataset.extrasReady === "1") return;
@@ -1354,12 +1367,14 @@
 
   var managementModeObserver = new MutationObserver(function () {
     hideManagementModeField();
+    dropOverviewCard();
     holdInterfacePageUntilReady();
   });
   if (document.body) {
     managementModeObserver.observe(document.body, { childList: true, subtree: true });
   }
   hideManagementModeField();
+  dropOverviewCard();
 
   // 模式 下拉里的「与 LAN 共享」已经下线：管理口只支持独立模式。
   function dropSharedManagement() {
@@ -1409,6 +1424,7 @@
     keepSuccessToasts();
     inject();
     hideManagementModeField();
+    dropOverviewCard();
     dropSharedManagement();
     stretchPolicyTable();
     normalizeStatusCopy();
