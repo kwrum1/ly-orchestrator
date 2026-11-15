@@ -648,8 +648,12 @@ func (controller *bypassController) SetGroupBypass(ctx context.Context, group st
 	}
 	controller.mu.Lock()
 	defer controller.mu.Unlock()
+	// A group without probe settings still exists in the topology, and an
+	// operator must be able to force or clear its bypass by hand. The handler
+	// validates the name against the persisted topology; here the group is
+	// registered on first use instead of being rejected as unknown.
 	if !controller.groupConfiguredLocked(group) {
-		return orchestratorapi.BypassState{}, fmt.Errorf("unknown orchestration group %q", group)
+		controller.config.Groups = append(controller.config.Groups, orchestratorapi.BypassGroupConfig{Name: group})
 	}
 	cause := "manual"
 	if strings.TrimSpace(reason) == "" {

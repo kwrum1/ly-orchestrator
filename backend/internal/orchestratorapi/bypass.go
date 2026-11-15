@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"ly-route/backend/internal/orchestrator"
 	"net/http"
 	"strings"
 	"time"
@@ -142,13 +144,13 @@ type BypassGroupState struct {
 	WindowSeconds float64 `json:"window_seconds,omitempty"`
 	// Interfaces, TCPTargets and FlowTargets echo the active group config so a
 	// GET /bypass explains what is watched.
-	Interfaces  []string              `json:"interfaces,omitempty"`
-	TCPTargets  []BypassTCPTarget     `json:"tcp_targets,omitempty"`
-	FlowTargets []BypassFlowTarget    `json:"flow_targets,omitempty"`
-	FlowAttempts  uint64  `json:"flow_attempts"`
-	FlowSuccess   uint64  `json:"flow_success"`
-	FlowRST       uint64  `json:"flow_rst"`
-	FlowTimeouts  uint64  `json:"flow_timeouts"`
+	Interfaces   []string           `json:"interfaces,omitempty"`
+	TCPTargets   []BypassTCPTarget  `json:"tcp_targets,omitempty"`
+	FlowTargets  []BypassFlowTarget `json:"flow_targets,omitempty"`
+	FlowAttempts uint64             `json:"flow_attempts"`
+	FlowSuccess  uint64             `json:"flow_success"`
+	FlowRST      uint64             `json:"flow_rst"`
+	FlowTimeouts uint64             `json:"flow_timeouts"`
 	// FlowStats is the cumulative plugin readback per configured target.
 	FlowStats []BypassFlowStats `json:"flow_stats,omitempty"`
 
@@ -256,6 +258,24 @@ func (handler *Handler) handleBypass(writer http.ResponseWriter, request *http.R
 		if err := decodeStrictJSON(writer, request, &body); err != nil {
 			writeAPIError(writer, http.StatusBadRequest, fmt.Errorf("invalid JSON: %w", err))
 			return
+		}
+		if group := strings.TrimSpace(body.Group); group != "" {
+			topology, _, err := handler.repository.Snapshot(request.Context())
+			if err != nil {
+				writeAPIError(writer, http.StatusNotFound, err)
+				return
+			}
+			known := false
+			for _, item := range topology.View().Groups {
+				if item.Name == group {
+					known = true
+					break
+				}
+			}
+			if !known {
+				writeAPIError(writer, http.StatusNotFound, fmt.Errorf("%w: %q", orchestrator.ErrGroupNotFound, group))
+				return
+			}
 		}
 		if body.Enabled == nil {
 			writeAPIError(writer, http.StatusUnprocessableEntity, errors.New("enabled is required"))
