@@ -149,3 +149,9 @@ func codeForError(err error) string {
 		return "internal_error"
 	}
 }
+
+// TopologyNotConfiguredReason is the operator-facing explanation for a fresh
+// appliance that has no saved topology. It is intentionally actionable: the
+// fix is to assign LAN and WAN ports on the 网卡设置 page and apply, so the
+// message must not read like a hardware fault.
+const TopologyNotConfiguredReason = "当前未配置 LAN 接口与 WAN 接口"

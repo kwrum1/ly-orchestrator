@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 
 	"ly-route/backend/internal/orchestrator"
 	orchestratortelemetry "ly-route/backend/internal/orchestrator/telemetry"
+	"ly-route/backend/internal/orchestratorapi"
 )
 
 type orchestratorTopologySnapshot interface {
@@ -55,7 +57,10 @@ func (runtime *orchestratorTelemetryRuntime) Collect(ctx context.Context) orches
 	}
 	topology, checksum, err := runtime.repository.Snapshot(ctx)
 	if err != nil {
-		return unavailableOrchestratorTelemetry(time.Now().UTC(), "orchestrator topology is unavailable")
+		if errors.Is(err, orchestrator.ErrTopologyNotFound) {
+			return unavailableOrchestratorTelemetry(time.Now().UTC(), orchestratorapi.TopologyNotConfiguredReason)
+		}
+		return unavailableOrchestratorTelemetry(time.Now().UTC(), "编排器拓扑读取失败")
 	}
 	now := time.Now().UTC()
 	if runtime.clock != nil {

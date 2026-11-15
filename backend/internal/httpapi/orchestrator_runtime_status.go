@@ -18,6 +18,21 @@ func (server *Server) orchestratorTransparentRuntimeComponents(ctx context.Conte
 	if server.profile.ID() != product.Orchestrator().ID() {
 		return nil, false
 	}
+	// An appliance that has never saved a topology is unconfigured, not
+	// broken: report the actionable reason instead of a readback failure so the
+	// dashboard does not read like a hardware fault.
+	if server.orchestratorRepository != nil {
+		if _, _, snapshotErr := server.orchestratorRepository.Snapshot(ctx); errors.Is(snapshotErr, orchestrator.ErrTopologyNotFound) {
+			now := server.now().UTC()
+			reason := orchestratorapi.TopologyNotConfiguredReason
+			server.setRuntimeEvidence(degradedRuntimeResult("orchestrator-observe", reason, now))
+			components := []RuntimeComponentState{
+				{Name: "vpp", State: "degraded", Available: false, Reason: reason},
+				{Name: "persistence", State: "running", Available: server.store != nil, Reason: persistenceRuntimeReason(server.store != nil)},
+			}
+			return server.applyRuntimeEvidence(components), true
+		}
+	}
 	provider, ok := server.orchestratorRuntime.(orchestratorapi.TransparentRuntimeEvidenceProvider)
 	if !ok {
 		return nil, false
