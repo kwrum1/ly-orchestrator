@@ -157,7 +157,6 @@ const policyOrderStep = 10
 func parsePolicyGroups(inputs []PolicyGroupInput, objects map[string]policyIPObject, topologyGroups map[string]InterfaceName) ([]policyGroup, error) {
 	groups := make([]policyGroup, 0, len(inputs))
 	ids := make(map[string]struct{}, len(inputs))
-	targetOwners := make(map[string]string)
 	for index, input := range inputs {
 		id, err := parsePolicyName(input.ID)
 		if err != nil {
@@ -171,17 +170,14 @@ func parsePolicyGroups(inputs []PolicyGroupInput, objects map[string]policyIPObj
 			return nil, fmt.Errorf("policy group %q: %w", id, err)
 		}
 		for target := range targets {
-			// A rule inside a group that targets the same orchestration group
-			// traverses it twice: the ingress group and the via hop are the
-			// same chain. The cross-group owner check below intentionally
-			// ignores the same owner, so reject self-reference explicitly.
+			// Several policy groups may send traffic into the same orchestration
+			// group: only the first matching policy group is evaluated, and a via
+			// path is a single hop that terminates, so sharing a group cannot
+			// loop. Only a policy group named after the group it targets is
+			// rejected (the ingress chain and the via hop would be the same).
 			if target == id.String() {
 				return nil, fmt.Errorf("%w: %q in %q", ErrPolicyLoop, target, id)
 			}
-			if owner := targetOwners[target]; owner != "" && owner != id.String() {
-				return nil, fmt.Errorf("%w: %q in %q and %q", ErrPolicyLoop, target, owner, id)
-			}
-			targetOwners[target] = id.String()
 		}
 		ids[id.String()] = struct{}{}
 		// input.Position is intentionally ignored: the request array is the

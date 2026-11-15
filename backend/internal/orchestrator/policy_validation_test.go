@@ -79,7 +79,7 @@ func TestParsePolicy_rejects_invalid_boundary_values(t *testing.T) {
 			input.Groups[0].Rules[0].Action = ActionInput{Kind: ActionDirect, Group: "inline-east"}
 			return input
 		}, ErrInvalidPolicyAction},
-		{"duplicate traversal across groups", duplicateTraversal, ErrPolicyLoop},
+		{"shared via target across policy groups", duplicateTraversal, nil},
 		{"empty default", func(input PolicyInput) PolicyInput { input.Default = ActionInput{}; return input }, ErrEmptyPolicyDefault},
 		{"default via group", func(input PolicyInput) PolicyInput {
 			input.Default = ActionInput{Kind: ActionVia, Group: "inline-east"}
