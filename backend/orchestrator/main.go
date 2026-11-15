@@ -270,8 +270,15 @@ type productionOrchestratorRuntime struct {
 	// bypass/probe writes or the transaction commit) is the only thing the
 	// status endpoint may report as "applying". The lock alone is not a
 	// truthful indicator: the reconciler holds it every two seconds.
-	transparentApplyActive    atomic.Bool
-	transparentApplyPending   atomic.Int32
+	transparentApplyActive  atomic.Bool
+	transparentApplyPending atomic.Int32
+	// resolvedNames memoises product-id -> kernel-netdev lookups for one apply
+	// and for the couple of seconds after it. Every lookup rebuilds the device
+	// inventory from sysfs (~40ms per port), and an apply resolves the same
+	// ports twice (topology view and runtime proof).
+	resolvedMu                sync.Mutex
+	resolvedNames             map[string]string
+	resolvedAt                time.Time
 	transparentApplyStartedAt atomic.Int64
 	// transparentVerified* keeps the readback of the most recently applied
 	// generation. A write verifies convergence right after the apply; asking
@@ -438,6 +445,8 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 	defer func() {
 		if err == nil {
 			failed = false
+		} else {
+			runtime.clearResolvedNames()
 		}
 	}()
 	// The persisted topology is the operator's intent and may still carry
@@ -1572,9 +1581,7 @@ func (runtime *productionOrchestratorRuntime) resolveLinuxInterfaces(ctx context
 		if name == "" {
 			continue
 		}
-		if resolved := strings.TrimSpace(runtime.linuxInterface(ctx, name)); resolved != "" {
-			name = resolved
-		}
+		name = runtime.resolveLinuxName(ctx, name)
 		if seen[name] {
 			continue
 		}
@@ -1584,19 +1591,52 @@ func (runtime *productionOrchestratorRuntime) resolveLinuxInterfaces(ctx context
 	return result
 }
 
+// resolveLinuxName memoises one product-id lookup. The resolver walks sysfs and
+// the ownership records for every call, which costs ~40ms per port on this
+// appliance; an apply resolves the same port twice.
+func (runtime *productionOrchestratorRuntime) resolveLinuxName(ctx context.Context, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || runtime.linuxInterface == nil {
+		return name
+	}
+	now := time.Now()
+	runtime.resolvedMu.Lock()
+	if runtime.resolvedNames != nil && now.Sub(runtime.resolvedAt) < 5*time.Second {
+		if cached, ok := runtime.resolvedNames[name]; ok {
+			runtime.resolvedMu.Unlock()
+			return cached
+		}
+	}
+	runtime.resolvedMu.Unlock()
+	resolved := strings.TrimSpace(runtime.linuxInterface(ctx, name))
+	if resolved == "" {
+		resolved = name
+	}
+	runtime.resolvedMu.Lock()
+	if runtime.resolvedNames == nil || now.Sub(runtime.resolvedAt) >= 5*time.Second {
+		runtime.resolvedNames = map[string]string{}
+	}
+	runtime.resolvedNames[name] = resolved
+	runtime.resolvedAt = now
+	runtime.resolvedMu.Unlock()
+	return resolved
+}
+
+// clearResolvedNames drops the memo after a failed apply so the next attempt
+// re-reads the device instead of retrying a stale name.
+func (runtime *productionOrchestratorRuntime) clearResolvedNames() {
+	runtime.resolvedMu.Lock()
+	runtime.resolvedNames = nil
+	runtime.resolvedAt = time.Time{}
+	runtime.resolvedMu.Unlock()
+}
+
 // resolveTopologyView resolves management, logical ports, bonds and group ports
 // to kernel netdev names so a restart never feeds ethN to the capability probe
 // or to the VPP boundary/group commands.
 func (runtime *productionOrchestratorRuntime) resolveTopologyView(ctx context.Context, view orchestrator.TopologyView) orchestrator.TopologyView {
 	resolve := func(value string) string {
-		value = strings.TrimSpace(value)
-		if value == "" || runtime.linuxInterface == nil {
-			return value
-		}
-		if resolved := strings.TrimSpace(runtime.linuxInterface(ctx, value)); resolved != "" {
-			return resolved
-		}
-		return value
+		return runtime.resolveLinuxName(ctx, value)
 	}
 	resolved := view
 	resolved.ManagementInterface = resolve(view.ManagementInterface)
