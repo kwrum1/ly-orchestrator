@@ -103,7 +103,10 @@ window.LyExtrasMirrorView = function (root) {
     rows.innerHTML = "";
     var list = sources();
     var empty = $("empty");
-    if (empty) empty.hidden = Boolean(list.length) || !port;
+    // Show the empty state whenever there is no policy, exactly like 编排组 and
+    // 流量编排. It used to stay hidden until a mirror port existed, which left a
+    // bare table header behind.
+    if (empty) empty.hidden = Boolean(list.length);
 
     var applying = state.busy || Boolean(state.component && /applying|recovering|pending/.test(String(state.component.state)));
     list.forEach(function (source) {
