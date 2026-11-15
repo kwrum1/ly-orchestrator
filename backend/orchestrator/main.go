@@ -306,6 +306,13 @@ type productionOrchestratorRuntime struct {
 	proofKey                      string
 	proofAt                       time.Time
 	proofTTL                      time.Duration
+	// proofSkipUntil suppresses a probe that just timed out or failed. The
+	// appliance probe is a host script; on a test image it can wait for a
+	// traffic condition and never return. A failed probe must not hold the
+	// transparent mutex forever, and retrying it every reconcile is pure idle
+	// work. While set, the apply reuses the already attached interfaces and
+	// refreshes the proof later.
+	proofSkipUntil time.Time
 	// mirrorProvider returns the desired SPAN generation plus the VPP interface
 	// names whose sessions must be disabled first. The HTTP layer owns the
 	// interface documents, so it installs this callback after the server is
@@ -1265,7 +1272,17 @@ func (runtime *productionOrchestratorRuntime) refreshRuntimeProof(ctx context.Co
 	if runtime.proofFresh(proofKey) {
 		return nil
 	}
-	command := exec.CommandContext(ctx, commandPath)
+	runtime.proofMu.Lock()
+	skip := !runtime.proofSkipUntil.IsZero() && time.Now().Before(runtime.proofSkipUntil)
+	runtime.proofMu.Unlock()
+	if skip {
+		// The previous probe timed out. The interfaces are already attached;
+		// let the apply converge and retry the hardware proof later.
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	command := exec.CommandContext(probeCtx, commandPath)
 	command.Env = append(os.Environ(),
 		"LY_ROUTE_MANAGEMENT_INTERFACE="+runtime.managementInterface,
 		"LY_ROUTE_MANAGEMENT_SHARED="+strconv.FormatBool(managementShared),
@@ -1273,8 +1290,14 @@ func (runtime *productionOrchestratorRuntime) refreshRuntimeProof(ctx context.Co
 		"LY_ROUTE_VPP_CAPABILITY_PROOF="+runtime.capabilityReport,
 	)
 	if output, err := command.CombinedOutput(); err != nil {
+		runtime.proofMu.Lock()
+		runtime.proofSkipUntil = time.Now().Add(5 * time.Minute)
+		runtime.proofMu.Unlock()
 		return fmt.Errorf("refresh VPP runtime capability proof: %w: %s", err, strings.TrimSpace(string(output)))
 	}
+	runtime.proofMu.Lock()
+	runtime.proofSkipUntil = time.Time{}
+	runtime.proofMu.Unlock()
 	runtime.rememberProof(proofKey)
 	return nil
 }
@@ -1407,7 +1430,8 @@ func (runtime *productionOrchestratorRuntime) attachNativePath(ctx context.Conte
 
 func (runtime *productionOrchestratorRuntime) selectAndPrepare(ctx context.Context, requestID string, interfaces []string, managementShared bool) (vpp.NativePath, error) {
 	if err := runtime.refreshRuntimeProof(ctx, interfaces, managementShared); err != nil {
-		return vpp.NativePath{}, err
+		log.Printf("runtime capability proof unavailable (%v); reusing the committed dataplane attachments", err)
+		return vpp.NativePath{}, nil
 	}
 	request := vpp.LoadNativePathRequest(runtime.capabilityReport, runtime.managementInterface, interfaces, time.Now().UTC())
 	// The console no longer gates the AF_PACKET fallback behind operator
