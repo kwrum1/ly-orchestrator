@@ -97,6 +97,25 @@ func run() error {
 	}
 	defer store.Close()
 
+	// The bootstrap administrator must survive a broken environment file: the
+	// gateway product lost management access when a bad edit removed the only
+	// credential. Persist it on first start and recover from the root-only file
+	// when the environment no longer carries it.
+	adminUsername := env("LY_ROUTE_ADMIN_USERNAME", "")
+	adminPassword := os.Getenv("LY_ROUTE_ADMIN_PASSWORD")
+	if strings.TrimSpace(adminPassword) == "" {
+		recoveryFile := env("LY_ROUTE_INITIAL_ADMIN_PASSWORD_FILE", "/root/ly-route-initial-admin-password")
+		if body, readErr := os.ReadFile(recoveryFile); readErr == nil {
+			if value := strings.TrimSpace(string(body)); value != "" {
+				adminPassword = value
+				log.Printf("bootstrap admin password recovered from %s", recoveryFile)
+			}
+		}
+	}
+	if err := httpapi.EnsureBootstrapAdmin(context.Background(), store, adminUsername, adminPassword); err != nil {
+		log.Printf("persist bootstrap admin: %v", err)
+	}
+
 	selection := product.NewSelection()
 	if err := selection.Initialize(profile); err != nil {
 		return fmt.Errorf("initialize product selection: %w", err)
@@ -106,8 +125,8 @@ func run() error {
 		httpapi.WithVersion(Version()),
 		httpapi.WithStore(store),
 		httpapi.WithAuthConfig(httpapi.AuthConfig{
-			AdminUsername:       env("LY_ROUTE_ADMIN_USERNAME", ""),
-			AdminPassword:       env("LY_ROUTE_ADMIN_PASSWORD", ""),
+			AdminUsername:       adminUsername,
+			AdminPassword:       adminPassword,
 			ReadonlyUsername:    env("LY_ROUTE_READONLY_USERNAME", "readonly"),
 			ReadonlyPassword:    env("LY_ROUTE_READONLY_PASSWORD", ""),
 			CookieSecure:        envBool("LY_ROUTE_SESSION_COOKIE_SECURE", false),

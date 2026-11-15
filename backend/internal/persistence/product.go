@@ -97,6 +97,13 @@ func OpenForProduct(ctx context.Context, dsn string, productID product.ID) (*Sto
 		}
 		return nil, err
 	}
+	// The ledger runs after initialize() released its connection: the pool holds
+	// exactly one connection, so running it inside the migration transaction
+	// would wait for itself forever.
+	if err := store.ensureSchemaMigrations(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	// WAL keeps a reader (status/session polling) from blocking a writer, and a
 	// longer busy timeout lets concurrent applies queue instead of failing a
 	// user save with "desired state could not be saved". The gateway serves API
@@ -229,8 +236,13 @@ func (s *Store) verifyProductMetadata(ctx context.Context, conn *sql.Conn) error
 		return fmt.Errorf("read product metadata: %w", err)
 	}
 	profile, err := product.ParseProfile(rawProduct)
-	if err != nil || singleton != 1 || version != SchemaVersion {
+	if err != nil || singleton != 1 || version <= 0 {
 		return fmt.Errorf("%w: singleton=%d product=%q schema_version=%d", ErrInvalidProductMetadata, singleton, rawProduct, version)
+	}
+	// An older database is upgraded by the migration ledger; a newer one was
+	// written by a build this binary does not understand and must not be opened.
+	if version > SchemaVersion {
+		return fmt.Errorf("%w: schema_version=%d, build understands up to %d", ErrSchemaNewer, version, SchemaVersion)
 	}
 	actual := profile.ID()
 	if actual != s.productID {

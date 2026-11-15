@@ -61,6 +61,7 @@ const (
 
 type HealthResponse struct {
 	Status       string                       `json:"status"`
+	System       map[string]any               `json:"system,omitempty"`
 	Version      string                       `json:"version"`
 	Degraded     bool                         `json:"degraded"`
 	RequestID    string                       `json:"request_id"`
@@ -199,7 +200,16 @@ type Server struct {
 	// configGraphMu serializes config_graph generation bookkeeping. The graph
 	// itself is derived on demand; only the counter and last-applied evidence
 	// are persisted, so two concurrent mutations must not lose an increment.
-	configGraphMu                 sync.Mutex
+	configGraphMu sync.Mutex
+	// Login throttling: the control plane sits on the management LAN, so
+	// repeated credential failures must not be free.
+	loginMu       sync.Mutex
+	loginFailures map[string]loginFailure
+	// The console polls /health; sampling /proc twice inside one second would
+	// report a meaningless 0% CPU.
+	systemMu                      sync.Mutex
+	systemCache                   map[string]any
+	systemCacheAt                 time.Time
 	store                         *persistence.Store
 	services                      *serviceRuntime.Runtime
 	vppReceiptPath                string
@@ -1685,6 +1695,13 @@ func (server *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if actor == "" {
 		actor = "anonymous"
 	}
+	throttleKey := clientAddress(r) + "|" + strings.ToLower(actor)
+	if wait, blocked := server.loginBlocked(throttleKey); blocked {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		server.recordAudit(actor, "system", "/api/v1/auth/login", "login", "blocked", "too many failed attempts", r)
+		writeError(w, r, http.StatusTooManyRequests, "too_many_attempts", "too many failed login attempts; retry later")
+		return
+	}
 	role, username, passwordChangeRequired := "", "", false
 	if constantEqual(req.Username, server.auth.AdminUsername) && server.adminPasswordMatches(r.Context(), req.Password) {
 		role = "admin"
@@ -1702,10 +1719,12 @@ func (server *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if role == "" {
+		server.recordLoginFailure(throttleKey)
 		server.recordAudit(actor, "system", "/api/v1/auth/login", "login", "failure", "invalid login", r)
 		writeError(w, r, http.StatusUnauthorized, "unauthorized", "invalid credentials")
 		return
 	}
+	server.clearLoginFailures(throttleKey)
 	session := server.sessions.create(username, role, passwordChangeRequired)
 	http.SetCookie(w, sessionCookie(session.ID, server.auth.CookieSecure))
 	server.recordAudit(session.Username, session.Role, "/api/v1/auth/login", "login", "success", "", r)
@@ -2027,6 +2046,7 @@ func (server *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
+	system := server.cachedSystemSummary()
 	dependencies := server.capabilities(ctx)
 	if capability := server.orchestratorRuntimeCapability(ctx); capability != nil {
 		dependencies = append(dependencies, *capability)
@@ -2045,7 +2065,7 @@ func (server *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	writeJSON(w, http.StatusOK, HealthResponse{Status: status, Version: server.version, Degraded: degraded, RequestID: requestID(r), Dependencies: dependencies, Thermal: server.thermalSnapshot()})
+	writeJSON(w, http.StatusOK, HealthResponse{Status: status, Version: server.version, Degraded: degraded, RequestID: requestID(r), Dependencies: dependencies, Thermal: server.thermalSnapshot(), System: system})
 }
 
 func requiredCapability(name string) bool {

@@ -125,10 +125,21 @@ restore_files() {
 health_check() {
   healthy=0
   i=0
-  while [ "$i" -lt 120 ]; do
+  # A slow appliance needs a startup grace, but a crash-looping candidate must
+  # fail fast instead of burning the whole window: count restarts rather than
+  # probing inactivity.
+  restart_base=$(systemctl show ly-route-control-api.service -p NRestarts --value 2>/dev/null || echo 0)
+  case "$restart_base" in ''|*[!0-9]*) restart_base=0;; esac
+  while [ "$i" -lt 180 ]; do
     if systemctl is-active --quiet ly-route-control-api.service &&
        curl -fsS --max-time 2 http://127.0.0.1:8080/api/v1/health >/dev/null 2>&1; then
       healthy=1
+      break
+    fi
+    restarts=$(systemctl show ly-route-control-api.service -p NRestarts --value 2>/dev/null || echo 0)
+    case "$restarts" in ''|*[!0-9]*) restarts=0;; esac
+    if [ "$restarts" -ge $((restart_base + 3)) ]; then
+      echo "candidate control crash-loop detected: NRestarts $restart_base->$restarts" >&2
       break
     fi
     i=$((i + 1))
@@ -218,6 +229,9 @@ fi
 if [ -f "$tmp/etc/nginx/conf.d/ly-route-admin.conf" ]; then
   install -D -m 0644 "$tmp/etc/nginx/conf.d/ly-route-admin.conf" /etc/nginx/conf.d/ly-route-admin.conf
 fi
+# A candidate must never replay the previous release's VPP command plan: the
+# persisted operations.json/receipt describe commands this build did not write.
+rm -f /var/lib/ly-route/vpp/operations.json /var/lib/ly-route/vpp-apply-receipt.json 2>/dev/null || true
 timeout 30 systemctl daemon-reload || true
 if [ -f "$backup_dir/plugin.changed" ]; then
   if ! timeout 60 systemctl restart vpp.service; then

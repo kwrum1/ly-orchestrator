@@ -71,7 +71,7 @@ func (server *Server) StartDataplaneWatcher(ctx context.Context, interval time.D
 // VPP-owned netdevs and their LCP peers; the watcher reasserts it after boot,
 // after a link event and whenever a new role port appears.
 func (server *Server) enforceDataplaneForwardingGuard(ctx context.Context) {
-	for _, rawName := range server.runtimeDataInterfaces(ctx) {
+	for _, rawName := range server.cachedRuntimeDataInterfaces(ctx) {
 		name := strings.TrimSpace(rawName)
 		if name == "" || name == server.managementInterfaceID(ctx) {
 			continue
@@ -145,6 +145,7 @@ func (server *Server) ensureDPDKInterfacesAdminUp(ctx context.Context) {
 }
 
 func (server *Server) watchDataplaneOnce(ctx context.Context) {
+	server.pruneStaleFactsOnce()
 	server.ensureDPDKInterfacesAdminUp(ctx)
 	server.enforceDataplaneForwardingGuard(ctx)
 	// An apply owns the dataplane transition. Letting the watcher adopt a port
@@ -156,12 +157,12 @@ func (server *Server) watchDataplaneOnce(ctx context.Context) {
 	// Repair a live attachment the rule library forbids (an igc AF_XDP residue)
 	// before the normal adoption loop can re-create it. The migration is
 	// one-shot per boot per port and falls back to AF_PACKET, never DPDK.
-	server.migrateForbiddenTakeoverModes(ctx)
-	interfaces := server.takeoverDataInterfaces(ctx)
+	server.migrateForbiddenOnce(ctx)
+	interfaces := server.cachedTakeoverDataInterfaces(ctx)
 	if len(interfaces) == 0 {
 		return
 	}
-	vppNames := server.vppInterfaceNames(ctx)
+	vppNames := server.cachedVPPInterfaceNames(ctx)
 	verificationState, _ := dataplane.LoadDPDKVerification(dataplaneVerificationPath())
 	verification := map[string]int{}
 	for index, entry := range verificationState.Interfaces {
