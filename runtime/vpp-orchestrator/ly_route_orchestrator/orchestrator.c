@@ -1373,5 +1373,10 @@ VLIB_INIT_FUNCTION (ly_orch_init);
 VNET_FEATURE_INIT (ly_orch_input_feature, static) = {
   .arc_name = "device-input",
   .node_name = "ly-route-orchestrator",
+  /* The orchestrator consumes the frame and enqueues it directly to the
+   * egress interface, so a later device-input feature never sees it. SPAN
+   * must run first or a mirrored source would miss every orchestrated frame
+   * (including the frames the policy drops). */
+  .runs_after = VNET_FEATURES ("span-input"),
   .runs_before = VNET_FEATURES ("ethernet-input"),
 };
