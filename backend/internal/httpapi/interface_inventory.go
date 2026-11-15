@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"ly-route/backend/internal/runtime/dataplane"
@@ -19,6 +20,47 @@ import (
 // gate is therefore the management port named by the inventory still existing
 // in sysfs (and matching its MAC when the file records one). If it does not,
 // validation stays out of the way instead of rejecting every synthetic port.
+
+// OrchestratorDataInterfaces lists every data port the appliance owns, as
+// kernel netdev names. The runtime capability probe uses it so one probe
+// describes the whole device: a topology or group edit that adds a port then
+// reuses that proof instead of walking the hardware again.
+func (server *Server) OrchestratorDataInterfaces(ctx context.Context) []string {
+	seen := map[string]struct{}{}
+	names := make([]string, 0, 8)
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || name == "lo" {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	if inventory, ok := server.operatorInterfaceInventory(ctx); ok {
+		add(inventory.Management.LinuxInterface)
+		for _, item := range inventory.DataInterfaces {
+			add(item.LinuxInterface)
+		}
+	}
+	if len(names) == 0 {
+		for _, item := range hostInterfaceInventory() {
+			add(nonEmpty(stringField(item, "system_name"), stringField(item, "name")))
+		}
+	}
+	management := strings.TrimSpace(server.managementRawInterfaceID(ctx))
+	filtered := make([]string, 0, len(names))
+	for _, name := range names {
+		if management != "" && strings.EqualFold(name, management) {
+			continue
+		}
+		filtered = append(filtered, name)
+	}
+	sort.Strings(filtered)
+	return filtered
+}
 
 func (server *Server) operatorInterfaceInventory(ctx context.Context) (dataplane.Inventory, bool) {
 	inventory, err := dataplane.LoadInventory(dataplaneInventoryPath())

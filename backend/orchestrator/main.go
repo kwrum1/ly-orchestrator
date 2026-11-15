@@ -226,6 +226,7 @@ func run() error {
 	}
 	if recoveryRuntime != nil {
 		recoveryRuntime.SetMirrorProvider(server.OrchestratorMirrorProvider())
+		recoveryRuntime.SetInterfaceInventoryProvider(server.OrchestratorDataInterfaces)
 	}
 	recoveryCtx, stopRecovery := context.WithCancel(context.Background())
 	defer stopRecovery()
@@ -272,6 +273,10 @@ type productionOrchestratorRuntime struct {
 	// truthful indicator: the reconciler holds it every two seconds.
 	transparentApplyActive  atomic.Bool
 	transparentApplyPending atomic.Int32
+	// inventoryProvider lists every data port (kernel names). The capability
+	// probe describes the whole device instead of only the current topology, so
+	// adding a group port later reuses the proof instead of re-walking sysfs.
+	inventoryProvider func(context.Context) []string
 	// resolvedNames memoises product-id -> kernel-netdev lookups for one apply
 	// and for the couple of seconds after it. Every lookup rebuilds the device
 	// inventory from sysfs (~40ms per port), and an apply resolves the same
@@ -1435,8 +1440,15 @@ func (runtime *productionOrchestratorRuntime) ApplyServiceChainTransition(ctx co
 	return result, err
 }
 
+// SetInterfaceInventoryProvider installs the device-wide data-port list used to
+// broaden the hardware capability probe.
+func (runtime *productionOrchestratorRuntime) SetInterfaceInventoryProvider(provider func(context.Context) []string) {
+	runtime.inventoryProvider = provider
+}
+
 func (runtime *productionOrchestratorRuntime) refreshRuntimeProof(ctx context.Context, interfaces []string, managementShared bool) error {
 	interfaces = runtime.resolveLinuxInterfaces(ctx, interfaces)
+	interfaces = runtime.expandProofInterfaces(ctx, interfaces)
 	if len(interfaces) == 0 {
 		return nil
 	}
@@ -1496,6 +1508,39 @@ func (runtime *productionOrchestratorRuntime) refreshRuntimeProof(ctx context.Co
 	runtime.proofMu.Unlock()
 	runtime.rememberProof(proofKey, interfaces, managementShared)
 	return nil
+}
+
+// expandProofInterfaces adds every device data port to the proof request. The
+// selection below still only uses the requested assignments; the extra entries
+// make later topology edits free.
+func (runtime *productionOrchestratorRuntime) expandProofInterfaces(ctx context.Context, interfaces []string) []string {
+	if runtime.inventoryProvider == nil {
+		return interfaces
+	}
+	seen := make(map[string]struct{}, len(interfaces))
+	merged := make([]string, 0, len(interfaces)+8)
+	for _, name := range interfaces {
+		if name = strings.TrimSpace(name); name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		merged = append(merged, name)
+	}
+	for _, name := range runtime.inventoryProvider(ctx) {
+		if name = strings.TrimSpace(name); name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		merged = append(merged, name)
+	}
+	sort.Strings(merged)
+	return merged
 }
 
 // runtimeProofKey identifies the hardware situation a proof describes: the data
