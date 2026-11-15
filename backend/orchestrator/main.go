@@ -281,6 +281,7 @@ type productionOrchestratorRuntime struct {
 	transparentVerifiedDefault    string
 	transparentVerifiedReadback   vpp.TransparentOrchestratorReadback
 	transparentVerifiedAt         time.Time
+	transparentAppliedInputKey    string
 	evidenceMu                    sync.Mutex
 	cachedEvidence                orchestratorapi.TransparentRuntimeEvidence
 	cachedEvidenceSet             bool
@@ -434,6 +435,12 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 	// The persisted topology is the operator's intent and may still carry
 	// product ids from an older build. Resolve every port once and use the same
 	// kernel-name view for the probe, the bonds, the generation and VPP.
+	var inputPolicyView *orchestrator.PolicyView
+	if policy != nil {
+		view := policy.View()
+		inputPolicyView = &view
+	}
+	inputKey := transparentInputKey(topology.View(), inputPolicyView)
 	topologyView := runtime.resolveTopologyView(ctx, topology.View())
 	mark("resolve-topology")
 	interfaces := transparentTopologyInterfaces(topologyView)
@@ -533,6 +540,7 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 	runtime.transparentVerifiedDefault = configuredDefault
 	runtime.transparentVerifiedReadback = readback
 	runtime.transparentVerifiedAt = runtime.transparentAppliedAt
+	runtime.transparentAppliedInputKey = inputKey
 	runtime.observeBypassReadback(readback)
 	runtime.lastReconcileAt = runtime.transparentAppliedAt
 	return nil
@@ -608,6 +616,21 @@ func bypassFlowFromReadback(observed vpp.TransparentOrchestratorReadback) []orch
 // transparentGeneration is the single source of truth for the VPP generation
 // of a topology/policy pair.  Apply and reconcile must compute it identically,
 // otherwise a readback comparison would report drift for an unchanged config.
+// transparentInputKey fingerprints the operator's input (before port name
+// resolution) so a reconcile can recognise the exact configuration an apply just
+// verified.
+func transparentInputKey(topologyView orchestrator.TopologyView, policyView *orchestrator.PolicyView) string {
+	payload, err := json.Marshal(struct {
+		Topology orchestrator.TopologyView `json:"topology"`
+		Policy   *orchestrator.PolicyView  `json:"policy,omitempty"`
+	}{Topology: topologyView, Policy: policyView})
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
+}
+
 func transparentGeneration(topologyView orchestrator.TopologyView, policyView *orchestrator.PolicyView) (string, error) {
 	payload, err := json.Marshal(struct {
 		Topology orchestrator.TopologyView `json:"topology"`
@@ -682,6 +705,26 @@ func (runtime *productionOrchestratorRuntime) reconcileTransparent(ctx context.C
 }
 
 func (runtime *productionOrchestratorRuntime) reconcileTransparentLocked(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) error {
+	var requestedPolicyView *orchestrator.PolicyView
+	if policy != nil {
+		view := policy.View()
+		requestedPolicyView = &view
+	}
+	// A write verifies convergence immediately after its own apply. Resolving
+	// the topology (port identity lookups) and reading the mirror document again
+	// costs ~1.9s on this appliance and can only repeat what the apply just did:
+	// configuration writes are serialised, so nothing can have changed in
+	// between. Reuse the apply evidence while it is fresh.
+	if !runtime.transparentVerifiedAt.IsZero() &&
+		time.Since(runtime.transparentVerifiedAt) < 5*time.Second &&
+		runtime.transparentAppliedInputKey != "" &&
+		runtime.transparentAppliedInputKey == transparentInputKey(topology.View(), requestedPolicyView) {
+		runtime.markReconcileConsistent(requestID, runtime.transparentVerifiedGeneration, runtime.transparentVerifiedDefault, runtime.transparentVerifiedReadback)
+		if runtime.transparentJournalPending {
+			return runtime.clearTransparentTransactionLocked()
+		}
+		return nil
+	}
 	topologyView := runtime.resolveTopologyView(ctx, topology.View())
 	var policyView *orchestrator.PolicyView
 	if policy != nil {
