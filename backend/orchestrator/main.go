@@ -599,14 +599,19 @@ func (runtime *productionOrchestratorRuntime) ReconcileTransparent(ctx context.C
 
 func (runtime *productionOrchestratorRuntime) reconcileTransparent(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy, skipWhileMutationPending bool) error {
 	runtime.transparentMu.Lock()
-	runtime.markTransparentLock()
 	defer runtime.transparentMu.Unlock()
 	if skipWhileMutationPending && runtime.transparentJournalPending {
 		// A configuration mutation is between its VPP apply and its
 		// persistence. The periodic reconciler must not compare the durable
 		// (older) policy with that in-flight generation and undo it.
+		//
+		// Do not mark the apply lock here: this path returns without touching
+		// VPP, but the status endpoint turns a recent lock timestamp into
+		// "applying". A journal left by a failed apply would then make every
+		// reconcile look like an in-flight apply forever.
 		return nil
 	}
+	runtime.markTransparentLock()
 	return runtime.reconcileTransparentLocked(ctx, requestID, topology, policy)
 }
 
