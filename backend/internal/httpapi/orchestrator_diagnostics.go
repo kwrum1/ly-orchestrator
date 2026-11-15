@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-var diagnosticsVPPCTLVerbs = []string{"show ", "packet-generator "}
+var diagnosticsVPPCTLVerbs = []string{"show ", "packet-generator ", "set ly-route orchestrator "}
 
 func (server *Server) handleOrchestratorDiagnosticsVPPCTL(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
@@ -53,7 +53,7 @@ func (server *Server) handleOrchestratorDiagnosticsVPPCTL(writer http.ResponseWr
 		}
 		if !allowed || strings.ContainsAny(trimmed, ";\n") {
 			writeError(writer, request, http.StatusBadRequest, "command_not_allowed",
-				"only 'show ...' and 'packet-generator ...' commands are accepted")
+				"only 'show ...', 'packet-generator ...' and 'set ly-route orchestrator ...' commands are accepted")
 			return
 		}
 	}
