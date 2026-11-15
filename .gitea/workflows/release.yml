@@ -157,6 +157,6 @@ jobs:
             fi
             curl -fsS -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" \
               -H "Content-Type: application/octet-stream" --data-binary @"$file" \
-              "$api/repos/$GH_REPO/releases/$id/assets?name=$name" >/dev/null
+              "https://uploads.github.com/repos/$GH_REPO/releases/$id/assets?name=$name" >/dev/null
             echo "uploaded $name to GitHub"
           done
