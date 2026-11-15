@@ -46,6 +46,11 @@ func (server *Server) setRuntimeEvidence(result RuntimeApplyResult) {
 	}
 	server.clearReconciliationNotice()
 	server.runtimeMu.Lock()
+	// A committed generation supersedes every older failure explanation; leaving
+	// it behind kept 配置异常 on screen after the operator fixed the problem.
+	if result.Status == RuntimeStatusCommitted && result.RuntimeState == RuntimeStateRunning {
+		server.lastFailedApply = nil
+	}
 	previousTransactionID := ""
 	if server.lastRuntime != nil {
 		previousTransactionID = server.lastRuntime.TransactionID
@@ -318,7 +323,7 @@ func (server *Server) reconcileRuntime(ctx context.Context) {
 	if server.store == nil {
 		return
 	}
-	snapshots, err := server.store.RuntimeSnapshots(ctx)
+	snapshots, err := server.store.GenerationSnapshotsLimit(ctx, 50)
 	if err != nil || len(snapshots) == 0 {
 		return
 	}
@@ -555,7 +560,7 @@ func (server *Server) latestRuntimeSnapshotID(ctx context.Context) string {
 	if server.store == nil {
 		return ""
 	}
-	snapshots, err := server.store.RuntimeSnapshots(ctx)
+	snapshots, err := server.store.GenerationSnapshotsLimit(ctx, 50)
 	if err != nil || len(snapshots) == 0 {
 		return ""
 	}

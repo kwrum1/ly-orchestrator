@@ -33,6 +33,10 @@ func Run() {
 		fmt.Println(Version())
 		return
 	}
+	if len(os.Args) == 2 && os.Args[1] == "--dump-config" {
+		dumpEffectiveConfig()
+		return
+	}
 	if err := run(); err != nil {
 		log.Fatal(err)
 	}
@@ -66,7 +70,7 @@ func Version() string {
 			Version      string `json:"version"`
 		}
 		if json.Unmarshal(data, &manifest) == nil {
-			for _, candidate := range []string{manifest.SourceCommit, manifest.Commit, manifest.Version} {
+			for _, candidate := range []string{manifest.Version, manifest.SourceCommit, manifest.Commit} {
 				if value := strings.TrimSpace(candidate); value != "" {
 					return value
 				}
@@ -99,7 +103,7 @@ func run() error {
 	}
 	dataplaneController := productionDataplaneController()
 	options := []httpapi.Option{
-		httpapi.WithVersion(env("LY_ROUTE_VERSION", "dev")),
+		httpapi.WithVersion(Version()),
 		httpapi.WithStore(store),
 		httpapi.WithAuthConfig(httpapi.AuthConfig{
 			AdminUsername:       env("LY_ROUTE_ADMIN_USERNAME", ""),
@@ -109,6 +113,17 @@ func run() error {
 			CookieSecure:        envBool("LY_ROUTE_SESSION_COOKIE_SECURE", false),
 			ForcePasswordChange: envBool("LY_ROUTE_FORCE_PASSWORD_CHANGE", true),
 		}),
+	}
+	// A slow board (QEMU/TCG, Atom-class appliances) legitimately needs longer
+	// than the 8 minute default; timing out produced rollback churn that looked
+	// like a dataplane bug.
+	if raw := strings.TrimSpace(os.Getenv("LY_ROUTE_APPLY_TIMEOUT")); raw != "" {
+		timeout, parseErr := time.ParseDuration(raw)
+		if parseErr != nil || timeout <= 0 {
+			log.Printf("ignoring invalid LY_ROUTE_APPLY_TIMEOUT=%q", raw)
+		} else {
+			options = append(options, httpapi.WithApplyTimeout(timeout))
+		}
 	}
 	var recoveryRepository *orchestrator.Repository
 	var recoveryRuntime *productionOrchestratorRuntime
@@ -1236,6 +1251,16 @@ func (runtime *productionOrchestratorRuntime) selectAndPrepare(ctx context.Conte
 		return vpp.NativePath{}, err
 	}
 	request := vpp.LoadNativePathRequest(runtime.capabilityReport, runtime.managementInterface, interfaces, time.Now().UTC())
+	// The console no longer gates the AF_PACKET fallback behind operator
+	// consent (allowsAFPacketFor always resolves true: a headless appliance must
+	// restore its dataplane without input). This path is used to validate a
+	// topology before it is saved and used to build the request without the
+	// flag, so a first-run save failed with af_fallback_required even though the
+	// same plan applied fine.
+	request.AFPacketConsent = true
+	for index := range request.Assignments {
+		request.Assignments[index].AFPacketConsent = true
+	}
 	path, err := vpp.SelectNativePath(request)
 	if err != nil {
 		return vpp.NativePath{}, err
@@ -1469,5 +1494,33 @@ func applyVPPCounterLine(item map[string]any, line string) {
 		if err == nil {
 			item[key] = value
 		}
+	}
+}
+
+// dumpEffectiveConfig prints the environment the control plane actually reads,
+// with secret values masked, so "which value won" no longer needs shell
+// archaeology during support.
+func dumpEffectiveConfig() {
+	fmt.Printf("version: %s\n", Version())
+	keys := []string{
+		"LY_ROUTE_PRODUCT_PROFILE", "LY_ROUTE_API_HOST", "LY_ROUTE_API_PORT",
+		"LY_ROUTE_DB_PATH", "LY_ROUTE_CONFIG_PATH", "LY_ROUTE_ARTIFACT_MANIFEST",
+		"LY_ROUTE_ADMIN_USERNAME", "LY_ROUTE_ADMIN_PASSWORD", "LY_ROUTE_ADMIN_PASSWORD_HASH",
+		"LY_ROUTE_READONLY_USERNAME", "LY_ROUTE_READONLY_PASSWORD",
+		"LY_ROUTE_SESSION_COOKIE_SECURE", "LY_ROUTE_FORCE_PASSWORD_CHANGE",
+		"LY_ROUTE_INITIAL_ADMIN_PASSWORD_FILE", "LY_ROUTE_CONTROL_ENV_FILE",
+		"LY_ROUTE_APPLY_TIMEOUT", "LY_ROUTE_PPROF", "LY_ROUTE_VERSION",
+	}
+	for _, key := range keys {
+		value, set := os.LookupEnv(key)
+		if !set {
+			fmt.Printf("%s=<unset>\n", key)
+			continue
+		}
+		if key == "LY_ROUTE_ADMIN_PASSWORD" || key == "LY_ROUTE_READONLY_PASSWORD" || strings.Contains(key, "HASH") {
+			fmt.Printf("%s=<redacted:%d chars>\n", key, len(value))
+			continue
+		}
+		fmt.Printf("%s=%s\n", key, value)
 	}
 }

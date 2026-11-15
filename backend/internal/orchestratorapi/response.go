@@ -107,6 +107,10 @@ func codeForError(err error) string {
 		return "group_in_use"
 	case errors.Is(err, orchestrator.ErrTopologyNotFound):
 		return "topology_not_found"
+	case errors.Is(err, orchestrator.ErrPolicyNotFound):
+		// A fresh appliance has no policy yet; that is a normal state, not an
+		// internal error the console should paint as a failure.
+		return "policy_not_found"
 	case errors.Is(err, orchestrator.ErrTopologyConflict):
 		return "topology_conflict"
 	case errors.Is(err, orchestrator.ErrGroupNotFound):

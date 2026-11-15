@@ -13038,11 +13038,32 @@ func importPackageContainsSecret(req map[string]any) bool {
 	return false
 }
 
+// emptySecretValue reports a value that cannot carry secret material, so a
+// redaction key with an empty placeholder survives a round trip.
+func emptySecretValue(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(typed) == ""
+	case map[string]any:
+		return len(typed) == 0
+	case []any:
+		return len(typed) == 0
+	}
+	return false
+}
+
 func containsSecret(value any) bool {
 	switch typed := value.(type) {
 	case map[string]any:
 		for key, child := range typed {
 			if configRedactionMetadata(key) {
+				continue
+			}
+			// An empty placeholder carries no secret material: export/import of a
+			// package whose password field is "" must not be rejected as a leak.
+			if emptySecretValue(child) {
 				continue
 			}
 			if secretToken(key) || containsSecret(child) {

@@ -593,6 +593,51 @@ func (s *Store) DeleteAuthUser(ctx context.Context, username string) error {
 	return nil
 }
 
+// GenerationSnapshots returns only snapshots that carry runtime apply
+// evidence. Config snapshots (manual-*, pre-import-*, pre-factory-reset-*,
+// conversion-*) live in the same table; reading those as the committed
+// generation made /runtime/status degrade a healthy appliance right after an
+// operator saved a snapshot.
+func (s *Store) GenerationSnapshots(ctx context.Context) ([]RuntimeSnapshot, error) {
+	return s.generationSnapshots(ctx, 0)
+}
+
+// GenerationSnapshotsLimit bounds the read so a long-lived appliance does not
+// load every plan into memory on each status poll.
+func (s *Store) GenerationSnapshotsLimit(ctx context.Context, limit int) ([]RuntimeSnapshot, error) {
+	return s.generationSnapshots(ctx, limit)
+}
+
+func (s *Store) generationSnapshots(ctx context.Context, limit int) ([]RuntimeSnapshot, error) {
+	query := `
+SELECT id, source_transaction_id, payload_json, payload_hash, created_at
+FROM runtime_snapshots
+WHERE id LIKE 'snapshot-runtime-%' OR id LIKE 'snapshot-txn-%'
+ORDER BY created_at DESC, id DESC`
+	args := []any{}
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var snapshots []RuntimeSnapshot
+	for rows.Next() {
+		snapshot, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, err
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return snapshots, nil
+}
+
 func (s *Store) RuntimeSnapshots(ctx context.Context) ([]RuntimeSnapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, source_transaction_id, payload_json, payload_hash, created_at

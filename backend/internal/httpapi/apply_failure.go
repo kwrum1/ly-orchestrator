@@ -39,6 +39,17 @@ func (server *Server) publishFailedRuntimeResult(lease *applyLease, result Runti
 	if lease != nil && lease.expired.Load() {
 		return
 	}
+	// A superseded apply is not a dataplane failure: the plan was stale, nothing
+	// committed, and the newest desired generation still has to reach VPP.
+	// Replaying the last committed generation here would strand the operator's
+	// change (and did: a WAN role edit left a uio-bound port without ownership
+	// records). Converge on the newest generation instead. Recording it as
+	// `last_failed_apply` first painted a permanent 配置异常 badge for normal
+	// concurrent editing, so the superseded case must return before the record.
+	if supersededApply.Swap(false) {
+		server.scheduleConvergeApply()
+		return
+	}
 	server.runtimeMu.Lock()
 	server.lastFailedApply = &result
 	// A newer failed apply is the authoritative explanation for why the
@@ -46,15 +57,6 @@ func (server *Server) publishFailedRuntimeResult(lease *applyLease, result Runti
 	// reconcile notice as the visible reason.
 	server.lastReconcile = nil
 	server.runtimeMu.Unlock()
-	// A superseded apply is not a dataplane failure: the plan was stale, nothing
-	// committed, and the newest desired generation still has to reach VPP.
-	// Replaying the last committed generation here would strand the operator's
-	// change (and did: a WAN role edit left a uio-bound port without ownership
-	// records). Converge on the newest generation instead.
-	if supersededApply.Swap(false) {
-		server.scheduleConvergeApply()
-		return
-	}
 	// A failed transaction can leave the dataplane half applied (the desktop
 	// run showed a rolled back role change that dropped the LAN address and
 	// left VPP with raw interfaces). The recovery unit replays the last

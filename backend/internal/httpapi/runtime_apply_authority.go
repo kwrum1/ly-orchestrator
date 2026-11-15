@@ -262,7 +262,7 @@ func (server *Server) tryNoopRuntimeApply(ctx context.Context, sourceHash string
 	if server.store == nil || strings.TrimSpace(sourceHash) == "" {
 		return nil, false
 	}
-	snapshots, err := server.store.RuntimeSnapshots(ctx)
+	snapshots, err := server.store.GenerationSnapshotsLimit(ctx, 50)
 	if err != nil || len(snapshots) == 0 {
 		return nil, false
 	}
