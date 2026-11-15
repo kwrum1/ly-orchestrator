@@ -171,6 +171,13 @@ func parsePolicyGroups(inputs []PolicyGroupInput, objects map[string]policyIPObj
 			return nil, fmt.Errorf("policy group %q: %w", id, err)
 		}
 		for target := range targets {
+			// A rule inside a group that targets the same orchestration group
+			// traverses it twice: the ingress group and the via hop are the
+			// same chain. The cross-group owner check below intentionally
+			// ignores the same owner, so reject self-reference explicitly.
+			if target == id.String() {
+				return nil, fmt.Errorf("%w: %q in %q", ErrPolicyLoop, target, id)
+			}
 			if owner := targetOwners[target]; owner != "" && owner != id.String() {
 				return nil, fmt.Errorf("%w: %q in %q and %q", ErrPolicyLoop, target, owner, id)
 			}
