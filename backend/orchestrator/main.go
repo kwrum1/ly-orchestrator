@@ -172,6 +172,7 @@ func run() error {
 			managementInterface: managementInterface,
 			linuxInterface:      resolveLinuxInterface,
 			proofCommand:        env("LY_ROUTE_VPP_PROBE_COMMAND", "/usr/lib/ly-route/runtime-check.sh"),
+			proofTTL:            durationEnv("LY_ROUTE_RUNTIME_PROOF_TTL", 2*time.Minute),
 			journalPath:         env("LY_ROUTE_ORCHESTRATOR_TRANSACTION_JOURNAL", "/var/lib/ly-route/orchestrator/transparent-transaction.json"),
 		}
 		if err := orchestratorRuntime.loadTransparentTransactionJournal(); err != nil {
@@ -301,6 +302,10 @@ type productionOrchestratorRuntime struct {
 	managementInterface           string
 	linuxInterface                func(context.Context, string) string
 	proofCommand                  string
+	proofMu                       sync.Mutex
+	proofKey                      string
+	proofAt                       time.Time
+	proofTTL                      time.Duration
 	// mirrorProvider returns the desired SPAN generation plus the VPP interface
 	// names whose sessions must be disabled first. The HTTP layer owns the
 	// interface documents, so it installs this callback after the server is
@@ -1217,6 +1222,14 @@ func (runtime *productionOrchestratorRuntime) refreshRuntimeProof(ctx context.Co
 		// probe.  Production images always provide it.
 		return nil
 	}
+	// The probe walks every data port and costs ~20s on this class of
+	// appliance, yet it only describes hardware capability. Re-running it for
+	// an unchanged interface set and unchanged takeover state is pure idle
+	// work: cache the successful proof and skip while it is fresh.
+	proofKey := runtime.runtimeProofKey(interfaces, managementShared)
+	if runtime.proofFresh(proofKey) {
+		return nil
+	}
 	command := exec.CommandContext(ctx, commandPath)
 	command.Env = append(os.Environ(),
 		"LY_ROUTE_MANAGEMENT_INTERFACE="+runtime.managementInterface,
@@ -1227,7 +1240,41 @@ func (runtime *productionOrchestratorRuntime) refreshRuntimeProof(ctx context.Co
 	if output, err := command.CombinedOutput(); err != nil {
 		return fmt.Errorf("refresh VPP runtime capability proof: %w: %s", err, strings.TrimSpace(string(output)))
 	}
+	runtime.rememberProof(proofKey)
 	return nil
+}
+
+// runtimeProofKey identifies the hardware situation a proof describes: the data
+// interface set, the management sharing mode, and the state files the takeover
+// machine rewrites when a port changes owner.
+func (runtime *productionOrchestratorRuntime) runtimeProofKey(interfaces []string, managementShared bool) string {
+	key := strings.Join(interfaces, ",") + "|" + strconv.FormatBool(managementShared)
+	for _, path := range []string{dataplaneOwnershipPathForProof(), dataplaneVerificationPathForProof()} {
+		if info, err := os.Stat(path); err == nil {
+			key += "|" + path + ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + ":" + strconv.FormatInt(info.Size(), 10)
+		}
+	}
+	return key
+}
+
+func (runtime *productionOrchestratorRuntime) proofFresh(key string) bool {
+	runtime.proofMu.Lock()
+	defer runtime.proofMu.Unlock()
+	if runtime.proofKey != key || runtime.proofKey == "" {
+		return false
+	}
+	ttl := runtime.proofTTL
+	if ttl <= 0 {
+		ttl = 2 * time.Minute
+	}
+	return time.Since(runtime.proofAt) < ttl
+}
+
+func (runtime *productionOrchestratorRuntime) rememberProof(key string) {
+	runtime.proofMu.Lock()
+	runtime.proofKey = key
+	runtime.proofAt = time.Now()
+	runtime.proofMu.Unlock()
 }
 
 // resolveLinuxInterfaces maps product ids to kernel netdev names and removes
@@ -1467,6 +1514,19 @@ func openStore(ctx context.Context, path string, productID product.ID) (*persist
 	return persistence.OpenForProduct(ctx, path, productID)
 }
 
+// durationEnv reads a duration setting, falling back when unset or invalid.
+func durationEnv(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+
 func env(key, fallback string) string {
 	value := os.Getenv(key)
 	if value == "" {
@@ -1600,4 +1660,28 @@ func dumpEffectiveConfig() {
 		}
 		fmt.Printf("%s=%s\n", key, value)
 	}
+}
+
+// dataplaneOwnershipPathForProof mirrors the control plane's ownership state
+// path so the proof cache notices a port that changed owner.
+func dataplaneOwnershipPathForProof() string {
+	if value := strings.TrimSpace(os.Getenv("LY_ROUTE_DPDK_OWNERSHIP_STATE")); value != "" {
+		return value
+	}
+	dir := strings.TrimSpace(os.Getenv("LY_ROUTE_DATAPLANE_STATE_DIR"))
+	if dir == "" {
+		dir = "/var/lib/ly-route/dataplane"
+	}
+	return filepath.Join(dir, "ownership.json")
+}
+
+func dataplaneVerificationPathForProof() string {
+	if value := strings.TrimSpace(os.Getenv("LY_ROUTE_DPDK_VERIFICATION_STATE")); value != "" {
+		return value
+	}
+	dir := strings.TrimSpace(os.Getenv("LY_ROUTE_DATAPLANE_STATE_DIR"))
+	if dir == "" {
+		dir = "/var/lib/ly-route/dataplane"
+	}
+	return filepath.Join(dir, "dpdk-verification.json")
 }
