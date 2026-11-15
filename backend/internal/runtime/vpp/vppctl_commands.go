@@ -607,17 +607,17 @@ func (channel *vppctlChannel) doCommands(ctx context.Context, operation Operatio
 	return Reply{Operation: operation.Name, Payload: payload}, nil
 }
 
-// doTransparentOrchestratorBatch runs the candidate-building commands of one
-// orchestrator apply through `vppctl exec` files. A policy apply is dominated by
-// process launches, not VPP work: one vppctl process per rule costs ~35ms on
-// this class of appliance.
+// doTransparentOrchestratorBatch runs the mutating commands of one orchestrator
+// apply through `vppctl exec` files instead of one process per command. A policy
+// apply is dominated by process launches, not VPP work: one vppctl process per
+// rule costs ~35ms on this class of appliance.
 //
-// The candidate commands are strict: a CLI error fails the apply. The SPAN
-// cleanup commands carry the `?` ignore-failure marker, so they go into a
-// lenient batch (a missing session is expected). Readback commands keep the
-// normal path because callers inspect their stdout. The readback verification
-// compares the policy row count with the rule commands, so a rule the batch
-// silently dropped still fails the apply.
+// The command list is ordered candidate -> SPAN cleanup (`?`, failures ignored)
+// -> SPAN sessions -> readback shows. Each run is batched separately so the
+// order is preserved: candidate and SPAN commands strictly (a CLI parse error
+// fails the apply), cleanup leniently, and the shows one by one because callers
+// inspect their stdout. The readback verification compares the policy row count
+// with the rule commands, so a rule the batch silently dropped still fails.
 func (channel *vppctlChannel) doTransparentOrchestratorBatch(ctx context.Context, operation Operation) (Reply, bool, error) {
 	if operation.Name != "vpp.transparent-orchestrator" || len(operation.VPPCtlCommands) < 8 {
 		return Reply{}, false, nil
@@ -632,78 +632,105 @@ func (channel *vppctlChannel) doTransparentOrchestratorBatch(ctx context.Context
 			return Reply{}, false, nil
 		}
 	}
-	// Candidate commands are a contiguous prefix, the `?` SPAN cleanup follows,
-	// and the readback is last. Anything else falls back to the old path.
-	strictEnd := 0
-	for strictEnd < len(commands) && strings.HasPrefix(commands[strictEnd], "set ly-route orchestrator ") {
-		strictEnd++
+	type batchRun struct {
+		kind     int
+		indices  []int
+		commands []string
 	}
-	lenientEnd := strictEnd
-	for lenientEnd < len(commands) && strings.HasPrefix(commands[lenientEnd], "?") {
-		lenientEnd++
-	}
-	for _, command := range commands[lenientEnd:] {
-		if !strings.HasPrefix(command, "show ") {
+	runs := make([]batchRun, 0, 4)
+	current := -1
+	mutating := 0
+	for index, command := range commands {
+		kind := batchCommandKind(command)
+		if kind < 0 || kind < current {
+			// Unknown command or an order the batcher does not model.
 			return Reply{}, false, nil
 		}
+		if kind != current {
+			runs = append(runs, batchRun{kind: kind})
+			current = kind
+		}
+		run := &runs[len(runs)-1]
+		run.indices = append(run.indices, index)
+		run.commands = append(run.commands, command)
+		if kind != batchKindShow {
+			mutating++
+		}
 	}
-	if strictEnd < 8 {
+	if mutating < 8 {
 		return Reply{}, false, nil
 	}
 	results := make([]VPPCTLCommandResult, len(commands))
 	for index, command := range commands {
 		results[index].Command = command
 	}
-	for begin := 0; begin < strictEnd; begin += vppRouteBatchChunkSize {
-		end := begin + vppRouteBatchChunkSize
-		if end > strictEnd {
-			end = strictEnd
-		}
-		label := fmt.Sprintf("vpp orchestrator batch %d-%d/%d", begin+1, end, strictEnd)
-		batchResult, err := channel.executeVPPBatchFile(ctx, commands[begin:end], label, true)
-		if err != nil {
-			return Reply{Operation: operation.Name, Retval: 1, Payload: VPPCTLReplyPayload{CommandResults: results}}, true, err
-		}
-		results[begin].Stdout = batchResult.Stdout
-		results[begin].Stderr = batchResult.Stderr
-	}
-	if lenientEnd > strictEnd {
-		cleanup := make([]string, 0, lenientEnd-strictEnd)
-		for _, command := range commands[strictEnd:lenientEnd] {
-			cleanup = append(cleanup, strings.TrimSpace(strings.TrimPrefix(command, "?")))
-		}
-		for begin := 0; begin < len(cleanup); begin += vppRouteBatchChunkSize {
-			end := begin + vppRouteBatchChunkSize
-			if end > len(cleanup) {
-				end = len(cleanup)
+	for _, run := range runs {
+		switch run.kind {
+		case batchKindShow:
+			for _, index := range run.indices {
+				reply, err := channel.doCommands(ctx, Operation{
+					Name:           operation.Name,
+					RequestID:      operation.RequestID,
+					Resource:       operation.Resource,
+					Payload:        operation.Payload,
+					VPPCtlCommands: []string{results[index].Command},
+				})
+				if err != nil {
+					return reply, true, err
+				}
+				payload, ok := reply.Payload.(VPPCTLReplyPayload)
+				if !ok || len(payload.CommandResults) != 1 {
+					return reply, true, fmt.Errorf("%w: %s readback is incomplete", ErrSnapshotIncomplete, operation.Name)
+				}
+				results[index] = payload.CommandResults[0]
 			}
-			label := fmt.Sprintf("vpp span cleanup batch %d-%d/%d", begin+1, end, len(cleanup))
-			batchResult, err := channel.executeVPPBatchFile(ctx, cleanup[begin:end], label, false)
-			if err != nil {
-				return Reply{Operation: operation.Name, Retval: 1, Payload: VPPCTLReplyPayload{CommandResults: results}}, true, err
+		default:
+			commandsToRun := run.commands
+			strict := run.kind != batchKindCleanup
+			if !strict {
+				commandsToRun = make([]string, 0, len(run.commands))
+				for _, command := range run.commands {
+					commandsToRun = append(commandsToRun, strings.TrimSpace(strings.TrimPrefix(command, "?")))
+				}
 			}
-			results[strictEnd+begin].Stdout = batchResult.Stdout
-			results[strictEnd+begin].Stderr = batchResult.Stderr
+			label := fmt.Sprintf("vpp orchestrator batch kind %d", run.kind)
+			for begin := 0; begin < len(commandsToRun); begin += vppRouteBatchChunkSize {
+				end := begin + vppRouteBatchChunkSize
+				if end > len(commandsToRun) {
+					end = len(commandsToRun)
+				}
+				batchResult, err := channel.executeVPPBatchFile(ctx, commandsToRun[begin:end], fmt.Sprintf("%s %d-%d/%d", label, begin+1, end, len(commandsToRun)), strict)
+				if err != nil {
+					return Reply{Operation: operation.Name, Retval: 1, Payload: VPPCTLReplyPayload{CommandResults: results}}, true, err
+				}
+				results[run.indices[begin]].Stdout = batchResult.Stdout
+				results[run.indices[begin]].Stderr = batchResult.Stderr
+			}
 		}
-	}
-	if lenientEnd < len(commands) {
-		reply, err := channel.doCommands(ctx, Operation{
-			Name:           operation.Name,
-			RequestID:      operation.RequestID,
-			Resource:       operation.Resource,
-			Payload:        operation.Payload,
-			VPPCtlCommands: commands[lenientEnd:],
-		})
-		if err != nil {
-			return reply, true, err
-		}
-		payload, ok := reply.Payload.(VPPCTLReplyPayload)
-		if !ok || len(payload.CommandResults) != len(commands)-lenientEnd {
-			return reply, true, fmt.Errorf("%w: %s readback is incomplete", ErrSnapshotIncomplete, operation.Name)
-		}
-		copy(results[lenientEnd:], payload.CommandResults)
 	}
 	return Reply{Operation: operation.Name, Payload: VPPCTLReplyPayload{CommandResults: results}}, true, nil
+}
+
+const (
+	batchKindCandidate = iota
+	batchKindCleanup
+	batchKindSpanSet
+	batchKindShow
+)
+
+func batchCommandKind(command string) int {
+	switch {
+	case strings.HasPrefix(command, "set ly-route orchestrator "):
+		return batchKindCandidate
+	case strings.HasPrefix(command, "?"):
+		return batchKindCleanup
+	case strings.HasPrefix(command, "set interface span "), strings.HasPrefix(command, "interface span "):
+		return batchKindSpanSet
+	case strings.HasPrefix(command, "show "):
+		return batchKindShow
+	default:
+		return -1
+	}
 }
 
 func collectVPPRouteBatch(commands []string, begin int) ([]string, int, error) {
