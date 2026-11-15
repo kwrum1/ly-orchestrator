@@ -1593,7 +1593,8 @@ func (runtime *productionOrchestratorRuntime) resolveLinuxInterfaces(ctx context
 
 // resolveLinuxName memoises one product-id lookup. The resolver walks sysfs and
 // the ownership records for every call, which costs ~40ms per port on this
-// appliance; an apply resolves the same port twice.
+// appliance; an apply resolves the same port twice. The mapping only changes
+// when a port is renamed or handed over, and a failed apply clears the memo.
 func (runtime *productionOrchestratorRuntime) resolveLinuxName(ctx context.Context, name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" || runtime.linuxInterface == nil {
@@ -1601,7 +1602,7 @@ func (runtime *productionOrchestratorRuntime) resolveLinuxName(ctx context.Conte
 	}
 	now := time.Now()
 	runtime.resolvedMu.Lock()
-	if runtime.resolvedNames != nil && now.Sub(runtime.resolvedAt) < 5*time.Second {
+	if runtime.resolvedNames != nil && now.Sub(runtime.resolvedAt) < 60*time.Second {
 		if cached, ok := runtime.resolvedNames[name]; ok {
 			runtime.resolvedMu.Unlock()
 			return cached
@@ -1613,7 +1614,7 @@ func (runtime *productionOrchestratorRuntime) resolveLinuxName(ctx context.Conte
 		resolved = name
 	}
 	runtime.resolvedMu.Lock()
-	if runtime.resolvedNames == nil || now.Sub(runtime.resolvedAt) >= 5*time.Second {
+	if runtime.resolvedNames == nil || now.Sub(runtime.resolvedAt) >= 60*time.Second {
 		runtime.resolvedNames = map[string]string{}
 	}
 	runtime.resolvedNames[name] = resolved
