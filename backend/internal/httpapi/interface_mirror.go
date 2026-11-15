@@ -190,6 +190,14 @@ func (server *Server) runtimeMirrorConfig(ctx context.Context) (*vpp.MirrorConfi
 	if role, _ := interfaceDesiredRole(target); role != "" {
 		return nil, fmt.Errorf("mirror port %q must not have a %s role", destinationID, strings.ToUpper(role))
 	}
+	if role, ok := boundaryRoleOf(server.orchestratorBoundaryPorts(ctx), []string{destinationID, destinationLinux}); ok {
+		return nil, fmt.Errorf("mirror port %q is the %s boundary port; move the boundary first", destinationID, strings.ToUpper(role))
+	}
+	if stored := server.interfaceStoredItem(ctx, destinationID, destinationLinux); stored != nil {
+		if bond := strings.TrimSpace(nonEmpty(stringField(stored, "bond"), nonEmpty(stringField(stored, "bond_id"), stringField(stored, "member_of")))); bond != "" {
+			return nil, fmt.Errorf("mirror port %q belongs to a bond; remove it from the bond first", destinationID)
+		}
+	}
 	mirror := &vpp.MirrorConfig{Destination: vppInterfaceName(destinationLinux), LinuxInterface: destinationLinux}
 	for _, source := range interfaceMirrorSourcesOf(target) {
 		sourceLinux := strings.TrimSpace(server.resolveInterfaceID(ctx, source.Interface))
@@ -259,6 +267,21 @@ func (server *Server) validateInterfaceMirror(ctx context.Context, payload map[s
 	}
 	if !server.takeoverFactsForPort(ctx, linuxName).Physical {
 		return fmt.Errorf("mirror port %q is not a physical data port", id)
+	}
+	// The boundary role lives in the topology document, not in the interface
+	// document being patched, so a payload-only role check missed it: marking
+	// the LAN/WAN boundary port as the mirror destination returned 200 and
+	// created a second identity for the same physical port.
+	if role, ok := boundaryRoleOf(server.orchestratorBoundaryPorts(ctx), []string{id, linuxName}); ok {
+		return fmt.Errorf("interface %s is the %s boundary port; move the boundary before marking it as the mirror port", id, strings.ToUpper(role))
+	}
+	if stored := server.interfaceStoredItem(ctx, id, linuxName); stored != nil {
+		if role, _ := interfaceDesiredRole(stored); role != "" {
+			return fmt.Errorf("interface %s already has the %s role; clear it before marking it as the mirror port", id, strings.ToUpper(role))
+		}
+		if bond := strings.TrimSpace(nonEmpty(stringField(stored, "bond"), nonEmpty(stringField(stored, "bond_id"), stringField(stored, "member_of")))); bond != "" {
+			return fmt.Errorf("interface %s belongs to a bond; remove it from the bond before marking it as the mirror port", id)
+		}
 	}
 	if groups := server.orchestratorGroupPorts(ctx); len(groups) > 0 {
 		if groups[linuxName] {
@@ -367,6 +390,31 @@ func (server *Server) OrchestratorMirrorProvider() func(context.Context) (*vpp.M
 		}
 		return mirror, cleanup, nil
 	}
+}
+
+// interfaceStoredItem finds the persisted interface document by product id or
+// resolved Linux name. Mirror validation runs on a PATCH payload, so the role
+// and bond identity can only come from the store.
+func (server *Server) interfaceStoredItem(ctx context.Context, id, linuxName string) map[string]any {
+	items, err := server.desiredItems(ctx, "interface")
+	if err != nil {
+		return nil
+	}
+	for _, item := range items {
+		if truthy(item["deleted"]) {
+			continue
+		}
+		for _, key := range []string{"id", "interface_id", "name", "system_name"} {
+			candidate := strings.TrimSpace(stringField(item, key))
+			if candidate == "" {
+				continue
+			}
+			if strings.EqualFold(candidate, id) || (linuxName != "" && strings.EqualFold(candidate, linuxName)) {
+				return item
+			}
+		}
+	}
+	return nil
 }
 
 // mirrorCleanupInterfaces lists every VPP interface a stale SPAN session could
