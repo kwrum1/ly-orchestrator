@@ -257,6 +257,15 @@
     var container = document.createElement("div");
     container.id = "extras-view";
     container.className = "page extras-embedded";
+    if (kind === "mirror") {
+      // The template is injected before its data-driven page script runs, so a
+      // visible container would show the card head and an empty table first.
+      // Hold it until the page script has written the first render.
+      container.style.visibility = "hidden";
+      window.setTimeout(function () {
+        if (container.style.visibility === "hidden") container.style.visibility = "";
+      }, 2500);
+    }
     mainInner.appendChild(container);
     active = { kind: kind, container: container, hidden: hidden, cleanup: null };
     setActive(kind);
@@ -870,6 +879,28 @@
     return parts.join(" · ");
   }
 
+  // The page is revealed once, after its data is written. Filling a visible page
+  // in place made the summary and the extra column appear under the operator's
+  // eyes; a single reveal is the only way to keep the compact layout without it.
+  function holdInterfacePageUntilReady() {
+    var page = interfacePage();
+    if (!page || page.dataset.extrasReady === "1") return;
+    if (page.style.visibility !== "hidden") page.style.visibility = "hidden";
+    if (page.dataset.extrasHold === "1") return;
+    page.dataset.extrasHold = "1";
+    // Safety net: a failed read must never leave the page invisible.
+    window.setTimeout(function () {
+      if (page.dataset.extrasReady !== "1") page.style.visibility = "";
+    }, 2500);
+  }
+
+  function revealInterfacePage() {
+    document.querySelectorAll(".main-inner .page").forEach(function (node) {
+      node.dataset.extrasReady = "1";
+      node.style.visibility = "";
+    });
+  }
+
   function ensureOverviewCard(page, facts) {
     var cards = Array.prototype.slice.call(page.querySelectorAll("section.card"));
     var card = cards.find(function (node) {
@@ -984,13 +1015,20 @@
   }
 
   function decorateInterfacesPage() {
-    var page = interfacePage();
-    if (!page) return;
+    if (!interfacePage()) return;
     refreshNicFacts().then(function (facts) {
-      if (!document.body.contains(page)) return;
-      ensureOverviewCard(page, facts);
-      ensureInterfaceTable(page, facts);
-      enhanceBondModal(page, facts);
+      // The read takes a moment and React can replace the page node meanwhile
+      // (the previous code held a stale reference and silently skipped every
+      // enhancement, which is why the summary sometimes never appeared).
+      var current = interfacePage();
+      if (!current) return;
+      ensureOverviewCard(current, facts);
+      ensureInterfaceTable(current, facts);
+      enhanceBondModal(current, facts);
+      revealInterfacePage();
+    }).catch(function () {
+      // Never leave the page hidden because a read failed.
+      revealInterfacePage();
     });
   }
 
@@ -1344,6 +1382,7 @@
 
   var managementModeObserver = new MutationObserver(function () {
     hideManagementModeField();
+    holdInterfacePageUntilReady();
   });
   if (document.body) {
     managementModeObserver.observe(document.body, { childList: true, subtree: true });

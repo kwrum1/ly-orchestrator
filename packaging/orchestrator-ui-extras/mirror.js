@@ -95,6 +95,61 @@ window.LyExtrasMirrorView = function (root) {
     return value === "rx" ? "仅接收" : value === "tx" ? "仅发送" : "双向";
   }
 
+  // The page used to write these sentences only after /api/v1/interfaces answered,
+  // so they popped in one by one. Paint the last known copy with the first frame
+  // and let the refresh rewrite it only when the values really changed.
+  var textsStorageKey = "lyroute.extras.mirrorTexts";
+
+  function subtitleText(port, count) {
+    return port
+      ? "共 " + count + " 条 · 输出口 " + portLabel(port)
+      : "源接口为物理数据口（不含管理口），输出口固定为镜像口";
+  }
+
+  function writeSubtitle(port, count) {
+    var subtitle = $("policy-subtitle");
+    if (!subtitle) return;
+    var next = port !== undefined ? subtitleText(port, count) : "";
+    if (next && subtitle.textContent !== next) subtitle.textContent = next;
+  }
+
+  function writeSummary(pairs) {
+    var summary = $("mirror-summary");
+    if (!summary || !pairs) return;
+    var current = summary.textContent.replace(/\s+/g, " ").trim();
+    var next = pairs.map(function (pair) { return pair[0] + " " + pair[1]; }).join(" ");
+    if (current === next) return;
+    summary.innerHTML = "";
+    pairs.forEach(function (pair) {
+      var span = document.createElement("span");
+      span.textContent = pair[0] + " ";
+      var strong = document.createElement("b");
+      strong.textContent = String(pair[1]);
+      span.appendChild(strong);
+      summary.appendChild(span);
+    });
+  }
+
+  function rememberTexts(payload) {
+    try { window.localStorage.setItem(textsStorageKey, JSON.stringify(payload)); } catch (err) { /* optional */ }
+  }
+
+  function primeFromCache() {
+    var raw = null;
+    try { raw = window.localStorage.getItem(textsStorageKey); } catch (err) { return; }
+    if (!raw) return;
+    var cached = null;
+    try { cached = JSON.parse(raw); } catch (err) { return; }
+    if (!cached) return;
+    if (cached.pairs) writeSummary(cached.pairs);
+    if (cached.subtitle) {
+      var subtitle = $("policy-subtitle");
+      if (subtitle && !subtitle.textContent) subtitle.textContent = cached.subtitle;
+    }
+    var noTarget = $("no-target");
+    if (noTarget && typeof cached.noTarget === "boolean") noTarget.hidden = !cached.noTarget;
+  }
+
   function renderTable() {
     if (!state.ready) return;
     var port = mirrorPort();
@@ -106,29 +161,17 @@ window.LyExtrasMirrorView = function (root) {
     if (empty) empty.hidden = Boolean(list.length) || !port;
     var noTarget = $("no-target");
     if (noTarget) noTarget.hidden = Boolean(port);
-    var summary = $("mirror-summary");
-    if (summary) {
-      summary.innerHTML = "";
-      var pairs = [
-        ["镜像口", port ? portLabel(port) : "未配置"],
-        ["策略", list.length + " 条"]
-      ];
-      pairs.forEach(function (pair) {
-        var span = document.createElement("span");
-        span.textContent = pair[0] + " ";
-        var strong = document.createElement("b");
-        strong.textContent = String(pair[1]);
-        span.appendChild(strong);
-        summary.appendChild(span);
-      });
-    }
-
-    var subtitle = $("policy-subtitle");
-    if (subtitle) {
-      subtitle.textContent = port
-        ? "共 " + list.length + " 条 · 输出口 " + portLabel(port)
-        : "源接口为物理数据口（不含管理口），输出口固定为镜像口";
-    }
+    var pairs = [
+      ["镜像口", port ? portLabel(port) : "未配置"],
+      ["策略", list.length + " 条"]
+    ];
+    writeSummary(pairs);
+    writeSubtitle(port, list.length);
+    rememberTexts({
+      pairs: pairs,
+      subtitle: subtitleText(port, list.length),
+      noTarget: !port
+    });
 
     var applying = state.busy || Boolean(state.component && /applying|recovering|pending/.test(String(state.component.state)));
     list.forEach(function (source) {
@@ -423,6 +466,7 @@ window.LyExtrasMirrorView = function (root) {
       state.component = components.find(function (component) { return component.name === "mirror"; }) || null;
       state.ready = true;
       renderTable();
+      if (root && root.style) root.style.visibility = "";
       syncAddButton();
     }).catch(function (error) {
       showError(error.message || error);
@@ -458,6 +502,10 @@ window.LyExtrasMirrorView = function (root) {
   }
 
   mountHeaderButton();
+  // Reveal the page only after the first read has been written, so nothing
+  // appears in stages.
+  if (root && root.style) root.style.visibility = "hidden";
+  window.setTimeout(function () { if (root && root.style) root.style.visibility = ""; }, 4000);
   load();
   return function () { closeDialog(); };
 };
