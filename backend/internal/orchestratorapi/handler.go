@@ -1,6 +1,7 @@
 package orchestratorapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,7 @@ const (
 	TopologyPath            = "/api/v1/orchestrator/topology"
 	OrchestrationGroupsPath = "/api/v1/orchestrator/orchestration-groups"
 	PolicyPath              = "/api/v1/orchestrator/policy"
+	PolicyStatusPath        = "/api/v1/orchestrator/policy/status"
 	PolicyCompilePath       = "/api/v1/orchestrator/policy/compile"
 	ServiceChainCompilePath = "/api/v1/orchestrator/service-chains/compile"
 	ServiceChainApplyPath   = "/api/v1/orchestrator/service-chains/apply"
@@ -45,6 +47,11 @@ type Handler struct {
 	// stored.  The data plane then disagreed with the configuration until the
 	// next manual apply.
 	mutationMu sync.Mutex
+	// policyTransactions tracks asynchronous policy writes. The console saves
+	// with Prefer: respond-async so a 90-rule policy no longer blocks the form
+	// for the whole VPP apply; it polls the status path instead.
+	policyTxMu         sync.Mutex
+	policyTransactions map[string]policyTransaction
 }
 
 // PortResolver maps a product interface id (eth2) to the kernel netdev that
@@ -221,6 +228,13 @@ func (handler *Handler) RegisterRoutes(mux *http.ServeMux) {
 				handle(writer, request)
 				return
 			}
+			if request.Method == http.MethodPut && request.URL.Path == PolicyPath && wantsAsyncPolicy(request) {
+				// The asynchronous worker takes mutationMu itself. Holding it here
+				// while the worker runs would block the status reads and every other
+				// configuration write for the whole apply.
+				handle(writer, request)
+				return
+			}
 			handler.mutationMu.Lock()
 			defer handler.mutationMu.Unlock()
 			handle(writer, request)
@@ -230,6 +244,7 @@ func (handler *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(OrchestrationGroupsPath, mutate(handler.handleGroups))
 	mux.HandleFunc(OrchestrationGroupsPath+"/", mutate(handler.handleGroup))
 	mux.HandleFunc(PolicyPath, mutate(handler.handlePolicy))
+	mux.HandleFunc(PolicyStatusPath, handler.handlePolicyStatus)
 	mux.HandleFunc(PolicyCompilePath, handler.handlePolicyCompile)
 	if _, transparent := handler.runtime.(TransparentRuntime); !transparent {
 		mux.HandleFunc(ServiceChainCompilePath, handler.handleServiceChainCompile)
@@ -538,6 +553,170 @@ func (handler *Handler) recordAudit(request *http.Request, resource, action, sta
 		return
 	}
 	recorder.RecordAudit(request, resource, action, status, detail)
+}
+
+// policyTransaction is the observable state of one asynchronous policy write.
+// Status values match the console contract: applying, applied, apply_failed.
+type policyTransaction struct {
+	ID         string    `json:"transaction_id"`
+	Status     string    `json:"status"`
+	Reason     string    `json:"reason,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+}
+
+func wantsAsyncPolicy(request *http.Request) bool {
+	if request.Method != http.MethodPut {
+		return false
+	}
+	if strings.Contains(strings.ToLower(request.Header.Get("Prefer")), "respond-async") {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(request.URL.Query().Get("async"))) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func requestWithBody(request *http.Request, body []byte) *http.Request {
+	clone := request.Clone(request.Context())
+	clone.Body = io.NopCloser(bytes.NewReader(body))
+	clone.ContentLength = int64(len(body))
+	return clone
+}
+
+func (handler *Handler) beginPolicyTransaction() (policyTransaction, error) {
+	handler.policyTxMu.Lock()
+	defer handler.policyTxMu.Unlock()
+	if handler.policyTransactions == nil {
+		handler.policyTransactions = map[string]policyTransaction{}
+	}
+	// Prune finished transactions after ten minutes: the console polls for at
+	// most a couple of minutes and the map must not grow forever.
+	cutoff := time.Now().Add(-10 * time.Minute)
+	for id, transaction := range handler.policyTransactions {
+		if !transaction.StartedAt.After(cutoff) {
+			delete(handler.policyTransactions, id)
+		}
+	}
+	for _, transaction := range handler.policyTransactions {
+		if transaction.Status == "applying" {
+			return policyTransaction{}, errors.New("another policy apply is already in progress")
+		}
+	}
+	transaction := policyTransaction{
+		ID:        fmt.Sprintf("policy-%d", time.Now().UnixNano()),
+		Status:    "applying",
+		StartedAt: time.Now().UTC(),
+	}
+	handler.policyTransactions[transaction.ID] = transaction
+	return transaction, nil
+}
+
+func (handler *Handler) finishPolicyTransaction(id, status, reason string) {
+	handler.policyTxMu.Lock()
+	defer handler.policyTxMu.Unlock()
+	transaction, ok := handler.policyTransactions[id]
+	if !ok {
+		return
+	}
+	transaction.Status = status
+	transaction.Reason = reason
+	transaction.FinishedAt = time.Now().UTC()
+	handler.policyTransactions[id] = transaction
+}
+
+func (handler *Handler) policyTransactionByID(id string) (policyTransaction, bool) {
+	handler.policyTxMu.Lock()
+	defer handler.policyTxMu.Unlock()
+	transaction, ok := handler.policyTransactions[id]
+	return transaction, ok
+}
+
+// runAsyncPolicyPut executes one asynchronous policy write. The caller already
+// validated the JSON body, so the worker can serialise with other mutations and
+// reuse the exact synchronous handler; its response is captured for the status
+// endpoint instead of being sent to the original request.
+func (handler *Handler) runAsyncPolicyPut(transactionID string, request *http.Request) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	request = request.WithContext(ctx)
+	recorder := &policyResponseRecorder{header: http.Header{}}
+	handler.mutationMu.Lock()
+	handler.servePolicyPut(recorder, request)
+	handler.mutationMu.Unlock()
+	status := recorder.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	if status >= 200 && status < 300 {
+		handler.finishPolicyTransaction(transactionID, "applied", "")
+		return
+	}
+	handler.finishPolicyTransaction(transactionID, "apply_failed", recorder.reason())
+}
+
+// policyResponseRecorder captures the synchronous handler's status and error
+// message so the asynchronous status endpoint can report a real reason.
+type policyResponseRecorder struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (recorder *policyResponseRecorder) Header() http.Header {
+	return recorder.header
+}
+
+func (recorder *policyResponseRecorder) WriteHeader(status int) {
+	if recorder.status == 0 {
+		recorder.status = status
+	}
+}
+
+func (recorder *policyResponseRecorder) Write(payload []byte) (int, error) {
+	if recorder.status == 0 {
+		recorder.status = http.StatusOK
+	}
+	return recorder.body.Write(payload)
+}
+
+func (recorder *policyResponseRecorder) reason() string {
+	var payload errorResponse
+	if err := json.Unmarshal(recorder.body.Bytes(), &payload); err == nil && payload.Error.Message != "" {
+		return payload.Error.Message
+	}
+	text := strings.TrimSpace(recorder.body.String())
+	if len(text) > 400 {
+		text = text[:400]
+	}
+	if text == "" {
+		return fmt.Sprintf("policy apply failed with status %d", recorder.status)
+	}
+	return text
+}
+
+func (handler *Handler) handlePolicyStatus(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		writeAPIError(writer, http.StatusMethodNotAllowed, errors.New("method is not allowed"))
+		return
+	}
+	if !handler.authorize(writer, request, PermissionRead) {
+		return
+	}
+	id := strings.TrimSpace(request.URL.Query().Get("transaction_id"))
+	if id == "" {
+		writeAPIError(writer, http.StatusBadRequest, errors.New("transaction_id is required"))
+		return
+	}
+	transaction, ok := handler.policyTransactionByID(id)
+	if !ok {
+		writeAPIError(writer, http.StatusNotFound, errors.New("policy transaction not found"))
+		return
+	}
+	writeJSON(writer, http.StatusOK, transaction)
 }
 
 func policyReferencesGroup(policy *orchestrator.Policy, name string) bool {

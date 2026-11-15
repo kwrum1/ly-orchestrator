@@ -172,7 +172,7 @@ func run() error {
 			managementInterface: managementInterface,
 			linuxInterface:      resolveLinuxInterface,
 			proofCommand:        env("LY_ROUTE_VPP_PROBE_COMMAND", "/usr/lib/ly-route/runtime-check.sh"),
-			proofTTL:            durationEnv("LY_ROUTE_RUNTIME_PROOF_TTL", 2*time.Minute),
+			proofTTL:            durationEnv("LY_ROUTE_RUNTIME_PROOF_TTL", 10*time.Minute),
 			journalPath:         env("LY_ROUTE_ORCHESTRATOR_TRANSACTION_JOURNAL", "/var/lib/ly-route/orchestrator/transparent-transaction.json"),
 		}
 		if err := orchestratorRuntime.loadTransparentTransactionJournal(); err != nil {
@@ -1393,7 +1393,7 @@ func (runtime *productionOrchestratorRuntime) proofFresh(key string) bool {
 	}
 	ttl := runtime.proofTTL
 	if ttl <= 0 {
-		ttl = 2 * time.Minute
+		ttl = 10 * time.Minute
 	}
 	return time.Since(runtime.proofAt) < ttl
 }

@@ -1,9 +1,11 @@
 package orchestratorapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -61,58 +63,36 @@ func (handler *Handler) handlePolicy(writer http.ResponseWriter, request *http.R
 		}
 		writeJSON(writer, http.StatusOK, map[string]any{"item": policy.View(), "checksum": checksum})
 	case http.MethodPut:
-		var input orchestrator.PolicyInput
-		if err := decodeStrictJSON(writer, request, &input); err != nil {
+		body, bodyErr := io.ReadAll(io.LimitReader(request.Body, maxBodyBytes+1))
+		if bodyErr != nil {
+			writeAPIError(writer, http.StatusBadRequest, bodyErr)
+			return
+		}
+		if len(body) > maxBodyBytes {
+			writeAPIError(writer, http.StatusRequestEntityTooLarge, errors.New("request body is too large"))
+			return
+		}
+		// Validate before accepting an asynchronous transaction: a malformed
+		// document is still a 400, never a 202 that fails in the background.
+		if err := decodeStrictJSON(writer, requestWithBody(request, body), &orchestrator.PolicyInput{}); err != nil {
 			writeAPIError(writer, http.StatusBadRequest, err)
 			return
 		}
-		topology, _, err := handler.repository.Snapshot(request.Context())
-		if err != nil {
-			writeRepositoryError(writer, err)
-			return
-		}
-		policy, err := orchestrator.ParsePolicy(topology, input)
-		if err != nil {
-			writeAPIError(writer, http.StatusUnprocessableEntity, err)
-			return
-		}
-		previous, _, previousErr := repository.PolicySnapshot(request.Context())
-		if previousErr != nil && !errors.Is(previousErr, orchestrator.ErrPolicyNotFound) {
-			writePolicyRepositoryError(writer, previousErr)
-			return
-		}
-		if err := handler.applyTransparent(request.Context(), topology, &policy); err != nil {
-			writeAPIError(writer, http.StatusUnprocessableEntity, err)
-			return
-		}
-		if err := repository.ReplacePolicy(request.Context(), policy); err != nil {
-			var rollbackErr error
-			if previousErr == nil {
-				rollbackErr = handler.rollbackTransparent(request.Context(), topology, &previous)
-			} else {
-				rollbackErr = handler.rollbackTransparent(request.Context(), topology, nil)
-			}
-			if rollbackErr != nil {
-				writeAPIError(writer, http.StatusInternalServerError, fmt.Errorf("persist policy: %v; restore transparent dataplane: %w", err, rollbackErr))
+		if wantsAsyncPolicy(request) {
+			transaction, beginErr := handler.beginPolicyTransaction()
+			if beginErr != nil {
+				writeAPIError(writer, http.StatusConflict, beginErr)
 				return
 			}
-			writePolicyRepositoryError(writer, err)
+			writeJSON(writer, http.StatusAccepted, map[string]any{
+				"transaction_id": transaction.ID,
+				"status":         transaction.Status,
+			})
+			worker := requestWithBody(request.Clone(context.Background()), body)
+			go handler.runAsyncPolicyPut(transaction.ID, worker)
 			return
 		}
-		if err := handler.commitTransparentTransaction(request.Context()); err != nil {
-			writeAPIError(writer, http.StatusInternalServerError, err)
-			return
-		}
-		stored, checksum, err := repository.PolicySnapshot(request.Context())
-		if err != nil {
-			writePolicyRepositoryError(writer, err)
-			return
-		}
-		if !handler.requireConverged(writer, request.Context(), topology, &stored) {
-			return
-		}
-		handler.recordAudit(request, PolicyPath, "update", "success", checksum)
-		writeJSON(writer, http.StatusOK, map[string]any{"item": stored.View(), "checksum": checksum})
+		handler.servePolicyPut(writer, requestWithBody(request, body))
 	case http.MethodDelete:
 		topology, _, topologyErr := handler.repository.Snapshot(request.Context())
 		if topologyErr != nil {
@@ -146,6 +126,70 @@ func (handler *Handler) handlePolicy(writer http.ResponseWriter, request *http.R
 		handler.recordAudit(request, PolicyPath, "delete", "success", "")
 		writer.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// servePolicyPut is the synchronous policy write: VPP apply, durable
+// persistence, transaction journal commit and convergence verification. The
+// asynchronous worker reuses it verbatim and reports its outcome through
+// policy/status.
+func (handler *Handler) servePolicyPut(writer http.ResponseWriter, request *http.Request) {
+	repository, ok := handler.policyRepository()
+	if !ok {
+		writeAPIError(writer, http.StatusServiceUnavailable, orchestrator.ErrRepositoryUnavailable)
+		return
+	}
+	var input orchestrator.PolicyInput
+	if err := decodeStrictJSON(writer, request, &input); err != nil {
+		writeAPIError(writer, http.StatusBadRequest, err)
+		return
+	}
+	topology, _, err := handler.repository.Snapshot(request.Context())
+	if err != nil {
+		writeRepositoryError(writer, err)
+		return
+	}
+	policy, err := orchestrator.ParsePolicy(topology, input)
+	if err != nil {
+		writeAPIError(writer, http.StatusUnprocessableEntity, err)
+		return
+	}
+	previous, _, previousErr := repository.PolicySnapshot(request.Context())
+	if previousErr != nil && !errors.Is(previousErr, orchestrator.ErrPolicyNotFound) {
+		writePolicyRepositoryError(writer, previousErr)
+		return
+	}
+	if err := handler.applyTransparent(request.Context(), topology, &policy); err != nil {
+		writeAPIError(writer, http.StatusUnprocessableEntity, err)
+		return
+	}
+	if err := repository.ReplacePolicy(request.Context(), policy); err != nil {
+		var rollbackErr error
+		if previousErr == nil {
+			rollbackErr = handler.rollbackTransparent(request.Context(), topology, &previous)
+		} else {
+			rollbackErr = handler.rollbackTransparent(request.Context(), topology, nil)
+		}
+		if rollbackErr != nil {
+			writeAPIError(writer, http.StatusInternalServerError, fmt.Errorf("persist policy: %v; restore transparent dataplane: %w", err, rollbackErr))
+			return
+		}
+		writePolicyRepositoryError(writer, err)
+		return
+	}
+	if err := handler.commitTransparentTransaction(request.Context()); err != nil {
+		writeAPIError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	stored, checksum, err := repository.PolicySnapshot(request.Context())
+	if err != nil {
+		writePolicyRepositoryError(writer, err)
+		return
+	}
+	if !handler.requireConverged(writer, request.Context(), topology, &stored) {
+		return
+	}
+	handler.recordAudit(request, PolicyPath, "update", "success", checksum)
+	writeJSON(writer, http.StatusOK, map[string]any{"item": stored.View(), "checksum": checksum})
 }
 
 func (handler *Handler) handlePolicyCompile(writer http.ResponseWriter, request *http.Request) {
