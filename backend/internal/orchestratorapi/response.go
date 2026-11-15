@@ -154,6 +154,11 @@ func codeForError(err error) string {
 	}
 }
 
+// ErrTransparentApplyInProgress marks a read that arrived while an apply holds
+// the dataplane mutex. It is a transient state, not a failure: an appliance that
+// is genuinely applying configuration must not be reported as degraded.
+var ErrTransparentApplyInProgress = errors.New("transparent orchestrator runtime is applying")
+
 // TopologyNotConfiguredReason is the operator-facing explanation for a fresh
 // appliance that has no saved topology. It is intentionally actionable: the
 // fix is to assign LAN and WAN ports on the 网卡设置 page and apply, so the

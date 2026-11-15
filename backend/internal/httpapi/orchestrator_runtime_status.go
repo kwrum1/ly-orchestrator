@@ -39,6 +39,22 @@ func (server *Server) orchestratorTransparentRuntimeComponents(ctx context.Conte
 	}
 	evidence, err := provider.TransparentRuntimeEvidence(ctx)
 	if err != nil {
+		if errors.Is(err, orchestratorapi.ErrTransparentApplyInProgress) {
+			// A read that arrives mid-apply is a normal transient state, not a
+			// failure. Reporting it as degraded made every configuration change
+			// look like a broken appliance for the duration of the apply.
+			now := server.now().UTC()
+			reason := "配置正在下发：" + err.Error()
+			result := degradedRuntimeResult("orchestrator-observe", reason, now)
+			result.Status = "applying"
+			result.RuntimeState = "applying"
+			server.setRuntimeEvidence(result)
+			components := []RuntimeComponentState{
+				{Name: "vpp", State: "applying", Available: true, Reason: reason},
+				{Name: "persistence", State: "running", Available: server.store != nil, Reason: persistenceRuntimeReason(server.store != nil)},
+			}
+			return server.applyRuntimeEvidence(components), true
+		}
 		now := server.now().UTC()
 		reason := "transparent orchestrator runtime readback failed: " + err.Error()
 		server.setRuntimeEvidence(degradedRuntimeResult("orchestrator-observe", reason, now))
@@ -132,6 +148,10 @@ func (server *Server) orchestratorRuntimeCapability(ctx context.Context) *contro
 	}
 	evidence, err := provider.TransparentRuntimeEvidence(ctx)
 	if err != nil {
+		if errors.Is(err, orchestratorapi.ErrTransparentApplyInProgress) {
+			// Applying is not a health failure; the next probe reports the result.
+			return nil
+		}
 		return &controlapi.CapabilityState{Name: "orchestrator_runtime", Available: false, State: controlapi.CapabilityDegraded, Reason: serviceRuntime.Redact(err.Error())}
 	}
 	if evidence.State != "running" {

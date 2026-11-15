@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ly-route/backend/internal/httpapi"
@@ -263,6 +264,7 @@ type productionOrchestratorRuntime struct {
 	adapter                   vpp.Adapter
 	dataplane                 apply.DataplaneController
 	transparentMu             sync.Mutex
+	transparentLockAt         atomic.Int64
 	transparentBonds          []vpp.BondState
 	transparentRequest        string
 	transparentGeneration     string
@@ -307,8 +309,24 @@ type productionOrchestratorRuntime struct {
 	mirrorProvider func(context.Context) (*vpp.MirrorConfig, []string, error)
 }
 
+// markTransparentLock records when the dataplane mutex was taken so a status
+// read that cannot acquire it can say how long the apply has been running
+// instead of a bare "applying or recovering".
+func (runtime *productionOrchestratorRuntime) markTransparentLock() {
+	runtime.transparentLockAt.Store(time.Now().UnixNano())
+}
+
+func (runtime *productionOrchestratorRuntime) transparentLockAge() time.Duration {
+	taken := runtime.transparentLockAt.Load()
+	if taken == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, taken)).Round(time.Second)
+}
+
 func (runtime *productionOrchestratorRuntime) ApplyTransparent(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) error {
 	runtime.transparentMu.Lock()
+	runtime.markTransparentLock()
 	defer runtime.transparentMu.Unlock()
 	return runtime.applyTransparentLocked(ctx, requestID, topology, policy)
 }
@@ -513,6 +531,7 @@ func (runtime *productionOrchestratorRuntime) ReconcileTransparent(ctx context.C
 
 func (runtime *productionOrchestratorRuntime) reconcileTransparent(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy, skipWhileMutationPending bool) error {
 	runtime.transparentMu.Lock()
+	runtime.markTransparentLock()
 	defer runtime.transparentMu.Unlock()
 	if skipWhileMutationPending && runtime.transparentJournalPending {
 		// A configuration mutation is between its VPP apply and its
@@ -644,6 +663,7 @@ func runTransparentRecovery(ctx context.Context, repository *orchestrator.Reposi
 
 func (runtime *productionOrchestratorRuntime) DisableTransparent(ctx context.Context, requestID string) error {
 	runtime.transparentMu.Lock()
+	runtime.markTransparentLock()
 	defer runtime.transparentMu.Unlock()
 	if err := runtime.beginTransparentTransaction(requestID, "disable", "", runtime.transparentBonds, nil); err != nil {
 		return err
@@ -674,6 +694,7 @@ func (runtime *productionOrchestratorRuntime) DisableTransparent(ctx context.Con
 // the bypass is cleared.
 func (runtime *productionOrchestratorRuntime) SetBypass(ctx context.Context, enabled bool, cause, reason string) error {
 	runtime.transparentMu.Lock()
+	runtime.markTransparentLock()
 	defer runtime.transparentMu.Unlock()
 	return runtime.setBypassLocked(ctx, enabled, cause, reason)
 }
@@ -745,6 +766,7 @@ func (runtime *productionOrchestratorRuntime) BypassSnapshot() orchestratorapi.B
 // other groups untouched.
 func (runtime *productionOrchestratorRuntime) SetGroupBypass(ctx context.Context, group string, enabled bool, cause, reason string) error {
 	runtime.transparentMu.Lock()
+	runtime.markTransparentLock()
 	defer runtime.transparentMu.Unlock()
 	requestID := fmt.Sprintf("orchestrator-group-bypass-%d", time.Now().UnixNano())
 	readback, err := runtime.adapter.SetTransparentOrchestratorGroupBypass(ctx, requestID, group, enabled, cause, reason)
@@ -764,6 +786,7 @@ func (runtime *productionOrchestratorRuntime) SetGroupBypass(ctx context.Context
 // runtime state, not part of the committed policy generation.
 func (runtime *productionOrchestratorRuntime) SetGroupProbes(ctx context.Context, targets []groupProbeTarget) error {
 	runtime.transparentMu.Lock()
+	runtime.markTransparentLock()
 	defer runtime.transparentMu.Unlock()
 	converted := make([]vpp.GroupProbeTarget, 0, len(targets))
 	for _, target := range targets {
@@ -874,6 +897,7 @@ func (runtime *productionOrchestratorRuntime) loadTransparentTransactionJournal(
 
 func (runtime *productionOrchestratorRuntime) CommitTransparentTransaction(context.Context) error {
 	runtime.transparentMu.Lock()
+	runtime.markTransparentLock()
 	defer runtime.transparentMu.Unlock()
 	return runtime.clearTransparentTransactionLocked()
 }
@@ -910,7 +934,7 @@ func syncDirectory(path string) error {
 
 func (runtime *productionOrchestratorRuntime) TransparentRuntimeEvidence(ctx context.Context) (orchestratorapi.TransparentRuntimeEvidence, error) {
 	if !runtime.transparentMu.TryLock() {
-		return orchestratorapi.TransparentRuntimeEvidence{}, errors.New("transparent orchestrator runtime is applying or recovering")
+		return orchestratorapi.TransparentRuntimeEvidence{}, fmt.Errorf("%w (started %s ago)", orchestratorapi.ErrTransparentApplyInProgress, runtime.transparentLockAge())
 	}
 	defer runtime.transparentMu.Unlock()
 	if strings.TrimSpace(runtime.transparentRequest) == "" || strings.TrimSpace(runtime.transparentGeneration) == "" || runtime.transparentAppliedAt.IsZero() {
