@@ -822,6 +822,7 @@ func (server *Server) Handler() http.Handler {
 		// most dataplane questions are answered by the plugin's own CLI output.
 		mux.HandleFunc("/api/v1/orchestrator/plugin-snapshot", server.handleOrchestratorPluginSnapshot)
 		mux.HandleFunc("/api/v1/orchestrator/apply-timings", server.handleOrchestratorApplyTimings)
+		mux.HandleFunc("/api/v1/orchestrator/diagnostics/vppctl", server.handleOrchestratorDiagnosticsVPPCTL)
 		if _, transparent := server.orchestratorRuntime.(orchestratorapi.TransparentRuntime); !transparent {
 			handler.StartServiceChainReconciler(context.Background(), server.orchestratorReconcileInterval)
 		}
