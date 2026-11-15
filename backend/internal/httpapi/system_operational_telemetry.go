@@ -47,10 +47,19 @@ func (server *Server) handleDashboardSummaryTelemetry(w http.ResponseWriter, r *
 	}
 	capabilities := append([]controlapi.CapabilityState{}, dependencies...)
 	capabilities = append(capabilities, systemCapability, factsCapability)
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"status": status, "degraded": degraded, "dependencies": dependencies,
 		"system": system, "capabilities": capabilities, "request_id": requestID(r),
-	})
+	}
+	// The console's 系统信息 card reads uptime/system_time/platform/CPU from the
+	// summary root, while other callers use the nested system object. Serve the
+	// same facts in both shapes so one page works without guessing the nesting.
+	for key, value := range system {
+		if _, exists := payload[key]; !exists {
+			payload[key] = value
+		}
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func readSystemOperationalFacts(now time.Time, readFile func(string) ([]byte, error)) (map[string]any, controlapi.CapabilityState) {

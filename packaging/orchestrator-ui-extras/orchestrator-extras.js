@@ -108,7 +108,9 @@
       kind: "mirror",
       id: "extras-mirror",
       after: 'a[href="/topology"]',
-      path: "/mirror",
+      // The mirror UI is a standalone page (mirror.html + mirror.js). The SPA
+      // has no /mirror route, so linking to /mirror rendered 页面不存在.
+      path: "/mirror.html",
       label: "流量镜像",
       title: "把物理口流量镜像到镜像口",
       icon:
