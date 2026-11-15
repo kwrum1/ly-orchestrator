@@ -76,6 +76,14 @@ jobs:
           sh scripts/build-orchestrator-ui.sh --out /tmp/ui-orch-release
           wc -c /tmp/ui-orch-release/app.js
 
+      - name: build VPP orchestrator plugin
+        run: |
+          set -euo pipefail
+          # The plugin carries the dataplane policy/SPAN fixes. Build it from the
+          # pinned VPP development packages so the package and ISO actually ship
+          # the same plugin this commit was accepted with.
+          sh scripts/build-vpp-orchestrator-plugin.sh
+
       - name: build upgrade package (amd64)
         run: |
           set -euo pipefail
@@ -83,7 +91,8 @@ jobs:
           mkdir -p dist/release
           bash scripts/build-orchestrator-upgrade-package.sh \
             --version "${VERSION}" --out dist/release \
-            --ui /tmp/ui-orch-release --vpp-apply "${LY_ROUTE_VPP_APPLY}"
+            --ui /tmp/ui-orch-release --vpp-apply "${LY_ROUTE_VPP_APPLY}" \
+            --plugin build/vpp-orchestrator/cmake/lib/vpp_plugins/ly_route_orchestrator_plugin.so
           ls -l dist/release
 
       - name: build installer ISO (amd64)
