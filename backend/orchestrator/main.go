@@ -262,10 +262,19 @@ func productionDataplaneController() *dataplane.Transaction {
 }
 
 type productionOrchestratorRuntime struct {
-	adapter                   vpp.Adapter
-	dataplane                 apply.DataplaneController
-	transparentMu             sync.Mutex
-	transparentLockAt         atomic.Int64
+	adapter           vpp.Adapter
+	dataplane         apply.DataplaneController
+	transparentMu     sync.Mutex
+	transparentLockAt atomic.Int64
+	// A real dataplane apply (not the periodic reconciler's observation, the
+	// bypass/probe writes or the transaction commit) is the only thing the
+	// status endpoint may report as "applying". The lock alone is not a
+	// truthful indicator: the reconciler holds it every two seconds.
+	transparentApplyActive    atomic.Bool
+	transparentApplyStartedAt atomic.Int64
+	evidenceMu                sync.Mutex
+	cachedEvidence            orchestratorapi.TransparentRuntimeEvidence
+	cachedEvidenceSet         bool
 	transparentBonds          []vpp.BondState
 	transparentRequest        string
 	transparentGeneration     string
@@ -342,6 +351,27 @@ func (runtime *productionOrchestratorRuntime) transparentLockAge() time.Duration
 	return time.Since(time.Unix(0, taken)).Round(time.Second)
 }
 
+func (runtime *productionOrchestratorRuntime) transparentApplyAge() time.Duration {
+	started := runtime.transparentApplyStartedAt.Load()
+	if started == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, started)).Round(time.Second)
+}
+
+func (runtime *productionOrchestratorRuntime) storeTransparentEvidence(evidence orchestratorapi.TransparentRuntimeEvidence) {
+	runtime.evidenceMu.Lock()
+	runtime.cachedEvidence = evidence
+	runtime.cachedEvidenceSet = true
+	runtime.evidenceMu.Unlock()
+}
+
+func (runtime *productionOrchestratorRuntime) cachedTransparentEvidence() (orchestratorapi.TransparentRuntimeEvidence, bool) {
+	runtime.evidenceMu.Lock()
+	defer runtime.evidenceMu.Unlock()
+	return runtime.cachedEvidence, runtime.cachedEvidenceSet
+}
+
 func (runtime *productionOrchestratorRuntime) ApplyTransparent(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) error {
 	runtime.transparentMu.Lock()
 	runtime.markTransparentLock()
@@ -363,6 +393,9 @@ func (runtime *productionOrchestratorRuntime) desiredMirror(ctx context.Context)
 }
 
 func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) (err error) {
+	runtime.transparentApplyActive.Store(true)
+	runtime.transparentApplyStartedAt.Store(time.Now().UnixNano())
+	defer runtime.transparentApplyActive.Store(false)
 	// Phase timing: the appliance is slow enough that "the apply is slow" needs
 	// a breakdown before anything can be optimized or explained.
 	started := time.Now()
@@ -751,6 +784,9 @@ func (runtime *productionOrchestratorRuntime) DisableTransparent(ctx context.Con
 	runtime.transparentMu.Lock()
 	runtime.markTransparentLock()
 	defer runtime.transparentMu.Unlock()
+	runtime.transparentApplyActive.Store(true)
+	runtime.transparentApplyStartedAt.Store(time.Now().UnixNano())
+	defer runtime.transparentApplyActive.Store(false)
 	if err := runtime.beginTransparentTransaction(requestID, "disable", "", runtime.transparentBonds, nil); err != nil {
 		return err
 	}
@@ -1033,6 +1069,16 @@ func syncDirectory(path string) error {
 
 func (runtime *productionOrchestratorRuntime) TransparentRuntimeEvidence(ctx context.Context) (orchestratorapi.TransparentRuntimeEvidence, error) {
 	if !runtime.transparentMu.TryLock() {
+		if runtime.transparentApplyActive.Load() {
+			return orchestratorapi.TransparentRuntimeEvidence{}, fmt.Errorf("%w (started %s ago)", orchestratorapi.ErrTransparentApplyInProgress, runtime.transparentApplyAge())
+		}
+		// The lock may be held by the periodic reconciler's observation, a
+		// bypass/probe write or the transaction commit. None of those change
+		// the committed generation, so serve the last successful evidence
+		// instead of a false "applying" state.
+		if evidence, ok := runtime.cachedTransparentEvidence(); ok {
+			return evidence, nil
+		}
 		return orchestratorapi.TransparentRuntimeEvidence{}, fmt.Errorf("%w (started %s ago)", orchestratorapi.ErrTransparentApplyInProgress, runtime.transparentLockAge())
 	}
 	defer runtime.transparentMu.Unlock()
@@ -1092,6 +1138,7 @@ func (runtime *productionOrchestratorRuntime) TransparentRuntimeEvidence(ctx con
 	if strings.TrimSpace(observed.Default) != "" && observed.Default != runtime.transparentConfiguredDefault {
 		return orchestratorapi.TransparentRuntimeEvidence{}, fmt.Errorf("transparent orchestrator policy drift: configured default %s, VPP default %s generation %s (repairs %d)", runtime.transparentConfiguredDefault, observed.Default, shortGeneration(observed.Generation), runtime.reconcileRepairs)
 	}
+	runtime.storeTransparentEvidence(evidence)
 	return evidence, nil
 }
 
