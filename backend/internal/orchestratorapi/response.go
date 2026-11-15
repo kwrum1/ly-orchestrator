@@ -44,7 +44,40 @@ func writeJSON(writer http.ResponseWriter, status int, value any) {
 }
 
 func writeAPIError(writer http.ResponseWriter, status int, err error) {
-	writeJSON(writer, status, errorResponse{Error: errorBody{Code: codeForError(err), Message: err.Error()}})
+	code := codeForError(err)
+	if code == "internal_error" && status < 500 {
+		// An unmapped 4xx is still a client problem. Reporting it as an internal
+		// error made operator input look like an appliance fault.
+		code = codeForStatus(status)
+	}
+	writeJSON(writer, status, errorResponse{Error: errorBody{Code: code, Message: err.Error()}})
+}
+
+func codeForStatus(status int) string {
+	switch status {
+	case 400:
+		return "invalid_request"
+	case 401:
+		return "unauthorized"
+	case 403:
+		return "forbidden"
+	case 404:
+		return "not_found"
+	case 405:
+		return "method_not_allowed"
+	case 409:
+		return "conflict"
+	case 413:
+		return "payload_too_large"
+	case 415:
+		return "unsupported_media_type"
+	case 422:
+		return "invalid_request"
+	case 429:
+		return "rate_limited"
+	default:
+		return "internal_error"
+	}
 }
 
 // isPolicyValidationError reports whether err is an operator-input problem that

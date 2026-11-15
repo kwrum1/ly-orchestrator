@@ -915,12 +915,36 @@ func decodeStrictJSON(writer http.ResponseWriter, request *http.Request, target 
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
-		return err
+		return friendlyRequestDecodeError(err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return errors.New("request body must contain one JSON value")
 	}
 	return nil
+}
+
+// friendlyRequestDecodeError turns a JSON decode failure into an operator
+// message. The raw error names Go struct fields (PortRangeInput.policy_groups...)
+// which is noise in a console toast.
+func friendlyRequestDecodeError(err error) error {
+	if errors.Is(err, io.EOF) {
+		return errors.New("request body is empty")
+	}
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) {
+		field := strings.TrimSpace(typeErr.Field)
+		if index := strings.Index(field, "."); index >= 0 {
+			field = field[index+1:]
+		}
+		if strings.HasSuffix(field, ".start") || strings.HasSuffix(field, ".end") {
+			return fmt.Errorf("invalid request body: %s must be between 1 and 65535", field)
+		}
+		return fmt.Errorf("invalid request body: %s has an invalid value", field)
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "unknown field") {
+		return err
+	}
+	return fmt.Errorf("invalid request body: %v", err)
 }
 
 func groupNameFromPath(path string) (string, error) {
