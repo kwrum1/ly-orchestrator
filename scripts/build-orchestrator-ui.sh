@@ -34,14 +34,28 @@ cp -a "$extras/." "$out_dir/"
 rm -f "$out_dir/README.md"
 
 python3 - "$out_dir" <<'PY'
-import io, os, sys
+import hashlib, io, os, re, sys
+
 root = sys.argv[1]
 index = os.path.join(root, "index.html")
 text = io.open(index, encoding="utf-8").read()
-tag = '    <script src="/orchestrator-extras.js"></script>\n'
-if "orchestrator-extras.js" not in text:
-    text = text.replace("  </body>", tag + "  </body>")
+
+def digest(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()[:12]
+
+# The appliance serves the console with a week-long asset cache. app.js and
+# styles.css already carry a content hash, but the extras bundle did not, so a
+# shipped UI fix never reached an operator who had opened the console before.
+extras_version = digest(os.path.join(root, "orchestrator-extras.js"))
+extras_tag = '<script src="/orchestrator-extras.js?v=%s"></script>' % extras_version
+if "orchestrator-extras.js" in text:
+    text = re.sub(r'<script src="/orchestrator-extras\.js[^"]*"></script>', extras_tag, text)
+else:
+    text = text.replace("  </body>", "    " + extras_tag + "\n  </body>")
+
 io.open(index, "w", encoding="utf-8", newline="\n").write(text)
+print("extras version:", extras_version)
 PY
 
 baseline_sha=$(sha256sum "$baseline/app.js" | cut -d' ' -f1)

@@ -66,6 +66,20 @@
     document.head.appendChild(style);
   })();
 
+  // The console is served with a week-long asset cache. Carry this script's own
+  // content hash into every page it loads, otherwise a shipped fix stays hidden
+  // behind the browser's cached copy.
+  var assetVersion = (function () {
+    var source = (document.currentScript && document.currentScript.src) || "";
+    var match = /[?&]v=([^&]+)/.exec(source);
+    return match ? match[1] : "";
+  })();
+
+  function assetUrl(path) {
+    if (!assetVersion || !path || path.indexOf("?") !== -1) return path;
+    return path + "?v=" + assetVersion;
+  }
+
   var ITEMS = [
     {
       kind: "mirror",
@@ -238,7 +252,7 @@
       if (window.location.pathname !== path) window.history.pushState({ extrasView: kind }, "", path);
     }
 
-    fetch(VIEWS[kind].html, { credentials: "same-origin" })
+    fetch(assetUrl(VIEWS[kind].html), { credentials: "same-origin" })
       .then(function (response) { return response.text(); })
       .then(function (html) {
         var parsed = new DOMParser().parseFromString(html, "text/html");
@@ -251,7 +265,7 @@
         });
         while (wrap.firstChild) container.appendChild(wrap.firstChild);
         addActions(container, kind);
-        return loadScript(VIEWS[kind].script);
+        return loadScript(assetUrl(VIEWS[kind].script));
       })
       .then(function () {
         if (!active || active.kind !== kind) return;
