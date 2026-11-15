@@ -11,7 +11,10 @@ window.LyExtrasMirrorView = function (root) {
   var state = {
     ports: [],
     component: null,
-    busy: false
+    busy: false,
+    // Nothing is written to the page before the first read finishes, otherwise
+    // the operator sees "未配置 / 0 条" and then the real values.
+    ready: false
   };
 
   var $ = function (id) { return root ? root.querySelector("#" + id) : document.getElementById(id); };
@@ -93,6 +96,7 @@ window.LyExtrasMirrorView = function (root) {
   }
 
   function renderTable() {
+    if (!state.ready) return;
     var port = mirrorPort();
     var rows = $("policy-rows");
     if (!rows) return;
@@ -417,6 +421,7 @@ window.LyExtrasMirrorView = function (root) {
       state.ports = (results[0] && results[0].items) || [];
       var components = (results[1] && results[1].components) || [];
       state.component = components.find(function (component) { return component.name === "mirror"; }) || null;
+      state.ready = true;
       renderTable();
       syncAddButton();
     }).catch(function (error) {

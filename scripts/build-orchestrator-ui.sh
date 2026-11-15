@@ -47,7 +47,18 @@ def digest(path):
 # The appliance serves the console with a week-long asset cache. app.js and
 # styles.css already carry a content hash, but the extras bundle did not, so a
 # shipped UI fix never reached an operator who had opened the console before.
-extras_version = digest(os.path.join(root, "orchestrator-extras.js"))
+# The version must cover every extras asset, not just the entry script: the
+# pages load each other by path, so a change to mirror.js has to invalidate the
+# same cached copies as a change to orchestrator-extras.js.
+extras_files = ["orchestrator-extras.js", "mirror.js", "mirror.html", "bypass.js", "bypass.html"]
+combined = hashlib.sha256()
+for name in extras_files:
+    path = os.path.join(root, name)
+    if os.path.isfile(path):
+        with open(path, "rb") as handle:
+            combined.update(name.encode())
+            combined.update(handle.read())
+extras_version = combined.hexdigest()[:12]
 extras_tag = '<script src="/orchestrator-extras.js?v=%s"></script>' % extras_version
 if "orchestrator-extras.js" in text:
     text = re.sub(r'<script src="/orchestrator-extras\.js[^"]*"></script>', extras_tag, text)

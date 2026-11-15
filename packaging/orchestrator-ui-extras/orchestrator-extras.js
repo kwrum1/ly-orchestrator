@@ -857,26 +857,6 @@
     return parts.join(" · ");
   }
 
-  function ensureTakeoverCard(page, facts) {
-    var cards = Array.prototype.slice.call(page.querySelectorAll("section.card"));
-    var card = cards.find(function (node) {
-      var h2 = node.querySelector(".card-head h2");
-      return h2 && h2.textContent.trim() === "网卡接管";
-    });
-    if (!card) return;
-    var factsBox = card.querySelector(".takeover-facts");
-    var note = card.querySelector(".takeover-panel p, .card-body > p.muted");
-    if (note) note.style.display = "none";
-    var headActions = card.querySelector(".card-actions");
-    var close = card.querySelector(".card-body button");
-    if (headActions && close && close.parentElement !== headActions) {
-      close.classList.add("btn-sm");
-      headActions.appendChild(close);
-    }
-    var oldBadge = headActions ? headActions.querySelector(".badge") : null;
-    if (oldBadge) oldBadge.style.display = "none";
-  }
-
   function ensureOverviewCard(page, facts) {
     var cards = Array.prototype.slice.call(page.querySelectorAll("section.card"));
     var card = cards.find(function (node) {
@@ -995,7 +975,6 @@
     if (!page) return;
     refreshNicFacts().then(function (facts) {
       if (!document.body.contains(page)) return;
-      ensureTakeoverCard(page, facts);
       ensureOverviewCard(page, facts);
       ensureInterfaceTable(page, facts);
       enhanceBondModal(page, facts);
