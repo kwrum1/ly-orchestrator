@@ -271,6 +271,7 @@ type productionOrchestratorRuntime struct {
 	// status endpoint may report as "applying". The lock alone is not a
 	// truthful indicator: the reconciler holds it every two seconds.
 	transparentApplyActive    atomic.Bool
+	transparentApplyPending   atomic.Int32
 	transparentApplyStartedAt atomic.Int64
 	// transparentVerified* keeps the readback of the most recently applied
 	// generation. A write verifies convergence right after the apply; asking
@@ -383,6 +384,11 @@ func (runtime *productionOrchestratorRuntime) cachedTransparentEvidence() (orche
 }
 
 func (runtime *productionOrchestratorRuntime) ApplyTransparent(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy) error {
+	// Announce the queued write before taking the dataplane mutex. The periodic
+	// reconciler holds that mutex for a couple of seconds while it observes the
+	// plugin; without this the write waited for the watchdog to finish.
+	runtime.transparentApplyPending.Add(1)
+	defer runtime.transparentApplyPending.Add(-1)
 	runtime.transparentMu.Lock()
 	runtime.markTransparentLock()
 	defer runtime.transparentMu.Unlock()
@@ -689,6 +695,11 @@ func (runtime *productionOrchestratorRuntime) ReconcileTransparent(ctx context.C
 func (runtime *productionOrchestratorRuntime) reconcileTransparent(ctx context.Context, requestID string, topology orchestrator.Topology, policy *orchestrator.Policy, skipWhileMutationPending bool) error {
 	runtime.transparentMu.Lock()
 	defer runtime.transparentMu.Unlock()
+	if skipWhileMutationPending && runtime.transparentApplyPending.Load() > 0 {
+		// A configuration write is queued or running. It verifies its own
+		// convergence, so the watchdog must not hold the mutex it waits for.
+		return nil
+	}
 	if skipWhileMutationPending && runtime.transparentJournalPending {
 		// A configuration mutation is between its VPP apply and its
 		// persistence. The periodic reconciler must not compare the durable
@@ -872,6 +883,8 @@ func runTransparentRecovery(ctx context.Context, repository *orchestrator.Reposi
 }
 
 func (runtime *productionOrchestratorRuntime) DisableTransparent(ctx context.Context, requestID string) error {
+	runtime.transparentApplyPending.Add(1)
+	defer runtime.transparentApplyPending.Add(-1)
 	runtime.transparentMu.Lock()
 	runtime.markTransparentLock()
 	defer runtime.transparentMu.Unlock()
@@ -1160,7 +1173,7 @@ func syncDirectory(path string) error {
 
 func (runtime *productionOrchestratorRuntime) TransparentRuntimeEvidence(ctx context.Context) (orchestratorapi.TransparentRuntimeEvidence, error) {
 	if !runtime.transparentMu.TryLock() {
-		if runtime.transparentApplyActive.Load() {
+		if runtime.transparentApplyActive.Load() || runtime.transparentApplyPending.Load() > 0 {
 			return orchestratorapi.TransparentRuntimeEvidence{}, fmt.Errorf("%w (started %s ago)", orchestratorapi.ErrTransparentApplyInProgress, runtime.transparentApplyAge())
 		}
 		// The lock may be held by the periodic reconciler's observation, a
