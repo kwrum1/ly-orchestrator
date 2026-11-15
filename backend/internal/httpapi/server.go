@@ -818,6 +818,9 @@ func (server *Server) Handler() http.Handler {
 		handler.SetOperationTracker(server)
 		handler.SetBypassController(server.orchestratorBypass)
 		handler.RegisterRoutes(mux)
+		// Read-only plugin diagnostics: support has no shell on the appliance and
+		// most dataplane questions are answered by the plugin's own CLI output.
+		mux.HandleFunc("/api/v1/orchestrator/plugin-snapshot", server.handleOrchestratorPluginSnapshot)
 		if _, transparent := server.orchestratorRuntime.(orchestratorapi.TransparentRuntime); !transparent {
 			handler.StartServiceChainReconciler(context.Background(), server.orchestratorReconcileInterval)
 		}
