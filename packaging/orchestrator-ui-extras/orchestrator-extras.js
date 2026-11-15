@@ -884,8 +884,8 @@
       return h2 && h2.textContent.trim() === "接口总览";
     });
     if (!card) return;
-    var grid = card.querySelector(".port-grid");
-    if (grid) grid.style.display = "none";
+    // The stylesheet hides .port-grid from the first paint; nothing to remove.
+
     var body = card.querySelector(".card-body");
     if (!body) return;
     var summary = body.querySelector(".nic-summary");
@@ -910,7 +910,10 @@
       // the "first wording, then a different wording" flicker operators see.
 
     }
-    if (takeoverTh && !takeoverTh.dataset.extrasStatus) {
+    // Exactly one canonical shape: insert the column only when the header is
+    // absent. No stored flag and no cleanup pass, so a scan can never add a
+    // second column or fight with its own previous output.
+    if (takeoverTh && !table.querySelector("th[data-extras-status]")) {
       var statusTh = document.createElement("th");
       statusTh.dataset.extrasStatus = "1";
       statusTh.style.width = "84px";
