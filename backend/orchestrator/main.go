@@ -312,6 +312,12 @@ type productionOrchestratorRuntime struct {
 	// built; every transparent apply (topology save, explicit apply, recovery)
 	// then converges the mirror in the same transaction.
 	mirrorProvider func(context.Context) (*vpp.MirrorConfig, []string, error)
+	// transparentMirrorSignature is the desired SPAN generation last applied
+	// with a successful transparent apply. Mirror changes do not alter the
+	// plugin generation (the plugin does not own SPAN), so without this the
+	// periodic reconciler sees an unchanged generation and never converges a
+	// mirror-only edit.
+	transparentMirrorSignature string
 }
 
 // markTransparentLock records when the dataplane mutex was taken so a status
@@ -453,9 +459,25 @@ func (runtime *productionOrchestratorRuntime) applyTransparentLocked(ctx context
 	runtime.transparentConfiguredDefault = transparentDefaultAction(policyView)
 	runtime.transparentObservedGeneration = readback.Generation
 	runtime.transparentObservedDefault = readback.Default
+	runtime.transparentMirrorSignature = mirrorSignature(mirror)
 	runtime.observeBypassReadback(readback)
 	runtime.lastReconcileAt = runtime.transparentAppliedAt
 	return nil
+}
+
+// mirrorSignature identifies the desired SPAN generation without hashing the
+// whole struct. Direction and the l2 flag are part of the identity: changing
+// either must re-apply the session.
+func mirrorSignature(mirror *vpp.MirrorConfig) string {
+	if mirror == nil {
+		return ""
+	}
+	parts := []string{strings.TrimSpace(mirror.Destination)}
+	for _, source := range mirror.Sources {
+		parts = append(parts, strings.TrimSpace(source.Interface)+"/"+strings.ToLower(strings.TrimSpace(source.Direction))+"/"+strconv.FormatBool(source.L2))
+	}
+	sort.Strings(parts[1:])
+	return strings.Join(parts, "\x00")
 }
 
 func (runtime *productionOrchestratorRuntime) observeBypassReadback(observed vpp.TransparentOrchestratorReadback) {
@@ -593,10 +615,20 @@ func (runtime *productionOrchestratorRuntime) reconcileTransparentLocked(ctx con
 		runtime.reconcileFailures++
 		return err
 	}
+	// Port mirroring is supplemental to the plugin generation. A mirror-only
+	// edit must still converge: compare the desired session set with the one
+	// this runtime last applied, otherwise the early return below would keep
+	// reporting a consistent generation while the SPAN session stayed absent.
+	mirror, _, mirrorErr := runtime.desiredMirror(ctx)
+	if mirrorErr != nil {
+		runtime.reconcileFailures++
+		return mirrorErr
+	}
+	mirrorDrift := mirrorSignature(mirror) != runtime.transparentMirrorSignature
 	configuredDefault := transparentDefaultAction(policyView)
 	observed, observeErr := runtime.adapter.ObserveTransparentOrchestrator(ctx, requestID+"-observe")
 	runtime.lastReconcileAt = time.Now().UTC()
-	if observeErr == nil && transparentStateMatchesConfiguration(observed, expected, configuredDefault) {
+	if observeErr == nil && !mirrorDrift && transparentStateMatchesConfiguration(observed, expected, configuredDefault) {
 		runtime.markReconcileConsistent(requestID, expected, configuredDefault, observed)
 		if runtime.transparentJournalPending {
 			return runtime.clearTransparentTransactionLocked()
@@ -604,6 +636,9 @@ func (runtime *productionOrchestratorRuntime) reconcileTransparentLocked(ctx con
 		return nil
 	}
 	reason := transparentDriftReason(expected, configuredDefault, observed, observeErr)
+	if mirrorDrift {
+		reason = "desired mirror session changed; " + reason
+	}
 	runtime.driftDetected = true
 	runtime.lastDriftReason = reason
 	runtime.reconcileRepairs++
