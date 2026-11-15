@@ -127,3 +127,36 @@ jobs:
             "dist/release/SHA256SUMS"; do
             bash scripts/ci-upload-release.sh "${VERSION}" "$file"
           done
+
+      - name: publish github release
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_REPO: kwrum1/ly-orchestrator
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "GH_TOKEN is not configured; skipping the GitHub mirror"
+            exit 0
+          fi
+          api=https://api.github.com
+          tag="v${VERSION}"
+          body=$(python3 -c 'import json,sys; print(json.dumps({"tag_name":sys.argv[1],"name":"Ly Orchestrator "+sys.argv[1],"body":"Ly Orchestrator release artifacts (upgrade package, installer ISO, checksums)"}))' "$tag")
+          release=$(curl -fsS -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "Content-Type: application/json" "$api/repos/$GH_REPO/releases" -d "$body" || true)
+          if [ -z "$release" ]; then
+            release=$(curl -fsS -H "Authorization: token $GH_TOKEN" "$api/repos/$GH_REPO/releases/tags/$tag")
+          fi
+          id=$(printf '%s' "$release" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
+          [ -n "$id" ] || { echo "GitHub release is unavailable" >&2; exit 1; }
+          for file in dist/release/*; do
+            [ -f "$file" ] || continue
+            name=$(basename "$file")
+            existing=$(curl -fsS -H "Authorization: token $GH_TOKEN" "$api/repos/$GH_REPO/releases/$id/assets" \
+              | python3 -c 'import json,sys; name=sys.argv[1]; print(next((a["id"] for a in json.load(sys.stdin) if a["name"]==name),""))' "$name")
+            if [ -n "$existing" ]; then
+              curl -fsS -X DELETE -H "Authorization: token $GH_TOKEN" "$api/repos/$GH_REPO/releases/assets/$existing" >/dev/null
+            fi
+            curl -fsS -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/octet-stream" --data-binary @"$file" \
+              "$api/repos/$GH_REPO/releases/$id/assets?name=$name" >/dev/null
+            echo "uploaded $name to GitHub"
+          done
