@@ -5,25 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="robots" content="noindex,nofollow" />
     <title>流量镜像 · ly Orchestrator</title>
-    <link rel="stylesheet" href="/styles.css" />
     <style>
-      body { padding: 0; }
+      /* The embedded view reuses the console's page/card/table classes; only the
+         mirror specific bits live here so the page matches 编排组 spacing. */
       [hidden] { display: none !important; }
-      .extras-wrap { display: flex; flex-direction: column; gap: 16px; max-width: 1280px; margin: 0 auto; padding: 20px 24px 40px; }
-      .muted { color: var(--text-tertiary); font-size: 11px; }
-      .table-wrap { border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; }
-      .policy-table { width: 100%; border-collapse: collapse; }
-      .policy-table th { height: 38px; padding: 0 12px; background: var(--surface-sunken); color: var(--text-tertiary); font-size: 11px; font-weight: 600; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
-      .policy-table td { height: 44px; padding: 7px 12px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-secondary); vertical-align: middle; }
-      .policy-table tr:last-child td { border-bottom: 0; }
-      .policy-table tbody tr:hover td { background: #f8fbff; }
+      .extras-wrap { display: flex; flex-direction: column; gap: 14px; }
+      .mirror-summary { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 10px; color: var(--text-tertiary); font-size: 11px; }
+      .mirror-summary b { color: var(--text-secondary); font-weight: 600; }
       .row-actions { display: flex; gap: 2px; justify-content: flex-end; }
-      .source-list { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow: auto; }
-      .source-row { display: flex; align-items: center; gap: 9px; padding: 7px 9px; border: 1px solid var(--border); border-radius: var(--radius-md); }
-      .source-row.checked { border-color: #c7ddf7; background: #f8fbff; }
-      .source-row .name { flex: 1; min-width: 0; }
-      .source-row .name strong { display: block; font-size: 12px; }
-      .source-row .name small { display: block; color: var(--text-tertiary); font-size: 10px; }
     </style>
   </head>
   <body data-extras-page="mirror">
@@ -45,12 +34,24 @@
           <div id="no-target" class="inline-warning" hidden>
             还没有镜像口。请到「网卡设置」把目标端口的角色配置为「镜像口」，再回来添加策略。
           </div>
+          <div id="mirror-summary" class="mirror-summary"></div>
           <div class="table-wrap">
-            <table class="policy-table">
-              <thead><tr><th style="width:260px">源接口</th><th style="width:140px">方向</th><th style="width:220px">输出口</th><th style="width:110px">状态</th><th style="width:120px">操作</th></tr></thead>
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>源接口</th>
+                  <th>方向</th>
+                  <th>输出口</th>
+                  <th>状态</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
               <tbody id="policy-rows"></tbody>
             </table>
-            <div id="empty" class="muted" style="padding:18px 12px">暂无镜像策略。</div>
+            <div id="empty" class="empty-state" hidden>
+              <strong>暂无镜像策略</strong>
+              <p>添加策略后，所选源接口的流量会复制到镜像口。</p>
+            </div>
           </div>
         </div>
       </section>

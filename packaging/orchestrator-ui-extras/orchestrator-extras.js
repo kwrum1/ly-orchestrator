@@ -40,6 +40,28 @@
     };
   }
 
+  // First-paint styles. The console re-renders this page from the frozen shell
+  // and only then compacts it; hiding the wide blocks here (before React mounts)
+  // makes the compact layout the *only* layout the operator ever sees.
+  (function injectBaseStyles() {
+    if (document.getElementById("extras-base-style")) return;
+    var style = document.createElement("style");
+    style.id = "extras-base-style";
+    style.textContent = [
+      "/* 网卡设置：直接按紧凑口径绘制，避免先铺开再收起的抖动 */",
+      ".card .port-grid{display:none !important}",
+      ".card .takeover-panel p{display:none !important}",
+      ".card .card-actions .badge{display:none !important}",
+      ".nic-summary{color:var(--text-tertiary);font-size:12px;line-height:1.6}",
+      "/* 固定列宽会在宽卡片里留下大片空白，统一交给表格自适应 */",
+      ".extras-stretch-table{table-layout:auto !important;width:100% !important}",
+      ".extras-stretch-table th[style*='width']{width:auto !important}",
+      ".mirror-summary{display:flex;flex-wrap:wrap;gap:6px 18px;margin:0 0 10px;color:var(--text-tertiary);font-size:11px}",
+      ".mirror-summary b{color:var(--text-secondary);font-weight:600}"
+    ].join("\n");
+    document.head.appendChild(style);
+  })();
+
   var ITEMS = [
     {
       kind: "mirror",
@@ -339,6 +361,73 @@
   window.LyOrchExtras.currentPorts = currentPorts;
   window.LyOrchExtras.portLabel = portLabel;
   window.LyOrchExtras.isManagement = isManagement;
+
+  // ---------- first-run topology ----------
+  //
+  // A factory appliance has no topology document, so GET answers 404 and the
+  // frozen console refuses every role save with "拓扑未加载". The API also
+  // rejects a document that lacks a boundary, which makes the very first
+  // 入口/出口 assignment impossible in one step. The console therefore works
+  // against a local draft: the half-configured document is kept here and is
+  // written for real as soon as both boundaries exist.
+
+  var draftStorageKey = "lyroute.extras.topologyDraft";
+  var topologyDraft = null;
+
+  function loadDraft() {
+    if (topologyDraft) return topologyDraft;
+    try {
+      var raw = window.localStorage.getItem(draftStorageKey);
+      if (raw) topologyDraft = JSON.parse(raw);
+    } catch (err) { /* ignore a broken draft */ }
+    return topologyDraft;
+  }
+
+  function rememberDraft(doc) {
+    topologyDraft = doc || null;
+    try {
+      if (doc) window.localStorage.setItem(draftStorageKey, JSON.stringify(doc));
+      else window.localStorage.removeItem(draftStorageKey);
+    } catch (err) { /* storage is optional */ }
+  }
+
+  function emptyTopologyDraft() {
+    return currentPorts().then(function (ports) {
+      var mgmt = (ports || []).find(isManagement);
+      return {
+        schema_version: 1,
+        management_interface: (mgmt && (mgmt.id || mgmt.name)) || "eth0",
+        interfaces: [],
+        orchestration_groups: [],
+        port_roles: {}
+      };
+    }).catch(function () {
+      return { schema_version: 1, management_interface: "eth0", interfaces: [], orchestration_groups: [], port_roles: {} };
+    });
+  }
+
+  function boundaryRoles(doc) {
+    var roles = {};
+    ((doc && doc.interfaces) || []).forEach(function (item) {
+      if (item && (item.role === "lan" || item.role === "wan")) roles[item.role] = item;
+    });
+    return roles;
+  }
+
+  function mergeTopologyDraft(base, incoming) {
+    var out = JSON.parse(JSON.stringify(base || {}));
+    out.schema_version = (incoming && incoming.schema_version) || out.schema_version || 1;
+    out.management_interface = (incoming && incoming.management_interface) || out.management_interface || "eth0";
+    out.interfaces = (incoming && incoming.interfaces && incoming.interfaces.length)
+      ? incoming.interfaces
+      : (out.interfaces || []);
+    out.orchestration_groups = (incoming && incoming.orchestration_groups && incoming.orchestration_groups.length)
+      ? incoming.orchestration_groups
+      : (out.orchestration_groups || []);
+    out.port_roles = Object.assign({}, out.port_roles || {}, (incoming && incoming.port_roles) || {});
+    delete out.checksum;
+    return out;
+  }
 
   // ---------- 角色配置: LAN / WAN / 镜像口 / 未配置 ----------
 
@@ -794,6 +883,24 @@
     if (oldBadge) oldBadge.style.display = "none";
   }
 
+  // The overview card used to render a wide port grid first and collapse to a
+  // one-line summary once the API answered. Keep the summary node from the very
+  // first paint so the card never changes height.
+  function ensureOverviewPlaceholder(page) {
+    var cards = Array.prototype.slice.call(page.querySelectorAll("section.card"));
+    var card = cards.find(function (node) {
+      var h2 = node.querySelector(".card-head h2");
+      return h2 && h2.textContent.trim() === "接口总览";
+    });
+    if (!card) return;
+    var body = card.querySelector(".card-body");
+    if (!body || body.querySelector(".nic-summary")) return;
+    var summary = document.createElement("div");
+    summary.className = "nic-summary";
+    summary.textContent = "正在读取网卡信息…";
+    body.appendChild(summary);
+  }
+
   function ensureOverviewCard(page, facts) {
     var cards = Array.prototype.slice.call(page.querySelectorAll("section.card"));
     var card = cards.find(function (node) {
@@ -917,6 +1024,7 @@
     if (!page) return;
     refreshNicFacts().then(function (facts) {
       if (!document.body.contains(page)) return;
+      ensureOverviewPlaceholder(page);
       ensureTakeoverCard(page, facts);
       ensureOverviewCard(page, facts);
       ensureInterfaceTable(page, facts);
@@ -1051,6 +1159,21 @@
         }
       : null;
 
+    if (method === "GET" && /\/api\/v1\/orchestrator\/topology(\?|$)/.test(url)) {
+      return rawFetch(input, opts).then(function (response) {
+        if (response.status !== 404) return response;
+        var draft = loadDraft();
+        var ready = draft ? Promise.resolve(draft) : emptyTopologyDraft();
+        return ready.then(function (doc) {
+          return new Response(JSON.stringify({ item: doc, checksum: "" }), {
+            status: 200,
+            statusText: "OK",
+            headers: { "Content-Type": "application/json" }
+          });
+        });
+      });
+    }
+
     if (method === "GET" && /\/api\/v1\/orchestrator\/policy$/.test(url)) {
       return rawFetch(input, opts).then(function (response) {
         if (!response.ok) return response;
@@ -1072,6 +1195,20 @@
         doc.port_roles = doc.port_roles || {};
         if (roleSnapshot.role === "") delete doc.port_roles[roleSnapshot.port];
         else doc.port_roles[roleSnapshot.port] = roleSnapshot.role;
+        var pending = loadDraft();
+        if (pending) doc = mergeTopologyDraft(pending, doc);
+        var boundaries = boundaryRoles(doc);
+        if (!boundaries.lan || !boundaries.wan) {
+          rememberDraft(doc);
+          var missing = !boundaries.lan ? "入口（LAN）" : "出口（WAN）";
+          showToast("已记录当前角色，还需要配置" + missing, "info");
+          return Promise.resolve(new Response(JSON.stringify({ item: doc, checksum: "" }), {
+            status: 200,
+            statusText: "OK",
+            headers: { "Content-Type": "application/json" }
+          }));
+        }
+        rememberDraft(null);
         opts = Object.assign({}, opts, { body: JSON.stringify(doc) });
       } catch (err) { /* keep the original body */ }
     }
@@ -1222,6 +1359,41 @@
     });
   }
 
+  // 模式 下拉里的「与 LAN 共享」已经下线：管理口只支持独立模式。
+  function dropSharedManagement() {
+    document.querySelectorAll('select option[value="shared_lan"]').forEach(function (option) {
+      var select = option.parentElement;
+      // Never auto-flip a device that is currently sharing the management port:
+      // that would change the very interface the operator is connected through.
+      // An existing shared setup stays visible (but not selectable) so it can be
+      // migrated deliberately; on everything else the option is simply gone.
+      if (select && select.value === "shared_lan") {
+        option.disabled = true;
+        option.setAttribute("data-extras-removed", "1");
+        if (option.textContent.indexOf("已下线") === -1) option.textContent = option.textContent + "（已下线）";
+        return;
+      }
+      option.hidden = true;
+      option.disabled = true;
+      option.setAttribute("data-extras-removed", "1");
+    });
+  }
+
+  // 流量编排 表格用固定列宽，宽屏下右侧会空一大片；让表格自适应卡片宽度。
+  function stretchPolicyTable() {
+    var h1 = document.querySelector(".main-inner h1");
+    if (!h1 || h1.textContent.trim() !== "流量编排") return;
+    document.querySelectorAll(".main-inner table.data-table").forEach(function (table) {
+      if (table.dataset.extrasStretch === "1") return;
+      table.dataset.extrasStretch = "1";
+      table.classList.add("extras-stretch-table");
+      table.querySelectorAll("th").forEach(function (th) {
+        if (th.style.width) th.style.width = "";
+        if (th.style.minWidth) th.style.minWidth = "";
+      });
+    });
+  }
+
   function scan() {
     document.querySelectorAll(".modal").forEach(function (modal) {
       var heading = modal.querySelector(".modal-head h2");
@@ -1234,6 +1406,8 @@
     relabelConfirmTitle();
     keepSuccessToasts();
     inject();
+    dropSharedManagement();
+    stretchPolicyTable();
     normalizeStatusCopy();
     scheduleRelabel();
   }

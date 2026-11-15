@@ -102,6 +102,23 @@ window.LyExtrasMirrorView = function (root) {
     if (empty) empty.hidden = Boolean(list.length) || !port;
     var noTarget = $("no-target");
     if (noTarget) noTarget.hidden = Boolean(port);
+    var summary = $("mirror-summary");
+    if (summary) {
+      summary.innerHTML = "";
+      var pairs = [
+        ["镜像口", port ? portLabel(port) : "未配置"],
+        ["策略", list.length + " 条"]
+      ];
+      pairs.forEach(function (pair) {
+        var span = document.createElement("span");
+        span.textContent = pair[0] + " ";
+        var strong = document.createElement("b");
+        strong.textContent = String(pair[1]);
+        span.appendChild(strong);
+        summary.appendChild(span);
+      });
+    }
+
     var subtitle = $("policy-subtitle");
     if (subtitle) {
       subtitle.textContent = port
