@@ -3259,6 +3259,41 @@ func (server *Server) compileInterfaceBond(ctx context.Context, payload map[stri
 		}
 		selected = append(selected, item)
 	}
+	// A bond is a dataplane identity, not a second role assignment. A member
+	// that already owns another identity (management, LAN/WAN boundary,
+	// orchestration group or mirror) would be attached twice with conflicting
+	// expectations: the group/role would keep addressing the physical port
+	// while VPP forwards through the bond. Refuse the ambiguous configuration
+	// instead of letting a later apply silently detach one of them.
+	managementID := strings.TrimSpace(server.managementInterfaceID(ctx))
+	boundaryPorts := server.orchestratorBoundaryPorts(ctx)
+	groupPorts := server.orchestratorGroupPorts(ctx)
+	mirrorPorts := server.interfaceMirrorBoundPorts(ctx)
+	for index, item := range selected {
+		member := members[index]
+		linux := strings.TrimSpace(server.resolveInterfaceID(ctx, member))
+		identities := []string{strings.TrimSpace(member), linux, strings.TrimSpace(stringField(item, "system_name"))}
+		hasIdentity := func(set map[string]bool) bool {
+			for _, identity := range identities {
+				if identity != "" && set[identity] {
+					return true
+				}
+			}
+			return false
+		}
+		if managementID != "" && (strings.EqualFold(member, managementID) || (linux != "" && strings.EqualFold(linux, managementID))) {
+			return nil, http.StatusUnprocessableEntity, fmt.Errorf("interface bond member %q is the management interface; it never joins the dataplane", member)
+		}
+		if role, ok := boundaryRoleOf(boundaryPorts, identities); ok {
+			return nil, http.StatusUnprocessableEntity, fmt.Errorf("interface bond member %q is the %s boundary port; move the boundary before aggregating it", member, strings.ToUpper(role))
+		}
+		if hasIdentity(groupPorts) {
+			return nil, http.StatusUnprocessableEntity, fmt.Errorf("interface bond member %q belongs to an orchestration group; remove it from the group first", member)
+		}
+		if hasIdentity(mirrorPorts) {
+			return nil, http.StatusUnprocessableEntity, fmt.Errorf("interface bond member %q is used by port mirroring; clear the mirror first", member)
+		}
+	}
 	// The persisted interface item often has no speed (a DPDK-bound port has no
 	// Linux netdev). Read the live link state and VPP/hardware speed instead of
 	// comparing two empty strings, and name the failing member in the error.
@@ -3359,6 +3394,103 @@ func (server *Server) compileInterfaceBond(ctx context.Context, payload map[stri
 		}
 	}
 	return map[string]any{"id": id, "name": nonEmpty(stringField(payload, "name"), id), "members": members, "mode": "xor", "load_balance": "l34", "speed": speed, "work_mode": workMode, "runtime_state": "desired_not_applied", "vpp_operation": map[string]any{"name": "vpp.interface-bond", "mode": "xor", "load_balance": "l34", "members": members}, "capabilities": server.degradedRuntimeCapabilities(ctx)}, http.StatusOK, nil
+}
+
+// orchestratorBoundaryPorts maps every port that currently owns the LAN or WAN
+// boundary to its role. Both the resolved Linux name and the product id are
+// included so callers can test whichever identity they hold.
+func (server *Server) orchestratorBoundaryPorts(ctx context.Context) map[string]string {
+	ports := map[string]string{}
+	if server.store == nil {
+		return ports
+	}
+	documents, err := server.store.Configs(ctx, orchestratorTopologyConfigResource)
+	if err != nil {
+		return ports
+	}
+	for _, document := range documents {
+		var pack orchestratorTopologyPackage
+		if err := json.Unmarshal(document.Payload, &pack); err != nil {
+			continue
+		}
+		for _, item := range pack.Interfaces {
+			if role := strings.TrimSpace(item.Role); role == "lan" || role == "wan" {
+				if port := strings.TrimSpace(item.Port); port != "" {
+					ports[port] = role
+					if linux := strings.TrimSpace(server.resolveInterfaceID(ctx, port)); linux != "" {
+						ports[linux] = role
+					}
+				}
+				if item.Bond != nil {
+					for _, member := range item.Bond.Members {
+						if linux := strings.TrimSpace(server.resolveInterfaceID(ctx, member)); linux != "" {
+							ports[linux] = role
+						}
+						if member = strings.TrimSpace(member); member != "" {
+							ports[member] = role
+						}
+					}
+				}
+			}
+		}
+		for id, role := range pack.PortRoles {
+			id = strings.TrimSpace(id)
+			if id == "" || (role != "lan" && role != "wan") {
+				continue
+			}
+			ports[id] = role
+			if linux := strings.TrimSpace(server.resolveInterfaceID(ctx, id)); linux != "" {
+				ports[linux] = role
+			}
+		}
+	}
+	return ports
+}
+
+// boundaryRoleOf returns the boundary role for the first identity present.
+func boundaryRoleOf(ports map[string]string, identities []string) (string, bool) {
+	for _, identity := range identities {
+		if identity == "" {
+			continue
+		}
+		if role, ok := ports[identity]; ok {
+			return role, true
+		}
+	}
+	return "", false
+}
+
+// interfaceMirrorBoundPorts lists the mirror destination and every source, in
+// both product-id and resolved Linux-name form.
+func (server *Server) interfaceMirrorBoundPorts(ctx context.Context) map[string]bool {
+	ports := map[string]bool{}
+	items, err := server.desiredItems(ctx, "interface")
+	if err != nil {
+		return ports
+	}
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		ports[id] = true
+		if linux := strings.TrimSpace(server.resolveInterfaceID(ctx, id)); linux != "" {
+			ports[linux] = true
+		}
+	}
+	for _, item := range items {
+		if truthy(item["deleted"]) {
+			continue
+		}
+		if !interfaceMirrorEnabled(item) {
+			continue
+		}
+		add(nonEmpty(stringField(item, "interface_id"), stringField(item, "id")))
+		for _, source := range interfaceMirrorSourcesOf(item) {
+			add(source.Interface)
+		}
+	}
+	return ports
 }
 
 func (server *Server) handleDHCPLeases(w http.ResponseWriter, r *http.Request) {
