@@ -1,0 +1,37 @@
+#!/bin/sh
+# Ly Route orchestrator installer kiosk session, started through xinit on tty1.
+set -eu
+
+export HOME=${HOME:-/var/lib/ly-route/installer/kiosk}
+export XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$HOME/.cache}
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+
+xsetroot -solid '#0b1219' 2>/dev/null || true
+xset s off 2>/dev/null || true
+xset -dpms 2>/dev/null || true
+
+: > "$HOME/chromium.log"
+
+exec /usr/bin/chromium \
+  --kiosk \
+  --no-sandbox \
+  --single-process \
+  --disable-gpu \
+  --disable-dev-shm-usage \
+  --disable-background-networking \
+  --disable-component-update \
+  --disable-sync \
+  --disable-translate \
+  --disable-features=Translate,MediaRouter,OptimizationHints \
+  --metrics-recording-only \
+  --no-first-run \
+  --no-default-browser-check \
+  --no-pings \
+  --password-store=basic \
+  --use-mock-keychain \
+  --lang=zh-CN \
+  --window-position=0,0 \
+  --window-size=1280,800 \
+  --user-data-dir="$HOME/chromium" \
+  http://127.0.0.1:8080/ >>"$HOME/chromium.log" 2>&1

@@ -1,0 +1,14 @@
+[Unit]
+Description=Ly Route orchestrator installer API (loopback only)
+After=local-fs.target
+Before=ly-route-kiosk.service
+ConditionKernelCommandLine=lyroute.autoinstall=1
+
+[Service]
+Type=simple
+ExecStart=/opt/ly-route/installer/bin/ly-installer-web -listen 127.0.0.1:8080
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

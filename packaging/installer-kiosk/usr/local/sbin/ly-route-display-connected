@@ -1,0 +1,8 @@
+#!/bin/sh
+# Exit 0 when a display is actually attached. A firmware framebuffer exists on
+# headless appliances too, so DRM connector state is the only reliable signal.
+for status in /sys/class/drm/card*-*/status; do
+  [ -r "$status" ] || continue
+  [ "$(cat "$status" 2>/dev/null || true)" = connected ] && exit 0
+done
+exit 1

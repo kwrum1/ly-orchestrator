@@ -1,0 +1,31 @@
+[Unit]
+Description=Ly Route orchestration graphical installer (Chromium on tty1)
+Wants=ly-route-installer-web.service
+After=ly-route-installer-web.service
+Conflicts=getty@tty1.service
+ConditionKernelCommandLine=lyroute.autoinstall=1
+ConditionKernelCommandLine=!lyroute.headless=1
+ConditionPathExists=/etc/ly-route/installer/kiosk
+ExecCondition=/usr/local/sbin/ly-route-display-connected
+
+[Service]
+Type=simple
+User=lykiosk
+Group=lykiosk
+SupplementaryGroups=video input audio tty
+Environment=HOME=/var/lib/ly-route/installer/kiosk
+Environment=XDG_CONFIG_HOME=/var/lib/ly-route/installer/kiosk/.config
+Environment=XDG_CACHE_HOME=/var/lib/ly-route/installer/kiosk/.cache
+WorkingDirectory=/var/lib/ly-route/installer/kiosk
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+ExecStartPre=/usr/lib/ly-route/installer/wait-for-installer
+ExecStart=/usr/bin/xinit /usr/lib/ly-route/installer/kiosk-session -- :0 vt1 -nolisten tcp -keeptty -logfile /var/lib/ly-route/installer/kiosk/Xorg.0.log
+Restart=on-failure
+RestartSec=3
+ReadWritePaths=/var/lib/ly-route/installer/kiosk /var/lib/xkb /run
+
+[Install]
+WantedBy=multi-user.target

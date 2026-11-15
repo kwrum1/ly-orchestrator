@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ly Route 编排器安装</title>
+<style>
+  :root {
+    --bg: #0b1219; --panel: #121c26; --line: #22303d; --text: #e6edf3;
+    --muted: #8ba0b3; --accent: #3f8cff; --ok: #35c07f; --warn: #ffb020; --bad: #ff5d5d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.6 "Noto Sans CJK SC", "DejaVu Sans", system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  header { padding: 28px 40px 8px; }
+  header h1 { margin: 0; font-size: 24px; font-weight: 600; letter-spacing: .5px; }
+  header p { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
+  main { max-width: 1080px; margin: 0 auto; padding: 16px 40px 48px; }
+  .steps { display: flex; gap: 10px; margin: 18px 0 22px; flex-wrap: wrap; }
+  .step { flex: 1 1 150px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; color: var(--muted); font-size: 13px; }
+  .step.active { border-color: var(--accent); color: var(--text); background: rgba(63,140,255,.08); }
+  .step.done { border-color: var(--ok); color: var(--ok); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 22px 24px; }
+  h2 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
+  .hint { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+  .list { display: flex; flex-direction: column; gap: 10px; }
+  .option {
+    display: flex; align-items: center; gap: 12px; padding: 13px 16px;
+    border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+  }
+  .option:hover { border-color: #35506b; }
+  .option.selected { border-color: var(--accent); background: rgba(63,140,255,.09); }
+  .option.disabled { opacity: .45; cursor: not-allowed; }
+  .option .grow { flex: 1; }
+  .mono { font-family: "DejaVu Sans Mono", monospace; font-size: 13px; }
+  .tag { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .tag.ok { color: var(--ok); border-color: rgba(53,192,127,.4); }
+  .tag.bad { color: var(--bad); border-color: rgba(255,93,93,.4); }
+  .field { margin-bottom: 16px; }
+  .field label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  input[type=text], input[type=password] {
+    width: 100%; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--line);
+    background: #0d1722; color: var(--text); font: inherit; font-family: "DejaVu Sans Mono", monospace;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .summary { display: grid; grid-template-columns: 150px 1fr; gap: 10px 18px; font-size: 14px; }
+  .summary dt { color: var(--muted); }
+  .summary dd { margin: 0; }
+  .actions { display: flex; gap: 12px; justify-content: flex-end; margin-top: 24px; }
+  button {
+    font: inherit; padding: 12px 26px; border-radius: 10px; border: 1px solid var(--line);
+    background: #16212c; color: var(--text); cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #04101f; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .notice { border: 1px solid rgba(255,176,32,.35); background: rgba(255,176,32,.08); color: #ffd48a;
+    border-radius: 10px; padding: 12px 14px; font-size: 13px; margin: 16px 0 0; }
+  pre#log {
+    margin: 0; max-height: 46vh; overflow: auto; background: #070d13; border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px; font-family: "DejaVu Sans Mono", monospace; font-size: 12.5px;
+    color: #b9cad9; white-space: pre-wrap; word-break: break-all;
+  }
+  .status { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; font-size: 14px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--warn); }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Ly Route 编排器安装</h1>
+  <p>选择安装磁盘与管理网口，确认后开始写入；数据网卡由安装器自动预检。</p>
+</header>
+<main>
+  <div class="steps">
+    <div class="step" data-step="1">1 · 安装磁盘</div>
+    <div class="step" data-step="2">2 · 管理网口</div>
+    <div class="step" data-step="3">3 · 管理地址</div>
+    <div class="step" data-step="4">4 · 确认安装</div>
+  </div>
+
+  <section id="panel-1" class="card">
+    <h2>选择安装磁盘</h2>
+    <p class="hint">被选中的磁盘会被整盘格式化。安装介质本身已自动排除。</p>
+    <div id="disks" class="list"></div>
+    <div class="actions"><button class="primary" id="next-1" disabled>下一步</button></div>
+  </section>
+
+  <section id="panel-2" class="card hidden">
+    <h2>选择管理网口</h2>
+    <p class="hint">该口用于管理访问（控制台与 API），其余网口进入数据面预检。</p>
+    <div id="nics" class="list"></div>
+    <div class="actions">
+      <button id="back-2">上一步</button>
+      <button class="primary" id="next-2" disabled>下一步</button>
+    </div>
+  </section>
+
+  <section id="panel-3" class="card hidden">
+    <h2>管理地址</h2>
+    <p class="hint">安装完成后用浏览器访问 https://&lt;管理地址&gt; 进入编排器控制台。</p>
+    <div class="row">
+      <div class="field">
+        <label>管理地址（IPv4/CIDR）</label>
+        <input type="text" id="cidr" value="192.168.88.254/24" spellcheck="false">
+      </div>
+      <div class="field">
+        <label>网关</label>
+        <input type="text" id="gateway" value="192.168.88.1" spellcheck="false">
+      </div>
+    </div>
+    <div class="field">
+      <label>初始管理员密码（可选，留空使用默认值）</label>
+      <input type="text" id="password" value="LyRoute@Init2026" spellcheck="false">
+    </div>
+    <p class="notice">首次登录会用该密码，并强制修改为新密码。请记下它。</p>
+    <div class="actions">
+      <button id="back-3">上一步</button>
+      <button class="primary" id="next-3">下一步</button>
+    </div>
+  </section>
+
+  <section id="panel-4" class="card hidden">
+    <h2>确认安装</h2>
+    <p class="hint">下面是要写入的最终参数，确认无误后开始。</p>
+    <dl class="summary">
+      <dt>安装磁盘</dt><dd id="sum-disk" class="mono"></dd>
+      <dt>管理网口</dt><dd id="sum-nic" class="mono"></dd>
+      <dt>管理地址</dt><dd id="sum-cidr" class="mono"></dd>
+      <dt>网关</dt><dd id="sum-gateway" class="mono"></dd>
+      <dt>初始密码</dt><dd id="sum-password" class="mono"></dd>
+    </dl>
+    <p class="notice">开始后磁盘数据会被清除，过程中请勿断电。</p>
+    <div class="actions">
+      <button id="back-4">上一步</button>
+      <button class="primary" id="install">开始安装</button>
+    </div>
+  </section>
+
+  <section id="panel-5" class="card hidden">
+    <div class="status"><span class="dot" id="state-dot"></span><span id="state-text">安装进行中…</span></div>
+    <pre id="log"></pre>
+    <div class="actions"><button id="reboot" class="hidden">立即重启</button></div>
+  </section>
+</main>
+<script>
+const state = { inventory: null, disk: null, nic: null, step: 1, offset: 0, timer: null };
+
+const $ = (id) => document.getElementById(id);
+
+function humanBytes(bytes) {
+  if (!bytes) return "?";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return value.toFixed(value >= 10 || unit === 0 ? 0 : 1) + units[unit];
+}
+
+function show(step) {
+  state.step = step;
+  [1, 2, 3, 4, 5].forEach((n) => $("panel-" + n).classList.toggle("hidden", n !== step));
+  document.querySelectorAll(".step").forEach((el) => {
+    const n = Number(el.dataset.step);
+    el.classList.toggle("active", n === step);
+    el.classList.toggle("done", n < step);
+  });
+}
+
+async function loadInventory() {
+  const response = await fetch("/api/installer/v1/inventory");
+  if (!response.ok) throw new Error("无法读取设备信息");
+  state.inventory = await response.json();
+  const disks = $("disks");
+  disks.innerHTML = "";
+  const list = state.inventory.disks || [];
+  list.forEach((disk) => {
+    const row = document.createElement("div");
+    row.className = "option" + (disk.eligible ? "" : " disabled");
+    row.innerHTML = '<div class="grow"><span class="mono">' + disk.name + "</span>" +
+      ' <span class="tag">' + humanBytes(disk.size) + "</span></div>" +
+      '<div class="mono">' + (disk.model || "") + "</div>" +
+      (disk.eligible ? "" : '<span class="tag bad">' + (disk.reason || "不可用") + "</span>");
+    if (disk.eligible) {
+      row.onclick = () => {
+        state.disk = disk;
+        document.querySelectorAll("#disks .option").forEach((el) => el.classList.remove("selected"));
+        row.classList.add("selected");
+        $("next-1").disabled = false;
+      };
+      if (!state.disk) { state.disk = disk; row.classList.add("selected"); $("next-1").disabled = false; }
+    }
+    disks.appendChild(row);
+  });
+  if (!list.some((disk) => disk.eligible)) {
+    disks.innerHTML = '<p class="hint">没有找到可安装的磁盘。</p>';
+  }
+
+  const nics = $("nics");
+  nics.innerHTML = "";
+  (state.inventory.nics || []).forEach((nic) => {
+    const row = document.createElement("div");
+    row.className = "option";
+    row.innerHTML = '<div class="grow"><span class="mono">' + nic.name + "</span>" +
+      ' <span class="tag' + (nic.link ? " ok" : "") + '">' + (nic.link ? "已连接" : "无链路") + "</span></div>" +
+      '<div class="mono">' + nic.mac + " · " + nic.pci + (nic.driver ? " · " + nic.driver : "") + "</div>";
+    row.onclick = () => {
+      state.nic = nic;
+      document.querySelectorAll("#nics .option").forEach((el) => el.classList.remove("selected"));
+      row.classList.add("selected");
+      $("next-2").disabled = false;
+    };
+    if (!state.nic && nic.link) { state.nic = nic; row.classList.add("selected"); $("next-2").disabled = false; }
+    nics.appendChild(row);
+  });
+  if (!(state.inventory.nics || []).length) {
+    nics.innerHTML = '<p class="hint">没有找到物理网口。</p>';
+  }
+  if (state.inventory.defaults) {
+    $("cidr").value = state.inventory.defaults.cidr || $("cidr").value;
+    $("gateway").value = state.inventory.defaults.gateway || $("gateway").value;
+  }
+}
+
+$("next-1").onclick = () => show(2);
+$("back-2").onclick = () => show(1);
+$("next-2").onclick = () => show(3);
+$("back-3").onclick = () => show(2);
+$("next-3").onclick = () => {
+  $("sum-disk").textContent = state.disk ? state.disk.name + "  " + humanBytes(state.disk.size) : "-";
+  $("sum-nic").textContent = state.nic ? state.nic.name + "  " + state.nic.mac : "-";
+  $("sum-cidr").textContent = $("cidr").value.trim();
+  $("sum-gateway").textContent = $("gateway").value.trim();
+  $("sum-password").textContent = $("password").value.trim() || "LyRoute@Init2026";
+  show(4);
+};
+$("back-4").onclick = () => show(3);
+
+$("install").onclick = async () => {
+  $("install").disabled = true;
+  const body = {
+    disk: state.disk ? state.disk.name : "",
+    management_mac: state.nic ? state.nic.mac : "",
+    cidr: $("cidr").value.trim(),
+    gateway: $("gateway").value.trim(),
+    password: $("password").value.trim(),
+  };
+  const response = await fetch("/api/installer/v1/install", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    $("install").disabled = false;
+    alert(payload.error || "无法开始安装");
+    return;
+  }
+  show(5);
+  state.offset = 0;
+  $("log").textContent = "";
+  if (state.timer) clearInterval(state.timer);
+  state.timer = setInterval(poll, 1000);
+  poll();
+};
+
+async function poll() {
+  try {
+    const logResponse = await fetch("/api/installer/v1/log?offset=" + state.offset);
+    if (logResponse.ok) {
+      const chunk = await logResponse.json();
+      if (chunk.data) {
+        state.offset = chunk.offset;
+        const pre = $("log");
+        const pinned = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 32;
+        pre.textContent += chunk.data;
+        if (pinned) pre.scrollTop = pre.scrollHeight;
+      }
+    }
+    const statusResponse = await fetch("/api/installer/v1/status");
+    if (statusResponse.ok) {
+      const status = await statusResponse.json();
+      const dot = $("state-dot");
+      const text = $("state-text");
+      if (status.state === "succeeded") {
+        dot.className = "dot ok"; text.textContent = status.message || "安装完成，正在重启";
+        $("reboot").classList.remove("hidden");
+        clearInterval(state.timer);
+      } else if (status.state === "failed") {
+        dot.className = "dot bad"; text.textContent = status.message || "安装失败";
+        $("reboot").classList.remove("hidden");
+        clearInterval(state.timer);
+      } else {
+        text.textContent = "安装进行中…" + (status.elapsed_seconds ? "（" + status.elapsed_seconds + " 秒）" : "");
+      }
+    }
+  } catch (err) { /* keep polling through transient errors */ }
+}
+
+$("reboot").onclick = async () => {
+  try { await fetch("/api/installer/v1/reboot", { method: "POST" }); } catch (err) {}
+};
+
+loadInventory().catch((err) => {
+  $("disks").innerHTML = '<p class="hint">' + err.message + "</p>";
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Wait until the installer API answers before starting the browser, so the
+# first page load cannot race the daemon.
+set -eu
+for _ in $(seq 1 120); do
+  if curl -fsS --max-time 1 http://127.0.0.1:8080/api/installer/v1/health >/dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 1
+done
+echo "ly-route: installer API did not become ready" >&2
+exit 1

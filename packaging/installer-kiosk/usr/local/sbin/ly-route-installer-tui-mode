@@ -1,0 +1,10 @@
+#!/bin/sh
+# The text installer owns the console when no display is attached, or when the
+# operator asked for it explicitly.
+for token in $(cat /proc/cmdline); do
+  case "$token" in
+    lyroute.console=*|lyroute.headless=1) exit 0 ;;
+  esac
+done
+/usr/local/sbin/ly-route-display-connected && exit 1
+exit 0

@@ -1,0 +1,14 @@
+{
+  "HomepageLocation": "http://127.0.0.1:8080/",
+  "RestoreOnStartup": 4,
+  "RestoreOnStartupURLs": ["http://127.0.0.1:8080/"],
+  "TranslateEnabled": false,
+  "DefaultBrowserSettingEnabled": false,
+  "MetricsReportingEnabled": false,
+  "NetworkPredictionOptions": 2,
+  "BrowserSignin": 0,
+  "PromotionsEnabled": false,
+  "SearchSuggestEnabled": false,
+  "SpellcheckEnabled": false,
+  "IncognitoModeAvailability": 1
+}

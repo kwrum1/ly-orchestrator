@@ -160,20 +160,50 @@ payload=$payload_dir/ly-route-orchestrator-x86_64.img.zst
 log=/var/log/ly-route-installer.log
 exec > >(tee -a "$log") 2>&1
 
-# The ESXi remote console injects keys into the graphical virtual terminal,
-# not into its optional serial-log device. Bind the installer service to tty1
-# so both local hardware consoles and ESXi use the same visible input path.
-prompt_tty=/dev/tty1
+# Console selection. Machines with a monitor must land on tty1 (the ESXi remote
+# console also injects keys into the graphical virtual terminal), headless
+# appliances must land on the serial console. An explicit lyroute.console=
+# kernel argument always wins; otherwise a connected DRM connector decides.
+connected_display() {
+  local status
+  for status in /sys/class/drm/card*-*/status; do
+    [ -r "$status" ] || continue
+    [ "$(cat "$status" 2>/dev/null || true)" = connected ] && return 0
+  done
+  return 1
+}
+console_override=
+for token in $(cat /proc/cmdline); do
+  case "$token" in lyroute.console=*) console_override=${token#lyroute.console=} ;; esac
+done
+prompt_tty=$console_override
+mirror_tty=
+if [ -z "$prompt_tty" ]; then
+  if connected_display; then
+    prompt_tty=/dev/tty1
+    mirror_tty=/dev/ttyS0
+  else
+    prompt_tty=/dev/ttyS0
+    mirror_tty=/dev/tty1
+  fi
+fi
 say() {
   local message="[ly Orchestrator] $*"
   printf '\n%s\n' "$message" >> "$log"
   printf '\n%s\n' "$message" > "$prompt_tty" 2>/dev/null || true
+  # Mirror to the other console so a machine with a monitor still leaves a
+  # serial log and a headless appliance still feeds a connected terminal.
+  if [ -n "$mirror_tty" ] && [ "$mirror_tty" != "$prompt_tty" ] && [ -w "$mirror_tty" ]; then
+    printf '\n%s\n' "$message" > "$mirror_tty" 2>/dev/null || true
+  fi
 }
 fail() { say "Installation stopped: $*"; exit 1; }
 [ -r "$prompt_tty" ] && [ -w "$prompt_tty" ] || prompt_tty=/dev/console
 [ -r "$prompt_tty" ] && [ -w "$prompt_tty" ] || fail 'installer console is unavailable'
 cmdline=" $(cat /proc/cmdline) "
-case "$cmdline" in *' lyroute.autoinstall=1 '*) ;; *) fail 'installer mode is not enabled' ;; esac
+if [ "${LYROUTE_AUTOINSTALL:-0}" != 1 ]; then
+  case "$cmdline" in *' lyroute.autoinstall=1 '*) ;; *) fail 'installer mode is not enabled' ;; esac
+fi
 
 ask() {
   local prompt=$1 default=$2 answer
@@ -182,13 +212,27 @@ ask() {
   printf '%s\n' "${answer:-$default}"
 }
 
+# Answer resolution. Kernel arguments stay the primary interface (they are what
+# a preseeded USB or an iPXE boot controls), but every answer can also come from
+# an environment variable named LYROUTE_<KEY> so the graphical installer can
+# drive the very same engine without rebooting the machine.
 cmdline_value() {
-  local key=$1 token
+  local key=$1 token env_name
+  env_name=LYROUTE_$(printf '%s' "$key" | tr '[:lower:].-' '[:upper:]__')
+  if [ -n "${!env_name:-}" ]; then printf '%s\n' "${!env_name}"; return 0; fi
   for token in $(cat /proc/cmdline); do
     case "$token" in "$key"=*) printf '%s\n' "${token#*=}"; return 0 ;; esac
   done
   return 1
 }
+
+# Factory default administrator password. A headless or serial install has no
+# screen to read a generated password from, so the installer seeds a known value
+# into the appliance. The appliance still boots with
+# LY_ROUTE_FORCE_PASSWORD_CHANGE=true, so the first web login must choose a new
+# password before anything else. Override with lyroute.admin_password=...
+initial_admin_password=$(cmdline_value lyroute.admin_password || true)
+[ -n "$initial_admin_password" ] || initial_admin_password='LyRoute@Init2026'
 
 list_nics() {
   local path name mac state device pci driver
@@ -453,6 +497,23 @@ EOF
 chmod 0600 /mnt/etc/ly-route/installer-network.env
 [ -s /mnt/etc/ly-route/installed-network.json ] || fail 'installed network mapping was not written'
 [ -s /mnt/etc/ly-route/installer-network.env ] || fail 'installer network environment was not written'
+# Seed a known initial administrator credential. firstboot.sh keeps the file
+# when it is non-empty and mirrors it into the control API environment, so the
+# serial console and the web UI accept the same password on first boot.
+password_file=/mnt/root/ly-route-initial-admin-password
+mkdir -p /mnt/root
+(umask 077; printf '%s' "$initial_admin_password" > "$password_file")
+chmod 0600 "$password_file"
+control_env=/mnt/etc/ly-route/control-api.env
+mkdir -p "$(dirname "$control_env")"
+touch "$control_env"
+chmod 0600 "$control_env"
+grep -v -E '^LY_ROUTE_ADMIN_PASSWORD(_HASH)?=' "$control_env" > "$control_env.tmp.$$" || true
+printf 'LY_ROUTE_ADMIN_PASSWORD=%s\n' "$initial_admin_password" >> "$control_env.tmp.$$"
+printf 'LY_ROUTE_FORCE_PASSWORD_CHANGE=true\n' >> "$control_env.tmp.$$"
+chmod 0600 "$control_env.tmp.$$"
+mv -f "$control_env.tmp.$$" "$control_env"
+[ -s "$password_file" ] || fail 'initial administrator password was not written'
 sync
 runtime_env=/mnt/etc/ly-route/runtime.env
 runtime_env_tmp="$runtime_env.tmp.$$"
@@ -465,6 +526,8 @@ printf 'LY_ROUTE_VMXNET3_TAP_BRIDGE_ACCEPTANCE=%s\n' "$vmxnet3_tap_bridge_accept
 chmod 0644 "$runtime_env_tmp"
 mv -f "$runtime_env_tmp" "$runtime_env"
 umount /mnt
+say "管理员账号：admin"
+say "初始管理员密码：$initial_admin_password （首次登录必须修改）"
 if [ "$(cmdline_value lyroute.poweroff || true)" = 1 ]; then
   say '安装完成，正在关闭电源。请移除 ISO 后从硬盘启动。'
   sync
@@ -477,13 +540,31 @@ fi
 INSTALLER
 chmod 0755 "$work/config/includes.chroot/usr/local/sbin/ly-route-auto-install"
 
+# Graphical installer assets. The kiosk drives the very same text engine through
+# LYROUTE_* answers, so there is one installation implementation, not two.
+cp -a "$repo_root/packaging/installer-kiosk/." "$work/config/includes.chroot/"
+mkdir -p "$work/config/includes.chroot/opt/ly-route/installer/bin"
+(
+  cd "$repo_root/backend"
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags '-s -w' \
+    -o "$work/config/includes.chroot/opt/ly-route/installer/bin/ly-installer-web" ./installerweb
+)
+chmod 0755 "$work/config/includes.chroot/opt/ly-route/installer/bin/ly-installer-web"
+ln -sf ../ly-route-kiosk.service \
+  "$work/config/includes.chroot/etc/systemd/system/multi-user.target.wants/ly-route-kiosk.service"
+ln -sf ../ly-route-installer-web.service \
+  "$work/config/includes.chroot/etc/systemd/system/multi-user.target.wants/ly-route-installer-web.service"
+
 cat > "$work/config/includes.chroot/etc/systemd/system/ly-route-auto-install.service" <<'EOF'
 [Unit]
 Description=ly Orchestrator automatic appliance installer
 After=live-config.service local-fs.target dev-tty1.device
 Before=getty.target
-Conflicts=getty@tty1.service
+Conflicts=getty@tty1.service serial-getty@ttyS0.service
 ConditionKernelCommandLine=lyroute.autoinstall=1
+# A machine with a display is driven by the Chromium kiosk; the text engine only
+# takes over when it is headless or the operator asked for lyroute.console=.
+ExecCondition=/usr/local/sbin/ly-route-installer-tui-mode
 
 [Service]
 Type=oneshot
@@ -491,7 +572,7 @@ ExecStart=/usr/local/sbin/ly-route-auto-install
 StandardInput=tty-force
 StandardOutput=tty
 StandardError=tty
-TTYPath=/dev/tty1
+TTYPath=/dev/ttyS0
 TTYReset=yes
 
 [Install]
@@ -522,6 +603,18 @@ findutils
 pciutils
 ethtool
 kmod
+# Graphical installer (kiosk): a machine with a monitor gets the Chromium
+# wizard, a headless appliance keeps the serial/text engine.
+xserver-xorg-core
+xserver-xorg-legacy
+xserver-xorg-input-libinput
+xserver-xorg-video-fbdev
+xinit
+x11-xserver-utils
+chromium
+fonts-dejavu-core
+fonts-noto-cjk
+curl
 EOF
 
 # The Debian live-build version on CI resolves its ISOLINUX source from
@@ -551,6 +644,14 @@ cat > "$work/config/hooks/live/0100-installer-permissions.hook.chroot" <<'EOF'
 #!/bin/sh
 set -e
 chmod 0755 /usr/local/sbin/ly-route-auto-install
+chmod 0755 /usr/local/sbin/ly-route-display-connected \
+  /usr/local/sbin/ly-route-installer-tui-mode \
+  /usr/lib/ly-route/installer/wait-for-installer \
+  /usr/lib/ly-route/installer/kiosk-session \
+  /opt/ly-route/installer/bin/ly-installer-web
+id lykiosk >/dev/null 2>&1 || useradd -r -m -d /var/lib/ly-route/installer/kiosk \
+  -s /usr/sbin/nologin -G video,input,audio,tty lykiosk
+install -d -o lykiosk -g lykiosk -m 0700 /var/lib/ly-route/installer/kiosk
 EOF
 chmod 0755 "$work/config/hooks/live/0100-installer-permissions.hook.chroot"
 
