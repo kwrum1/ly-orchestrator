@@ -710,13 +710,13 @@ func (runtime *productionOrchestratorRuntime) reconcileTransparentLocked(ctx con
 		runtime.transparentVerifiedGeneration == expected &&
 		runtime.transparentVerifiedDefault == configuredDefault &&
 		!runtime.transparentVerifiedAt.IsZero() &&
-		time.Since(runtime.transparentVerifiedAt) < 30*time.Second
+		time.Since(runtime.transparentVerifiedAt) < 5*time.Second
 	if reusedReadback {
+		// Do not consume the readback: both the write's own verification and the
+		// periodic loop may reconcile inside the same few seconds, and the
+		// observation costs about two seconds on this appliance. After the short
+		// window expires the next loop observes the plugin for real.
 		observed = runtime.transparentVerifiedReadback
-		// Consume it: the next reconciliation must observe the plugin again.
-		runtime.transparentVerifiedGeneration = ""
-		runtime.transparentVerifiedDefault = ""
-		runtime.transparentVerifiedAt = time.Time{}
 	} else {
 		observed, observeErr = runtime.adapter.ObserveTransparentOrchestrator(ctx, requestID+"-observe")
 	}
