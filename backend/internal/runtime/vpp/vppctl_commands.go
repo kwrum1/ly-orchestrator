@@ -608,74 +608,100 @@ func (channel *vppctlChannel) doCommands(ctx context.Context, operation Operatio
 }
 
 // doTransparentOrchestratorBatch runs the candidate-building commands of one
-// orchestrator apply through a single `vppctl exec`. It only takes over when the
-// operation is the plain apply (not an observation/disable), every command is a
-// candidate/commit/SPAN mutation or a show, and there is enough work to pay for
-// the file round trip. Anything unusual falls back to the per-command path.
+// orchestrator apply through `vppctl exec` files. A policy apply is dominated by
+// process launches, not VPP work: one vppctl process per rule costs ~35ms on
+// this class of appliance.
+//
+// The candidate commands are strict: a CLI error fails the apply. The SPAN
+// cleanup commands carry the `?` ignore-failure marker, so they go into a
+// lenient batch (a missing session is expected). Readback commands keep the
+// normal path because callers inspect their stdout. The readback verification
+// compares the policy row count with the rule commands, so a rule the batch
+// silently dropped still fails the apply.
 func (channel *vppctlChannel) doTransparentOrchestratorBatch(ctx context.Context, operation Operation) (Reply, bool, error) {
 	if operation.Name != "vpp.transparent-orchestrator" || len(operation.VPPCtlCommands) < 8 {
 		return Reply{}, false, nil
 	}
-	results := make([]VPPCTLCommandResult, len(operation.VPPCtlCommands))
-	mutating := make([]string, 0, len(operation.VPPCtlCommands))
-	mutatingSlots := make([]int, 0, len(operation.VPPCtlCommands))
-	shows := make([]int, 0, 2)
+	commands := make([]string, len(operation.VPPCtlCommands))
 	for index, raw := range operation.VPPCtlCommands {
-		command := strings.TrimSpace(raw)
-		results[index].Command = command
-		// The batch file cannot express the `?` ignore-failure marker; mirror
-		// cleanup uses it, so those applies keep the per-command path.
-		if command == "" || strings.HasPrefix(command, "?") {
+		commands[index] = strings.TrimSpace(raw)
+		if commands[index] == "" {
 			return Reply{}, false, nil
 		}
-		if err := forbiddenVPPCTLCommand(command); err != nil {
-			return Reply{}, false, nil
-		}
-		switch {
-		case strings.HasPrefix(command, "show "):
-			shows = append(shows, index)
-		case strings.HasPrefix(command, "set ly-route orchestrator "),
-			strings.HasPrefix(command, "set interface span "),
-			strings.HasPrefix(command, "interface span "):
-			mutating = append(mutating, command)
-			mutatingSlots = append(mutatingSlots, index)
-		default:
+		if err := forbiddenVPPCTLCommand(commands[index]); err != nil {
 			return Reply{}, false, nil
 		}
 	}
-	if len(mutating) < 8 {
+	// Candidate commands are a contiguous prefix, the `?` SPAN cleanup follows,
+	// and the readback is last. Anything else falls back to the old path.
+	strictEnd := 0
+	for strictEnd < len(commands) && strings.HasPrefix(commands[strictEnd], "set ly-route orchestrator ") {
+		strictEnd++
+	}
+	lenientEnd := strictEnd
+	for lenientEnd < len(commands) && strings.HasPrefix(commands[lenientEnd], "?") {
+		lenientEnd++
+	}
+	for _, command := range commands[lenientEnd:] {
+		if !strings.HasPrefix(command, "show ") {
+			return Reply{}, false, nil
+		}
+	}
+	if strictEnd < 8 {
 		return Reply{}, false, nil
 	}
-	for begin := 0; begin < len(mutating); begin += vppRouteBatchChunkSize {
+	results := make([]VPPCTLCommandResult, len(commands))
+	for index, command := range commands {
+		results[index].Command = command
+	}
+	for begin := 0; begin < strictEnd; begin += vppRouteBatchChunkSize {
 		end := begin + vppRouteBatchChunkSize
-		if end > len(mutating) {
-			end = len(mutating)
+		if end > strictEnd {
+			end = strictEnd
 		}
-		label := fmt.Sprintf("vpp orchestrator batch %d-%d/%d", begin+1, end, len(mutating))
-		batchResult, err := channel.executeVPPBatchFile(ctx, mutating[begin:end], label)
+		label := fmt.Sprintf("vpp orchestrator batch %d-%d/%d", begin+1, end, strictEnd)
+		batchResult, err := channel.executeVPPBatchFile(ctx, commands[begin:end], label, true)
 		if err != nil {
 			return Reply{Operation: operation.Name, Retval: 1, Payload: VPPCTLReplyPayload{CommandResults: results}}, true, err
 		}
-		// Attribute the combined output to the first command of the chunk for
-		// diagnostics; the caller only reads the trailing show results.
-		results[mutatingSlots[begin]].Stdout = batchResult.Stdout
-		results[mutatingSlots[begin]].Stderr = batchResult.Stderr
+		results[begin].Stdout = batchResult.Stdout
+		results[begin].Stderr = batchResult.Stderr
 	}
-	for _, index := range shows {
+	if lenientEnd > strictEnd {
+		cleanup := make([]string, 0, lenientEnd-strictEnd)
+		for _, command := range commands[strictEnd:lenientEnd] {
+			cleanup = append(cleanup, strings.TrimSpace(strings.TrimPrefix(command, "?")))
+		}
+		for begin := 0; begin < len(cleanup); begin += vppRouteBatchChunkSize {
+			end := begin + vppRouteBatchChunkSize
+			if end > len(cleanup) {
+				end = len(cleanup)
+			}
+			label := fmt.Sprintf("vpp span cleanup batch %d-%d/%d", begin+1, end, len(cleanup))
+			batchResult, err := channel.executeVPPBatchFile(ctx, cleanup[begin:end], label, false)
+			if err != nil {
+				return Reply{Operation: operation.Name, Retval: 1, Payload: VPPCTLReplyPayload{CommandResults: results}}, true, err
+			}
+			results[strictEnd+begin].Stdout = batchResult.Stdout
+			results[strictEnd+begin].Stderr = batchResult.Stderr
+		}
+	}
+	if lenientEnd < len(commands) {
 		reply, err := channel.doCommands(ctx, Operation{
 			Name:           operation.Name,
 			RequestID:      operation.RequestID,
 			Resource:       operation.Resource,
-			VPPCtlCommands: []string{results[index].Command},
+			Payload:        operation.Payload,
+			VPPCtlCommands: commands[lenientEnd:],
 		})
 		if err != nil {
 			return reply, true, err
 		}
 		payload, ok := reply.Payload.(VPPCTLReplyPayload)
-		if !ok || len(payload.CommandResults) != 1 {
+		if !ok || len(payload.CommandResults) != len(commands)-lenientEnd {
 			return reply, true, fmt.Errorf("%w: %s readback is incomplete", ErrSnapshotIncomplete, operation.Name)
 		}
-		results[index] = payload.CommandResults[0]
+		copy(results[lenientEnd:], payload.CommandResults)
 	}
 	return Reply{Operation: operation.Name, Payload: VPPCTLReplyPayload{CommandResults: results}}, true, nil
 }
@@ -890,12 +916,12 @@ func (channel *vppctlChannel) doVPPRouteBatch(ctx context.Context, commands []st
 
 func (channel *vppctlChannel) doVPPRouteBatchChunk(ctx context.Context, commands []string, begin, end, total int) (VPPCTLCommandResult, error) {
 	label := fmt.Sprintf("vpp route command batch %d-%d/%d", begin+1, end, total)
-	return channel.executeVPPBatchFile(ctx, commands, label)
+	return channel.executeVPPBatchFile(ctx, commands, label, true)
 }
 
 // executeVPPBatchFile writes the commands to a CLI file and runs one
 // `vppctl exec`, which executes them in a single process.
-func (channel *vppctlChannel) executeVPPBatchFile(ctx context.Context, commands []string, label string) (VPPCTLCommandResult, error) {
+func (channel *vppctlChannel) executeVPPBatchFile(ctx context.Context, commands []string, label string, strict bool) (VPPCTLCommandResult, error) {
 	file, err := os.CreateTemp("", "ly-route-vpp-batch-*.conf")
 	if err != nil {
 		return VPPCTLCommandResult{Command: label}, fmt.Errorf("create %s: %w", label, err)
@@ -936,9 +962,11 @@ func (channel *vppctlChannel) executeVPPBatchFile(ctx context.Context, commands 
 		}
 		return result, fmt.Errorf("vppctl exec %s failed: %w: %s", label, runErr, strings.TrimSpace(stderr.String()))
 	}
-	combined := strings.ToLower(stdout.String() + "\n" + stderr.String())
-	if strings.Contains(combined, "cli line error") || strings.Contains(combined, "unknown input") || strings.Contains(combined, "parse error") {
-		return result, fmt.Errorf("vppctl exec %s reported an error: %s", label, strings.TrimSpace(stdout.String()+" "+stderr.String()))
+	if strict {
+		combined := strings.ToLower(stdout.String() + "\n" + stderr.String())
+		if strings.Contains(combined, "cli line error") || strings.Contains(combined, "unknown input") || strings.Contains(combined, "parse error") {
+			return result, fmt.Errorf("vppctl exec %s reported an error: %s", label, strings.TrimSpace(stdout.String()+" "+stderr.String()))
+		}
 	}
 	return result, nil
 }
