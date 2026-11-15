@@ -525,14 +525,19 @@ func transparentBoundaryInterfaces(topology orchestrator.TopologyView) (string, 
 func transparentGroupInterfaces(group orchestrator.GroupView) (string, string, error) {
 	var wan, lan string
 	for _, port := range group.Ports {
+		// A group port may be an aggregated bond. The bond lifecycle creates
+		// lyroute-bond-<name> before the plugin apply, and the plugin treats it
+		// exactly like a physical group port (the bond presents its own
+		// sw_if_index on ingress).
+		name := port.Interface
 		if port.Bond != nil {
-			return "", "", orchestrator.ErrGroupBond
+			name = port.Bond.Name
 		}
 		switch port.Direction {
 		case orchestrator.DirectionWANFacing:
-			wan = transparentVPPInterface(port.Interface)
+			wan = transparentVPPInterface(name)
 		case orchestrator.DirectionLANFacing:
-			lan = transparentVPPInterface(port.Interface)
+			lan = transparentVPPInterface(name)
 		}
 	}
 	if wan == "" || lan == "" {

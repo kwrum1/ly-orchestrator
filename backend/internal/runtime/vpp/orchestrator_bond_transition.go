@@ -16,19 +16,38 @@ import (
 // TransparentOrchestratorBonds translates the product topology into the
 // logical VPP bonds consumed by the transparent orchestrator plugin. The
 // product currently exposes one deterministic, low-surprise aggregation mode:
-// active-backup. Orchestration groups themselves are deliberately never bonds.
+// active-backup. Bonds are created for the boundary LAN/WAN logical interfaces
+// and for aggregated orchestration-group ports.
 func TransparentOrchestratorBonds(topology orchestrator.TopologyView) []BondState {
 	bonds := make([]BondState, 0, len(topology.Interfaces))
+	seen := make(map[string]struct{}, len(topology.Interfaces))
+	add := func(name string, members []string) {
+		vppName := transparentVPPInterface(name)
+		if vppName == "" {
+			return
+		}
+		if _, duplicate := seen[vppName]; duplicate {
+			return
+		}
+		seen[vppName] = struct{}{}
+		vppMembers := make([]string, 0, len(members))
+		for _, member := range members {
+			vppMembers = append(vppMembers, transparentVPPInterface(member))
+		}
+		sort.Strings(vppMembers)
+		bonds = append(bonds, BondState{Name: vppName, Mode: "active-backup", Members: vppMembers})
+	}
 	for _, logical := range topology.Interfaces {
-		if logical.Bond == nil {
-			continue
+		if logical.Bond != nil {
+			add(logical.Bond.Name, logical.Bond.Members)
 		}
-		members := make([]string, 0, len(logical.Bond.Members))
-		for _, member := range logical.Bond.Members {
-			members = append(members, transparentVPPInterface(member))
+	}
+	for _, group := range topology.Groups {
+		for _, port := range group.Ports {
+			if port.Bond != nil {
+				add(port.Bond.Name, port.Bond.Members)
+			}
 		}
-		sort.Strings(members)
-		bonds = append(bonds, BondState{Name: transparentVPPInterface(logical.Bond.Name), Mode: "active-backup", Members: members})
 	}
 	sort.Slice(bonds, func(i, j int) bool { return bonds[i].Name < bonds[j].Name })
 	return bonds

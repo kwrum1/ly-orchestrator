@@ -47,7 +47,11 @@ func validateOwnership(topology Topology) error {
 			case name == topology.management.String():
 				return fmt.Errorf("%w: %q", ErrManagementMembership, name)
 			case !port.hasBond && bonds[name]:
-				return fmt.Errorf("%w: %q is already owned by a logical interface", ErrGroupBond, name)
+				// A group port that is an aggregate must carry its own
+				// bond:{name,members}; a bare name that already belongs to the
+				// logical LAN/WAN bond would attach the same physical bond to
+				// two roles.
+				return fmt.Errorf("%w: %q belongs to the logical LAN/WAN bond", ErrGroupBond, name)
 			case logical[name]:
 				return fmt.Errorf("%w: %q", ErrLogicalMembership, name)
 			}

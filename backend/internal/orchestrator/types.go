@@ -17,7 +17,7 @@ var (
 	ErrSharedInterface       = errors.New("interface ownership must be globally unique")
 	ErrGroupSize             = errors.New("orchestration group must contain exactly two ports")
 	ErrGroupDirection        = errors.New("orchestration group requires one LAN-facing and one WAN-facing port")
-	ErrGroupBond             = errors.New("orchestration groups cannot contain bonds")
+	ErrGroupBond             = errors.New("orchestration group ports may declare their own bond, but cannot reuse an existing logical LAN/WAN bond")
 	ErrServiceChainBond      = errors.New("service chains on bonds are not supported")
 	ErrManagementMembership  = errors.New("management interface is Linux-owned and globally excluded")
 	ErrLogicalMembership     = errors.New("orchestration groups cannot contain logical LAN or WAN interfaces")

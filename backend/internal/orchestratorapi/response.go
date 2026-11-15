@@ -94,6 +94,8 @@ func codeForError(err error) string {
 	case errors.Is(err, orchestrator.ErrGroupDirection):
 		return "invalid_group_direction"
 	case errors.Is(err, orchestrator.ErrGroupBond):
+		// Inline group bonds are supported; only reusing a logical LAN/WAN
+		// bond as a group port is forbidden.
 		return "group_bond_forbidden"
 	case errors.Is(err, orchestrator.ErrManagementMembership):
 		return "management_interface_forbidden"
