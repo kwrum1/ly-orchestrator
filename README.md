@@ -85,15 +85,15 @@ ly Orchestrator 部署在网关与业务网络之间，以两个物理口组成�
 
 | 形态 | 产物 |
 | --- | --- |
-| 在线升级 | `ly-route-orchestrator-1.0.3-amd64.tar.zst` |
-| 裸机安装 | `ly-route-orchestrator-1.0.3-amd64.iso` |
+| 在线升级 | `ly-route-orchestrator-1.1.0-amd64.tar.zst` |
+| 裸机安装 | `ly-route-orchestrator-1.1.0-amd64.iso` |
 
 安装 ISO 支持 BIOS/UEFI 启动，安装时选择目标磁盘与管理口，写入管理地址后首次启动
 即进入编排器控制台。系统要求：x86_64、至少 2 张数据网卡、4 GB 以上系统盘。
 
 ## 版本
 
-- 当前正式版本：`1.0.3`
+- 当前正式版本：`1.1.0`
 - 仅发布 x86_64（amd64）产物。
 
 ## 文档
